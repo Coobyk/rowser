@@ -4376,6 +4376,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rowser-image"
+version = "0.0.0"
+
+[[package]]
 name = "rowser-ipc"
 version = "0.0.0"
 
@@ -4388,6 +4392,10 @@ dependencies = [
  "rowser-html",
  "rowser-text",
 ]
+
+[[package]]
+name = "rowser-net"
+version = "0.0.0"
 
 [[package]]
 name = "rowser-paint"
@@ -4415,6 +4423,10 @@ version = "0.0.0"
 dependencies = [
  "swash",
 ]
+
+[[package]]
+name = "rowser-tls"
+version = "0.0.0"
 
 [[package]]
 name = "roxmltree"
