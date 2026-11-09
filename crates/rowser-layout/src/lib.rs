@@ -2,9 +2,13 @@
 //!
 //! Styles come from the real cascade (rowser-css): a built-in user-agent
 //! stylesheet plus any <style> sheets in the document. Supports: display
-//! (none/block/inline), color, background-color, font-size/-weight/-style/
-//! -family, text-decoration, text-align, white-space:pre, margin/padding
-//! shorthand + sides, simple `border` shorthand.
+//! (none/block/inline/inline-block), color, background-color (blocks paint a
+//! box rect, inlines a per-word highlight), font-size/-weight/-style/-family
+//! (arbitrary family names resolve through FontCache), line-height,
+//! text-decoration, text-align, white-space:pre, margin/padding shorthand +
+//! sides (incl. margin-?:auto centering with `width`), `border` shorthand,
+//! `width`/`height`, float:left|right (lines inset while the float lasts),
+//! and minimal auto table layout (table/tr/td/th with per-cell borders).
 
 use rowser_css as css;
 use rowser_dom::{Document, NodeId, NodeKind};
@@ -63,7 +67,8 @@ struct Style {
     size: f32,
     bold: bool,
     italic: bool,
-    family: Family,
+    /// family name handed to FontCache::resolve (fuzzy substring match)
+    family: String,
     color: Color,
     underline: bool,
     strike: bool,
@@ -71,23 +76,17 @@ struct Style {
     pre: bool,
     align: Align,
     href: Option<String>,
+    /// line-height override: multiplier of font-size or an absolute px length
+    line_h: Option<LineH>,
+    /// background-color of the nearest inline ancestor; painted per-word.
+    /// Cleared when a block/inline-box paints its own background rect.
+    inline_bg: Option<Color>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Family {
-    Sans,
-    Serif,
-    Mono,
-}
-
-impl Family {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Sans => "liberation sans",
-            Self::Serif => "liberation serif",
-            Self::Mono => "liberation mono",
-        }
-    }
+#[derive(Clone, Copy)]
+enum LineH {
+    Mul(f32),
+    Px(f32),
 }
 
 const BASE_SIZE: f32 = 16.0;
@@ -97,7 +96,7 @@ fn base_style() -> Style {
         size: BASE_SIZE,
         bold: false,
         italic: false,
-        family: Family::Sans,
+        family: "liberation sans".to_string(),
         color: BLACK,
         underline: false,
         strike: false,
@@ -105,6 +104,8 @@ fn base_style() -> Style {
         pre: false,
         align: Align::Left,
         href: None,
+        line_h: None,
+        inline_bg: None,
     }
 }
 
@@ -135,6 +136,8 @@ big{font-size:1.17em}
 sub{vertical-align:sub;font-size:.8em}
 sup{vertical-align:super;font-size:.8em}
 hr{margin-top:.5em;margin-bottom:.5em}
+td,th{display:inline-block}
+th{font-weight:bold;text-align:center}
 "#;
 
 fn ua_sheet() -> &'static css::StyleSheet {
@@ -306,6 +309,43 @@ fn side(c: &HashMap<String, String>, name: &str, rel: f32) -> Option<f32> {
     c.get(name).and_then(|v| parse_len(v, rel))
 }
 
+/// margin/padding longhands merged over the shorthand.
+/// Returns [top, right, bottom, left] in px (0 when unset).
+fn box_sides(c: &HashMap<String, String>, name: &str, rel: f32) -> [f32; 4] {
+    let sh = sides(c, name, rel);
+    [
+        side(c, &format!("{name}-top"), rel).or(sh[0]).unwrap_or(0.0),
+        side(c, &format!("{name}-right"), rel).or(sh[1]).unwrap_or(0.0),
+        side(c, &format!("{name}-bottom"), rel).or(sh[2]).unwrap_or(0.0),
+        side(c, &format!("{name}-left"), rel).or(sh[3]).unwrap_or(0.0),
+    ]
+}
+
+/// Is margin-left/right `auto` (longhand or shorthand position)?
+fn margin_auto(c: &HashMap<String, String>, left: bool) -> bool {
+    let long = if left { "margin-left" } else { "margin-right" };
+    if c.get(long).is_some_and(|v| v.trim().eq_ignore_ascii_case("auto")) {
+        return true;
+    }
+    if let Some(v) = c.get("margin") {
+        let t: Vec<&str> = v.split_whitespace().collect();
+        let idx = match t.len() {
+            0 => return false,
+            1 => 0,
+            2 | 3 => 1,
+            _ => {
+                if left {
+                    3
+                } else {
+                    2
+                }
+            }
+        };
+        return t.get(idx).is_some_and(|s| s.eq_ignore_ascii_case("auto"));
+    }
+    false
+}
+
 /// `border: 2px solid red` → (width px, color).
 fn parse_border(v: &str, _rel: f32) -> Option<(f32, Color)> {
     let mut width = None;
@@ -342,6 +382,69 @@ struct Word {
     ascent: f32,
     line_h: f32,
     href: Option<String>,
+    /// inline background — FillRect emitted behind the text
+    bg: Option<Color>,
+    /// inline-block payload: display items in box-local coords (origin top-left)
+    items: Option<Vec<DisplayItem>>,
+    /// inline-block height (baseline alignment: box bottom sits on baseline)
+    box_h: f32,
+}
+
+/// A floated box occupying [x .. x+w] horizontally until `bottom`.
+/// While `y < bottom`, lines inset by `w` on the float's side.
+struct Float {
+    right: bool,
+    w: f32,
+    bottom: f32,
+}
+
+/// Translate a display item by (dx, dy).
+fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
+    match it {
+        DisplayItem::Text {
+            x,
+            baseline,
+            text,
+            font,
+            size,
+            color,
+            underline,
+            strike,
+            href,
+        } => DisplayItem::Text {
+            x: x + dx,
+            baseline: baseline + dy,
+            text,
+            font,
+            size,
+            color,
+            underline,
+            strike,
+            href,
+        },
+        DisplayItem::FillRect { x, y, w, h, color } => DisplayItem::FillRect {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            color,
+        },
+        DisplayItem::Image { x, y, w, h, src } => DisplayItem::Image {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            src,
+        },
+    }
+}
+
+/// Push the 4 edge FillRects of a `w`×`h` box border.
+fn edge_rects(out: &mut Vec<DisplayItem>, x: f32, y: f32, w: f32, h: f32, bw: f32, color: Color) {
+    out.push(DisplayItem::FillRect { x, y, w, h: bw, color });
+    out.push(DisplayItem::FillRect { x, y: y + h - bw, w, h: bw, color });
+    out.push(DisplayItem::FillRect { x, y, w: bw, h, color });
+    out.push(DisplayItem::FillRect { x: x + w - bw, y, w: bw, h, color });
 }
 
 struct BlockPatch {
@@ -358,15 +461,19 @@ pub struct Layouter<'a> {
     doc: &'a Document,
     sheets: Vec<&'a css::StyleSheet>,
     fonts: &'a mut FontCache,
-    width: f32,
     items: Vec<DisplayItem>,
     y: f32,
+    /// left edge of the current content box
     margin_x: f32,
+    /// width available to the current content box (before float insets)
+    avail_w: f32,
     align: Align,
     line: Vec<Word>,
     line_x: f32,
     pending_space: bool,
     list_stack: Vec<(bool, usize)>,
+    /// active floats; inset following lines until `y` passes `bottom`
+    floats: Vec<Float>,
 }
 
 impl<'a> Layouter<'a> {
@@ -387,24 +494,51 @@ impl<'a> Layouter<'a> {
             doc,
             sheets,
             fonts,
-            width,
             items: Vec::new(),
             y: 8.0 - scroll,
             margin_x: 8.0,
+            avail_w: width - 16.0,
             align: Align::Left,
             line: Vec::new(),
             line_x: 0.0,
             pending_space: false,
             list_stack: Vec::new(),
+            floats: Vec::new(),
         };
         l.walk(doc.root, base_style());
         l.flush_line();
+        // floats don't consume vertical space at their site; make sure the
+        // document is at least as tall as the deepest float
+        for f in &l.floats {
+            l.y = l.y.max(f.bottom);
+        }
         let h = l.y + scroll + 8.0;
         (l.items, h)
     }
 
+    /// Horizontal space taken by floats on (left, right) at the current y.
+    fn float_insets(&self) -> (f32, f32) {
+        let (mut l, mut r) = (0.0f32, 0.0f32);
+        for f in &self.floats {
+            if self.y < f.bottom {
+                if f.right {
+                    r += f.w;
+                } else {
+                    l += f.w;
+                }
+            }
+        }
+        (l, r)
+    }
+
     fn content_width(&self) -> f32 {
-        (self.width - self.margin_x * 2.0).max(60.0)
+        let (l, r) = self.float_insets();
+        (self.avail_w - l - r).max(1.0)
+    }
+
+    /// x where a new line starts (left float insets included).
+    fn line_origin(&self) -> f32 {
+        self.margin_x + self.float_insets().0
     }
 
     fn walk(&mut self, node: NodeId, style: Style) {
@@ -425,6 +559,7 @@ impl<'a> Layouter<'a> {
                     Some("block") | Some("list-item") => {
                         self.block(node, tag, &c, st);
                     }
+                    Some("inline-block") => self.inline_block(node, &c, st),
                     _ => self.inline(node, tag, &c, st),
                 }
             }
@@ -444,12 +579,16 @@ impl<'a> Layouter<'a> {
         }
         if let Some(v) = c.get("font-family") {
             let first = v.split(',').next().unwrap_or("").trim().trim_matches('"').trim_matches('\'').to_lowercase();
-            st.family = if first.contains("mono") {
-                Family::Mono
-            } else if first.contains("serif") && !first.contains("sans") {
-                Family::Serif
-            } else {
-                Family::Sans
+            // generic families map to our bundled Liberation set; anything
+            // else is passed through so FontCache::resolve can fuzzy-match
+            // real installed family names (e.g. "DejaVu Sans")
+            st.family = match first.as_str() {
+                "monospace" | "mono" | "fixed" | "fixed-width" => {
+                    "liberation mono".to_string()
+                }
+                "serif" => "liberation serif".to_string(),
+                "" | "sans" | "sans-serif" | "system-ui" => "liberation sans".to_string(),
+                other => other.to_string(),
             };
         }
         if let Some(v) = c.get("color") {
@@ -478,24 +617,55 @@ impl<'a> Layouter<'a> {
                 _ => 0.0,
             };
         }
+        if let Some(v) = c.get("line-height") {
+            let v = v.trim();
+            st.line_h = if v == "normal" {
+                None
+            } else if let Ok(n) = v.parse::<f32>() {
+                Some(LineH::Mul(n))
+            } else {
+                parse_len(v, st.size).map(LineH::Px)
+            };
+        }
+        if let Some(v) = c.get("background-color") {
+            st.inline_bg = parse_color(v);
+        }
     }
 
-    fn block(&mut self, node: NodeId, tag: &str, c: &HashMap<String, String>, st: Style) {
+    fn block(&mut self, node: NodeId, tag: &str, c: &HashMap<String, String>, mut st: Style) {
         self.flush_line();
-        let mt = side(c, "margin-top", st.size)
-            .or_else(|| sides(c, "margin", st.size)[0])
-            .unwrap_or(0.0);
-        let mb = side(c, "margin-bottom", st.size)
-            .or_else(|| sides(c, "margin", st.size)[2])
-            .unwrap_or(0.0);
-        let ml = side(c, "margin-left", st.size)
-            .or_else(|| sides(c, "margin", st.size)[3])
-            .unwrap_or(0.0);
-        let pl = side(c, "padding-left", st.size)
-            .or_else(|| sides(c, "padding", st.size)[3])
-            .unwrap_or(0.0);
+        if tag == "table" {
+            return self.table(node, c, st);
+        }
+        let size = st.size;
+        let [mt, mr, mb, ml] = box_sides(c, "margin", size);
+        let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
         let bg = c.get("background-color").and_then(|v| parse_color(v));
-        let border = c.get("border").and_then(|v| parse_border(v, st.size));
+        let border = c.get("border").and_then(|v| parse_border(v, size));
+        // the block's own background paints behind the whole box, not per word
+        st.inline_bg = None;
+        let bw = border.map(|b| b.0).unwrap_or(0.0);
+
+        if matches!(c.get("float").map(String::as_str), Some("left") | Some("right")) {
+            return self.float_block(node, c, st, mt, mb);
+        }
+
+        // `width` caps the content box; `margin-?:auto` splits leftover space
+        let mut ml = ml;
+        let mut mr = mr;
+        let w_prop = side(c, "width", size);
+        if let Some(w) = w_prop {
+            let extra = (self.avail_w - ml - mr - pl - pr - 2.0 * bw - w).max(0.0);
+            match (margin_auto(c, true), margin_auto(c, false)) {
+                (true, true) => {
+                    ml += extra / 2.0;
+                    mr += extra / 2.0;
+                }
+                (true, false) => ml += extra,
+                (false, true) => mr += extra,
+                (false, false) => {}
+            }
+        }
 
         match tag {
             "ul" | "menu" | "dir" => self.list_stack.push((false, 0)),
@@ -518,11 +688,19 @@ impl<'a> Layouter<'a> {
 
         self.y += mt.max(0.0);
         let saved_mx = self.margin_x;
+        let saved_avail = self.avail_w;
         let saved_align = self.align;
-        self.margin_x += ml.max(0.0) + pl.max(0.0);
+        let inner_w = if let Some(w) = w_prop {
+            w.max(0.0)
+        } else {
+            (self.avail_w - ml - mr - pl - pr - 2.0 * bw).max(1.0)
+        };
+        self.margin_x += ml.max(0.0) + pl + bw;
+        self.avail_w = inner_w;
         self.align = st.align;
 
         // background/border need the final rect — reserve placeholders.
+        // The patch covers the border box (padding included).
         let patch = if bg.is_some() || border.is_some() {
             let idx = self.items.len();
             for _ in 0..5 {
@@ -536,9 +714,9 @@ impl<'a> Layouter<'a> {
             }
             Some(BlockPatch {
                 idx,
-                x: self.margin_x - pl.max(0.0),
+                x: self.margin_x - pl - bw,
                 y: self.y,
-                w: self.width - (self.margin_x - pl.max(0.0)) * 2.0,
+                w: pl + inner_w + pr + 2.0 * bw,
                 bg,
                 border,
             })
@@ -546,9 +724,11 @@ impl<'a> Layouter<'a> {
             None
         };
 
+        // padding-top + border push content down inside the painted box
+        self.y += pt + bw;
         if tag == "hr" {
             self.items.push(DisplayItem::FillRect {
-                x: self.margin_x,
+                x: self.line_origin(),
                 y: self.y + 0.3 * st.size,
                 w: self.content_width(),
                 h: 1.5,
@@ -564,16 +744,465 @@ impl<'a> Layouter<'a> {
             }
             self.flush_line();
         }
+        // padding-bottom + border extend the painted box below content
+        self.y += pb + bw;
 
         if let Some(p) = patch {
             self.finish_patch(&p);
         }
         self.margin_x = saved_mx;
+        self.avail_w = saved_avail;
         self.align = saved_align;
         self.y += mb.max(0.0);
         if tag == "ul" || tag == "ol" || tag == "menu" || tag == "dir" {
             self.list_stack.pop();
         }
+    }
+
+    /// `float:left|right` block: shrink-wrapped (or `width`-sized), placed at
+    /// the margin edge; following lines inset via `self.floats` until `bottom`.
+    /// Approximations: shrink-wrap = longest word (min-content); no stacking
+    /// when floats don't fit; floats don't consume vertical space in flow.
+    fn float_block(
+        &mut self,
+        node: NodeId,
+        c: &HashMap<String, String>,
+        mut st: Style,
+        mt: f32,
+        mb: f32,
+    ) {
+        let size = st.size;
+        let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
+        let [_t, mr, _b, ml] = box_sides(c, "margin", size);
+        let bg = c.get("background-color").and_then(|v| parse_color(v));
+        let border = c.get("border").and_then(|v| parse_border(v, size));
+        st.inline_bg = None;
+        let bw = border.map(|b| b.0).unwrap_or(0.0);
+        let right = c.get("float").is_some_and(|v| v.trim() == "right");
+
+        let inner = if let Some(w) = side(c, "width", size) {
+            w.max(1.0)
+        } else {
+            self.shrink_width(node, &st)
+        };
+        let (li, ri) = self.float_insets();
+        let room = (self.avail_w - li - ri).max(1.0);
+        let box_w = (inner + pl + pr + 2.0 * bw).min(room);
+        let inner = (box_w - pl - pr - 2.0 * bw).max(1.0);
+
+        self.y += mt.max(0.0);
+        let top = self.y;
+        let saved = (self.margin_x, self.avail_w, self.align);
+        let outer_x = if right {
+            self.margin_x + self.avail_w - ri - box_w - mr.max(0.0)
+        } else {
+            self.margin_x + li + ml.max(0.0)
+        };
+        self.margin_x = outer_x + pl + bw;
+        self.avail_w = inner;
+        self.align = st.align;
+
+        let patch = if bg.is_some() || border.is_some() {
+            let idx = self.items.len();
+            for _ in 0..5 {
+                self.items.push(DisplayItem::FillRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 0.0,
+                    color: 0,
+                });
+            }
+            Some(BlockPatch {
+                idx,
+                x: outer_x,
+                y: self.y,
+                w: box_w,
+                bg,
+                border,
+            })
+        } else {
+            None
+        };
+
+        self.y += pt + bw;
+        for &ch in self.doc.children(node) {
+            self.walk(ch, st.clone());
+        }
+        self.flush_line();
+        self.y += pb + bw;
+        if let Some(p) = patch {
+            self.finish_patch(&p);
+        }
+        let bottom = self.y + mb.max(0.0);
+
+        self.margin_x = saved.0;
+        self.avail_w = saved.1;
+        self.align = saved.2;
+        // floats take no vertical space in normal flow
+        self.y = top;
+        self.floats.push(Float {
+            right,
+            w: box_w + ml.max(0.0) + mr.max(0.0),
+            bottom,
+        });
+    }
+
+    /// `display:inline-block`: a box sitting on the text line like a word.
+    /// Content is laid out off-screen via `nest`, then emitted offset to the
+    /// box's position on the line. Bottom of the box sits on the baseline.
+    fn inline_block(&mut self, node: NodeId, c: &HashMap<String, String>, mut st: Style) {
+        let size = st.size;
+        let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
+        let [_t, mr, mb, ml] = box_sides(c, "margin", size);
+        let bg = c.get("background-color").and_then(|v| parse_color(v));
+        let border = c.get("border").and_then(|v| parse_border(v, size));
+        st.inline_bg = None; // the box paints its own bg
+        let bw = border.map(|b| b.0).unwrap_or(0.0);
+
+        // width property else shrink-wrap (min-content approx)
+        let inner = if let Some(w) = side(c, "width", size) {
+            w.max(1.0)
+        } else {
+            self.shrink_width(node, &st)
+        };
+        let room = self.content_width();
+        let box_w = (inner + pl + pr + 2.0 * bw).min(room);
+        let inner = (box_w - pl - pr - 2.0 * bw).max(1.0);
+
+        let (items, y_end) = self.nest(node, &st, pl + bw, pt + bw, inner);
+        let box_h = side(c, "height", size).unwrap_or(y_end + pb + bw).max(1.0);
+
+        let mut out: Vec<DisplayItem> = Vec::new();
+        if let Some(col) = bg {
+            out.push(DisplayItem::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: box_w,
+                h: box_h,
+                color: col,
+            });
+        }
+        if let Some((bw2, col)) = border {
+            edge_rects(&mut out, 0.0, 0.0, box_w, box_h, bw2, col);
+        }
+        out.extend(items);
+
+        // a pending inter-word space becomes a gap before the box
+        if self.pending_space && !self.line.is_empty() {
+            let space_w = self
+                .resolve_font(&st)
+                .and_then(|f| {
+                    self.fonts.font(f).map(|f| {
+                        f.advance_units(f.glyph_id(' ')) as f32 * st.size
+                            / f.units_per_em() as f32
+                    })
+                })
+                .unwrap_or(st.size * 0.3);
+            self.line_x += space_w;
+            if let Some(last) = self.line.last_mut() {
+                last.width += space_w;
+            }
+        }
+        self.pending_space = false;
+        if ml > 0.0 {
+            self.spacer(ml);
+        }
+        self.push_box(box_w, box_h, out, mb.max(0.0));
+        if mr > 0.0 {
+            self.spacer(mr);
+        }
+    }
+
+    /// Minimal auto table layout: column width = max over rows of each cell's
+    /// min-content width (longest word + padding + border), scaled down to fit.
+    /// Each row is laid out cell-by-cell via `nest` at the column's x.
+    /// Approximations: no colspan/rowspan, borders always drawn per-cell
+    /// (border-collapse ≈ same visual since cells abut), rows don't wrap.
+    fn table(&mut self, node: NodeId, c: &HashMap<String, String>, mut st: Style) {
+        let size = st.size;
+        let [mt, _mr, mb, ml] = box_sides(c, "margin", size);
+        let bg = c.get("background-color").and_then(|v| parse_color(v));
+        let border = c.get("border").and_then(|v| parse_border(v, size));
+        st.inline_bg = None;
+        // <table border=N> fallback cell borders (border="0" = none)
+        let attr_border = self
+            .doc
+            .attr(node, "border")
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|w| *w > 0.0)
+            .map(|w| (w, BLACK));
+
+        // gather rows: direct <tr> children plus tr inside row groups
+        let cells_of = |doc: &Document, tr: NodeId| -> Vec<NodeId> {
+            doc.children(tr)
+                .iter()
+                .copied()
+                .filter(|&ch| matches!(doc.tag(ch), Some("td") | Some("th")))
+                .collect()
+        };
+        let mut rows: Vec<Vec<NodeId>> = Vec::new();
+        let mut extra: Vec<NodeId> = Vec::new();
+        for &ch in self.doc.children(node) {
+            match self.doc.tag(ch) {
+                Some("tr") => rows.push(cells_of(self.doc, ch)),
+                Some("tbody") | Some("thead") | Some("tfoot") => {
+                    for &g in self.doc.children(ch) {
+                        if self.doc.tag(g) == Some("tr") {
+                            rows.push(cells_of(self.doc, g));
+                        } else {
+                            extra.push(g);
+                        }
+                    }
+                }
+                _ => extra.push(ch),
+            }
+        }
+
+        // column widths: max min-content width per column
+        let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut col_w = vec![0.0f32; ncols];
+        for row in &rows {
+            for (i, &cell) in row.iter().enumerate() {
+                let cs = css::computed(self.doc, cell, &self.sheets);
+                let mut cst = st.clone();
+                self.apply_computed(&cs, &mut cst);
+                let [_t, pr, _b, pl] = box_sides(&cs, "padding", cst.size).map(|v| v.max(0.0));
+                let bw = cs
+                    .get("border")
+                    .and_then(|v| parse_border(v, cst.size))
+                    .or(attr_border)
+                    .map(|b| b.0)
+                    .unwrap_or(0.0);
+                let mut w = self.shrink_width(cell, &cst) + pl + pr + 2.0 * bw;
+                if let Some(wp) = side(&cs, "width", cst.size) {
+                    w = w.max(wp + pl + pr + 2.0 * bw);
+                }
+                col_w[i] = col_w[i].max(w);
+            }
+        }
+
+        self.y += mt.max(0.0);
+        let saved = (self.margin_x, self.avail_w, self.align);
+        self.margin_x += ml.max(0.0);
+        self.avail_w -= ml.max(0.0);
+        self.align = st.align;
+
+        // scale columns down to fit the available width
+        let avail = self.avail_w.max(1.0);
+        let total: f32 = col_w.iter().sum();
+        if total > avail && total > 0.0 {
+            for w in col_w.iter_mut() {
+                *w *= avail / total;
+            }
+        }
+        let table_w: f32 = col_w.iter().sum();
+
+        let patch = if bg.is_some() || border.is_some() {
+            let idx = self.items.len();
+            for _ in 0..5 {
+                self.items.push(DisplayItem::FillRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 0.0,
+                    color: 0,
+                });
+            }
+            Some(BlockPatch {
+                idx,
+                x: self.margin_x,
+                y: self.y,
+                w: table_w,
+                bg,
+                border,
+            })
+        } else {
+            None
+        };
+
+        for row in &rows {
+            // (x, cell w, cell h, bg, border, items in cell-local coords)
+            let mut boxes: Vec<(
+                f32,
+                f32,
+                f32,
+                Option<Color>,
+                Option<(f32, Color)>,
+                Vec<DisplayItem>,
+            )> = Vec::new();
+            let mut x = self.margin_x;
+            let mut row_h = 0.0f32;
+            for (i, &cell) in row.iter().enumerate() {
+                let cw = col_w[i];
+                let cs = css::computed(self.doc, cell, &self.sheets);
+                let mut cst = st.clone();
+                self.apply_computed(&cs, &mut cst);
+                cst.inline_bg = None; // cell bg paints the whole cell
+                let [pt, pr, pb, pl] = box_sides(&cs, "padding", cst.size).map(|v| v.max(0.0));
+                let cborder = cs
+                    .get("border")
+                    .and_then(|v| parse_border(v, cst.size))
+                    .or(attr_border);
+                let bw = cborder.map(|b| b.0).unwrap_or(0.0);
+                let cbg = cs.get("background-color").and_then(|v| parse_color(v));
+                let inner = (cw - pl - pr - 2.0 * bw).max(1.0);
+                let (items, y_end) = self.nest(cell, &cst, pl + bw, pt + bw, inner);
+                let min_h = self.eff_line_h(&cst);
+                let cell_h = (y_end + pb + bw).max(min_h);
+                boxes.push((x, cw, cell_h, cbg, cborder, items));
+                x += cw;
+                row_h = row_h.max(cell_h);
+            }
+            // second pass: stretch cell bg/borders to row height, place content
+            for (cx, cw, _ch, cbg, cborder, items) in boxes {
+                if let Some(col) = cbg {
+                    self.items.push(DisplayItem::FillRect {
+                        x: cx,
+                        y: self.y,
+                        w: cw,
+                        h: row_h,
+                        color: col,
+                    });
+                }
+                if let Some((bw2, col)) = cborder {
+                    edge_rects(&mut self.items, cx, self.y, cw, row_h, bw2, col);
+                }
+                for it in items {
+                    self.items.push(offset_item(it, cx, self.y));
+                }
+            }
+            self.y += row_h;
+        }
+
+        if let Some(p) = patch {
+            self.finish_patch(&p);
+        }
+        self.margin_x = saved.0;
+        self.avail_w = saved.1;
+        self.align = saved.2;
+        self.y += mb.max(0.0);
+        // non-row children (captions, stray content) laid out after the grid
+        for &e in &extra {
+            self.walk(e, st.clone());
+        }
+    }
+
+    /// Lay out `node`'s children off-screen into a private item list.
+    /// Content box: origin (x0, y0), `avail` wide. Returns (items, bottom y).
+    fn nest(
+        &mut self,
+        node: NodeId,
+        st: &Style,
+        x0: f32,
+        y0: f32,
+        avail: f32,
+    ) -> (Vec<DisplayItem>, f32) {
+        let saved_items = std::mem::take(&mut self.items);
+        let saved_line = std::mem::take(&mut self.line);
+        let saved_floats = std::mem::take(&mut self.floats);
+        let saved = (self.y, self.margin_x, self.avail_w, self.align);
+        let saved_lx = self.line_x;
+        let saved_ps = self.pending_space;
+        self.y = y0;
+        self.margin_x = x0;
+        self.avail_w = avail.max(1.0);
+        self.align = st.align;
+        self.line_x = 0.0;
+        self.pending_space = false;
+        for &ch in self.doc.children(node) {
+            self.walk(ch, st.clone());
+        }
+        self.flush_line();
+        let bottom = self.y;
+        let items = std::mem::replace(&mut self.items, saved_items);
+        self.y = saved.0;
+        self.margin_x = saved.1;
+        self.avail_w = saved.2;
+        self.align = saved.3;
+        self.line = saved_line;
+        self.line_x = saved_lx;
+        self.pending_space = saved_ps;
+        self.floats = saved_floats;
+        (items, bottom)
+    }
+
+    /// min-content width approximation: the longest word inside `node`
+    /// measured in the current font (or a default for textless content).
+    fn shrink_width(&mut self, node: NodeId, st: &Style) -> f32 {
+        let text = self.doc.text_content(node);
+        let mut w = 0.0f32;
+        if let Some(fi) = self.resolve_font(st) {
+            if let Some(f) = self.fonts.font(fi) {
+                for word in text.split_whitespace() {
+                    w = w.max(f.measure(word, st.size));
+                }
+            }
+        }
+        if w <= 0.0 {
+            w = st.size * 4.0; // default for empty/image-ish content
+        }
+        w
+    }
+
+    /// Effective line height for a style: line-height override else font metric.
+    fn eff_line_h(&mut self, st: &Style) -> f32 {
+        match st.line_h {
+            Some(LineH::Mul(m)) => st.size * m,
+            Some(LineH::Px(p)) => p,
+            None => self
+                .resolve_font(st)
+                .and_then(|fi| self.fonts.font(fi).map(|f| f.line_height(st.size)))
+                .unwrap_or(st.size * 1.2),
+        }
+    }
+
+    /// Empty word used for inline margins/spacing — contributes width only.
+    fn spacer(&mut self, w: f32) {
+        if w <= 0.0 {
+            return;
+        }
+        self.line.push(Word {
+            text: String::new(),
+            font: usize::MAX,
+            size: 0.0,
+            color: 0,
+            underline: false,
+            strike: false,
+            shift: 0.0,
+            width: w,
+            ascent: 0.0,
+            line_h: 0.0,
+            href: None,
+            bg: None,
+            items: None,
+            box_h: 0.0,
+        });
+        self.line_x += w;
+    }
+
+    /// Push an inline-block box (pre-rendered items) onto the line like a word.
+    fn push_box(&mut self, w: f32, h: f32, items: Vec<DisplayItem>, mb: f32) {
+        if self.line_x + w > self.content_width() && !self.line.is_empty() {
+            self.flush_line();
+        }
+        self.line.push(Word {
+            text: String::new(),
+            font: usize::MAX,
+            size: 0.0,
+            color: 0,
+            underline: false,
+            strike: false,
+            shift: 0.0,
+            width: w,
+            ascent: h, // box bottom sits on the baseline
+            line_h: h + mb,
+            href: None,
+            bg: None,
+            items: Some(items),
+            box_h: h,
+        });
+        self.line_x += w;
     }
 
     fn finish_patch(&mut self, p: &BlockPatch) {
@@ -590,9 +1219,14 @@ impl<'a> Layouter<'a> {
         }
     }
 
-    fn inline(&mut self, node: NodeId, tag: &str, _c: &HashMap<String, String>, mut st: Style) {
+    fn inline(&mut self, node: NodeId, tag: &str, c: &HashMap<String, String>, mut st: Style) {
         if tag == "a" {
             st.href = self.doc.attr(node, "href").map(String::from);
+        }
+        // inline margins become spacing around the element's runs
+        let [_t, mr, _b, ml] = box_sides(c, "margin", st.size);
+        if ml > 0.0 {
+            self.spacer(ml);
         }
         match tag {
             "br" => self.flush_line(),
@@ -604,14 +1238,10 @@ impl<'a> Layouter<'a> {
                 let h = self.doc.attr(node, "height")
                     .and_then(|v| v.trim_end_matches("px").parse().ok())
                     .unwrap_or(48.0f32);
-                let line_h = self
-                    .fonts
-                    .resolve(st.family.name(), st.bold, st.italic)
-                    .and_then(|f| self.fonts.font(f).map(|f| f.line_height(st.size)))
-                    .unwrap_or(st.size * 1.2);
+                let line_h = self.eff_line_h(&st);
                 if let Some(src) = self.doc.attr(node, "src") {
                     self.items.push(DisplayItem::Image {
-                        x: self.margin_x,
+                        x: self.line_origin(),
                         y: self.y,
                         w,
                         h,
@@ -628,6 +1258,9 @@ impl<'a> Layouter<'a> {
                     self.walk(ch, st.clone());
                 }
             }
+        }
+        if mr > 0.0 {
+            self.spacer(mr);
         }
     }
 
@@ -665,7 +1298,7 @@ impl<'a> Layouter<'a> {
 
     fn resolve_font(&mut self, st: &Style) -> Option<usize> {
         self.fonts
-            .resolve(st.family.name(), st.bold, st.italic)
+            .resolve(&st.family, st.bold, st.italic)
             .or_else(|| self.fonts.resolve("liberation sans", false, false))
     }
 
@@ -699,7 +1332,11 @@ impl<'a> Layouter<'a> {
             (
                 f.measure(word, st.size),
                 f.ascender as f32 * st.size / upem,
-                f.line_height(st.size),
+                match st.line_h {
+                    Some(LineH::Mul(m)) => st.size * m,
+                    Some(LineH::Px(p)) => p,
+                    None => f.line_height(st.size),
+                },
             )
         };
         if self.line_x + w > self.content_width() && !self.line.is_empty() {
@@ -729,6 +1366,9 @@ impl<'a> Layouter<'a> {
                         width: cw,
                         ascent,
                         line_h,
+                        bg: st.inline_bg,
+                        items: None,
+                        box_h: 0.0,
                     });
                     self.flush_line();
                     chunk.clear();
@@ -750,6 +1390,9 @@ impl<'a> Layouter<'a> {
                     width: cw,
                     ascent,
                     line_h,
+                    bg: st.inline_bg,
+                    items: None,
+                    box_h: 0.0,
                 });
                 self.line_x += cw;
             }
@@ -767,6 +1410,9 @@ impl<'a> Layouter<'a> {
             width: w,
             ascent,
             line_h,
+            bg: st.inline_bg,
+            items: None,
+            box_h: 0.0,
         });
         self.line_x += w;
     }
@@ -789,24 +1435,43 @@ impl<'a> Layouter<'a> {
         let max_ascent = self.line.iter().map(|w| w.ascent).fold(0.0f32, f32::max);
         let baseline = self.y + max_ascent;
         let used = self.line.iter().map(|w| w.width).sum::<f32>();
-        let mut x = self.margin_x
+        let mut x = self.line_origin()
             + match self.align {
                 Align::Left => 0.0,
                 Align::Center => ((self.content_width() - used) / 2.0).max(0.0),
                 Align::Right => (self.content_width() - used).max(0.0),
             };
         for w in self.line.drain(..) {
-            self.items.push(DisplayItem::Text {
-                x,
-                baseline: baseline - w.shift * w.size,
-                text: w.text,
-                font: w.font,
-                size: w.size,
-                color: w.color,
-                underline: w.underline,
-                strike: w.strike,
-                href: w.href,
-            });
+            if let Some(items) = w.items {
+                // inline-block: box bottom sits on the baseline
+                let dy = baseline - w.box_h;
+                for it in items {
+                    self.items.push(offset_item(it, x, dy));
+                }
+            } else if !w.text.is_empty() {
+                if let Some(bg) = w.bg {
+                    // inline background: rect behind the word's extent
+                    self.items.push(DisplayItem::FillRect {
+                        x,
+                        y: baseline - w.ascent,
+                        w: w.width,
+                        h: w.ascent + w.size * 0.3,
+                        color: bg,
+                    });
+                }
+                self.items.push(DisplayItem::Text {
+                    x,
+                    baseline: baseline - w.shift * w.size,
+                    text: w.text,
+                    font: w.font,
+                    size: w.size,
+                    color: w.color,
+                    underline: w.underline,
+                    strike: w.strike,
+                    href: w.href,
+                });
+            }
+            // empty words (inline-margin spacers) just advance x
             x += w.width;
         }
         self.y += line_h;
@@ -897,6 +1562,156 @@ mod tests {
         let t = texts(&items);
         if let DisplayItem::Text { size, .. } = t[0] {
             assert!(*size > 30.0);
+        }
+    }
+
+    fn text_pos(items: &[DisplayItem], needle: &str) -> (f32, f32) {
+        for i in items {
+            if let DisplayItem::Text { x, baseline, text, .. } = i {
+                if text.as_str() == needle {
+                    return (*x, *baseline);
+                }
+            }
+        }
+        panic!("text {needle:?} not found");
+    }
+
+    #[test]
+    fn inline_block_advances_line() {
+        let (items, _) = lay(
+            "<style>.ib{display:inline-block;width:100px;height:12px}</style>\
+             <p>a<span class=ib></span>b</p>",
+        );
+        let (xa, _) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        assert!(xb - xa > 100.0, "b should sit past the 100px box: {xa} -> {xb}");
+    }
+
+    #[test]
+    fn inline_block_bg_and_border() {
+        let (items, _) = lay(
+            "<style>.ib{display:inline-block;width:50px;height:20px;\
+             background-color:#ff0000;border:2px solid blue}</style>\
+             <p><span class=ib></span></p>",
+        );
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::FillRect { w, h, color, .. }
+                if *color == bgra(255, 0, 0) && *w >= 50.0 && *h >= 20.0)));
+        assert!(items
+            .iter()
+            .any(|i| matches!(i, DisplayItem::FillRect { color, .. }
+                if *color == bgra(0, 0, 255))));
+    }
+
+    #[test]
+    fn table_places_cells_in_columns() {
+        let (items, _) = lay(
+            "<table><tr><td>a1</td><td>bbb1</td></tr>\
+             <tr><td>a2</td><td>b2</td></tr></table>",
+        );
+        let (xa1, ya1) = text_pos(&items, "a1");
+        let (xb1, yb1) = text_pos(&items, "bbb1");
+        let (xa2, ya2) = text_pos(&items, "a2");
+        let (xb2, _yb2) = text_pos(&items, "b2");
+        // same row → same baseline; second row below; columns aligned
+        assert!((ya1 - yb1).abs() < 0.01, "same-row cells share baseline");
+        assert!(ya2 > ya1, "second row below first");
+        assert!(xb1 > xa1, "second column right of first");
+        assert!((xa2 - xa1).abs() < 0.01, "column 0 aligned across rows");
+        assert!((xb2 - xb1).abs() < 0.01, "column 1 aligned across rows");
+    }
+
+    #[test]
+    fn td_border_draws() {
+        let (items, _) = lay(
+            "<style>td{border:2px solid #ff0000}</style>\
+             <table><tr><td>x</td></tr></table>",
+        );
+        let reds = items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)))
+            .count();
+        assert_eq!(reds, 4, "four border edges around the cell");
+    }
+
+    #[test]
+    fn float_narrows_following_lines() {
+        let (items, _) = lay(
+            "<style>.fl{float:left;width:200px}</style>\
+             <div class=fl>nav</div><p>hello world</p>",
+        );
+        let (xnav, _) = text_pos(&items, "nav");
+        let (xhello, _) = text_pos(&items, "hello");
+        assert!(xnav < 30.0, "float content at left edge, x={xnav}");
+        assert!(xhello >= xnav + 190.0, "text flows beside the float: {xhello}");
+    }
+
+    #[test]
+    fn padding_expands_background_rect() {
+        let (items, _) = lay(
+            "<style>div{background-color:#ff0000}.p{padding:20px}</style>\
+             <div>a</div><div class=p>b</div>",
+        );
+        let hs: Vec<f32> = items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::FillRect { h, color, .. } if *color == bgra(255, 0, 0) => Some(*h),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hs.len(), 2);
+        assert!(hs[1] - hs[0] >= 30.0, "padding grows bg: {:?} vs {:?}", hs[0], hs[1]);
+    }
+
+    #[test]
+    fn inline_margin_and_background() {
+        let (items, _) = lay(
+            "<style>span{margin-left:50px;background-color:#00ff00}</style>\
+             <p>a<span>b</span></p>",
+        );
+        let (xa, _) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        assert!(xb - xa >= 50.0, "margin-left shifts the run: {xa} -> {xb}");
+        // a word-sized green rect sits behind "b"
+        assert!(items.iter().any(|i| matches!(
+            i,
+            DisplayItem::FillRect { x, w, color, .. }
+                if *color == bgra(0, 255, 0) && *w < 100.0 && (*x - xb).abs() < 1.0
+        )));
+    }
+
+    #[test]
+    fn line_height_grows_line_box() {
+        let (items, _) =
+            lay("<style>.lh{line-height:3}</style><p class=lh>a</p><p>b</p>");
+        let (_, ya) = text_pos(&items, "a");
+        let (_, yb) = text_pos(&items, "b");
+        assert!(yb - ya > 40.0, "line-height 3x16 separates baselines: {yb} - {ya}");
+    }
+
+    #[test]
+    fn width_caps_block_content() {
+        let (items, _) = lay(
+            "<style>.w{width:150px}</style>\
+             <div class=w>aa bb cc dd ee ff gg hh ii jj kk ll</div>",
+        );
+        let t = texts(&items);
+        assert!(t.len() >= 4, "words wrap inside the narrow block");
+        let mut baselines: Vec<f32> = t
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Text { baseline, .. } => Some(*baseline),
+                _ => None,
+            })
+            .collect();
+        baselines.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        baselines.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+        assert!(baselines.len() >= 2, "capped width forces multiple lines");
+        for i in &t {
+            if let DisplayItem::Text { x, .. } = i {
+                assert!(*x < 8.0 + 150.0 + 1.0, "word starts inside 150px box, x={x}");
+            }
         }
     }
 }

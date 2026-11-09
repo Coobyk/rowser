@@ -187,6 +187,7 @@ mod tests {
                 color: BLACK,
                 underline: false,
                 strike: false,
+                href: None,
             },
             DisplayItem::Image {
                 x: 0.0,
@@ -203,7 +204,7 @@ mod tests {
                 color: bgra(255, 0, 0),
             },
         ];
-        let px = paint(&items, &mut fonts, 200, 100, rowser_layout::WHITE);
+        let px = paint(&items, &mut fonts, 200, 100, rowser_layout::WHITE, &HashMap::new());
         // some dark pixels must exist (the text)
         let dark = px.chunks(4).filter(|p| p[2] < 100).count();
         assert!(dark > 50);
