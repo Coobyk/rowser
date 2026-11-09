@@ -384,6 +384,7 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
 mod tests {
     use super::*;
 
+    #[allow(dead_code)]
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
@@ -455,11 +456,12 @@ mod tests {
 
     #[test]
     fn sha384_long() {
-        // >128 bytes to exercise multi-block SHA-512 core.
-        let msg = hex("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
-                      hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu");
+        // FIPS 180-4 example: 112-byte ASCII message, exercises the
+        // multi-block SHA-512 core.
+        let msg = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
+                    hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
         assert_eq!(
-            hexify(&sha384(&msg)),
+            hexify(&sha384(msg)),
             "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712\
              fcc7c71a557e2db966c3e9fa91746039"
         );

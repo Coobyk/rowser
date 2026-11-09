@@ -7,7 +7,7 @@ use crate::aes::Aes;
 
 /// R = 0xe1 followed by zeros — the reduction constant for the GCM
 /// polynomial x^128 + x^7 + x^2 + x + 1.
-const R: u128 = 0xe1_00_00_00_00_00_00_00_00_00_00_00_00_00;
+const R: u128 = 0xe1_00_00_00_00_00_00_00_00_00_00_00_00_00_00_00;
 
 /// `x * y` in GF(2^128) with the GCM polynomial.
 fn gf_mul(x: u128, y: u128) -> u128 {
@@ -172,20 +172,20 @@ mod tests {
 
     #[test]
     fn gcm_case3() {
-        // Nonzero key, 60-byte plaintext, no AAD.
+        // Nonzero key, 64-byte plaintext, no AAD (spec Test Case 3).
         let key: [u8; 16] = hex("feffe9928665731c6d6a8f9467308308").try_into().unwrap();
         let iv: [u8; 12] = hex("cafebabefacedbaddecaf888").try_into().unwrap();
         let pt = hex(
             "d9313225f88406e5a55909c5aff5269a\
              86a7a9531534f7da2e4c303d8a318a72\
              1c3c0c95956809532fcf0e2449a6b525\
-             b16aedf5aa0de657ba637b39",
+             b16aedf5aa0de657ba637b391aafd255",
         );
         let want_ct = hex(
             "42831ec2217774244b7221b784d0d49c\
              e3aa212f2c02a4e035c17e2329aca12e\
              21d514b25466931c7d8f6a5aac84aa05\
-             1ba30b396a0aac973d58e091",
+             1ba30b396a0aac973d58e091473f5985",
         );
         let want_tag = hex("4d5c2af327cd64a62cf35abd2ba6fab4");
         let g = AesGcm::new128(&key);
@@ -245,7 +245,7 @@ mod tests {
              8cb08e48590dbb3da7b08b1056828838\
              c5f61e6393ba7a0abcc9f662",
         );
-        let want_tag = hex("3612d2e79e3b0785561be14aaca2fccb");
+        let want_tag = hex("76fc6ece0f4e1768cddf8853bb2d551b");
         let g = AesGcm::new256(&key);
         let (ct, tag) = g.seal(&iv, &aad, &pt);
         assert_eq!(ct, want_ct);

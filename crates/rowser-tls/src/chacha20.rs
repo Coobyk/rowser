@@ -301,7 +301,7 @@ mod tests {
             .try_into()
             .unwrap();
         let nonce: [u8; 12] = hex("070000004041424344454647").try_into().unwrap();
-        let aad = hex("505149532f2a6576652a657665");
+        let aad = hex("50515253c0c1c2c3c4c5c6c7");
         let pt = b"Ladies and Gentlemen of the class of '99: If I could offer you \
                    only one tip for the future, sunscreen would be it.";
         let want_ct = hex(

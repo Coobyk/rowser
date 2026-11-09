@@ -191,7 +191,7 @@ fn fe_to_bytes(f: &Fe) -> [u8; 32] {
     let l0 = r[0] | (r[1] << 51);
     let l1 = (r[1] >> 13) | (r[2] << 38);
     let l2 = (r[2] >> 26) | (r[3] << 25);
-    let l3 = (r[3] >> 38) | (r[4] << 12);
+    let l3 = (r[3] >> 39) | (r[4] << 12);
     let mut out = [0u8; 32];
     out[0..8].copy_from_slice(&l0.to_le_bytes());
     out[8..16].copy_from_slice(&l1.to_le_bytes());
@@ -269,7 +269,10 @@ impl PrivateKey {
     }
 
     pub fn public_key(&self) -> PublicKey {
-        PublicKey(x25519(&self.0, &[9u8; 32]))
+        // The X25519 base point is u = 9, little-endian: 0x09 followed by zeros.
+        let mut basepoint = [0u8; 32];
+        basepoint[0] = 9;
+        PublicKey(x25519(&self.0, &basepoint))
     }
 
     /// Diffie–Hellman against a peer public key.
