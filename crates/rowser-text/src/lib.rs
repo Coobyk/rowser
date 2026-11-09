@@ -151,6 +151,8 @@ pub struct Font {
     cmap12: Option<usize>, // offset of format-12 subtable
     kern_pairs: HashMap<u32, i16>,
     kern_loaded: bool,
+    /// swash handle over leaked data for hinted rasterization
+    swash: Option<swash::FontRef<'static>>,
 }
 
 fn be_u16(d: &[u8], o: usize) -> u16 {
@@ -225,6 +227,7 @@ impl Font {
             cmap12: None,
             kern_pairs: HashMap::new(),
             kern_loaded: false,
+            swash: None,
         };
         font.load_loca();
         font.load_hmtx();
@@ -232,6 +235,10 @@ impl Font {
         if font.cmap4.is_none() && font.cmap12.is_none() {
             return None;
         }
+        // Leak a copy of the font bytes so swash's FontRef can outlive us —
+        // fonts live for the process lifetime anyway.
+        let leaked: &'static [u8] = Box::leak(font.data.clone().into_boxed_slice());
+        font.swash = swash::FontRef::from_index(leaked, 0);
         Some(font)
     }
 
@@ -452,6 +459,10 @@ impl Font {
             .get(&((left as u32) << 16 | right as u32))
             .copied()
             .unwrap_or(0)
+    }
+
+    pub fn swash_font(&self) -> Option<swash::FontRef<'static>> {
+        self.swash
     }
 
     /// Horizontal advance for a glyph, in font units.
@@ -795,6 +806,7 @@ pub struct FontCache {
     faces: Vec<FontFace>,
     fonts: HashMap<usize, Font>, // index into faces
     glyphs: HashMap<(usize, u16, u32), Option<Raster>>, // (face idx, gid, px*4)
+    ctx: swash::scale::ScaleContext,
 }
 
 impl Default for FontCache {
@@ -809,6 +821,7 @@ impl FontCache {
             faces: scan_system(),
             fonts: HashMap::new(),
             glyphs: HashMap::new(),
+            ctx: swash::scale::ScaleContext::new(),
         }
     }
 
@@ -847,7 +860,21 @@ impl FontCache {
     pub fn raster(&mut self, idx: usize, gid: u16, px: f32) -> Option<&Raster> {
         let key = (idx, gid, (px * 4.0) as u32);
         if !self.glyphs.contains_key(&key) {
-            let r = self.fonts.get_mut(&idx)?.raster(gid, px);
+            let font = self.fonts.get(&idx)?;
+            let r = if let Some(sf) = font.swash_font() {
+                let mut scaler = self.ctx.builder(sf).size(px).hint(true).build();
+                swash::scale::Render::new(&[swash::scale::Source::Outline])
+                    .render(&mut scaler, gid)
+                    .map(|img| Raster {
+                        width: img.placement.width,
+                        height: img.placement.height,
+                        bearing_x: img.placement.left,
+                        bearing_y: img.placement.top,
+                        alpha: img.data,
+                    })
+            } else {
+                font.raster(gid, px)
+            };
             self.glyphs.insert(key, r);
         }
         self.glyphs.get(&key)?.as_ref()

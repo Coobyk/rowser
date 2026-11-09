@@ -4412,6 +4412,9 @@ dependencies = [
 [[package]]
 name = "rowser-text"
 version = "0.0.0"
+dependencies = [
+ "swash",
+]
 
 [[package]]
 name = "roxmltree"
