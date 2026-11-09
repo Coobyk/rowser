@@ -32,12 +32,31 @@ struct Tab {
     title: String,
     url: String,
     alive: bool,
+    history: Vec<String>,
+    hist: usize,
 }
 
 impl Tab {
     fn send(&mut self, msg: &ToRenderer) {
         if let Some(out) = &mut self.ipc_out {
             let _ = write_frame(out, &msg.encode());
+        }
+    }
+
+    /// Navigate, recording the visit in history (drops forward entries).
+    fn navigate(&mut self, url: &str) {
+        self.url = url.to_string();
+        self.history.truncate(self.hist + 1);
+        self.history.push(url.to_string());
+        self.hist = self.history.len() - 1;
+        self.send(&ToRenderer::Navigate(url.to_string()));
+    }
+
+    fn go(&mut self, idx: usize) {
+        if idx < self.history.len() {
+            self.hist = idx;
+            self.url = self.history[idx].clone();
+            self.send(&ToRenderer::Navigate(self.url.clone()));
         }
     }
 }
@@ -114,6 +133,8 @@ impl BrowserView {
             title: "New Tab".into(),
             url: url.clone(),
             alive: false,
+            history: vec![url.clone()],
+            hist: 0,
         };
 
         if let Some((child, out, reader)) = Self::spawn_renderer() {
@@ -126,7 +147,7 @@ impl BrowserView {
                 width: self.last_viewport.0,
                 height: self.last_viewport.1,
             });
-            tab.send(&ToRenderer::Navigate(url));
+            tab.navigate(&url);
         } else {
             tab.title = "spawn failed".into();
         }
@@ -147,6 +168,8 @@ impl BrowserView {
             title: "New Tab".into(),
             url: url.clone(),
             alive: false,
+            history: vec![url.clone()],
+            hist: 0,
         };
         if let Some((child, out, reader)) = Self::spawn_renderer() {
             fresh.child = Some(child);
@@ -158,6 +181,8 @@ impl BrowserView {
                 width: self.last_viewport.0,
                 height: self.last_viewport.1,
             });
+            fresh.history = self.tabs[idx].history.clone();
+            fresh.hist = self.tabs[idx].hist;
             fresh.send(&ToRenderer::Navigate(url));
         }
         let mut old = std::mem::replace(&mut self.tabs[idx], fresh);
@@ -344,14 +369,44 @@ impl Render for BrowserView {
                 div()
                     .px_2()
                     .rounded_md()
-                    .text_color(rgb(0x555566))
+                    .text_color(if self.tabs[self.active].hist > 0 {
+                        rgb(0xdddddd)
+                    } else {
+                        rgb(0x555566)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _e, _w, cx| {
+                            let i = view.active;
+                            let h = view.tabs[i].hist;
+                            if h > 0 {
+                                view.tabs[i].go(h - 1);
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .child("◀"),
             )
             .child(
                 div()
                     .px_2()
                     .rounded_md()
-                    .text_color(rgb(0x555566))
+                    .text_color(
+                        if self.tabs[self.active].hist + 1 < self.tabs[self.active].history.len() {
+                            rgb(0xdddddd)
+                        } else {
+                            rgb(0x555566)
+                        },
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _e, _w, cx| {
+                            let i = view.active;
+                            let h = view.tabs[i].hist;
+                            view.tabs[i].go(h + 1);
+                            cx.notify();
+                        }),
+                    )
                     .child("▶"),
             )
             .child(
@@ -424,11 +479,12 @@ impl Render for BrowserView {
             div()
                 .size_full()
                 .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, window, cx| {
-                    let dy = e.delta.pixel_delta(px(20.0)).y;
+                    // GPUI reports content deltas (natural-scroll style):
+                    // wheel up yields positive y. Our scroll offset is
+                    // document-space, so negate it.
+                    let dy = -f32::from(e.delta.pixel_delta(px(20.0)).y);
                     let i = view.active;
-                    view.tabs[i].send(&ToRenderer::Scroll {
-                        dy: f32::from(dy),
-                    });
+                    view.tabs[i].send(&ToRenderer::Scroll { dy });
                     cx.notify();
                     let _ = window;
                 }))
