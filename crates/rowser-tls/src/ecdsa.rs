@@ -258,7 +258,7 @@ pub fn ecdsa_verify(
     let p1 = scalar_mul(&u1, &g, p);
     let p2 = scalar_mul(&u2, &q, p);
     let sum = add(&p1, &p2, p);
-    let x = affine_x(&sum)?;
+    let x = affine_x(&sum, p)?;
     let v = x.rem(n);
     if v == *r {
         Ok(())

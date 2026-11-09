@@ -242,11 +242,11 @@ struct ServerHello {
     peer_pubkey: [u8; 32],
 }
 
-/// RFC 8446 §4.1.3 — ServerHello.random value that means HelloRetryRequest.
-const HRR_RANDOM: [u8; 32] = [
-    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
-    0xc2, 0xa2, 0x11, 0x67, 0xab, 0xb8, 0xc5, 0xe0, 0x79, 0xe0, 0x9e, 0x2c, 0xa8, 0x33, 0x9c,
-];
+/// RFC 8446 §4.1.3 — ServerHello.random for HelloRetryRequest is
+/// SHA-256("HelloRetryRequest"); computed rather than transcribed.
+fn hrr_random() -> [u8; 32] {
+    crate::sha2::sha256(b"HelloRetryRequest")
+}
 
 fn parse_server_hello(body: &[u8]) -> Result<ServerHello> {
     if body.len() < 38 {
@@ -256,7 +256,7 @@ fn parse_server_hello(body: &[u8]) -> Result<ServerHello> {
     if body[0] != 0x03 || body[1] != 0x03 {
         return Err(Error::Decode("serverhello: bad version"));
     }
-    if body[2..34] == HRR_RANDOM {
+    if body[2..34] == hrr_random() {
         return Err(Error::Unsupported("hello retry request"));
     }
     let sid_len = body[34] as usize;

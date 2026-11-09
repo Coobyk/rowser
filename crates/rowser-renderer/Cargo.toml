@@ -14,3 +14,4 @@ rowser-paint = { path = "../rowser-paint" }
 rowser-net = { path = "../rowser-net" }
 rowser-image = { path = "../rowser-image" }
 rowser-css = { path = "../rowser-css" }
+rowser-tls = { path = "../rowser-tls" }

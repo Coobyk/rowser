@@ -98,7 +98,15 @@ fn single_request(url: &Url) -> io::Result<Response> {
     let mut stream = TcpStream::connect((url.host.as_str(), url.port))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    request_over(&mut stream, url)
+}
 
+/// One HTTP/1.1 GET over an already-connected stream (plain TCP or TLS).
+/// Does NOT follow redirects — inspect `Response.status` + `location`.
+pub fn request_over<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    url: &Url,
+) -> io::Result<Response> {
     let host_header = if default_port(&url.scheme) == Some(url.port) {
         url.host.clone()
     } else {

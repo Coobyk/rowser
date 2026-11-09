@@ -255,7 +255,7 @@ fn load_url(url: &str) -> (String, String) {
         return (WELCOME.to_string(), url.to_string());
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        return match rowser_net::fetch(url) {
+        return match web_fetch(url) {
             Ok(res) => (
                 String::from_utf8_lossy(&res.body).into_owned(),
                 res.url.to_string(),
@@ -404,4 +404,57 @@ fn resolve_url(base: &str, resource: &str) -> Option<String> {
     };
     let resolved = base_u.resolve(r).ok()?;
     Some(resolved.to_string())
+}
+
+
+/// http/https fetch with cross-scheme redirect handling.
+fn web_fetch(url: &str) -> io::Result<rowser_net::Response> {
+    use std::net::TcpStream;
+    let mut parsed = rowser_net::Url::parse(url)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    for _ in 0..10 {
+        let resp = match parsed.scheme.as_str() {
+            "http" => {
+                let mut tcp = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
+                rowser_net::request_over(&mut tcp, &parsed)?
+            }
+            "https" => {
+                let tcp = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
+                let mut tls =
+                    rowser_tls::TlsStream::connect(&parsed.host, parsed.port, tcp)?;
+                if let Err(e) = tls.verify_certificate() {
+                    return Ok(rowser_net::Response {
+                        url: parsed.to_string(),
+                        status: 0,
+                        headers: vec![],
+                        body: format!(
+                            "<html><body><h1>Certificate error</h1><p>{e}</p></body></html>"
+                        )
+                        .into_bytes(),
+                    });
+                }
+                rowser_net::request_over(&mut tls, &parsed)?
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("scheme {other}"),
+                ))
+            }
+        };
+        let is_redir = matches!(resp.status, 301 | 302 | 303 | 307 | 308);
+        if !is_redir {
+            return Ok(resp);
+        }
+        let loc = resp
+            .header("location")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no Location"))?;
+        parsed = parsed
+            .resolve(loc.trim())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "too many redirects",
+    ))
 }

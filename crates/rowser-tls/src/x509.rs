@@ -179,7 +179,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// Strip the unused-bits count byte from a BIT STRING value.
-fn bit_string_value(tlv: &Tlv<'_>) -> Result<&[u8]> {
+fn bit_string_value<'a>(tlv: &'a Tlv<'a>) -> Result<&'a [u8]> {
     if tlv.tag != der::TAG_BIT_STRING || tlv.value.is_empty() || tlv.value[0] > 7 {
         return Err(Error::Decode("bad bit string"));
     }

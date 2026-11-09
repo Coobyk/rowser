@@ -6,6 +6,7 @@ mod http;
 mod inflate;
 mod url;
 
+pub use http::request_over;
 pub use http::{Response, fetch, http_get};
 pub use inflate::{InflateError, inflate, inflate_gzip, inflate_zlib};
 pub use url::{Url, UrlError, percent_decode};
