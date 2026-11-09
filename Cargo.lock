@@ -4357,6 +4357,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rowser-dom"
+version = "0.0.0"
+
+[[package]]
+name = "rowser-html"
+version = "0.0.0"
+dependencies = [
+ "rowser-dom",
+]
+
+[[package]]
 name = "rowser-ipc"
 version = "0.0.0"
 
@@ -4366,6 +4377,10 @@ version = "0.0.0"
 dependencies = [
  "rowser-ipc",
 ]
+
+[[package]]
+name = "rowser-text"
+version = "0.0.0"
 
 [[package]]
 name = "roxmltree"
