@@ -2,6 +2,17 @@
 <html>
 <head>
 <title>Welcome to Rowser</title>
+<style>
+body { background-color: #fdfbf7 }
+h1 { color: #2b3f8c; border-bottom: none }
+h2 { color: #4a5ba6; margin-top: 1.2em }
+blockquote { background-color: #f0ecdf; padding-left: 20px; border: 1px solid #d8d2c0 }
+ul li { color: #333 }
+ol li { color: #333 }
+code { color: #8c2b56 }
+.callout { background-color: #e8f0e8; border: 2px solid #6a9a6a; margin-top: 1em; margin-bottom: 1em }
+.callout p { text-align: center; color: #2f5d2f; font-weight: bold }
+</style>
 </head>
 <body>
 <h1>Rowser</h1>
@@ -57,6 +68,11 @@ jugs! How vexingly quick daft zebras jump.</p>
 &laquo;bonjour&raquo; &times; &divide; &deg; &plusmn; &euro; &pound; &yen;
 caf&eacute; na&iuml;ve r&eacute;sum&eacute; &mdash; entities decoded by our
 own tokenizer.</p>
+
+<div class="callout">
+<p>This box is styled with a real CSS stylesheet — colors, backgrounds,
+borders, and text-align all go through the cascade.</p>
+</div>
 
 <p><a href="rowser://newtab/1">This is a link</a> (it does nothing yet —
 hit-testing arrives with real navigation).</p>

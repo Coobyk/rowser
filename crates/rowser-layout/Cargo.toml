@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rowser-css = { path = "../rowser-css" }
 rowser-dom = { path = "../rowser-dom" }
 rowser-text = { path = "../rowser-text" }
 

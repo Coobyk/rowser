@@ -4357,6 +4357,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rowser-css"
+version = "0.0.0"
+dependencies = [
+ "rowser-dom",
+ "rowser-html",
+]
+
+[[package]]
 name = "rowser-dom"
 version = "0.0.0"
 
@@ -4375,6 +4383,7 @@ version = "0.0.0"
 name = "rowser-layout"
 version = "0.0.0"
 dependencies = [
+ "rowser-css",
  "rowser-dom",
  "rowser-html",
  "rowser-text",
