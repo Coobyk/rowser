@@ -1,12 +1,15 @@
 //! rowser-renderer: the per-tab child process.
 //!
-//! Speaks `rowser-ipc` on stdin/stdout (the socketpair handed to it by the
-//! browser process at spawn). M0: responds to Ping, repaints a deterministic
-//! test pattern on Navigate/ResizeViewport. No engine yet — this process is
-//! where html/css/layout/text/paint will live.
+//! Speaks `rowser-ipc` on stdin/stdout. Loads documents (file://, built-in
+//! rowser:// pages, error pages for everything else), runs them through the
+//! engine pipeline — parse → layout → paint — and ships BGRA frames.
 
 use rowser_ipc::{read_frame, write_frame, ToBrowser, ToRenderer};
+use rowser_layout::{bgra, Layouter};
+use rowser_text::FontCache;
 use std::io::{self, Write};
+
+const WELCOME: &str = include_str!("../../../assets/welcome.html");
 
 fn main() {
     let stdin = io::stdin();
@@ -14,8 +17,8 @@ fn main() {
     let mut input = stdin.lock();
     let mut output = stdout.lock();
 
-    let mut viewport = (800u32, 600u32);
-    let mut url = String::from("about:blank");
+    let mut fonts = FontCache::new();
+    let mut page = Page::new();
 
     loop {
         let payload = match read_frame(&mut input) {
@@ -33,32 +36,44 @@ fn main() {
             ToRenderer::Ping(n) => {
                 let _ = send(&mut output, &ToBrowser::Pong(n));
             }
-            ToRenderer::Navigate(u) => {
-                url = u;
+            ToRenderer::Navigate(url) => {
                 let _ = send(&mut output, &ToBrowser::LoadStarted);
-                let pixels = test_pattern(viewport.0, viewport.1, &url);
-                let _ = send(
-                    &mut output,
-                    &ToBrowser::Frame {
-                        width: viewport.0,
-                        height: viewport.1,
-                        pixels,
-                    },
-                );
-                let _ = send(&mut output, &ToBrowser::Title(format!("{url} — rowser")));
+                let (html, effective) = load_url(&url);
+                let doc = rowser_html::parse(&html);
+                let title = doc
+                    .find_deep(doc.root, "title")
+                    .map(|t| doc.text_content(t))
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| effective.clone());
+                page.load(doc, effective, title.clone());
+                page.repaint(&mut fonts);
+                let _ = send(&mut output, &ToBrowser::Title(title));
+                let _ = send(&mut output, &frame_msg(&page));
                 let _ = send(&mut output, &ToBrowser::LoadDone);
             }
             ToRenderer::ResizeViewport { width, height } => {
-                viewport = (width.max(1), height.max(1));
-                let pixels = test_pattern(viewport.0, viewport.1, &url);
-                let _ = send(
-                    &mut output,
-                    &ToBrowser::Frame {
-                        width: viewport.0,
-                        height: viewport.1,
-                        pixels,
-                    },
-                );
+                page.viewport = (width.max(1), height.max(1));
+                if page.has_doc() {
+                    page.repaint(&mut fonts);
+                    let _ = send(&mut output, &frame_msg(&page));
+                } else {
+                    let pixels = test_pattern(width.max(1), height.max(1), "blank");
+                    let _ = send(
+                        &mut output,
+                        &ToBrowser::Frame {
+                            width: width.max(1),
+                            height: height.max(1),
+                            pixels,
+                        },
+                    );
+                }
+            }
+            ToRenderer::Scroll { dy } => {
+                if page.has_doc() {
+                    page.scroll = (page.scroll + dy).clamp(0.0, page.max_scroll());
+                    page.repaint(&mut fonts);
+                    let _ = send(&mut output, &frame_msg(&page));
+                }
             }
             ToRenderer::Shutdown => break,
         }
@@ -69,55 +84,132 @@ fn send(w: &mut impl Write, msg: &ToBrowser) -> io::Result<()> {
     write_frame(w, &msg.encode())
 }
 
-/// FNV-1a hash of the URL → base color for the pattern.
-fn hash(s: &str) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+struct Page {
+    doc: Option<rowser_dom::Document>,
+    url: String,
+    title: String,
+    viewport: (u32, u32),
+    scroll: f32,
+    content_h: f32,
+    pixels: Vec<u8>,
 }
 
-/// Premultiplied BGRA test pattern (alpha = 255 throughout, so premultiply is
-/// a no-op). Checkerboard tinted by URL hash, plus channel-order bars along
-/// the bottom so a swapped channel is immediately visible: red, green, blue,
-/// black, white.
-fn test_pattern(width: u32, height: u32, seed: &str) -> Vec<u8> {
-    let h = hash(seed);
-    let r0 = (32 + (h & 0x7f)) as u8;
-    let g0 = (32 + ((h >> 8) & 0x7f)) as u8;
-    let b0 = (32 + ((h >> 16) & 0x7f)) as u8;
+impl Page {
+    fn new() -> Self {
+        Self {
+            doc: None,
+            url: "about:blank".into(),
+            title: String::new(),
+            viewport: (800, 600),
+            scroll: 0.0,
+            content_h: 0.0,
+            pixels: Vec::new(),
+        }
+    }
 
-    let (w, hgt) = (width as usize, height as usize);
-    let mut px = vec![0u8; w * hgt * 4];
-    let bar_h = 48usize.min(hgt / 6);
+    fn has_doc(&self) -> bool {
+        self.doc.is_some()
+    }
 
-    for y in 0..hgt {
+    fn load(&mut self, doc: rowser_dom::Document, url: String, title: String) {
+        self.doc = Some(doc);
+        self.url = url;
+        self.title = title;
+        self.scroll = 0.0;
+    }
+
+    fn max_scroll(&self) -> f32 {
+        (self.content_h - self.viewport.1 as f32).max(0.0)
+    }
+
+    fn repaint(&mut self, fonts: &mut FontCache) {
+        let Some(doc) = &self.doc else { return };
+        let (items, height) =
+            Layouter::layout(doc, fonts, self.viewport.0 as f32, self.scroll);
+        self.content_h = height;
+        self.pixels = rowser_paint::paint(
+            &items,
+            fonts,
+            self.viewport.0,
+            self.viewport.1,
+            bgra(0xff, 0xff, 0xff),
+        );
+    }
+}
+
+fn frame_msg(page: &Page) -> ToBrowser {
+    ToBrowser::Frame {
+        width: page.viewport.0,
+        height: page.viewport.1,
+        pixels: page.pixels.clone(),
+    }
+}
+
+/// Resolve a URL to HTML text + the effective URL (after fallback).
+fn load_url(url: &str) -> (String, String) {
+    if let Some(rest) = url.strip_prefix("file://") {
+        let path = percent_decode(rest);
+        return match std::fs::read_to_string(&path) {
+            Ok(html) => (html, url.to_string()),
+            Err(e) => (error_page(url, &format!("cannot read {path}: {e}")), url.to_string()),
+        };
+    }
+    if url.starts_with("rowser://") {
+        return (WELCOME.to_string(), url.to_string());
+    }
+    if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) {
+        return (
+            error_page(url, &format!("network stack not built yet — {rest}")),
+            url.to_string(),
+        );
+    }
+    if url == "about:blank" {
+        return ("<html><body></body></html>".into(), url.into());
+    }
+    // Bare path? try as file
+    if std::path::Path::new(url).exists() {
+        if let Ok(html) = std::fs::read_to_string(url) {
+            return (html, format!("file://{url}"));
+        }
+    }
+    (error_page(url, "unrecognized URL"), url.to_string())
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn error_page(url: &str, why: &str) -> String {
+    format!(
+        "<html><body><h1>Cannot display page</h1><p><b>{url}</b></p><p>{why}</p><hr><p><small>rowser error page</small></p></body></html>"
+    )
+}
+
+/// Premultiplied-BGRA checkerboard for the blank/no-document state.
+fn test_pattern(width: u32, height: u32, _seed: &str) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut px = vec![0u8; w * h * 4];
+    for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) * 4;
-            let (r, g, b) = if hgt - y <= bar_h {
-                // Channel-order check strip: R | G | B | black | white
-                let seg = x * 5 / w.max(1);
-                match seg.min(4) {
-                    0 => (255, 0, 0),
-                    1 => (0, 255, 0),
-                    2 => (0, 0, 255),
-                    3 => (0, 0, 0),
-                    _ => (255, 255, 255),
-                }
-            } else {
-                // 32px checkerboard between two shades of the hashed color
-                let check = ((x / 32) + (y / 32)) % 2 == 0;
-                if check {
-                    (r0, g0, b0)
-                } else {
-                    (r0 / 3 + 24, g0 / 3 + 24, b0 / 3 + 24)
-                }
-            };
-            px[i] = b;
-            px[i + 1] = g;
-            px[i + 2] = r;
+            let v = if ((x / 32) + (y / 32)) % 2 == 0 { 40u8 } else { 48u8 };
+            px[i] = v;
+            px[i + 1] = v;
+            px[i + 2] = v + 8;
             px[i + 3] = 255;
         }
     }

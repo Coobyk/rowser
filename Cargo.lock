@@ -4372,10 +4372,32 @@ name = "rowser-ipc"
 version = "0.0.0"
 
 [[package]]
+name = "rowser-layout"
+version = "0.0.0"
+dependencies = [
+ "rowser-dom",
+ "rowser-html",
+ "rowser-text",
+]
+
+[[package]]
+name = "rowser-paint"
+version = "0.0.0"
+dependencies = [
+ "rowser-layout",
+ "rowser-text",
+]
+
+[[package]]
 name = "rowser-renderer"
 version = "0.0.0"
 dependencies = [
+ "rowser-dom",
+ "rowser-html",
  "rowser-ipc",
+ "rowser-layout",
+ "rowser-paint",
+ "rowser-text",
 ]
 
 [[package]]

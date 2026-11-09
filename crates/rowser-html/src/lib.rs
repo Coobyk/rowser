@@ -54,12 +54,6 @@ impl<'a> Tokenizer<'a> {
         self.input.get(self.pos).copied()
     }
 
-    fn next(&mut self) -> Option<u8> {
-        let c = self.peek()?;
-        self.pos += 1;
-        Some(c)
-    }
-
     fn starts_with_ci(&self, s: &str) -> bool {
         self.input[self.pos..]
             .iter()

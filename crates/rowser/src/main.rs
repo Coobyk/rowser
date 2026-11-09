@@ -420,6 +420,15 @@ impl Render for BrowserView {
         } else if let Some(frame) = &active.frame {
             div()
                 .size_full()
+                .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, window, cx| {
+                    let dy = e.delta.pixel_delta(px(20.0)).y;
+                    let i = view.active;
+                    view.tabs[i].send(&ToRenderer::Scroll {
+                        dy: f32::from(dy),
+                    });
+                    cx.notify();
+                    let _ = window;
+                }))
                 .child(img(frame.clone()).size_full().object_fit(ObjectFit::Fill))
         } else {
             div()

@@ -1,0 +1,9 @@
+[package]
+name = "rowser-paint"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rowser-layout = { path = "../rowser-layout" }
+rowser-text = { path = "../rowser-text" }

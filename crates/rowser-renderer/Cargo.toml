@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 rowser-ipc = { path = "../rowser-ipc" }
+rowser-dom = { path = "../rowser-dom" }
+rowser-html = { path = "../rowser-html" }
+rowser-text = { path = "../rowser-text" }
+rowser-layout = { path = "../rowser-layout" }
+rowser-paint = { path = "../rowser-paint" }

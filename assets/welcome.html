@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+<title>Welcome to Rowser</title>
+</head>
+<body>
+<h1>Rowser</h1>
+<p>A web browser written in <b>Rust</b> and <b>GPUI</b> — with an engine built
+<em>entirely from scratch</em>. What you are reading right now was tokenized,
+parsed, laid out, shaped, and rasterized by code that lives in this
+repository.</p>
+
+<h2>What works</h2>
+<ul>
+<li>Multi-process architecture — one renderer per tab</li>
+<li>HTML parsing with implied end tags &amp; entities</li>
+<li>Block &amp; inline layout with word wrapping</li>
+<li>TrueType fonts: cmap, glyf outlines, kerning</li>
+<li>Supersampled scanline rasterization</li>
+</ul>
+
+<h2>Font showcase</h2>
+<p><b>Bold text</b>, <i>italic text</i>, <b><i>bold italic</i></b>,
+<code>monospace code</code>, <small>small text</small>, <big>big text</big>,
+H<sub>2</sub>O, x<sup>2</sup>, <u>underlined</u>, and <s>struck through</s>.</p>
+
+<h2>Typography test</h2>
+<p>Avenue — WAVE — ToVe — typeset with real kerning. The quick brown fox
+jumps over the lazy dog. 0123456789. Pack my box with five dozen liquor
+jugs! How vexingly quick daft zebras jump.</p>
+
+<blockquote>
+<p>"The best way to predict the future is to invent it."</p>
+<p>— Alan Kay, probably</p>
+</blockquote>
+
+<h3>Lists can be ordered too</h3>
+<ol>
+<li>Parse the document</li>
+<li>Build the box tree</li>
+<li>Break text into lines</li>
+<li>Paint pixels</li>
+<li>Ship a frame over IPC</li>
+</ol>
+
+<hr>
+
+<h2>Preformatted</h2>
+<pre>fn main() {
+    let engine = rowser::Engine::new();
+    engine.navigate("file:///welcome.html");
+    // every pixel you see was earned
+}</pre>
+
+<h2>Character entities</h2>
+<p>&amp; &lt; &gt; &quot; &copy; &reg; &trade; &hellip; &mdash; &ndash;
+&laquo;bonjour&raquo; &times; &divide; &deg; &plusmn; &euro; &pound; &yen;
+caf&eacute; na&iuml;ve r&eacute;sum&eacute; &mdash; entities decoded by our
+own tokenizer.</p>
+
+<p><a href="rowser://newtab/1">This is a link</a> (it does nothing yet —
+hit-testing arrives with real navigation).</p>
+
+<hr>
+<p><small>rowser &middot; milestone 1 &middot; rendered locally, honestly</small></p>
+</body>
+</html>

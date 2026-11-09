@@ -122,6 +122,8 @@ pub enum ToRenderer {
     Navigate(String),
     /// Viewport size changed; the renderer should produce a new frame.
     ResizeViewport { width: u32, height: u32 },
+    /// Scroll the document by dy pixels (positive = down).
+    Scroll { dy: f32 },
     Shutdown,
 }
 
@@ -146,7 +148,8 @@ pub enum ToBrowser {
 const TAG_PING: u8 = 0;
 const TAG_NAVIGATE: u8 = 1;
 const TAG_RESIZE: u8 = 2;
-const TAG_SHUTDOWN: u8 = 3;
+const TAG_SCROLL: u8 = 3;
+const TAG_SHUTDOWN: u8 = 4;
 
 const TAG_PONG: u8 = 0;
 const TAG_LOAD_STARTED: u8 = 1;
@@ -172,6 +175,10 @@ impl ToRenderer {
                 w.u32(*width);
                 w.u32(*height);
             }
+            Self::Scroll { dy } => {
+                w.u8(TAG_SCROLL);
+                w.u32(dy.to_bits());
+            }
             Self::Shutdown => w.u8(TAG_SHUTDOWN),
         }
         w.into_payload()
@@ -185,6 +192,9 @@ impl ToRenderer {
             TAG_RESIZE => Self::ResizeViewport {
                 width: r.u32()?,
                 height: r.u32()?,
+            },
+            TAG_SCROLL => Self::Scroll {
+                dy: f32::from_bits(r.u32()?),
             },
             TAG_SHUTDOWN => Self::Shutdown,
             tag => {
@@ -266,6 +276,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
             },
+            ToRenderer::Scroll { dy: -240.5 },
             ToRenderer::Shutdown,
         ];
         for msg in msgs {

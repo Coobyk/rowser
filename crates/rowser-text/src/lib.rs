@@ -731,15 +731,16 @@ impl Font {
                         sum += cov[(y * SS + sy) as usize * (w * SS) as usize + (x * SS + sx) as usize] as u32;
                     }
                 }
-                alpha[(y * w + x) as usize] = (sum * 255 / (SS * SS) as u32 / 255 * 255) as u8;
+                alpha[(y * w + x) as usize] = (sum / (SS * SS) as u32) as u8;
             }
         }
         Some(Raster {
             width: w as u32,
             height: h as u32,
-            // distance from pen origin: left bearing and distance up to top
             bearing_x: (min_x - 1.0).round() as i32,
-            bearing_y: (-max_y - 1.0).round() as i32, // y-up → negative = above baseline
+            // Distance the ink extends above the baseline (y-up, positive).
+            // Draw at: top = baseline - bearing_y.
+            bearing_y: (-min_y - 1.0).round() as i32,
             alpha,
         })
     }
@@ -754,6 +755,102 @@ pub struct Raster {
     /// Pixels above the baseline where ink starts (y-up convention).
     pub bearing_y: i32,
     pub alpha: Vec<u8>,
+}
+
+impl Font {
+    /// Pixel advance of a glyph at the given pixels-per-em.
+    pub fn advance(&self, gid: u16, px: f32) -> f32 {
+        self.advance_units(gid) as f32 * px / self.units_per_em as f32
+    }
+
+    /// Width of a text run at `px`, applying kerning.
+    pub fn measure(&mut self, text: &str, px: f32) -> f32 {
+        let s = px / self.units_per_em as f32;
+        let mut w = 0.0f32;
+        let mut prev = 0u16;
+        for c in text.chars() {
+            let gid = self.glyph_id(c);
+            w += self.kern(prev, gid) as f32 * s;
+            w += self.advance_units(gid) as f32;
+            prev = gid;
+        }
+        w * s
+    }
+
+    /// Ascent at `px` (distance from baseline to top of line box).
+    pub fn ascent(&self, px: f32) -> f32 {
+        self.ascender as f32 * px / self.units_per_em as f32
+    }
+
+    /// Full line height at `px` (ascent - descent + gap).
+    pub fn line_height(&self, px: f32) -> f32 {
+        self.line_height_units() as f32 * px / self.units_per_em as f32
+    }
+}
+
+/// Loads and caches fonts by (family, bold, italic). Lazily parses files —
+/// rasterizing glyphs is cached per (glyph, pixel size) inside `GlyphCache`.
+pub struct FontCache {
+    faces: Vec<FontFace>,
+    fonts: HashMap<usize, Font>, // index into faces
+    glyphs: HashMap<(usize, u16, u32), Option<Raster>>, // (face idx, gid, px*4)
+}
+
+impl Default for FontCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FontCache {
+    pub fn new() -> Self {
+        Self {
+            faces: scan_system(),
+            fonts: HashMap::new(),
+            glyphs: HashMap::new(),
+        }
+    }
+
+    /// Resolve (family, bold, italic) → index of the loaded font, if found.
+    pub fn resolve(&mut self, family: &str, bold: bool, italic: bool) -> Option<usize> {
+        let want = family.to_lowercase();
+        let mut best: Option<(usize, u32)> = None;
+        for (i, f) in self.faces.iter().enumerate() {
+            if !f.family.to_lowercase().contains(&want) {
+                continue;
+            }
+            let mut score = 1u32;
+            if f.bold == bold {
+                score += 4;
+            }
+            if f.italic == italic {
+                score += 2;
+            }
+            if best.is_none_or(|(_, s)| score > s) {
+                best = Some((i, score));
+            }
+        }
+        let idx = best?.0;
+        if !self.fonts.contains_key(&idx) {
+            let font = Font::load(&self.faces[idx].path)?;
+            self.fonts.insert(idx, font);
+        }
+        Some(idx)
+    }
+
+    pub fn font(&mut self, idx: usize) -> Option<&mut Font> {
+        self.fonts.get_mut(&idx)
+    }
+
+    /// Cached glyph raster at `px` (quantized to quarter pixels).
+    pub fn raster(&mut self, idx: usize, gid: u16, px: f32) -> Option<&Raster> {
+        let key = (idx, gid, (px * 4.0) as u32);
+        if !self.glyphs.contains_key(&key) {
+            let r = self.fonts.get_mut(&idx)?.raster(gid, px);
+            self.glyphs.insert(key, r);
+        }
+        self.glyphs.get(&key)?.as_ref()
+    }
 }
 
 fn f2dot14(v: i16) -> f32 {
@@ -774,8 +871,10 @@ fn flatten_quad(p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), scale: f32, dx: 
 
 /// Scanline non-zero winding fill of one closed polyline into a coverage
 /// buffer at supersampled resolution. `ox/oy` are the pixel-space offset
-/// the polyline coordinates are relative to.
+/// the polyline coordinates are relative to. The coverage buffer is
+/// `w`×`h` *supersamples* — coordinates are scaled by SS accordingly.
 fn raster_contour(poly: &[(f32, f32)], ox: f32, oy: f32, cov: &mut [u8], w: i32, h: i32) {
+    const SS: f32 = 4.0;
     // For each scanline (supersampled row), collect edge crossings.
     for sy in 0..h {
         let y = sy as f32 + 0.5;
@@ -784,12 +883,12 @@ fn raster_contour(poly: &[(f32, f32)], ox: f32, oy: f32, cov: &mut [u8], w: i32,
         for i in 0..n {
             let (x0, y0) = poly[i];
             let (x1, y1) = poly[(i + 1) % n];
-            let (ya, yb) = (y0 - oy, y1 - oy);
+            let (ya, yb) = ((y0 - oy) * SS, (y1 - oy) * SS);
             if (ya <= y) == (yb <= y) || ya == yb {
                 continue;
             }
             let t = (y - ya) / (yb - ya);
-            let x = x0 - ox + t * (x1 - x0);
+            let x = (x0 - ox + t * (x1 - x0)) * SS;
             xs.push((x, if yb > ya { 1 } else { -1 }));
         }
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -865,3 +964,4 @@ mod tests {
         assert!(sans.bold);
     }
 }
+
