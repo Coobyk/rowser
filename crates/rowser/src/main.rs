@@ -225,6 +225,7 @@ impl BrowserView {
                         }
                     }
                     ToBrowser::LoadDone => {}
+                    ToBrowser::NavigationRequest(url) => tab.navigate(&url),
                     ToBrowser::Log(m) => self.logs.push(format!("tab {id}: {m}")),
                 },
                 TabEvent::Disconnected => {
@@ -478,6 +479,21 @@ impl Render for BrowserView {
         } else if let Some(frame) = &active.frame {
             div()
                 .size_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, e: &MouseDownEvent, window, cx| {
+                        let p = e.position;
+                        // webview starts below the 72px chrome; document space
+                        // is device px (logical × scale factor)
+                        let sf = window.scale_factor();
+                        let i = view.active;
+                        view.tabs[i].send(&ToRenderer::Click {
+                            x: f32::from(p.x) * sf,
+                            y: (f32::from(p.y) - 72.0) * sf,
+                        });
+                        cx.notify();
+                    }),
+                )
                 .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, window, cx| {
                     // GPUI reports content deltas (natural-scroll style):
                     // wheel up yields positive y. Our scroll offset is

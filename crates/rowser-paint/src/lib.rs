@@ -106,6 +106,7 @@ pub fn paint_into(canvas: &mut Canvas, items: &[DisplayItem], fonts: &mut FontCa
                 color,
                 underline,
                 strike,
+                href: _,
             } => {
                 let mut pen = *x;
                 let mut prev = 0u16;

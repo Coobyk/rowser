@@ -124,6 +124,8 @@ pub enum ToRenderer {
     ResizeViewport { width: u32, height: u32 },
     /// Scroll the document by dy pixels (positive = down).
     Scroll { dy: f32 },
+    /// Mouse click at document-space coordinates (device px).
+    Click { x: f32, y: f32 },
     Shutdown,
 }
 
@@ -143,12 +145,15 @@ pub enum ToBrowser {
     LoadDone,
     /// Free-form diagnostics from the renderer (shown in a log view later).
     Log(String),
+    /// The user clicked a link — browser should navigate.
+    NavigationRequest(String),
 }
 
 const TAG_PING: u8 = 0;
 const TAG_NAVIGATE: u8 = 1;
 const TAG_RESIZE: u8 = 2;
 const TAG_SCROLL: u8 = 3;
+const TAG_CLICK: u8 = 5;
 const TAG_SHUTDOWN: u8 = 4;
 
 const TAG_PONG: u8 = 0;
@@ -157,6 +162,7 @@ const TAG_TITLE: u8 = 2;
 const TAG_FRAME: u8 = 3;
 const TAG_LOAD_DONE: u8 = 4;
 const TAG_LOG: u8 = 5;
+const TAG_NAV_REQUEST: u8 = 6;
 
 impl ToRenderer {
     pub fn encode(&self) -> Vec<u8> {
@@ -179,6 +185,11 @@ impl ToRenderer {
                 w.u8(TAG_SCROLL);
                 w.u32(dy.to_bits());
             }
+            Self::Click { x, y } => {
+                w.u8(TAG_CLICK);
+                w.u32(x.to_bits());
+                w.u32(y.to_bits());
+            }
             Self::Shutdown => w.u8(TAG_SHUTDOWN),
         }
         w.into_payload()
@@ -194,7 +205,11 @@ impl ToRenderer {
                 height: r.u32()?,
             },
             TAG_SCROLL => Self::Scroll {
-                dy: f32::from_bits(r.u32()?),
+                dy: f32::from_bits(r.u32()?)
+            },
+            TAG_CLICK => Self::Click {
+                x: f32::from_bits(r.u32()?),
+                y: f32::from_bits(r.u32()?),
             },
             TAG_SHUTDOWN => Self::Shutdown,
             tag => {
@@ -235,6 +250,10 @@ impl ToBrowser {
                 w.u8(TAG_LOG);
                 w.string(msg);
             }
+            Self::NavigationRequest(url) => {
+                w.u8(TAG_NAV_REQUEST);
+                w.string(url);
+            }
         }
         w.into_payload()
     }
@@ -252,6 +271,7 @@ impl ToBrowser {
             },
             TAG_LOAD_DONE => Self::LoadDone,
             TAG_LOG => Self::Log(r.string()?),
+            TAG_NAV_REQUEST => Self::NavigationRequest(r.string()?),
             tag => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,

@@ -68,6 +68,36 @@ fn main() {
                     );
                 }
             }
+            ToRenderer::Click { x, y } => {
+                // hit-test link regions in document space
+                let mut found = None;
+                for it in &page.items {
+                    if let rowser_layout::DisplayItem::Text {
+                        x: tx,
+                        baseline,
+                        text,
+                        font,
+                        size,
+                        href: Some(href),
+                        ..
+                    } = it
+                    {
+                        let _ = (tx, font);
+                        let w = fonts
+                            .font(*font)
+                            .map(|f| f.measure(text, *size))
+                            .unwrap_or(0.0);
+                        // rough hit box: from x to x+width, baseline-ascent to baseline+descent
+                        if x >= *tx && x <= *tx + w && y >= baseline - size && y <= *baseline + size * 0.4 {
+                            found = Some(href.clone());
+                            break;
+                        }
+                    }
+                }
+                if let Some(url) = found {
+                    let _ = send(&mut output, &ToBrowser::NavigationRequest(url));
+                }
+            }
             ToRenderer::Scroll { dy } => {
                 if page.has_doc() {
                     page.scroll = (page.scroll + dy).clamp(0.0, page.max_scroll());
@@ -92,6 +122,7 @@ struct Page {
     scroll: f32,
     content_h: f32,
     pixels: Vec<u8>,
+    items: Vec<rowser_layout::DisplayItem>,
 }
 
 impl Page {
@@ -104,6 +135,7 @@ impl Page {
             scroll: 0.0,
             content_h: 0.0,
             pixels: Vec::new(),
+            items: Vec::new(),
         }
     }
 
@@ -127,8 +159,8 @@ impl Page {
         let (items, height) =
             Layouter::layout(doc, fonts, self.viewport.0 as f32, self.scroll);
         self.content_h = height;
-        self.pixels = rowser_paint::paint(
-            &items,
+        self.items = items;
+        self.pixels = rowser_paint::paint(&self.items,
             fonts,
             self.viewport.0,
             self.viewport.1,

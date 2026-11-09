@@ -32,6 +32,7 @@ pub enum DisplayItem {
         color: Color,
         underline: bool,
         strike: bool,
+        href: Option<String>,
     },
     FillRect {
         x: f32,
@@ -49,7 +50,7 @@ pub enum Align {
     Right,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Style {
     size: f32,
     bold: bool,
@@ -61,6 +62,7 @@ struct Style {
     shift: f32,
     pre: bool,
     align: Align,
+    href: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -94,6 +96,7 @@ fn base_style() -> Style {
         shift: 0.0,
         pre: false,
         align: Align::Left,
+        href: None,
     }
 }
 
@@ -330,6 +333,7 @@ struct Word {
     width: f32,
     ascent: f32,
     line_h: f32,
+    href: Option<String>,
 }
 
 struct BlockPatch {
@@ -397,14 +401,14 @@ impl<'a> Layouter<'a> {
         match self.doc.kind(node) {
             NodeKind::Document => {
                 for &c in self.doc.children(node) {
-                    self.walk(c, style);
+                    self.walk(c, style.clone());
                 }
             }
             NodeKind::Text(t) => self.text(t, style),
             NodeKind::Comment(_) => {}
             NodeKind::Element { tag, .. } => {
                 let c = css::computed(self.doc, node, &self.sheets);
-                let mut st = style;
+                let mut st = style.clone();
                 self.apply_computed(&c, &mut st);
                 match c.get("display").map(String::as_str) {
                     Some("none") => return,
@@ -543,10 +547,10 @@ impl<'a> Layouter<'a> {
             self.y += st.size * 0.4 + 6.0;
         } else {
             if let Some(m) = marker {
-                self.word(&m, st);
+                self.word(&m, st.clone());
             }
             for &ch in self.doc.children(node) {
-                self.walk(ch, st);
+                self.walk(ch, st.clone());
             }
             self.flush_line();
         }
@@ -576,7 +580,10 @@ impl<'a> Layouter<'a> {
         }
     }
 
-    fn inline(&mut self, node: NodeId, tag: &str, _c: &HashMap<String, String>, st: Style) {
+    fn inline(&mut self, node: NodeId, tag: &str, _c: &HashMap<String, String>, mut st: Style) {
+        if tag == "a" {
+            st.href = self.doc.attr(node, "href").map(String::from);
+        }
         match tag {
             "br" => self.flush_line(),
             "img" | "input" | "textarea" | "select" | "button" => {
@@ -585,11 +592,11 @@ impl<'a> Layouter<'a> {
                     .attr(node, "alt")
                     .map(|a| format!("[{a}]"))
                     .unwrap_or_else(|| "[image]".into());
-                self.word(&alt, st);
+                self.word(&alt, st.clone());
             }
             _ => {
                 for &ch in self.doc.children(node) {
-                    self.walk(ch, st);
+                    self.walk(ch, st.clone());
                 }
             }
         }
@@ -606,7 +613,7 @@ impl<'a> Layouter<'a> {
                         self.pending_space = true;
                         continue;
                     }
-                    self.word_with_space(word, st);
+                    self.word_with_space(word, st.clone());
                     self.pending_space = true;
                 }
                 self.pending_space = false;
@@ -621,20 +628,20 @@ impl<'a> Layouter<'a> {
             if !first {
                 self.pending_space = true;
             }
-            self.word_with_space(word, st);
+            self.word_with_space(word, st.clone());
             first = false;
         }
         self.pending_space = text.chars().last().is_some_and(|c| c.is_whitespace());
     }
 
-    fn resolve_font(&mut self, st: Style) -> Option<usize> {
+    fn resolve_font(&mut self, st: &Style) -> Option<usize> {
         self.fonts
             .resolve(st.family.name(), st.bold, st.italic)
             .or_else(|| self.fonts.resolve("liberation sans", false, false))
     }
 
     fn word_with_space(&mut self, word: &str, st: Style) {
-        let Some(font) = self.resolve_font(st) else { return };
+        let Some(font) = self.resolve_font(&st) else { return };
         let space_w = self
             .fonts
             .font(font)
@@ -647,12 +654,12 @@ impl<'a> Layouter<'a> {
             }
         }
         self.pending_space = false;
-        self.push_word(word, st, font);
+        self.push_word(word, st.clone(), font);
     }
 
     fn word(&mut self, word: &str, st: Style) {
-        if let Some(font) = self.resolve_font(st) {
-            self.push_word(word, st, font);
+        if let Some(font) = self.resolve_font(&st) {
+            self.push_word(word, st.clone(), font);
         }
     }
 
@@ -689,6 +696,7 @@ impl<'a> Layouter<'a> {
                         underline: st.underline,
                         strike: st.strike,
                         shift: st.shift,
+                        href: st.href.clone(),
                         width: cw,
                         ascent,
                         line_h,
@@ -709,6 +717,7 @@ impl<'a> Layouter<'a> {
                     underline: st.underline,
                     strike: st.strike,
                     shift: st.shift,
+                    href: st.href.clone(),
                     width: cw,
                     ascent,
                     line_h,
@@ -725,6 +734,7 @@ impl<'a> Layouter<'a> {
             underline: st.underline,
             strike: st.strike,
             shift: st.shift,
+            href: st.href.clone(),
             width: w,
             ascent,
             line_h,
@@ -766,6 +776,7 @@ impl<'a> Layouter<'a> {
                 color: w.color,
                 underline: w.underline,
                 strike: w.strike,
+                href: w.href,
             });
             x += w.width;
         }
