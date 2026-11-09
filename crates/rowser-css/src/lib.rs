@@ -8,7 +8,7 @@
 //! The cascade: user-agent sheet < author sheets, then !important author >
 //! !important UA; ties broken by specificity then source order.
 
-use rowser_dom::{Document, NodeId, NodeKind};
+use rowser_dom::{Document, NodeId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]

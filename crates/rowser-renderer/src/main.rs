@@ -105,6 +105,11 @@ fn main() {
                     let _ = send(&mut output, &frame_msg(&page));
                 }
             }
+            ToRenderer::DomDump => {
+                if let Some(doc) = &page.doc {
+                    let _ = send(&mut output, &ToBrowser::DomDump(dom_dump(doc)));
+                }
+            }
             ToRenderer::Shutdown => break,
         }
     }
@@ -187,6 +192,10 @@ fn load_url(url: &str) -> (String, String) {
         };
     }
     if url.starts_with("rowser://") {
+        let name = url.trim_start_matches("rowser://").trim_end_matches('/');
+        if name == "bookmarks" || name == "history" {
+            return (list_page(name), url.to_string());
+        }
         return (WELCOME.to_string(), url.to_string());
     }
     if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) {
@@ -246,4 +255,54 @@ fn test_pattern(width: u32, height: u32, _seed: &str) -> Vec<u8> {
         }
     }
     px
+}
+
+
+fn dom_dump(doc: &rowser_dom::Document) -> String {
+    let mut s = String::new();
+    dump_node(doc, doc.root, 0, &mut s);
+    s
+}
+
+fn dump_node(doc: &rowser_dom::Document, id: rowser_dom::NodeId, d: usize, out: &mut String) {
+    let pad = "  ".repeat(d.min(24));
+    match doc.kind(id) {
+        rowser_dom::NodeKind::Document => {}
+        rowser_dom::NodeKind::Comment(_) => {}
+        rowser_dom::NodeKind::Text(t) => {
+            let t = t.trim();
+            if !t.is_empty() {
+                out.push_str(&format!("{pad}\"{}\"\n", &t[..t.len().min(60)]));
+            }
+        }
+        rowser_dom::NodeKind::Element { tag, attrs } => {
+            let a: String = attrs
+                .iter()
+                .map(|(k, v)| format!(" {k}=\"{}\"", &v[..v.len().min(40)]))
+                .collect();
+            out.push_str(&format!("{pad}<{tag}{a}>\n"));
+        }
+    }
+    for &c in doc.children(id) {
+        dump_node(doc, c, d + 1, out);
+    }
+}
+
+/// rowser://bookmarks and rowser://history — built from ~/.config/rowser files.
+fn list_page(name: &str) -> String {
+    let file = format!("{}/.config/rowser/{name}.txt", std::env::var("HOME").unwrap_or_default());
+    let mut items = String::new();
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        for line in text.lines().rev() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            items.push_str(&format!("<li><a href=\"{}\">{}</a></li>", line, line));
+        }
+    }
+    if items.is_empty() {
+        items = "<li><i>nothing yet</i></li>".into();
+    }
+    format!("<html><body><h1>rowser:{name}</h1><ul>{items}</ul></body></html>")
 }

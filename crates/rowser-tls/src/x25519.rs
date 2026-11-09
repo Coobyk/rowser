@@ -18,16 +18,20 @@ fn fe_add(a: &Fe, b: &Fe) -> Fe {
     ]
 }
 
-/// `a - b`. Adds 2p first so limbs never underflow; p in this radix is
-/// (2^51-19, 2^51-1, 2^51-1, 2^51-1, 2^51-1).
+/// `a - b`. Normalizes `b` below 2^51, then adds 2p so limbs never
+/// underflow; p in this radix is (2^51-19, 2^51-1, ..., 2^51-1).
 fn fe_sub(a: &Fe, b: &Fe) -> Fe {
     const B: u64 = 1 << 51;
+    let mut bb = *b;
+    carry_pass(&mut bb);
+    carry_pass(&mut bb);
+    carry_pass(&mut bb);
     [
-        a[0] + 2 * B - 38 - b[0],
-        a[1] + 2 * B - 2 - b[1],
-        a[2] + 2 * B - 2 - b[2],
-        a[3] + 2 * B - 2 - b[3],
-        a[4] + 2 * B - 2 - b[4],
+        a[0] + 2 * B - 38 - bb[0],
+        a[1] + 2 * B - 2 - bb[1],
+        a[2] + 2 * B - 2 - bb[2],
+        a[3] + 2 * B - 2 - bb[3],
+        a[4] + 2 * B - 2 - bb[4],
     ]
 }
 

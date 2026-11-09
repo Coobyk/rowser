@@ -10,6 +10,7 @@ use rowser_ipc::{read_frame, write_frame, ToBrowser, ToRenderer};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -49,6 +50,7 @@ impl Tab {
         self.history.truncate(self.hist + 1);
         self.history.push(url.to_string());
         self.hist = self.history.len() - 1;
+        record_history(url);
         self.send(&ToRenderer::Navigate(url.to_string()));
     }
 
@@ -69,6 +71,11 @@ struct BrowserView {
     outbox: mpsc::Sender<(usize, TabEvent)>,
     last_viewport: (u32, u32),
     logs: Vec<String>,
+    url_text: String,
+    url_editing: bool,
+    url_focus: FocusHandle,
+    inspector: bool,
+    dom_dump: String,
 }
 
 impl BrowserView {
@@ -82,6 +89,11 @@ impl BrowserView {
             outbox,
             last_viewport: (1280, 720),
             logs: Vec::new(),
+            url_text: "rowser://newtab/0".into(),
+            url_editing: false,
+            url_focus: cx.focus_handle(),
+            inspector: false,
+            dom_dump: String::new(),
         };
 
         // Drain renderer messages into the UI. Polling via gpui::Timer keeps
@@ -207,6 +219,7 @@ impl BrowserView {
 
     fn drain_inbox(&mut self) {
         while let Ok((id, event)) = self.inbox.try_recv() {
+            let is_active = self.tabs.get(self.active).is_some_and(|t| t.id == id);
             let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
                 continue;
             };
@@ -214,7 +227,17 @@ impl BrowserView {
                 TabEvent::Msg(msg) => match msg {
                     ToBrowser::Pong(_) => {}
                     ToBrowser::LoadStarted => tab.title = "Loading…".into(),
-                    ToBrowser::Title(t) => tab.title = t,
+                    ToBrowser::Title(t) => {
+                        if t.is_empty() {
+                            tab.title = tab.url.clone();
+                        } else {
+                            tab.title = t;
+                        }
+                        tab.send(&ToRenderer::DomDump);
+                        if !self.url_editing && is_active {
+                            self.url_text = tab.url.clone();
+                        }
+                    }
                     ToBrowser::Frame {
                         width,
                         height,
@@ -226,6 +249,11 @@ impl BrowserView {
                     }
                     ToBrowser::LoadDone => {}
                     ToBrowser::NavigationRequest(url) => tab.navigate(&url),
+                    ToBrowser::DomDump(text) => {
+                        if self.inspector {
+                            self.dom_dump = text;
+                        }
+                    }
                     ToBrowser::Log(m) => self.logs.push(format!("tab {id}: {m}")),
                 },
                 TabEvent::Disconnected => {
@@ -356,7 +384,12 @@ impl Render for BrowserView {
 
         // Nav bar
         let active = &self.tabs[self.active];
-        let url = active.url.clone();
+        let url = if self.url_editing {
+            format!("{}▍", self.url_text)
+        } else {
+            active.url.clone()
+        };
+        let starred = bookmarks().iter().any(|b| *b == active.url);
         let alive = active.alive;
         let nav = div()
             .flex()
@@ -439,7 +472,78 @@ impl Render for BrowserView {
                     .bg(rgb(0x151518))
                     .text_sm()
                     .text_color(rgb(0xcccccc))
+                    .track_focus(&self.url_focus)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _e, window, cx| {
+                            view.url_focus.focus(window);
+                            view.url_editing = true;
+                            let i = view.active;
+                            view.url_text = view.tabs[i].url.clone();
+                            cx.notify();
+                        }),
+                    )
+                    .on_key_down(cx.listener(|view, e: &KeyDownEvent, window, cx| {
+                        match e.keystroke.key.as_str() {
+                            "enter" => {
+                                let url = normalize_url(&view.url_text);
+                                view.url_editing = false;
+                                window.blur();
+                                let i = view.active;
+                                view.tabs[i].navigate(&url);
+                            }
+                            "escape" => {
+                                view.url_editing = false;
+                                window.blur();
+                            }
+                            "backspace" => {
+                                view.url_text.pop();
+                            }
+                            _ => {
+                                if let Some(c) = &e.keystroke.key_char {
+                                    if !e.keystroke.modifiers.control {
+                                        view.url_text.push_str(c);
+                                    }
+                                }
+                            }
+                        }
+                        cx.notify();
+                    }))
                     .child(url),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .rounded_md()
+                    .text_color(if starred { rgb(0xffcc44) } else { rgb(0x666677) })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _e, _w, cx| {
+                            let i = view.active;
+                            let url = view.tabs[i].url.clone();
+                            toggle_bookmark(&url);
+                            cx.notify();
+                        }),
+                    )
+                    .child("★"),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .rounded_md()
+                    .text_color(if self.inspector { rgb(0x66ccff) } else { rgb(0x666677) })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _e, _w, cx| {
+                            view.inspector = !view.inspector;
+                            if view.inspector {
+                                let i = view.active;
+                                view.tabs[i].send(&ToRenderer::DomDump);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child("◈"),
             );
 
         // Web view
@@ -522,7 +626,33 @@ impl Render for BrowserView {
             .bg(rgb(0x101013))
             .child(tab_strip)
             .child(nav)
-            .child(webview.flex_1().min_h_0())
+            .child({
+                let mut row = div().flex_1().min_h_0().flex().child(webview.flex_1().min_w_0());
+                if self.inspector {
+                    let mut panel = div()
+                        .w(px(320.0))
+                        .h_full()
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .bg(rgb(0x0c0c10))
+                        .border_l_1()
+                        .border_color(rgb(0x333344))
+                        .p_2()
+                        .flex()
+                        .flex_col();
+                    for line in self.dom_dump.lines().take(600) {
+                        panel = panel.child(
+                            div()
+                                .text_xs()
+                                .whitespace_nowrap()
+                                .text_color(rgb(0x88aa88))
+                                .child(line.to_string()),
+                        );
+                    }
+                    row = row.child(panel);
+                }
+                row
+            })
     }
 }
 
@@ -539,4 +669,53 @@ fn main() {
         .unwrap();
         cx.activate(true);
     });
+}
+
+
+/// ~/.config/rowser, creating it on first use.
+fn config_dir() -> PathBuf {
+    let d = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/rowser");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+fn record_history(url: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(config_dir().join("history.txt"))
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{url}");
+    }
+}
+
+fn bookmarks() -> Vec<String> {
+    std::fs::read_to_string(config_dir().join("bookmarks.txt"))
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn toggle_bookmark(url: &str) {
+    let path = config_dir().join("bookmarks.txt");
+    let mut bm = bookmarks();
+    if let Some(i) = bm.iter().position(|b| b == url) {
+        bm.remove(i);
+    } else {
+        bm.push(url.to_string());
+    }
+    let _ = std::fs::write(path, bm.join("\n") + "\n");
+}
+
+/// Turn user-typed text into a URL: keep schemes, guess https for hosts,
+/// treat existing paths as file://.
+fn normalize_url(input: &str) -> String {
+    let s = input.trim();
+    if s.contains("://") || s == "about:blank" {
+        return s.to_string();
+    }
+    if std::path::Path::new(s).exists() {
+        return format!("file://{s}");
+    }
+    format!("https://{s}")
 }

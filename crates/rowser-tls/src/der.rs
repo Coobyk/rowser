@@ -121,5 +121,5 @@ pub fn oid_eq(value: &[u8], dotted: &[u64]) -> bool {
             enc.push(groups[i] | cont);
         }
     }
-    enc == value
+    enc.as_slice() == value
 }

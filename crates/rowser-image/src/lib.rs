@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn deflate_dynamic_rle() {
+    fn deflate_dynamic_rle_decode() {
         // small alphabet → exercises code-length repeat codes 16/17/18
         let mut data = Vec::new();
         for i in 0..400usize {

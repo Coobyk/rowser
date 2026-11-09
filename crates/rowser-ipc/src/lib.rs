@@ -126,6 +126,8 @@ pub enum ToRenderer {
     Scroll { dy: f32 },
     /// Mouse click at document-space coordinates (device px).
     Click { x: f32, y: f32 },
+    /// Request a text dump of the DOM tree (inspector).
+    DomDump,
     Shutdown,
 }
 
@@ -147,6 +149,8 @@ pub enum ToBrowser {
     Log(String),
     /// The user clicked a link — browser should navigate.
     NavigationRequest(String),
+    /// Indented DOM tree text for the inspector.
+    DomDump(String),
 }
 
 const TAG_PING: u8 = 0;
@@ -154,6 +158,7 @@ const TAG_NAVIGATE: u8 = 1;
 const TAG_RESIZE: u8 = 2;
 const TAG_SCROLL: u8 = 3;
 const TAG_CLICK: u8 = 5;
+const TAG_DOMDUMP: u8 = 6;
 const TAG_SHUTDOWN: u8 = 4;
 
 const TAG_PONG: u8 = 0;
@@ -163,6 +168,7 @@ const TAG_FRAME: u8 = 3;
 const TAG_LOAD_DONE: u8 = 4;
 const TAG_LOG: u8 = 5;
 const TAG_NAV_REQUEST: u8 = 6;
+const TAG_BDOMDUMP: u8 = 7;
 
 impl ToRenderer {
     pub fn encode(&self) -> Vec<u8> {
@@ -190,6 +196,7 @@ impl ToRenderer {
                 w.u32(x.to_bits());
                 w.u32(y.to_bits());
             }
+            Self::DomDump => w.u8(TAG_DOMDUMP),
             Self::Shutdown => w.u8(TAG_SHUTDOWN),
         }
         w.into_payload()
@@ -208,9 +215,10 @@ impl ToRenderer {
                 dy: f32::from_bits(r.u32()?)
             },
             TAG_CLICK => Self::Click {
-                x: f32::from_bits(r.u32()?),
+                x: f32::from_bits(r.u32()?) ,
                 y: f32::from_bits(r.u32()?),
             },
+            TAG_DOMDUMP => Self::DomDump,
             TAG_SHUTDOWN => Self::Shutdown,
             tag => {
                 return Err(io::Error::new(
@@ -254,6 +262,10 @@ impl ToBrowser {
                 w.u8(TAG_NAV_REQUEST);
                 w.string(url);
             }
+            Self::DomDump(text) => {
+                w.u8(TAG_BDOMDUMP);
+                w.string(text);
+            }
         }
         w.into_payload()
     }
@@ -272,6 +284,7 @@ impl ToBrowser {
             TAG_LOAD_DONE => Self::LoadDone,
             TAG_LOG => Self::Log(r.string()?),
             TAG_NAV_REQUEST => Self::NavigationRequest(r.string()?),
+            TAG_BDOMDUMP => Self::DomDump(r.string()?),
             tag => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
