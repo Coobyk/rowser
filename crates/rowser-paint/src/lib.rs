@@ -119,8 +119,8 @@ pub fn paint_into(canvas: &mut Canvas, items: &[DisplayItem], fonts: &mut FontCa
                         let (rw, rh, bx, by) = (r.width, r.height, r.bearing_x, r.bearing_y);
                         let alpha = &r.alpha;
                         canvas.blend_alpha(
-                            (pen + bx as f32) as i32,
-                            (*baseline - by as f32) as i32,
+                            (pen + bx as f32).round() as i32,
+                            (*baseline - by as f32).round() as i32,
                             rw,
                             rh,
                             alpha,

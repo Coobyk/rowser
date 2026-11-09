@@ -236,10 +236,13 @@ fn reader_loop(id: usize, mut reader: UnixStream, tx: mpsc::Sender<(usize, TabEv
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Propagate viewport changes to every live renderer.
+        // Propagate viewport changes to every live renderer. Frames are
+        // painted at *device* pixels (logical size × scale factor) so text
+        // isn't bilinearly blurred when GPUI composites the bitmap.
         let size = window.viewport_size();
-        let content_w = (f32::from(size.width) - 0.0).max(64.0) as u32;
-        let content_h = (f32::from(size.height) - CHROME_PX).max(64.0) as u32;
+        let sf = window.scale_factor();
+        let content_w = (f32::from(size.width) * sf).max(64.0) as u32;
+        let content_h = ((f32::from(size.height) - CHROME_PX) * sf).max(64.0) as u32;
         if (content_w, content_h) != self.last_viewport {
             self.last_viewport = (content_w, content_h);
             for tab in &mut self.tabs {
