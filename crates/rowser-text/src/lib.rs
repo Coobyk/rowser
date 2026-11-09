@@ -423,9 +423,10 @@ impl Font {
             }
             let len = be_u16(d, o + 2) as usize;
             let coverage = be_u16(d, o + 4);
-            if coverage & 0xff != 0 || len < 14 {
+            // format is the high byte; only format 0 horizontal (bit0) is used
+            if coverage >> 8 != 0 || coverage & 1 == 0 || len < 14 {
                 o += len.max(1);
-                continue; // only format 0
+                continue;
             }
             let n_pairs = be_u16(d, o + 6) as usize;
             for i in 0..n_pairs {
@@ -964,4 +965,5 @@ mod tests {
         assert!(sans.bold);
     }
 }
+
 
