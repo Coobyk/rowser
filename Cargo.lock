@@ -4401,6 +4401,7 @@ version = "0.0.0"
 name = "rowser-paint"
 version = "0.0.0"
 dependencies = [
+ "rowser-image",
  "rowser-layout",
  "rowser-text",
 ]
@@ -4409,10 +4410,13 @@ dependencies = [
 name = "rowser-renderer"
 version = "0.0.0"
 dependencies = [
+ "rowser-css",
  "rowser-dom",
  "rowser-html",
+ "rowser-image",
  "rowser-ipc",
  "rowser-layout",
+ "rowser-net",
  "rowser-paint",
  "rowser-text",
 ]

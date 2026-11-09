@@ -123,7 +123,9 @@ fn record_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
     n
 }
 
-fn read_record(tcp: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
+/// Returns `(header, body)` — the header is needed as the AEAD's
+/// additional data.
+fn read_record(tcp: &mut TcpStream) -> Result<([u8; 5], Vec<u8>)> {
     let mut hdr = [0u8; 5];
     tcp.read_exact(&mut hdr)?;
     let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
@@ -135,7 +137,7 @@ fn read_record(tcp: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
     }
     let mut body = vec![0u8; len];
     tcp.read_exact(&mut body)?;
-    Ok((hdr[0], body))
+    Ok((hdr, body))
 }
 
 fn write_record(tcp: &mut TcpStream, typ: u8, body: &[u8]) -> Result<()> {
@@ -549,8 +551,8 @@ impl TlsStream {
     /// Returns Ok(true) when app data or EOF arrived.
     fn pump(&mut self) -> Result<()> {
         loop {
-            let (typ, body) = read_record(&mut self.tcp)?;
-            match typ {
+            let (hdr, body) = read_record(&mut self.tcp)?;
+            match hdr[0] {
                 RT_CHANGE_CIPHER => continue, // ignore compat CCS
                 RT_ALERT => {
                     if body.len() >= 2 && body[1] == 0 {
@@ -562,15 +564,8 @@ impl TlsStream {
                 RT_APPDATA => {}
                 _ => return Err(Error::Decode("unexpected record type")),
             }
-            // Decrypt with read keys.
-            let aad = {
-                let mut a = [0u8; 5];
-                a[0] = RT_APPDATA;
-                a[1] = 0x03;
-                a[2] = 0x03;
-                a[3..5].copy_from_slice(&(body.len() as u16).to_be_bytes());
-                a
-            };
+            // The AAD is the record's own header.
+            let aad = hdr;
             if body.len() < 16 {
                 return Err(Error::Decode("short ciphertext"));
             }
@@ -743,8 +738,8 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
     // fragmented across records so reassemble) ----
     let mut sh_buf: Vec<u8> = Vec::new();
     let sh_body = loop {
-        let (typ, body) = read_record(&mut tcp)?;
-        match typ {
+        let (hdr, body) = read_record(&mut tcp)?;
+        match hdr[0] {
             RT_CHANGE_CIPHER => continue,
             RT_ALERT => return Err(Error::Alert(*body.get(1).unwrap_or(&255))),
             RT_HANDSHAKE => sh_buf.extend_from_slice(&body),
@@ -798,8 +793,8 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
     let mut server_finished = false;
 
     while !server_finished {
-        let (typ, body) = read_record(&mut tcp)?;
-        match typ {
+        let (hdr, body) = read_record(&mut tcp)?;
+        match hdr[0] {
             RT_CHANGE_CIPHER => continue,
             RT_ALERT => return Err(Error::Alert(*body.get(1).unwrap_or(&255))),
             RT_APPDATA => {}
@@ -811,15 +806,8 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
             _ => return Err(Error::Decode("unexpected record")),
         }
 
-        // decrypt
-        let aad = {
-            let mut a = [0u8; 5];
-            a[0] = RT_APPDATA;
-            a[1] = 0x03;
-            a[2] = 0x03;
-            a[3..5].copy_from_slice(&(body.len() as u16).to_be_bytes());
-            a
-        };
+        // decrypt; AAD is the record header itself
+        let aad = hdr;
         if body.len() < 16 {
             return Err(Error::Decode("short ciphertext"));
         }

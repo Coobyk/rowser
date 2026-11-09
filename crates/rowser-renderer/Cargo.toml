@@ -11,3 +11,6 @@ rowser-html = { path = "../rowser-html" }
 rowser-text = { path = "../rowser-text" }
 rowser-layout = { path = "../rowser-layout" }
 rowser-paint = { path = "../rowser-paint" }
+rowser-net = { path = "../rowser-net" }
+rowser-image = { path = "../rowser-image" }
+rowser-css = { path = "../rowser-css" }

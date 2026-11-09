@@ -4,7 +4,9 @@
 //! Text is drawn by blending cached glyph coverage bitmaps with the run
 //! color. Underline/strikethrough are plain rects under/over the baseline.
 
+use rowser_image::Image;
 use rowser_layout::{Color, DisplayItem};
+use std::collections::HashMap;
 use rowser_text::FontCache;
 
 pub struct Canvas {
@@ -85,15 +87,34 @@ pub fn paint(
     width: u32,
     height: u32,
     bg: Color,
+    images: &HashMap<String, Image>,
 ) -> Vec<u8> {
     let mut canvas = Canvas::new(width, height, bg);
-    paint_into(&mut canvas, items, fonts);
+    paint_into(&mut canvas, items, fonts, images);
     canvas.pixels
 }
 
-pub fn paint_into(canvas: &mut Canvas, items: &[DisplayItem], fonts: &mut FontCache) {
+pub fn paint_into(
+    canvas: &mut Canvas,
+    items: &[DisplayItem],
+    fonts: &mut FontCache,
+    images: &HashMap<String, Image>,
+) {
     for item in items {
         match item {
+            DisplayItem::Image { x, y, w, h, src } => {
+                if let Some(img) = images.get(src) {
+                    canvas.blit(img, *x as i32, *y as i32, *w as i32, *h as i32);
+                } else {
+                    canvas.fill_rect(
+                        *x as i32,
+                        *y as i32,
+                        w.max(1.0) as u32,
+                        h.max(1.0) as u32,
+                        0xffe8e8e8,
+                    );
+                }
+            }
             DisplayItem::FillRect { x, y, w, h, color } => {
                 canvas.fill_rect(*x as i32, *y as i32, *w as u32, *h as u32, *color);
             }
@@ -167,6 +188,13 @@ mod tests {
                 underline: false,
                 strike: false,
             },
+            DisplayItem::Image {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+                src: "missing.png".into(),
+            },
             DisplayItem::FillRect {
                 x: 0.0,
                 y: 0.0,
@@ -184,3 +212,42 @@ mod tests {
     }
 }
 
+
+
+impl Canvas {
+    /// Nearest-neighbor blit of a decoded BGRA image into a rect.
+    fn blit(&mut self, img: &Image, dx: i32, dy: i32, dw: i32, dh: i32) {
+        if img.width == 0 || img.height == 0 {
+            return;
+        }
+        let (cw, ch) = (self.width as i32, self.height as i32);
+        for y in dy.max(0)..(dy + dh).min(ch) {
+            let sy = ((y - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
+            for x in dx.max(0)..(dx + dw).min(cw) {
+                let sx = ((x - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
+                let si = ((sy * img.width + sx) * 4) as usize;
+                let di = ((y * cw + x) * 4) as usize;
+                let (b, g, r, a) = (
+                    img.pixels[si],
+                    img.pixels[si + 1],
+                    img.pixels[si + 2],
+                    img.pixels[si + 3] as u32,
+                );
+                if a == 255 {
+                    self.pixels[di] = b;
+                    self.pixels[di + 1] = g;
+                    self.pixels[di + 2] = r;
+                    self.pixels[di + 3] = 255;
+                } else if a > 0 {
+                    let inv = 255 - a;
+                    self.pixels[di] = ((b as u32 * a + self.pixels[di] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 1] =
+                        ((g as u32 * a + self.pixels[di + 1] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 2] =
+                        ((r as u32 * a + self.pixels[di + 2] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 3] = 255;
+                }
+            }
+        }
+    }
+}

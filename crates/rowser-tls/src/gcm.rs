@@ -192,10 +192,7 @@ mod tests {
         let (ct, tag) = g.seal(&iv, &[], &pt);
         assert_eq!(ct, want_ct);
         assert_eq!(tag.to_vec(), want_tag);
-        assert_eq!(
-            g.open(&iv, &[], &ct, &tag.try_into().unwrap()).unwrap(),
-            pt
-        );
+        assert_eq!(g.open(&iv, &[], &ct, &tag).unwrap(), pt);
     }
 
     #[test]
@@ -253,9 +250,6 @@ mod tests {
         let (ct, tag) = g.seal(&iv, &aad, &pt);
         assert_eq!(ct, want_ct);
         assert_eq!(tag.to_vec(), want_tag);
-        assert_eq!(
-            g.open(&iv, &aad, &ct, &tag.try_into().unwrap()).unwrap(),
-            pt
-        );
+        assert_eq!(g.open(&iv, &aad, &ct, &tag).unwrap(), pt);
     }
 }

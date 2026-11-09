@@ -41,6 +41,14 @@ pub enum DisplayItem {
         h: f32,
         color: Color,
     },
+    /// Resolved image URL + rect (paint draws the decoded bitmap).
+    Image {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        src: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -369,9 +377,11 @@ impl<'a> Layouter<'a> {
         fonts: &'a mut FontCache,
         width: f32,
         scroll: f32,
+        external: &[css::StyleSheet],
     ) -> (Vec<DisplayItem>, f32) {
         let author = css::document_sheets(doc);
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
+        sheets.extend(external.iter());
         sheets.extend(author.iter());
         let mut l = Layouter {
             doc,
@@ -586,13 +596,32 @@ impl<'a> Layouter<'a> {
         }
         match tag {
             "br" => self.flush_line(),
-            "img" | "input" | "textarea" | "select" | "button" => {
-                let alt = self
-                    .doc
-                    .attr(node, "alt")
-                    .map(|a| format!("[{a}]"))
-                    .unwrap_or_else(|| "[image]".into());
-                self.word(&alt, st.clone());
+            "img" => {
+                self.flush_line();
+                let w = self.doc.attr(node, "width")
+                    .and_then(|v| v.trim_end_matches("px").parse().ok())
+                    .unwrap_or(64.0f32);
+                let h = self.doc.attr(node, "height")
+                    .and_then(|v| v.trim_end_matches("px").parse().ok())
+                    .unwrap_or(48.0f32);
+                let line_h = self
+                    .fonts
+                    .resolve(st.family.name(), st.bold, st.italic)
+                    .and_then(|f| self.fonts.font(f).map(|f| f.line_height(st.size)))
+                    .unwrap_or(st.size * 1.2);
+                if let Some(src) = self.doc.attr(node, "src") {
+                    self.items.push(DisplayItem::Image {
+                        x: self.margin_x,
+                        y: self.y,
+                        w,
+                        h,
+                        src: src.to_string(),
+                    });
+                }
+                self.y += h.max(line_h);
+            }
+            "input" | "textarea" | "select" | "button" => {
+                self.word("[control]", st.clone());
             }
             _ => {
                 for &ch in self.doc.children(node) {
@@ -797,7 +826,7 @@ mod tests {
     fn lay(html: &str) -> (Vec<DisplayItem>, f32) {
         let d = doc(html);
         let mut fonts = FontCache::new();
-        Layouter::layout(&d, &mut fonts, 800.0, 0.0)
+        Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[])
     }
 
     fn texts(items: &[DisplayItem]) -> Vec<&DisplayItem> {

@@ -128,6 +128,8 @@ struct Page {
     content_h: f32,
     pixels: Vec<u8>,
     items: Vec<rowser_layout::DisplayItem>,
+    images: std::collections::HashMap<String, rowser_image::Image>,
+    sheets: Vec<rowser_css::StyleSheet>,
 }
 
 impl Page {
@@ -141,6 +143,8 @@ impl Page {
             content_h: 0.0,
             pixels: Vec::new(),
             items: Vec::new(),
+            images: std::collections::HashMap::new(),
+            sheets: Vec::new(),
         }
     }
 
@@ -153,6 +157,55 @@ impl Page {
         self.url = url;
         self.title = title;
         self.scroll = 0.0;
+        self.images.clear();
+        self.sheets.clear();
+        self.load_linked_css();
+    }
+
+    /// Fetch <link rel="stylesheet" href=...> documents into style sheets.
+    fn load_linked_css(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let mut hrefs = Vec::new();
+        for id in doc.descendants(doc.root) {
+            if doc.tag(id) == Some("link") {
+                let rel = doc.attr(id, "rel").unwrap_or("").to_lowercase();
+                if rel.contains("stylesheet") {
+                    if let Some(h) = doc.attr(id, "href") {
+                        hrefs.push(h.to_string());
+                    }
+                }
+            }
+        }
+        for h in hrefs {
+            if let Some(text) = fetch_text(&self.url, &h) {
+                self.sheets.push(rowser_css::parse(&text));
+            }
+        }
+    }
+
+    /// Fetch + decode every <img src> referenced by the display list.
+    fn load_images(&mut self) {
+        let srcs: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(|it| {
+                if let rowser_layout::DisplayItem::Image { src, .. } = it {
+                    Some(src.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for src in srcs {
+            if self.images.contains_key(&src) {
+                continue;
+            }
+            if let Some(bytes) = fetch_bytes(&self.url, &src) {
+                if let Ok(img) = rowser_image::decode(&bytes) {
+                    self.images.insert(src, img);
+                }
+            }
+        }
     }
 
     fn max_scroll(&self) -> f32 {
@@ -162,14 +215,17 @@ impl Page {
     fn repaint(&mut self, fonts: &mut FontCache) {
         let Some(doc) = &self.doc else { return };
         let (items, height) =
-            Layouter::layout(doc, fonts, self.viewport.0 as f32, self.scroll);
+            Layouter::layout(doc, fonts, self.viewport.0 as f32, self.scroll, &self.sheets);
         self.content_h = height;
         self.items = items;
-        self.pixels = rowser_paint::paint(&self.items,
+        self.load_images();
+        self.pixels = rowser_paint::paint(
+            &self.items,
             fonts,
             self.viewport.0,
             self.viewport.1,
             bgra(0xff, 0xff, 0xff),
+            &self.images,
         );
     }
 }
@@ -198,11 +254,14 @@ fn load_url(url: &str) -> (String, String) {
         }
         return (WELCOME.to_string(), url.to_string());
     }
-    if let Some(rest) = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")) {
-        return (
-            error_page(url, &format!("network stack not built yet — {rest}")),
-            url.to_string(),
-        );
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return match rowser_net::fetch(url) {
+            Ok(res) => (
+                String::from_utf8_lossy(&res.body).into_owned(),
+                res.url.to_string(),
+            ),
+            Err(e) => (error_page(url, &format!("network error: {e}")), url.to_string()),
+        };
     }
     if url == "about:blank" {
         return ("<html><body></body></html>".into(), url.into());
@@ -305,4 +364,44 @@ fn list_page(name: &str) -> String {
         items = "<li><i>nothing yet</i></li>".into();
     }
     format!("<html><body><h1>rowser:{name}</h1><ul>{items}</ul></body></html>")
+}
+
+
+/// Fetch a resource relative to a page URL — http(s), file://, or plain path.
+fn fetch_bytes(base_url: &str, resource: &str) -> Option<Vec<u8>> {
+    let url = resolve_url(base_url, resource)?;
+    if let Some(path) = url.strip_prefix("file://") {
+        return std::fs::read(path).ok();
+    }
+    if url.starts_with("http") {
+        return rowser_net::fetch(&url).ok().map(|r| r.body);
+    }
+    std::fs::read(&url).ok()
+}
+
+fn fetch_text(base_url: &str, resource: &str) -> Option<String> {
+    fetch_bytes(base_url, resource).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Resolve `resource` against `base` (absolute URLs pass through).
+fn resolve_url(base: &str, resource: &str) -> Option<String> {
+    let r = resource.trim();
+    if r.starts_with("data:") {
+        return None; // no data: URLs yet
+    }
+    if r.contains("://") || r.starts_with("file:") {
+        return Some(r.to_string());
+    }
+    let Ok(base_u) = rowser_net::Url::parse(base) else {
+        // base was a local path → join directories
+        if r.starts_with('/') {
+            return Some(format!("file://{r}"));
+        }
+        let dir = std::path::Path::new(base)
+            .parent()
+            .unwrap_or(std::path::Path::new("/"));
+        return Some(format!("file://{}", dir.join(r).display()));
+    };
+    let resolved = base_u.resolve(r).ok()?;
+    Some(resolved.to_string())
 }
