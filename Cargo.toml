@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+# Transitive dep of gpui (via zed-async-tar). 0.2.3 breaks against modern
+# libc (ENOATTR removed on Linux); vendored with the upstream-style fix.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
