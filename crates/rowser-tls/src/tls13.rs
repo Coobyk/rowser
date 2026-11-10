@@ -551,7 +551,17 @@ impl TlsStream {
     /// Returns Ok(true) when app data or EOF arrived.
     fn pump(&mut self) -> Result<()> {
         loop {
-            let (hdr, body) = read_record(&mut self.tcp)?;
+            let (hdr, body) = match read_record(&mut self.tcp) {
+                Ok(rb) => rb,
+                // Servers (Google among them) close the TCP connection after
+                // the last record without close_notify — a clean end of the
+                // response, not a protocol error.
+                Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    self.eof = true;
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             match hdr[0] {
                 RT_CHANGE_CIPHER => continue, // ignore compat CCS
                 RT_ALERT => {
