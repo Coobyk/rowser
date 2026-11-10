@@ -11,17 +11,25 @@ use std::io::{self, Write};
 
 const WELCOME: &str = include_str!("../../../assets/welcome.html");
 
-/// Stage timing: set ROWSER_PROFILE=1 to get per-stage eprintln! timings.
-fn prof() -> bool {
-    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *P.get_or_init(|| std::env::var_os("ROWSER_PROFILE").is_some())
+/// Stage timing + event trace → shared log the browser owner can read.
+fn dlog(msg: &str) {
+    use std::io::Write as _;
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64 / 1000.0)
+        .unwrap_or(0.0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/rowser-events.log")
+    {
+        let _ = writeln!(f, "{t:.3} [renderer] {msg}");
+    }
 }
 
 macro_rules! pt {
     ($($a:tt)*) => {
-        if prof() {
-            eprintln!($($a)*);
-        }
+        dlog(&format!($($a)*));
     };
 }
 

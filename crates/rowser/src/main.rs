@@ -49,6 +49,7 @@ impl Tab {
 
     /// Navigate, recording the visit in history (drops forward entries).
     fn navigate(&mut self, url: &str) {
+        dlog(&format!("navigate {url}"));
         self.url = url.to_string();
         self.sel_text.clear();
         self.history.truncate(self.hist + 1);
@@ -96,6 +97,23 @@ struct BrowserView {
     /// In-progress page-text drag: the anchor point in document-space
     /// device px (set on mouse-down, cleared on mouse-up).
     drag: Option<(f32, f32)>,
+}
+
+/// Append a timestamped line to the shared event log (renderer writes
+/// the same file — lets us reconstruct clicks/keys/timings after the fact).
+fn dlog(msg: &str) {
+    use std::io::Write as _;
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64 / 1000.0)
+        .unwrap_or(0.0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/rowser-events.log")
+    {
+        let _ = writeln!(f, "{t:.3} [browser] {msg}");
+    }
 }
 
 impl BrowserView {
@@ -171,6 +189,7 @@ impl BrowserView {
     }
 
     fn open_tab(&mut self) {
+        dlog("open_tab (ctrl+t / +)");
         let id = self.next_id;
         self.next_id += 1;
         let url = format!("rowser://newtab/{id}");
@@ -335,6 +354,7 @@ impl BrowserView {
     }
 
     fn close_tab(&mut self, idx: usize) {
+        dlog(&format!("close_tab {idx}"));
         let mut tab = self.tabs.remove(idx);
         tab.send(&ToRenderer::Shutdown);
         if let Some(mut c) = tab.child.take() {
@@ -877,9 +897,11 @@ impl Render for BrowserView {
                         let i = view.active;
                         if (x1 - x0).hypot(y1 - y0) < 4.0 * sf {
                             // Didn't move — a plain click, not a drag.
+                            dlog(&format!("click x={x1:.0} y={y1:.0}"));
                             view.tabs[i].send(&ToRenderer::Click { x: x1, y: y1 });
                         } else {
                             // Final position may be past the last move event.
+                            dlog(&format!("select-drag {x0:.0},{y0:.0} → {x1:.0},{y1:.0}"));
                             view.tabs[i].send(&ToRenderer::Select { x0, y0, x1, y1 });
                         }
                         cx.notify();
@@ -896,6 +918,7 @@ impl Render for BrowserView {
                     // wheel up yields positive y. Our scroll offset is
                     // document-space, so negate it.
                     let dy = -f32::from(e.delta.pixel_delta(px(20.0)).y);
+                    dlog(&format!("scroll dy={dy:.0}"));
                     let i = view.active;
                     view.tabs[i].send(&ToRenderer::Scroll { dy });
                     cx.notify();
@@ -926,6 +949,7 @@ impl Render for BrowserView {
             .on_key_down(cx.listener(|view, e: &KeyDownEvent, window, cx| {
                 let ks = &e.keystroke;
                 let m = ks.modifiers;
+                dlog(&format!("key {} mods c:{} a:{} s:{}", ks.key, m.control, m.alt, m.shift));
                 // Ctrl on Linux/Windows, Cmd on macOS — same as the URL bar.
                 let ctrl = m.control || m.platform;
                 let editing = view.url_editing;
