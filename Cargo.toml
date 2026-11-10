@@ -10,3 +10,21 @@ license = "MIT"
 # libc (ENOATTR removed on Linux); vendored with the upstream-style fix.
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
+
+# Dev-profile speed: the engine's numeric hot paths (paint, text
+# shaping/raster, layout, css, parsing, image, deflate, net, tls) get
+# opt-level 3 while the workspace keeps fast debug compiles. Removes the
+# 5-15x debug penalty on per-pixel/per-glyph work that made scrolling lag.
+[profile.dev.package]
+rowser-paint.opt-level = 3
+rowser-text.opt-level = 3
+rowser-layout.opt-level = 3
+rowser-css.opt-level = 3
+rowser-html.opt-level = 3
+rowser-image.opt-level = 3
+rowser-deflate.opt-level = 3
+rowser-net.opt-level = 3
+rowser-tls.opt-level = 3
+rowser-dom.opt-level = 3
+rowser-ipc.opt-level = 3
+rowser-renderer.opt-level = 3
