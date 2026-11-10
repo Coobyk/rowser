@@ -235,7 +235,14 @@ impl Page {
     fn repaint(&mut self, fonts: &mut FontCache) {
         let Some(doc) = &self.doc else { return };
         let (items, height, anchors) =
-            Layouter::layout(doc, fonts, self.viewport.0 as f32, self.scroll, &self.sheets);
+            Layouter::layout_vh(
+                doc,
+                fonts,
+                self.viewport.0 as f32,
+                self.scroll,
+                self.viewport.1 as f32,
+                &self.sheets,
+            );
         self.content_h = height;
         self.items = items;
         self.anchors = anchors;

@@ -497,6 +497,22 @@ fn calc_len(expr: &str, rel: f32) -> Option<f32> {
     p.expr()
 }
 
+/// parse_len plus viewport units (vh/svh/dvh/lvh→vh_px, vw→vw_px).
+fn parse_len_vp(v: &str, rel: f32, vh: f32, vw: f32) -> Option<f32> {
+    let v = v.trim().to_lowercase();
+    for suf in ["svh", "dvh", "lvh", "vh"] {
+        if let Some(x) = v.strip_suffix(suf) {
+            return x.trim().parse::<f32>().ok().map(|n| n * vh / 100.0);
+        }
+    }
+    for suf in ["svw", "dvw", "lvw", "vw"] {
+        if let Some(x) = v.strip_suffix(suf) {
+            return x.trim().parse::<f32>().ok().map(|n| n * vw / 100.0);
+        }
+    }
+    parse_len(&v, rel)
+}
+
 fn parse_len(v: &str, rel: f32) -> Option<f32> {
     let v = v.trim().to_lowercase();
     if let Some(inner) = v.strip_prefix("calc(").and_then(|x| x.strip_suffix(')')) {
@@ -741,6 +757,8 @@ pub struct Layouter<'a> {
     scroll: f32,
     /// element `id` → document-y, for #fragment navigation
     anchors: Vec<(String, f32)>,
+    /// viewport height — vh/svh units and flex justify-center
+    viewport_h: f32,
 }
 
 impl<'a> Layouter<'a> {
@@ -751,6 +769,18 @@ impl<'a> Layouter<'a> {
         fonts: &'a mut FontCache,
         width: f32,
         scroll: f32,
+        external: &[css::StyleSheet],
+    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>) {
+        Self::layout_vh(doc, fonts, width, scroll, 768.0, external)
+    }
+
+    /// layout with an explicit viewport height (vh units, flex centering).
+    pub fn layout_vh(
+        doc: &'a Document,
+        fonts: &'a mut FontCache,
+        width: f32,
+        scroll: f32,
+        viewport_h: f32,
         external: &[css::StyleSheet],
     ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>) {
         let author = css::document_sheets(doc);
@@ -773,6 +803,7 @@ impl<'a> Layouter<'a> {
             floats: Vec::new(),
             scroll,
             anchors: Vec::new(),
+            viewport_h,
         };
         l.walk(doc.root, base_style());
         l.flush_line();
@@ -967,7 +998,14 @@ impl<'a> Layouter<'a> {
         // `width` caps the content box; `margin-?:auto` splits leftover space
         let mut ml = ml;
         let mut mr = mr;
-        let w_prop = side(c, "width", self.avail_w);
+        let mut w_prop = side(c, "width", self.avail_w);
+        if let Some(mxw) = c.get("max-width").and_then(|v| parse_len_vp(v, self.avail_w, self.viewport_h, self.avail_w)) {
+            w_prop = Some(w_prop.unwrap_or(self.avail_w).min(mxw));
+        }
+        if let Some(mnw) = c.get("min-width").and_then(|v| parse_len_vp(v, self.avail_w, self.viewport_h, self.avail_w)) {
+            w_prop = Some(w_prop.unwrap_or(0.0).max(mnw));
+        }
+        let w_prop = w_prop;
         if let Some(w) = w_prop {
             let extra = (self.avail_w - ml - mr - pl - pr - 2.0 * bw - w).max(0.0);
             match (margin_auto(c, true), margin_auto(c, false)) {
@@ -1041,6 +1079,8 @@ impl<'a> Layouter<'a> {
 
         // padding-top + border push content down inside the painted box
         self.y += pt + bw;
+        let content_top = self.y;
+        let children_items_start = self.items.len();
         if tag == "hr" {
             self.items.push(DisplayItem::FillRect {
                 x: self.line_origin(),
@@ -1062,6 +1102,31 @@ impl<'a> Layouter<'a> {
                 }
             }
             self.flush_line();
+            // min-height: grow the box; centered flex columns shift children
+            if let Some(mh) = c
+                .get("min-height")
+                .and_then(|v| parse_len_vp(v, self.avail_w, self.viewport_h, self.avail_w))
+            {
+                let extra = mh - (self.y - content_top);
+                if extra > 0.0 {
+                    let centered = c.get("display").map(String::as_str) == Some("flex")
+                        && matches!(
+                            c.get("justify-content").map(String::as_str),
+                            Some("center") | Some("space-evenly") | Some("space-around")
+                        );
+                    if centered {
+                        let dy = extra / 2.0;
+                        for i in children_items_start..self.items.len() {
+                            let it = std::mem::replace(
+                                &mut self.items[i],
+                                DisplayItem::FillRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0, color: 0 },
+                            );
+                            self.items[i] = offset_item(it, 0.0, dy);
+                        }
+                    }
+                    self.y += extra;
+                }
+            }
         }
         // padding-bottom + border extend the painted box below content
         self.y += pb + bw;
