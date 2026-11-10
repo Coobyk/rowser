@@ -256,11 +256,27 @@ pub fn parse_color(v: &str) -> Option<Color> {
     if let Some(hex) = v.strip_prefix('#') {
         let d = u32::from_str_radix(hex, 16).ok()?;
         return Some(match hex.len() {
-            3 => {
-                let (r, g, b) = ((d >> 8) & 0xf, (d >> 4) & 0xf, d & 0xf);
+            3 | 4 => {
+                let (r, g, b, a) = (
+                    (d >> 12) & 0xf,
+                    (d >> 8) & 0xf,
+                    (d >> 4) & 0xf,
+                    if hex.len() == 4 { d & 0xf } else { 0xf },
+                );
                 bgra((r * 17) as u8, (g * 17) as u8, (b * 17) as u8)
             }
             6 => bgra(((d >> 16) & 0xff) as u8, ((d >> 8) & 0xff) as u8, (d & 0xff) as u8),
+            8 => {
+                let (r, g, b, a) = (
+                    (d >> 24) & 0xff,
+                    (d >> 16) & 0xff,
+                    (d >> 8) & 0xff,
+                    d & 0xff,
+                );
+                // composite semi-transparent colors over white
+                let blend = |c: u32| ((c * a + 255 * (255 - a)) / 255) as u8;
+                bgra(blend(r), blend(g), blend(b))
+            }
             _ => return None,
         });
     }
@@ -1318,6 +1334,10 @@ impl<'a> Layouter<'a> {
             .unwrap_or(0.0);
         // column direction: children stack as blocks, vertical gap
         if c.get("flex-direction").map(String::as_str) == Some("column") {
+            let mut st = st;
+            if c.get("align-items").map(String::as_str) == Some("center") {
+                st.align = Align::Center;
+            }
             let mut first = true;
             for &ch in self.doc.children(node) {
                 if !matches!(self.doc.kind(ch), NodeKind::Element { .. } | NodeKind::Text(_)) {
@@ -1331,6 +1351,24 @@ impl<'a> Layouter<'a> {
             }
             return;
         }
+        // justify-content on the main axis: pre-measure total child width
+        let total = self.flex_shrink_width(node, c, &st);
+        let extra = (self.content_width() - total).max(0.0);
+        let n_children = self
+            .doc
+            .children(node)
+            .iter()
+            .filter(|&&ch| matches!(self.doc.kind(ch), NodeKind::Element { .. }))
+            .count();
+        let mut effective_gap = gap;
+        match c.get("justify-content").map(String::as_str) {
+            Some("center") => self.spacer(extra / 2.0),
+            Some("flex-end") | Some("right") | Some("end") => self.spacer(extra),
+            Some("space-between") if n_children > 1 => {
+                effective_gap = gap + extra / (n_children - 1) as f32;
+            }
+            _ => {}
+        }
         let mut first = true;
         for &ch in self.doc.children(node) {
             match self.doc.kind(ch) {
@@ -1339,8 +1377,8 @@ impl<'a> Layouter<'a> {
                     if cc.get("display").map(String::as_str) == Some("none") {
                         continue;
                     }
-                    if !first && gap > 0.0 {
-                        self.spacer(gap);
+                    if !first && effective_gap > 0.0 {
+                        self.spacer(effective_gap);
                     }
                     let mut cst = st.clone();
                     self.apply_computed(&cc, &mut cst);
