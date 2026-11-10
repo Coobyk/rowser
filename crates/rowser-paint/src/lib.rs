@@ -127,7 +127,23 @@ pub fn paint_into(
     fonts: &mut FontCache,
     images: &HashMap<String, Image>,
 ) {
+    let ch = canvas.height as f32;
     for item in items {
+        // Vertical cull: items fully off-canvas can't write visible pixels.
+        // Text gets a ±4em band — glyph ink can overshoot the em box, but
+        // never by multiples of it.
+        let (top, bot) = match item {
+            DisplayItem::FillRect { y, h, .. }
+            | DisplayItem::RoundedRect { y, h, .. }
+            | DisplayItem::Raster { y, h, .. }
+            | DisplayItem::Image { y, h, .. } => (*y, *y + *h),
+            DisplayItem::Text { baseline, size, .. } => {
+                (baseline - size * 4.0, baseline + size * 4.0)
+            }
+        };
+        if bot < 0.0 || top > ch {
+            continue;
+        }
         match item {
             DisplayItem::RoundedRect { x, y, w, h, radius, color } => {
                 canvas.fill_rounded(*x as i32, *y as i32, *w as u32, *h as u32, *radius, *color);

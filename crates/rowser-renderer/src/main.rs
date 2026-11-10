@@ -11,34 +11,65 @@ use std::io::{self, Write};
 
 const WELCOME: &str = include_str!("../../../assets/welcome.html");
 
+/// Stage timing: set ROWSER_PROFILE=1 to get per-stage eprintln! timings.
+fn prof() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var_os("ROWSER_PROFILE").is_some())
+}
+
+macro_rules! pt {
+    ($($a:tt)*) => {
+        if prof() {
+            eprintln!($($a)*);
+        }
+    };
+}
+
 /// Parallel subresource fetchers and their budgets.
 const SUBRESOURCE_WORKERS: usize = 8;
 const CSS_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 const IMG_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 const MAX_IMAGES_PER_LOAD: usize = 64;
+/// Cap on the cross-navigation decoded-image cache (url → Image).
+const MAX_IMG_CACHE: usize = 1024;
 /// Per-socket read/write timeout — covers TLS handshake and response reads
 /// (otherwise a stalled server hangs the fetch forever).
 const FETCH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn main() {
-    let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut input = stdin.lock();
     let mut output = stdout.lock();
+
+    // Reader thread pulls IPC frames off stdin into a channel so the main
+    // loop can look ahead: back-to-back Scroll messages get coalesced into
+    // a single repaint instead of queuing one full repaint per event.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        while let Ok(p) = read_frame(&mut input) {
+            if tx.send(p).is_err() {
+                return; // main loop exited
+            }
+        }
+    });
 
     let mut fonts = FontCache::new();
     let mut page = Page::new();
+    let mut pending: std::collections::VecDeque<ToRenderer> =
+        std::collections::VecDeque::new();
 
     loop {
-        let payload = match read_frame(&mut input) {
-            Ok(p) => p,
-            Err(_) => break, // parent hung up
-        };
-        let msg = match ToRenderer::decode(&payload) {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = send(&mut output, &ToBrowser::Log(format!("bad message: {e}")));
-                continue;
+        let msg = if let Some(m) = pending.pop_front() {
+            m
+        } else {
+            let Ok(payload) = rx.recv() else { break }; // parent hung up
+            match ToRenderer::decode(&payload) {
+                Ok(m) => m,
+                Err(e) => {
+                    let _ = send(&mut output, &ToBrowser::Log(format!("bad message: {e}")));
+                    continue;
+                }
             }
         };
         match msg {
@@ -53,14 +84,18 @@ fn main() {
                 if same_page && !frag.is_empty() {
                     if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
                         page.scroll = (*y - 8.0).clamp(0.0, page.max_scroll());
-                        page.repaint(&mut fonts);
+                        page.repaint_scrolled(&mut fonts);
                         let _ = send(&mut output, &frame_msg(&page));
                     }
                     let _ = send(&mut output, &ToBrowser::LoadDone);
                     continue;
                 }
+                let t0 = std::time::Instant::now();
                 let (html, effective) = load_url(&url);
+                let t_fetch = t0.elapsed();
+                let t1 = std::time::Instant::now();
                 let doc = rowser_html::parse(&html);
+                pt!("[prof] navigate fetch={t_fetch:?} parse={:?}", t1.elapsed());
                 let title = doc
                     .find_deep(doc.root, "title")
                     .map(|t| doc.text_content(t))
@@ -71,7 +106,7 @@ fn main() {
                 if !frag.is_empty() {
                     if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
                         page.scroll = (*y - 8.0).clamp(0.0, page.max_scroll());
-                        page.repaint(&mut fonts);
+                        page.repaint_scrolled(&mut fonts);
                     }
                 }
                 let _ = send(&mut output, &ToBrowser::Title(title));
@@ -126,9 +161,28 @@ fn main() {
                 }
             }
             ToRenderer::Scroll { dy } => {
+                // Coalesce any already-queued Scrolls into this repaint —
+                // intermediate frames would be superseded anyway. Stops at
+                // the first non-Scroll message (queued for next iteration).
+                let mut total = dy;
+                while let Ok(p) = rx.try_recv() {
+                    match ToRenderer::decode(&p) {
+                        Ok(ToRenderer::Scroll { dy: d }) => total += d,
+                        Ok(m) => {
+                            pending.push_back(m);
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
                 if page.has_doc() {
-                    page.scroll = (page.scroll + dy).clamp(0.0, page.max_scroll());
-                    page.repaint(&mut fonts);
+                    let new = (page.scroll + total).clamp(0.0, page.max_scroll());
+                    if new != page.scroll {
+                        page.scroll = new;
+                        page.repaint_scrolled(&mut fonts);
+                    }
+                    // Unchanged offset: cached pixels are still valid — just
+                    // resend the last frame instead of re-running the pipeline.
                     let _ = send(&mut output, &frame_msg(&page));
                 }
             }
@@ -146,6 +200,19 @@ fn send(w: &mut impl Write, msg: &ToBrowser) -> io::Result<()> {
     write_frame(w, &msg.encode())
 }
 
+/// Background image pipeline messages. Fetch workers report raw bodies
+/// (IO-bound — they run during layout without stealing CPU); decode jobs
+/// run in a parallel pool at fill time and report decoded images.
+enum ImgMsg {
+    /// fetch result for a URL; None = fetch failed
+    Body(Option<Vec<u8>>),
+    /// decode result for a URL; None = decode failed
+    Decoded(Option<rowser_image::Image>),
+}
+
+type ImgRx = std::sync::mpsc::Receiver<(String, ImgMsg)>;
+type ImgTx = std::sync::mpsc::Sender<(String, ImgMsg)>;
+
 struct Page {
     doc: Option<rowser_dom::Document>,
     viewport: (u32, u32),
@@ -156,12 +223,36 @@ struct Page {
     anchors: Vec<(String, f32)>,
     pixels: Vec<u8>,
     items: Vec<rowser_layout::DisplayItem>,
-    images: std::collections::HashMap<String, rowser_image::Image>,
+    /// Scroll offset baked into `items` at the last layout. A scroll by dy
+    /// is a pure -dy translation of every item unless `scroll_pinned`.
+    items_scroll: f32,
+    /// Any loaded/inline stylesheet uses `position:fixed|sticky` — those
+    /// anchor to the viewport, so scrolling must re-run layout.
+    scroll_pinned: bool,
     sheets: Vec<rowser_css::StyleSheet>,
+    /// <img src> → decoded pixels for the current page.
+    images: std::collections::HashMap<String, rowser_image::Image>,
+    /// <img src>s that failed to fetch/decode — never retried.
+    img_failed: std::collections::HashSet<String>,
+    /// Resolved URL → fetch+decode result. Persists across navigations —
+    /// a shared subresource (logo, stylesheet sprite) decodes once.
+    img_by_url: std::collections::HashMap<String, Option<rowser_image::Image>>,
+    /// Resolved URL → fetched body awaiting decode.
+    img_bodies: std::collections::HashMap<String, Vec<u8>>,
+    /// Resolved URLs a background worker is currently fetching or decoding.
+    img_inflight: std::collections::HashSet<String>,
+    /// Channel background fetch+decode workers report on. `img_tx` is kept
+    /// so extra workers can be spawned onto the same stream at any time.
+    img_tx: ImgTx,
+    img_rx: ImgRx,
+    /// First repaint after load waits for in-flight images; later repaints
+    /// just drain whatever has arrived.
+    img_waited: bool,
 }
 
 impl Page {
     fn new() -> Self {
+        let (img_tx, img_rx) = std::sync::mpsc::channel();
         Self {
             doc: None,
             viewport: (800, 600),
@@ -172,8 +263,17 @@ impl Page {
             anchors: Vec::new(),
             pixels: Vec::new(),
             items: Vec::new(),
-            images: std::collections::HashMap::new(),
+            items_scroll: 0.0,
+            scroll_pinned: false,
             sheets: Vec::new(),
+            images: std::collections::HashMap::new(),
+            img_failed: std::collections::HashSet::new(),
+            img_by_url: std::collections::HashMap::new(),
+            img_bodies: std::collections::HashMap::new(),
+            img_inflight: std::collections::HashSet::new(),
+            img_tx,
+            img_rx,
+            img_waited: false,
         }
     }
 
@@ -181,14 +281,21 @@ impl Page {
         self.doc.is_some()
     }
 
-    fn load(&mut self, doc: rowser_dom::Document, url: String, title: String) {
+    fn load(&mut self, doc: rowser_dom::Document, url: String, _title: String) {
         self.doc = Some(doc);
         self.url_base = url.clone();
         self.cur_url = url;
         self.scroll = 0.0;
+        self.items_scroll = 0.0;
         self.images.clear();
+        self.img_failed.clear();
+        self.img_waited = false;
         self.sheets.clear();
+        // Start image fetches immediately — they overlap the (blocking)
+        // stylesheet fetch and layout, so first paint rarely waits.
+        self.start_image_prefetch();
         self.load_linked_css();
+        self.scroll_pinned = self.detect_scroll_pinned();
     }
 
     /// Fetch <link rel="stylesheet" href=...> documents into style sheets.
@@ -215,7 +322,9 @@ impl Page {
                 }
             }
         }
+        let t = std::time::Instant::now();
         let bodies = fetch_pool(&resolved, CSS_FETCH_DEADLINE);
+        pt!("[prof] css fetch {} urls in {:?}", resolved.len(), t.elapsed());
         for u in &resolved {
             if let Some(b) = bodies.get(u) {
                 self.sheets
@@ -224,54 +333,338 @@ impl Page {
         }
     }
 
-    /// Fetch + decode <img src>s referenced by the display list, in parallel.
-    fn load_images(&mut self) {
-        let all_srcs: Vec<String> = self
-            .items
-            .iter()
-            .filter_map(|it| {
-                if let rowser_layout::DisplayItem::Image { src, .. } = it {
-                    Some(src.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // Unique srcs not already decoded, capped, in display order.
-        let mut srcs: Vec<String> = Vec::new();
-        for src in all_srcs {
-            if !self.images.contains_key(&src) && !srcs.contains(&src) {
-                srcs.push(src);
-            }
-        }
-        srcs.truncate(MAX_IMAGES_PER_LOAD);
-        // Resolve each src; several srcs may share one resolved URL.
-        let mut pairs: Vec<(String, String)> = Vec::new();
+    /// Kick off background fetches of every <img src> in the document right
+    /// after the HTML lands — transfers overlap the (blocking) stylesheet
+    /// fetch and layout, so first paint rarely waits on the network.
+    /// Decode is deferred to fill time: it is CPU-bound and would steal
+    /// cycles from the single-threaded layout pass.
+    fn start_image_prefetch(&mut self) {
+        let Some(doc) = &self.doc else { return };
         let mut urls: Vec<String> = Vec::new();
-        for src in &srcs {
-            if let Some(u) = resolve_url(&self.url_base, src) {
-                if !urls.contains(&u) {
-                    urls.push(u.clone());
+        let mut seen: Vec<String> = Vec::new();
+        for id in doc.descendants(doc.root) {
+            if doc.tag(id) != Some("img") {
+                continue;
+            }
+            let Some(src) = doc.attr(id, "src") else { continue };
+            if seen.iter().any(|s| s == src) {
+                continue;
+            }
+            seen.push(src.to_string());
+            match resolve_url(&self.url_base, src) {
+                Some(u) => {
+                    if self.img_by_url.contains_key(&u)
+                        || self.img_inflight.contains(&u)
+                        || urls.contains(&u)
+                    {
+                        continue;
+                    }
+                    urls.push(u);
                 }
-                pairs.push((src.clone(), u));
+                // data:/unresolvable — permanently unavailable
+                None => {
+                    self.img_failed.insert(src.to_string());
+                }
+            }
+            if urls.len() >= MAX_IMAGES_PER_LOAD {
+                break;
             }
         }
-        let bodies = fetch_pool(&urls, IMG_FETCH_DEADLINE);
-        for (src, u) in pairs {
-            if let Some(b) = bodies.get(&u) {
-                if let Ok(img) = rowser_image::decode(b) {
-                    self.images.insert(src, img);
+        if !urls.is_empty() {
+            self.spawn_img_workers(urls);
+        }
+    }
+
+    /// Spawn a worker pool that fetches each resolved URL, reporting
+    /// (url, Body) on the shared channel — failures report Body(None) so
+    /// they are never retried by later repaints. Fetch is IO-bound, so
+    /// these run concurrently with layout without stealing its CPU.
+    fn spawn_img_workers(&mut self, urls: Vec<String>) {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        for u in &urls {
+            self.img_inflight.insert(u.clone());
+        }
+        let queue = Arc::new(Mutex::new(urls.into_iter().collect::<VecDeque<_>>()));
+        for _ in 0..SUBRESOURCE_WORKERS {
+            let queue = Arc::clone(&queue);
+            let tx = self.img_tx.clone();
+            std::thread::spawn(move || loop {
+                let url = queue.lock().unwrap().pop_front();
+                let Some(url) = url else { break };
+                let body = fetch_resolved(&url);
+                if tx.send((url, ImgMsg::Body(body))).is_err() {
+                    break;
+                }
+            });
+        }
+    }
+
+    /// Spawn a worker pool decoding fetched bodies to Images — CPU-heavy,
+    /// so it only runs at fill time when nothing else is on the main thread.
+    fn spawn_decode_workers(&mut self, jobs: Vec<(String, Vec<u8>)>) {
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+        for (u, _) in &jobs {
+            self.img_inflight.insert(u.clone());
+        }
+        let queue = Arc::new(Mutex::new(jobs.into_iter().collect::<VecDeque<_>>()));
+        for _ in 0..SUBRESOURCE_WORKERS {
+            let queue = Arc::clone(&queue);
+            let tx = self.img_tx.clone();
+            std::thread::spawn(move || loop {
+                let job = queue.lock().unwrap().pop_front();
+                let Some((url, body)) = job else { break };
+                let img = rowser_image::decode(&body).ok();
+                if tx.send((url, ImgMsg::Decoded(img))).is_err() {
+                    break;
+                }
+            });
+        }
+    }
+
+    /// Move finished background results into `img_bodies`/`img_by_url`.
+    fn drain_images(&mut self) {
+        while let Ok((u, msg)) = self.img_rx.try_recv() {
+            self.img_inflight.remove(&u);
+            match msg {
+                ImgMsg::Body(Some(b)) => {
+                    // Bodies for images layout never displays (display:none)
+                    // are never consumed — bound the stash.
+                    if self.img_bodies.len() < MAX_IMG_CACHE {
+                        self.img_bodies.insert(u, b);
+                    }
+                }
+                ImgMsg::Body(None) | ImgMsg::Decoded(None) => {
+                    self.img_by_url.insert(u, None);
+                }
+                ImgMsg::Decoded(img) => {
+                    if self.img_by_url.len() >= MAX_IMG_CACHE {
+                        self.img_by_url.clear(); // bound session memory
+                    }
+                    self.img_by_url.insert(u, img);
                 }
             }
         }
+    }
+
+    /// Unique display-list <img> srcs with no decoded image and no known
+    /// failure, in display order.
+    fn missing_srcs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for it in &self.items {
+            if let rowser_layout::DisplayItem::Image { src, .. } = it {
+                if !self.images.contains_key(src)
+                    && !self.img_failed.contains(src)
+                    && !out.contains(src)
+                {
+                    out.push(src.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Fill `images`/`img_failed` from `img_by_url` for every missing src,
+    /// and kick decode jobs for bodies that have arrived. Returns resolved
+    /// URLs still outstanding (fetch or decode in flight).
+    fn sync_pending_images(&mut self) -> std::collections::HashSet<String> {
+        let mut outstanding = std::collections::HashSet::new();
+        let mut decode_jobs: Vec<(String, Vec<u8>)> = Vec::new();
+        for src in self.missing_srcs() {
+            match resolve_url(&self.url_base, &src) {
+                None => {
+                    self.img_failed.insert(src);
+                }
+                Some(u) => match self.img_by_url.get(&u) {
+                    Some(Some(img)) => {
+                        // Image isn't Clone — copy its public fields.
+                        self.images.insert(
+                            src,
+                            rowser_image::Image {
+                                width: img.width,
+                                height: img.height,
+                                pixels: img.pixels.clone(),
+                            },
+                        );
+                    }
+                    Some(None) => {
+                        self.img_failed.insert(src);
+                    }
+                    None => {
+                        if let Some(body) = self.img_bodies.remove(&u) {
+                            decode_jobs.push((u.clone(), body));
+                        }
+                        outstanding.insert(u);
+                    }
+                },
+            }
+        }
+        if !decode_jobs.is_empty() {
+            self.spawn_decode_workers(decode_jobs);
+        }
+        outstanding
+    }
+
+    /// Block until every URL in `need` has a fetch result (`img_bodies` or
+    /// `img_by_url`) or `deadline` expires. Decode jobs are kicked by the
+    /// surrounding sync loop and report into `img_by_url` the same way.
+    fn wait_images(&mut self, need: &std::collections::HashSet<String>, deadline: std::time::Duration) {
+        let start = std::time::Instant::now();
+        while need
+            .iter()
+            .any(|u| !self.img_by_url.contains_key(u) && !self.img_bodies.contains_key(u))
+        {
+            let left = deadline.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match self.img_rx.recv_timeout(left) {
+                Ok((u, msg)) => {
+                    self.img_inflight.remove(&u);
+                    match msg {
+                        ImgMsg::Body(Some(b)) => {
+                            if self.img_bodies.len() < MAX_IMG_CACHE {
+                                self.img_bodies.insert(u, b);
+                            }
+                        }
+                        ImgMsg::Body(None) | ImgMsg::Decoded(None) => {
+                            self.img_by_url.insert(u, None);
+                        }
+                        ImgMsg::Decoded(img) => {
+                            if self.img_by_url.len() >= MAX_IMG_CACHE {
+                                self.img_by_url.clear();
+                            }
+                            self.img_by_url.insert(u, img);
+                        }
+                    }
+                }
+                Err(_) => break, // deadline hit
+            }
+        }
+    }
+
+    /// Make sure every image the display list references is decoded —
+    /// or at least in flight. `wait` (first repaint of a load) blocks for
+    /// stragglers up to IMG_FETCH_DEADLINE; later repaints just collect
+    /// what finished so scrolling never stalls on the network.
+    fn load_images(&mut self, wait: bool) {
+        if !wait {
+            self.drain_images();
+            let outstanding = self.sync_pending_images();
+            // Kick background fetches for urls nothing covers (e.g. img
+            // tags introduced by a resize relayout); they fill on the next
+            // repaint without stalling this one.
+            let extra: Vec<String> = outstanding
+                .iter()
+                .filter(|u| {
+                    !self.img_inflight.contains(*u) && !self.img_bodies.contains_key(*u)
+                })
+                .cloned()
+                .collect();
+            if !extra.is_empty() {
+                self.spawn_img_workers(extra);
+            }
+            return;
+        }
+        let start = std::time::Instant::now();
+        let mut extras_spawned = false;
+        loop {
+            self.drain_images();
+            let outstanding = self.sync_pending_images();
+            if outstanding.is_empty() {
+                break;
+            }
+            if !extras_spawned {
+                extras_spawned = true;
+                // Resolved URLs no worker covers (e.g. beyond the prefetch
+                // cap) get their own fetch pool on the same channel.
+                let extra: Vec<String> = outstanding
+                    .iter()
+                    .filter(|u| {
+                        !self.img_inflight.contains(*u) && !self.img_bodies.contains_key(*u)
+                    })
+                    .cloned()
+                    .collect();
+                if !extra.is_empty() {
+                    self.spawn_img_workers(extra);
+                }
+            }
+            let left = IMG_FETCH_DEADLINE.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            self.wait_images(&outstanding, left);
+        }
+    }
+
+    /// `position:fixed`/`sticky` anchor to the viewport — a page using them
+    /// can't reuse its display list across scroll offsets, so scrolling it
+    /// re-runs layout. `absolute` (and everything else) shifts uniformly.
+    fn detect_scroll_pinned(&self) -> bool {
+        if std::env::var_os("ROWSER_FORCE_RELAYOUT").is_some() {
+            return true; // testing hook: never take the translate fast path
+        }
+        if self.sheets.iter().any(sheet_pins_scroll) {
+            return true;
+        }
+        let Some(doc) = &self.doc else { return false };
+        if rowser_css::document_sheets(doc)
+            .iter()
+            .any(sheet_pins_scroll)
+        {
+            return true;
+        }
+        for id in doc.descendants(doc.root) {
+            if let Some(s) = doc.attr(id, "style") {
+                if style_attr_pins(s) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn max_scroll(&self) -> f32 {
         (self.content_h - self.viewport.1 as f32).max(0.0)
     }
 
+    /// Repaint after a scroll. Pages without fixed/sticky positioning keep
+    /// their display list — items just translate by the scroll delta, so a
+    /// scroll costs one paint instead of a full re-layout.
+    fn repaint_scrolled(&mut self, fonts: &mut FontCache) {
+        if self.scroll_pinned {
+            self.repaint(fonts);
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let dy = self.scroll - self.items_scroll;
+        if dy != 0.0 {
+            for it in &mut self.items {
+                shift_item_y(it, -dy);
+            }
+            self.items_scroll = self.scroll;
+        }
+        self.load_images(false);
+        let t1 = std::time::Instant::now();
+        self.pixels = rowser_paint::paint(
+            &self.items,
+            fonts,
+            self.viewport.0,
+            self.viewport.1,
+            bgra(0xff, 0xff, 0xff),
+            &self.images,
+        );
+        pt!(
+            "[prof] scroll-repaint translate+images={:?} paint={:?}",
+            t1 - t0,
+            t1.elapsed()
+        );
+    }
+
     fn repaint(&mut self, fonts: &mut FontCache) {
         let Some(doc) = &self.doc else { return };
+        let t0 = std::time::Instant::now();
         let (items, height, anchors) =
             Layouter::layout_vh(
                 doc,
@@ -281,10 +674,17 @@ impl Page {
                 self.viewport.1 as f32,
                 &self.sheets,
             );
+        let t_layout = t0.elapsed();
         self.content_h = height;
         self.items = items;
+        self.items_scroll = self.scroll;
         self.anchors = anchors;
-        self.load_images();
+        let wait = !self.img_waited;
+        self.img_waited = true;
+        let t1 = std::time::Instant::now();
+        self.load_images(wait);
+        let t_img = t1.elapsed();
+        let t2 = std::time::Instant::now();
         self.pixels = rowser_paint::paint(
             &self.items,
             fonts,
@@ -293,6 +693,49 @@ impl Page {
             bgra(0xff, 0xff, 0xff),
             &self.images,
         );
+        pt!(
+            "[prof] repaint layout={t_layout:?} images={t_img:?} paint={:?} items={} imgs={}",
+            t2.elapsed(),
+            self.items.len(),
+            self.images.len()
+        );
+    }
+}
+
+/// True if `sheet` declares `position:fixed|sticky` (or `position:var(...)`,
+/// which could resolve to either — be conservative).
+fn sheet_pins_scroll(sheet: &rowser_css::StyleSheet) -> bool {
+    sheet.rules.iter().any(|r| {
+        r.decls.iter().any(|d| {
+            d.prop.trim().eq_ignore_ascii_case("position") && {
+                let v = d.value.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "fixed" | "sticky") || v.contains("var(")
+            }
+        })
+    })
+}
+
+/// Same check for an inline `style="..."` attribute.
+fn style_attr_pins(style: &str) -> bool {
+    style.split(';').any(|d| {
+        let Some((k, v)) = d.split_once(':') else { return false };
+        if !k.trim().eq_ignore_ascii_case("position") {
+            return false;
+        }
+        let v = v.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "fixed" | "sticky") || v.contains("var(")
+    })
+}
+
+/// Translate a display item vertically (scroll fast path).
+fn shift_item_y(it: &mut rowser_layout::DisplayItem, dy: f32) {
+    use rowser_layout::DisplayItem as D;
+    match it {
+        D::Text { baseline, .. } => *baseline += dy,
+        D::FillRect { y, .. }
+        | D::RoundedRect { y, .. }
+        | D::Raster { y, .. }
+        | D::Image { y, .. } => *y += dy,
     }
 }
 
