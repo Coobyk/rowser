@@ -31,6 +31,33 @@ impl Canvas {
         fill(&mut self.pixels, self.width, self.height, x, y, w, h, color);
     }
 
+    /// Filled rect with uniform rounded corners (quarter-circle arcs).
+    pub fn fill_rounded(&mut self, x: i32, y: i32, w: u32, h: u32, r: f32, color: Color) {
+        let r = r.min(w as f32 / 2.0).min(h as f32 / 2.0).max(0.0);
+        if r < 0.5 {
+            return self.fill_rect(x, y, w, h, color);
+        }
+        // side strips + center span
+        let ri = r.ceil() as i32;
+        self.fill_rect(x + ri, y, w.saturating_sub(2 * ri as u32), h, color);
+        self.fill_rect(x, y + ri, w, h.saturating_sub(2 * ri as u32), color);
+        // four corner quarter-discs
+        for (cx, cy) in [(x + ri, y + ri), (x + w as i32 - ri, y + ri), (x + ri, y + h as i32 - ri), (x + w as i32 - ri, y + h as i32 - ri)] {
+            let mut dy = -ri;
+            while dy <= ri {
+                let mut dx = -ri;
+                while dx <= ri {
+                    let dist = ((dx * dx + dy * dy) as f32).sqrt();
+                    if dist <= r {
+                        self.fill_rect(cx + dx, cy + dy, 1, 1, color);
+                    }
+                    dx += 1;
+                }
+                dy += 1;
+            }
+        }
+    }
+
     /// Blend a coverage bitmap with `color` onto the canvas at (x, y).
     pub fn blend_alpha(&mut self, x: i32, y: i32, w: u32, h: u32, alpha: &[u8], color: Color) {
         let (cw, ch) = (self.width as i32, self.height as i32);
@@ -102,6 +129,9 @@ pub fn paint_into(
 ) {
     for item in items {
         match item {
+            DisplayItem::RoundedRect { x, y, w, h, radius, color } => {
+                canvas.fill_rounded(*x as i32, *y as i32, *w as u32, *h as u32, *radius, *color);
+            }
             DisplayItem::Raster { x, y, w, h, pixels } => {
                 canvas.blit_pixels(pixels, *x as i32, *y as i32, *w as i32, *h as i32);
             }

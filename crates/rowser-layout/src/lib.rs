@@ -47,6 +47,15 @@ pub enum DisplayItem {
         h: f32,
         color: Color,
     },
+    /// Filled rect with uniform corner radius.
+    RoundedRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        color: Color,
+    },
     /// Raw BGRA bitmap painted at (x,y,w,h) — for inline <svg>.
     Raster {
         x: f32,
@@ -79,6 +88,8 @@ struct Style {
     italic: bool,
     /// family name handed to FontCache::resolve (fuzzy substring match)
     family: String,
+    /// text-transform applied per word
+    transform: u8, // 0 none, 1 upper, 2 lower, 3 capitalize
     color: Color,
     underline: bool,
     strike: bool,
@@ -107,6 +118,7 @@ fn base_style() -> Style {
         bold: false,
         italic: false,
         family: "liberation sans".to_string(),
+        transform: 0,
         color: BLACK,
         underline: false,
         strike: false,
@@ -336,6 +348,17 @@ fn bg_color(c: &HashMap<String, String>) -> Option<Color> {
         }
     }
     None
+}
+
+/// `border-radius` → uniform max radius (px).
+fn parse_radius(c: &HashMap<String, String>, size: f32) -> f32 {
+    c.get("border-radius")
+        .and_then(|v| {
+            v.split_whitespace()
+                .filter_map(|t| parse_len(t, size))
+                .reduce(f32::max)
+        })
+        .unwrap_or(0.0)
 }
 
 /// `border-width`/`border-style`/`border-color` split properties.
@@ -632,6 +655,14 @@ fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             h,
             pixels,
         },
+        DisplayItem::RoundedRect { x, y, w, h, radius, color } => DisplayItem::RoundedRect {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            radius,
+            color,
+        },
         DisplayItem::Text {
             x,
             baseline,
@@ -686,6 +717,7 @@ struct BlockPatch {
     w: f32,
     bg: Option<Color>,
     border: Option<(f32, Color)>,
+    radius: f32,
 }
 
 pub struct Layouter<'a> {
@@ -818,6 +850,14 @@ impl<'a> Layouter<'a> {
         }
         if let Some(v) = c.get("font-style") {
             st.italic = matches!(v.as_str(), "italic" | "oblique");
+        }
+        if let Some(v) = c.get("text-transform") {
+            st.transform = match v.trim() {
+                "uppercase" => 1,
+                "lowercase" => 2,
+                "capitalize" => 3,
+                _ => 0,
+            };
         }
         if let Some(v) = c.get("font-family") {
             let first = v.split(',').next().unwrap_or("").trim().trim_matches('"').trim_matches('\'').to_lowercase();
@@ -993,6 +1033,7 @@ impl<'a> Layouter<'a> {
                 w: pl + inner_w + pr + 2.0 * bw,
                 bg,
                 border,
+                radius: parse_radius(c, size),
             })
         } else {
             None
@@ -1106,6 +1147,7 @@ impl<'a> Layouter<'a> {
                 w: box_w,
                 bg,
                 border,
+                radius: parse_radius(c, size),
             })
         } else {
             None
@@ -1313,6 +1355,7 @@ impl<'a> Layouter<'a> {
                 w: table_w,
                 bg,
                 border,
+                radius: parse_radius(c, st.size),
             })
         } else {
             None
@@ -1618,7 +1661,11 @@ impl<'a> Layouter<'a> {
         let h = self.y - p.y;
         let mut put = |i: usize, it: DisplayItem| self.items[p.idx + i] = it;
         if let Some(bg) = p.bg {
-            put(0, DisplayItem::FillRect { x: p.x, y: p.y, w: p.w, h, color: bg });
+            if p.radius > 0.5 {
+                put(0, DisplayItem::RoundedRect { x: p.x, y: p.y, w: p.w, h, radius: p.radius, color: bg });
+            } else {
+                put(0, DisplayItem::FillRect { x: p.x, y: p.y, w: p.w, h, color: bg });
+            }
         }
         if let Some((bw, col)) = p.border {
             put(1, DisplayItem::FillRect { x: p.x, y: p.y, w: p.w, h: bw, color: col });
@@ -1777,6 +1824,13 @@ impl<'a> Layouter<'a> {
     }
 
     fn push_word(&mut self, word: &str, st: Style, font: usize) {
+        let owned: String;
+        let word = match st.transform {
+            1 => { owned = word.to_uppercase(); &owned }
+            2 => { owned = word.to_lowercase(); &owned }
+            3 => { owned = word.chars().enumerate().map(|(i, c)| if i == 0 { c.to_uppercase().next().unwrap_or(c) } else { c }).collect(); &owned }
+            _ => word,
+        };
         let (w, ascent, line_h) = {
             let Some(f) = self.fonts.font(font) else { return };
             let upem = f.units_per_em() as f32;
