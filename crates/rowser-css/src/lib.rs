@@ -56,6 +56,14 @@ pub enum Simple {
 
 pub struct StyleSheet {
     pub rules: Vec<Rule>,
+    /// Rightmost-compound index built at parse time: rules bucketed by a
+    /// tag/class/id their rightmost compound requires. `plain` holds rules
+    /// whose rightmost compound needs no such key (`*`, `[attr]`, pseudos).
+    /// The buckets are a superset of real matches — full matching still runs.
+    by_tag: HashMap<String, Vec<u32>>,
+    by_class: HashMap<String, Vec<u32>>,
+    by_id: HashMap<String, Vec<u32>>,
+    plain: Vec<u32>,
 }
 
 pub fn parse(css: &str) -> StyleSheet {
@@ -76,7 +84,98 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         }
         p.skip_ws_comments();
     }
-    StyleSheet { rules }
+    let mut sheet = StyleSheet {
+        rules,
+        by_tag: HashMap::new(),
+        by_class: HashMap::new(),
+        by_id: HashMap::new(),
+        plain: Vec::new(),
+    };
+    sheet.reindex();
+    sheet
+}
+
+/// Bucket key a selector's rightmost compound is indexed under. Picking id >
+/// class > tag > none keeps buckets selective; any required key is correct
+/// because the full matcher still runs on candidates.
+fn rightmost_key(sel: &Selector) -> Option<(&str, &str)> {
+    let (_, simples) = sel.parts.last()?;
+    for s in simples {
+        if let Simple::Id(i) = s {
+            return Some(("id", i));
+        }
+    }
+    for s in simples {
+        if let Simple::Class(c) = s {
+            return Some(("class", c));
+        }
+    }
+    for s in simples {
+        if let Simple::Tag(t) = s {
+            return Some(("tag", t));
+        }
+    }
+    None
+}
+
+impl StyleSheet {
+    /// (Re)build the rightmost-compound index after `rules` changes.
+    pub fn reindex(&mut self) {
+        self.by_tag.clear();
+        self.by_class.clear();
+        self.by_id.clear();
+        self.plain.clear();
+        for (i, rule) in self.rules.iter().enumerate() {
+            let mut bucketed = false;
+            for sel in &rule.selectors {
+                match rightmost_key(sel) {
+                    Some(("id", k)) => {
+                        self.by_id.entry(k.to_string()).or_default().push(i as u32);
+                        bucketed = true;
+                    }
+                    Some(("class", k)) => {
+                        self.by_class.entry(k.to_string()).or_default().push(i as u32);
+                        bucketed = true;
+                    }
+                    Some(("tag", k)) => {
+                        self.by_tag.entry(k.to_string()).or_default().push(i as u32);
+                        bucketed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !bucketed {
+                self.plain.push(i as u32);
+            }
+        }
+    }
+
+    /// Positions of rules that could match `node`, in sheet order. Union of
+    /// every bucket the node keys into, deduplicated — a superset of the
+    /// rules whose selectors actually match.
+    fn candidates(&self, doc: &Document, node: NodeId) -> Vec<u32> {
+        let mut v = self.plain.clone();
+        if let Some(t) = doc.tag(node) {
+            if let Some(ix) = self.by_tag.get(t) {
+                v.extend_from_slice(ix);
+            }
+        }
+        if let Some(id) = doc.attr(node, "id") {
+            if let Some(ix) = self.by_id.get(id) {
+                v.extend_from_slice(ix);
+            }
+        }
+        if let Some(cls) = doc.attr(node, "class") {
+            for c in cls.split_whitespace() {
+                if let Some(ix) = self.by_class.get(c) {
+                    v.extend_from_slice(ix);
+                }
+            }
+        }
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
 }
 
 struct CssParser<'a> {
@@ -101,6 +200,8 @@ impl<'a> CssParser<'a> {
         matches!(c, b' ' | b'\t' | b'\n' | 0x0c | b'\r')
     }
     fn skip_ws_comments(&mut self) {
+        // Defensive: malformed input elsewhere may have pushed pos past len.
+        self.pos = self.pos.min(self.s.len());
         loop {
             while self.peek().is_some_and(Self::is_ws) {
                 self.pos += 1;
@@ -159,7 +260,7 @@ impl<'a> CssParser<'a> {
                                 rules.push(r);
                             }
                         } else {
-                            self.pos += 1;
+                            let _ = self.bump();
                         }
                     }
                 }
@@ -333,7 +434,7 @@ impl<'a> CssParser<'a> {
                                         self.pos += 1;
                                     }
                                     let v = String::from_utf8_lossy(&self.s[st..self.pos]).into_owned();
-                                    self.pos += 1;
+                                    let _ = self.bump(); // closing quote, if present
                                     v
                                 }
                                 _ => self.ident(),
@@ -366,7 +467,7 @@ impl<'a> CssParser<'a> {
                                     while self.peek().is_some_and(|c| c != b')') {
                                         self.pos += 1;
                                     }
-                                    self.pos += 1;
+                                    let _ = self.bump(); // closing ')', if present
                                 }
                                 Simple::Unsupported
                             }
@@ -409,7 +510,7 @@ impl<'a> CssParser<'a> {
             self.skip_ws_comments();
             match self.peek() {
                 Some(b'}') | None => {
-                    self.pos += 1;
+                    let _ = self.bump(); // consume '}' only if present
                     break;
                 }
                 Some(b';') => {
@@ -589,7 +690,8 @@ pub fn computed(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> HashMap
     let mut order = 0usize;
     for (origin, sheet) in sheets.iter().enumerate() {
         // origin 0 = UA (weakest), later = author
-        for rule in &sheet.rules {
+        for &ri in &sheet.candidates(doc, node) {
+            let rule = &sheet.rules[ri as usize];
             let spec = rule
                 .selectors
                 .iter()
@@ -674,7 +776,8 @@ fn physical_props(prop: &str) -> Vec<&str> {
 
 fn has_custom_decl(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> bool {
     sheets.iter().any(|sh| {
-        sh.rules.iter().any(|r| {
+        sh.candidates(doc, node).iter().any(|&ri| {
+            let r = &sh.rules[ri as usize];
             r.decls.iter().any(|d| d.prop.starts_with("--"))
                 && r
                     .selectors
@@ -692,7 +795,8 @@ fn element_customs(
 ) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for sh in sheets {
-        for r in &sh.rules {
+        for &ri in &sh.candidates(doc, node) {
+            let r = &sh.rules[ri as usize];
             if !r
                 .selectors
                 .iter()

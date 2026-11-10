@@ -11,6 +11,15 @@ use std::io::{self, Write};
 
 const WELCOME: &str = include_str!("../../../assets/welcome.html");
 
+/// Parallel subresource fetchers and their budgets.
+const SUBRESOURCE_WORKERS: usize = 8;
+const CSS_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+const IMG_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+const MAX_IMAGES_PER_LOAD: usize = 64;
+/// Per-socket read/write timeout — covers TLS handshake and response reads
+/// (otherwise a stalled server hangs the fetch forever).
+const FETCH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn main() {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -196,16 +205,28 @@ impl Page {
                 }
             }
         }
-        for h in hrefs {
-            if let Some(text) = fetch_text(&self.url_base, &h) {
-                self.sheets.push(rowser_css::parse(&text));
+        // Resolve + dedupe (document order preserved), then fetch in parallel
+        // on a worker pool so each stylesheet's TLS handshake overlaps.
+        let mut resolved: Vec<String> = Vec::new();
+        for h in &hrefs {
+            if let Some(u) = resolve_url(&self.url_base, h) {
+                if !resolved.contains(&u) {
+                    resolved.push(u);
+                }
+            }
+        }
+        let bodies = fetch_pool(&resolved, CSS_FETCH_DEADLINE);
+        for u in &resolved {
+            if let Some(b) = bodies.get(u) {
+                self.sheets
+                    .push(rowser_css::parse(&String::from_utf8_lossy(b)));
             }
         }
     }
 
-    /// Fetch + decode every <img src> referenced by the display list.
+    /// Fetch + decode <img src>s referenced by the display list, in parallel.
     fn load_images(&mut self) {
-        let srcs: Vec<String> = self
+        let all_srcs: Vec<String> = self
             .items
             .iter()
             .filter_map(|it| {
@@ -216,12 +237,29 @@ impl Page {
                 }
             })
             .collect();
-        for src in srcs {
-            if self.images.contains_key(&src) {
-                continue;
+        // Unique srcs not already decoded, capped, in display order.
+        let mut srcs: Vec<String> = Vec::new();
+        for src in all_srcs {
+            if !self.images.contains_key(&src) && !srcs.contains(&src) {
+                srcs.push(src);
             }
-            if let Some(bytes) = fetch_bytes(&self.url_base, &src) {
-                if let Ok(img) = rowser_image::decode(&bytes) {
+        }
+        srcs.truncate(MAX_IMAGES_PER_LOAD);
+        // Resolve each src; several srcs may share one resolved URL.
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut urls: Vec<String> = Vec::new();
+        for src in &srcs {
+            if let Some(u) = resolve_url(&self.url_base, src) {
+                if !urls.contains(&u) {
+                    urls.push(u.clone());
+                }
+                pairs.push((src.clone(), u));
+            }
+        }
+        let bodies = fetch_pool(&urls, IMG_FETCH_DEADLINE);
+        for (src, u) in pairs {
+            if let Some(b) = bodies.get(&u) {
+                if let Ok(img) = rowser_image::decode(b) {
                     self.images.insert(src, img);
                 }
             }
@@ -377,21 +415,64 @@ fn list_page(name: &str) -> String {
 }
 
 
-/// Fetch a resource relative to a page URL — http(s), file://, or plain path.
-fn fetch_bytes(base_url: &str, resource: &str) -> Option<Vec<u8>> {
-    let url = resolve_url(base_url, resource)?;
+/// Fetch a fully-resolved URL — http(s), file://, or plain path.
+fn fetch_resolved(url: &str) -> Option<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
         let path = rowser_net::percent_decode(path).unwrap_or_else(|_| path.to_string());
         return std::fs::read(path).ok();
     }
     if url.starts_with("http") {
-        return web_fetch(&url).ok().map(|r| r.body);
+        return web_fetch(url).ok().map(|r| r.body);
     }
-    std::fs::read(&url).ok()
+    std::fs::read(url).ok()
 }
 
-fn fetch_text(base_url: &str, resource: &str) -> Option<String> {
-    fetch_bytes(base_url, resource).map(|b| String::from_utf8_lossy(&b).into_owned())
+/// Fetch `urls` on a small worker pool, returning url → body for everything
+/// that completes before `deadline`. Serial fetching is a poor fit for the
+/// web: each https request costs a full TLS handshake, so a page with dozens
+/// of subresources would otherwise take minutes. Workers are detached; the
+/// per-socket timeouts in web_fetch bound how long stragglers live.
+fn fetch_pool(
+    urls: &[String],
+    deadline: std::time::Duration,
+) -> std::collections::HashMap<String, Vec<u8>> {
+    use std::collections::VecDeque;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Instant;
+
+    let queue = Arc::new(Mutex::new(
+        urls.iter().cloned().collect::<VecDeque<_>>(),
+    ));
+    let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>();
+    for _ in 0..urls.len().min(SUBRESOURCE_WORKERS) {
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            let url = queue.lock().unwrap().pop_front();
+            let Some(url) = url else { break };
+            if let Some(body) = fetch_resolved(&url) {
+                if tx.send((url, body)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+    let mut out = std::collections::HashMap::new();
+    let start = Instant::now();
+    while out.len() < urls.len() {
+        let left = deadline.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok((url, body)) => {
+                out.insert(url, body);
+            }
+            Err(_) => break, // timeout expired or all workers finished
+        }
+    }
+    out
 }
 
 /// Resolve `resource` against `base` (absolute URLs pass through).
@@ -427,10 +508,16 @@ fn web_fetch(url: &str) -> io::Result<rowser_net::Response> {
         let resp = match parsed.scheme.as_str() {
             "http" => {
                 let mut tcp = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
+                tcp.set_read_timeout(Some(FETCH_IO_TIMEOUT))?;
+                tcp.set_write_timeout(Some(FETCH_IO_TIMEOUT))?;
                 rowser_net::request_over(&mut tcp, &parsed)?
             }
             "https" => {
                 let tcp = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
+                // SO_RCVTIMEO/SO_SNDTIMEO live on the socket — they stay in
+                // effect once `tcp` is moved into the TlsStream.
+                tcp.set_read_timeout(Some(FETCH_IO_TIMEOUT))?;
+                tcp.set_write_timeout(Some(FETCH_IO_TIMEOUT))?;
                 let mut tls =
                     rowser_tls::TlsStream::connect(&parsed.host, parsed.port, tcp)?;
                 if let Err(e) = tls.verify_certificate() {
