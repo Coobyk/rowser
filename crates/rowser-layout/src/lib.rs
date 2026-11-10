@@ -1694,8 +1694,34 @@ impl<'a> Layouter<'a> {
             .or_else(|| self.fonts.resolve("liberation sans", false, false))
     }
 
+    /// Like resolve_font, but for `word` containing chars the primary font
+    /// lacks — fall back through symbol-capable families.
+    fn resolve_font_covering(&mut self, word: &str, st: &Style) -> Option<usize> {
+        let covers = |fonts: &mut FontCache, idx: usize, w: &str| {
+            fonts
+                .font(idx)
+                .is_some_and(|f| w.chars().all(|c| f.glyph_id(c) != 0))
+        };
+        let primary = self.resolve_font(st)?;
+        if covers(&mut self.fonts, primary, word) {
+            return Some(primary);
+        }
+        const ALT: &[&str] = &[
+            "noto sans symbols2", "noto sans symbols", "noto sans math",
+            "symbola", "dejavu sans", "noto sans",
+        ];
+        for fam in ALT {
+            if let Some(idx) = self.fonts.resolve(fam, st.bold, st.italic) {
+                if covers(&mut self.fonts, idx, word) {
+                    return Some(idx);
+                }
+            }
+        }
+        Some(primary)
+    }
+
     fn word_with_space(&mut self, word: &str, st: Style) {
-        let Some(font) = self.resolve_font(&st) else { return };
+        let Some(font) = self.resolve_font_covering(word, &st) else { return };
         let space_w = self
             .fonts
             .font(font)
