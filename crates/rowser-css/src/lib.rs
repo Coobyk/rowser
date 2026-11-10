@@ -9,7 +9,11 @@
 //! !important UA; ties broken by specificity then source order.
 
 use rowser_dom::{Document, NodeId};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+
+/// Property maps keyed by CSS property name — Fx-hashed (string keys are
+/// small and lookups/inserts dominate the cascade).
+pub type StrMap<V> = FxHashMap<String, V>;
 
 #[derive(Debug, Clone)]
 pub struct Decl {
@@ -60,9 +64,9 @@ pub struct StyleSheet {
     /// tag/class/id their rightmost compound requires. `plain` holds rules
     /// whose rightmost compound needs no such key (`*`, `[attr]`, pseudos).
     /// The buckets are a superset of real matches — full matching still runs.
-    by_tag: HashMap<String, Vec<u32>>,
-    by_class: HashMap<String, Vec<u32>>,
-    by_id: HashMap<String, Vec<u32>>,
+    by_tag: FxHashMap<String, Vec<u32>>,
+    by_class: FxHashMap<String, Vec<u32>>,
+    by_id: FxHashMap<String, Vec<u32>>,
     plain: Vec<u32>,
 }
 
@@ -86,9 +90,9 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
     }
     let mut sheet = StyleSheet {
         rules,
-        by_tag: HashMap::new(),
-        by_class: HashMap::new(),
-        by_id: HashMap::new(),
+        by_tag: FxHashMap::default(),
+        by_class: FxHashMap::default(),
+        by_id: FxHashMap::default(),
         plain: Vec::new(),
     };
     sheet.reindex();
@@ -150,31 +154,33 @@ impl StyleSheet {
         }
     }
 
-    /// Positions of rules that could match `node`, in sheet order. Union of
-    /// every bucket the node keys into, deduplicated — a superset of the
-    /// rules whose selectors actually match.
-    fn candidates(&self, doc: &Document, node: NodeId) -> Vec<u32> {
-        let mut v = self.plain.clone();
+    /// Positions of rules that could match `node`, in sheet order, appended
+    /// to `out` (cleared first). Union of every bucket the node keys into,
+    /// deduplicated — a superset of the rules whose selectors actually match.
+    /// Each bucket is already sorted (rule indices are pushed in order), so
+    /// the final sort is over a mostly-sorted vec.
+    fn candidates_into(&self, doc: &Document, node: NodeId, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend_from_slice(&self.plain);
         if let Some(t) = doc.tag(node) {
             if let Some(ix) = self.by_tag.get(t) {
-                v.extend_from_slice(ix);
+                out.extend_from_slice(ix);
             }
         }
         if let Some(id) = doc.attr(node, "id") {
             if let Some(ix) = self.by_id.get(id) {
-                v.extend_from_slice(ix);
+                out.extend_from_slice(ix);
             }
         }
         if let Some(cls) = doc.attr(node, "class") {
             for c in cls.split_whitespace() {
                 if let Some(ix) = self.by_class.get(c) {
-                    v.extend_from_slice(ix);
+                    out.extend_from_slice(ix);
                 }
             }
         }
-        v.sort_unstable();
-        v.dedup();
-        v
+        out.sort_unstable();
+        out.dedup();
     }
 }
 
@@ -683,119 +689,179 @@ pub fn matches(doc: &Document, node: NodeId, sel: &Selector) -> bool {
     true
 }
 
+/// Per-document style-resolution context: owns the scratch buffer used for
+/// candidate lists and memoizes the `:root` element's custom properties, so
+/// repeated `computed` calls over a full tree don't reallocate or re-match.
+/// Create once per document + sheet set, reuse for every node.
+pub struct StyleCtx<'a> {
+    doc: &'a Document,
+    sheets: Vec<&'a StyleSheet>,
+    buf: Vec<u32>,
+    /// html element's `--*` decls, resolved on first var() use.
+    root_customs: Option<StrMap<String>>,
+}
+
 /// Cascade `sheets` (UA sheet(s) first, then author, in order) for `node`.
 /// Returns property → value with inheritance applied for text props.
-pub fn computed(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> HashMap<String, String> {
-    let mut out: HashMap<String, (String, u8, (u32, u32, u32), usize)> = HashMap::new();
-    let mut order = 0usize;
-    for (origin, sheet) in sheets.iter().enumerate() {
-        // origin 0 = UA (weakest), later = author
-        for &ri in &sheet.candidates(doc, node) {
-            let rule = &sheet.rules[ri as usize];
-            let spec = rule
-                .selectors
-                .iter()
-                .filter(|s| rightmost_ok(doc, node, s) && matches(doc, node, s))
-                .map(specificity)
-                .max()
-                .unwrap_or((0, 0, 0));
-            if spec == (0, 0, 0)
-                && !rule
-                    .selectors
-                    .iter()
-                    .any(|s| rightmost_ok(doc, node, s) && matches(doc, node, s))
-            {
-                continue;
-            }
-            for d in &rule.decls {
-                // priority: important > normal; origin weight breaks ties
-                let pri: u8 = if d.important { 2 + origin as u8 } else { origin as u8 };
-                for prop in physical_props(&d.prop) {
-                    let e = out.entry(prop.to_string()).or_insert((
-                        d.value.clone(),
-                        0,
-                        (0, 0, 0),
-                        0,
-                    ));
-                    if (pri, spec, order) >= (e.1, e.2, e.3) {
-                        *e = (d.value.clone(), pri, spec, order);
+/// For resolving more than a handful of nodes, prefer `StyleCtx::computed`
+/// (this builds a fresh context — and re-resolves :root customs — per call).
+pub fn computed(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> StrMap<String> {
+    StyleCtx::new(doc, sheets).computed(node)
+}
+
+impl<'a> StyleCtx<'a> {
+    pub fn new(doc: &'a Document, sheets: &[&'a StyleSheet]) -> Self {
+        StyleCtx {
+            doc,
+            sheets: sheets.to_vec(),
+            buf: Vec::new(),
+            root_customs: None,
+        }
+    }
+
+    /// The `<html>` element's own custom-property declarations, computed
+    /// once and shared read-only thereafter (an empty map if there's no
+    /// html element — same as the previous per-node `find_deep` miss).
+    fn root_customs(&mut self) -> &StrMap<String> {
+        if self.root_customs.is_none() {
+            self.root_customs = Some(
+                self.doc
+                    .find_deep(self.doc.root, "html")
+                    .map(|h| element_customs(self.doc, h, &self.sheets))
+                    .unwrap_or_default(),
+            );
+        }
+        self.root_customs.as_ref().unwrap()
+    }
+
+    pub fn computed(&mut self, node: NodeId) -> StrMap<String> {
+        let doc = self.doc;
+        let mut out: StrMap<(String, u8, (u32, u32, u32), usize)> = StrMap::default();
+        // `--*` decls from rules matching this node (element_customs folded
+        // into the main match pass — one selector match per rule, not two).
+        let mut customs: StrMap<String> = StrMap::default();
+        let mut order = 0usize;
+        for (origin, sheet) in self.sheets.iter().enumerate() {
+            // origin 0 = UA (weakest), later = author
+            sheet.candidates_into(doc, node, &mut self.buf);
+            for &ri in &self.buf {
+                let rule = &sheet.rules[ri as usize];
+                // best specificity across matching selectors — and whether
+                // any matched at all — in one pass over the selector list
+                let mut spec = (0u32, 0u32, 0u32);
+                let mut matched = false;
+                for s in &rule.selectors {
+                    if rightmost_ok(doc, node, s) && matches(doc, node, s) {
+                        matched = true;
+                        let sp = specificity(s);
+                        if sp > spec {
+                            spec = sp;
+                        }
                     }
                 }
+                if !matched {
+                    continue;
+                }
+                for d in &rule.decls {
+                    // priority: important > normal; origin weight breaks ties
+                    let pri: u8 = if d.important { 2 + origin as u8 } else { origin as u8 };
+                    if d.prop.starts_with("--") {
+                        customs.insert(d.prop.clone(), d.value.clone());
+                    }
+                    each_physical(&d.prop, |prop| match out.get_mut(prop) {
+                        Some(e) => {
+                            if (pri, spec, order) >= (e.1, e.2, e.3) {
+                                *e = (d.value.clone(), pri, spec, order);
+                            }
+                        }
+                        None => {
+                            out.insert(prop.to_string(), (d.value.clone(), pri, spec, order));
+                        }
+                    });
+                }
+                order += 1;
             }
-            order += 1;
         }
-    }
-    let mut props: HashMap<String, String> =
-        out.into_iter().map(|(k, (v, _, _, _))| (k, v)).collect();
-    // Custom properties: same cascade, resolved against this element's map
-    // and the :root element's globals.
-    if props.values().any(|v| v.contains("var(")) || has_custom_decl(doc, node, sheets) {
-        let mut customs = element_customs(doc, node, sheets);
-        if let Some(html) = doc.find_deep(doc.root, "html") {
-            for (k, v) in element_customs(doc, html, sheets) {
-                customs.entry(k).or_insert(v);
+        let mut props: StrMap<String> =
+            out.into_iter().map(|(k, (v, _, _, _))| (k, v)).collect();
+        // Custom properties: resolve var() only when a value actually uses
+        // it — collecting the customs map is free (folded above), and the
+        // :root globals are cached on the ctx rather than re-matched per node.
+        if props.values().any(|v| v.contains("var(")) {
+            for (k, v) in self.root_customs().iter() {
+                customs.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+            for v in props.values_mut() {
+                *v = resolve_vars(v, &customs);
             }
         }
-        for v in props.values_mut() {
-            *v = resolve_vars(v, &customs);
-        }
+        props
     }
-    props
 }
 
-/// Logical → physical property expansion (LTR horizontal writing mode).
-fn physical_props(prop: &str) -> Vec<&str> {
+/// Logical → physical property expansion (LTR horizontal writing mode):
+/// run `f` once per longhand `prop` expands to (identity for most props).
+fn each_physical(prop: &str, mut f: impl FnMut(&str)) {
     match prop {
-        "padding-inline" => vec!["padding-left", "padding-right"],
-        "padding-inline-start" => vec!["padding-left"],
-        "padding-inline-end" => vec!["padding-right"],
-        "padding-block" => vec!["padding-top", "padding-bottom"],
-        "padding-block-start" => vec!["padding-top"],
-        "padding-block-end" => vec!["padding-bottom"],
-        "margin-inline" => vec!["margin-left", "margin-right"],
-        "margin-inline-start" => vec!["margin-left"],
-        "margin-inline-end" => vec!["margin-right"],
-        "margin-block" => vec!["margin-top", "margin-bottom"],
-        "margin-block-start" => vec!["margin-top"],
-        "margin-block-end" => vec!["margin-bottom"],
-        "border-inline" => vec!["border-left", "border-right"],
-        "border-block" => vec!["border-top", "border-bottom"],
-        "border-inline-color" => vec!["border-color"],
-        "border-block-color" => vec!["border-color"],
-        "border-inline-width" => vec!["border-width"],
-        "border-block-width" => vec!["border-width"],
-        "inset-inline" => vec!["left", "right"],
-        "inset-block" => vec!["top", "bottom"],
-        "inset-inline-start" => vec!["left"],
-        "inset-inline-end" => vec!["right"],
-        "inset-block-start" => vec!["top"],
-        "inset-block-end" => vec!["bottom"],
-        p => vec![p],
+        "padding-inline" => {
+            f("padding-left");
+            f("padding-right");
+        }
+        "padding-inline-start" => f("padding-left"),
+        "padding-inline-end" => f("padding-right"),
+        "padding-block" => {
+            f("padding-top");
+            f("padding-bottom");
+        }
+        "padding-block-start" => f("padding-top"),
+        "padding-block-end" => f("padding-bottom"),
+        "margin-inline" => {
+            f("margin-left");
+            f("margin-right");
+        }
+        "margin-inline-start" => f("margin-left"),
+        "margin-inline-end" => f("margin-right"),
+        "margin-block" => {
+            f("margin-top");
+            f("margin-bottom");
+        }
+        "margin-block-start" => f("margin-top"),
+        "margin-block-end" => f("margin-bottom"),
+        "border-inline" => {
+            f("border-left");
+            f("border-right");
+        }
+        "border-block" => {
+            f("border-top");
+            f("border-bottom");
+        }
+        "border-inline-color" => f("border-color"),
+        "border-block-color" => f("border-color"),
+        "border-inline-width" => f("border-width"),
+        "border-block-width" => f("border-width"),
+        "inset-inline" => {
+            f("left");
+            f("right");
+        }
+        "inset-block" => {
+            f("top");
+            f("bottom");
+        }
+        "inset-inline-start" => f("left"),
+        "inset-inline-end" => f("right"),
+        "inset-block-start" => f("top"),
+        "inset-block-end" => f("bottom"),
+        p => f(p),
     }
-}
-
-fn has_custom_decl(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> bool {
-    sheets.iter().any(|sh| {
-        sh.candidates(doc, node).iter().any(|&ri| {
-            let r = &sh.rules[ri as usize];
-            r.decls.iter().any(|d| d.prop.starts_with("--"))
-                && r
-                    .selectors
-                    .iter()
-                    .any(|s| rightmost_ok(doc, node, s) && matches(doc, node, s))
-        })
-    })
 }
 
 /// Custom-property declarations (--x) matching this element.
-fn element_customs(
-    doc: &Document,
-    node: NodeId,
-    sheets: &[&StyleSheet],
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
+fn element_customs(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> StrMap<String> {
+    let mut out = StrMap::default();
+    let mut buf = Vec::new();
     for sh in sheets {
-        for &ri in &sh.candidates(doc, node) {
+        sh.candidates_into(doc, node, &mut buf);
+        for &ri in &buf {
             let r = &sh.rules[ri as usize];
             if !r
                 .selectors
@@ -815,7 +881,7 @@ fn element_customs(
 }
 
 /// Substitute `var(--name)` and `var(--name, fallback)` recursively.
-fn resolve_vars(value: &str, customs: &HashMap<String, String>) -> String {
+fn resolve_vars(value: &str, customs: &StrMap<String>) -> String {
     let mut out = value.to_string();
     for _ in 0..8 {
         let Some(start) = out.find("var(") else { break };

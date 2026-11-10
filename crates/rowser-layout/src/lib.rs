@@ -15,8 +15,12 @@ mod svg;
 
 use rowser_dom::{Document, NodeId, NodeKind};
 use rowser_text::FontCache;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
+use std::rc::Rc;
 use std::sync::OnceLock;
+
+/// Computed-style map for one element (fx-hashed, built by rowser-css).
+type Props = css::StrMap<String>;
 
 /// BGRA pixel.
 pub type Color = u32;
@@ -329,7 +333,7 @@ pub fn parse_color(v: &str) -> Option<Color> {
 }
 
 /// `background-color` or a color inside the `background` shorthand.
-fn bg_color(c: &HashMap<String, String>) -> Option<Color> {
+fn bg_color(c: &Props) -> Option<Color> {
     if let Some(v) = c.get("background-color") {
         if let Some(col) = parse_color(v) {
             return Some(col);
@@ -359,7 +363,7 @@ fn bg_color(c: &HashMap<String, String>) -> Option<Color> {
 
 /// `box-shadow: x y [blur] [spread] [color]` → (dx, dy, color); blur/spread
 /// ignored (flat shadow approximation).
-fn parse_shadow(c: &HashMap<String, String>, size: f32) -> Option<(f32, f32, Color)> {
+fn parse_shadow(c: &Props, size: f32) -> Option<(f32, f32, Color)> {
     let v = c.get("box-shadow")?;
     if v.trim() == "none" {
         return None;
@@ -396,7 +400,7 @@ fn parse_shadow(c: &HashMap<String, String>, size: f32) -> Option<(f32, f32, Col
 }
 
 /// `border-radius` → uniform max radius (px).
-fn parse_radius(c: &HashMap<String, String>, size: f32) -> f32 {
+fn parse_radius(c: &Props, size: f32) -> f32 {
     c.get("border-radius")
         .and_then(|v| {
             v.split_whitespace()
@@ -407,7 +411,7 @@ fn parse_radius(c: &HashMap<String, String>, size: f32) -> f32 {
 }
 
 /// `border-width`/`border-style`/`border-color` split properties.
-fn split_border(c: &HashMap<String, String>, size: f32) -> Option<(f32, Color)> {
+fn split_border(c: &Props, size: f32) -> Option<(f32, Color)> {
     let w = c.get("border-width").and_then(|v| parse_len(v, size))?;
     if w <= 0.0 || c.get("border-style").map(String::as_str) == Some("none") {
         return None;
@@ -595,7 +599,7 @@ fn parse_font_size(v: &str, parent: f32) -> f32 {
 }
 
 /// Shorthand sides (top, right, bottom, left) from 1–4 values.
-fn sides(c: &HashMap<String, String>, name: &str, rel: f32) -> [Option<f32>; 4] {
+fn sides(c: &Props, name: &str, rel: f32) -> [Option<f32>; 4] {
     if let Some(v) = c.get(name) {
         let vals: Vec<Option<f32>> = v
             .split_whitespace()
@@ -613,24 +617,42 @@ fn sides(c: &HashMap<String, String>, name: &str, rel: f32) -> [Option<f32>; 4] 
     }
 }
 
-fn side(c: &HashMap<String, String>, name: &str, rel: f32) -> Option<f32> {
+fn side(c: &Props, name: &str, rel: f32) -> Option<f32> {
     c.get(name).and_then(|v| parse_len(v, rel))
 }
 
 /// margin/padding longhands merged over the shorthand.
 /// Returns [top, right, bottom, left] in px (0 when unset).
-fn box_sides(c: &HashMap<String, String>, name: &str, rel: f32) -> [f32; 4] {
+fn box_sides(c: &Props, name: &str, rel: f32) -> [f32; 4] {
     let sh = sides(c, name, rel);
+    // static longhand names — the old format!() allocated 4 strings per call
+    let (t, r, b, l) = match name {
+        "margin" => ("margin-top", "margin-right", "margin-bottom", "margin-left"),
+        "padding" => (
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        ),
+        _ => {
+            return [
+                side(c, &format!("{name}-top"), rel).or(sh[0]).unwrap_or(0.0),
+                side(c, &format!("{name}-right"), rel).or(sh[1]).unwrap_or(0.0),
+                side(c, &format!("{name}-bottom"), rel).or(sh[2]).unwrap_or(0.0),
+                side(c, &format!("{name}-left"), rel).or(sh[3]).unwrap_or(0.0),
+            ];
+        }
+    };
     [
-        side(c, &format!("{name}-top"), rel).or(sh[0]).unwrap_or(0.0),
-        side(c, &format!("{name}-right"), rel).or(sh[1]).unwrap_or(0.0),
-        side(c, &format!("{name}-bottom"), rel).or(sh[2]).unwrap_or(0.0),
-        side(c, &format!("{name}-left"), rel).or(sh[3]).unwrap_or(0.0),
+        side(c, t, rel).or(sh[0]).unwrap_or(0.0),
+        side(c, r, rel).or(sh[1]).unwrap_or(0.0),
+        side(c, b, rel).or(sh[2]).unwrap_or(0.0),
+        side(c, l, rel).or(sh[3]).unwrap_or(0.0),
     ]
 }
 
 /// Is margin-left/right `auto` (longhand or shorthand position)?
-fn margin_auto(c: &HashMap<String, String>, left: bool) -> bool {
+fn margin_auto(c: &Props, left: bool) -> bool {
     let long = if left { "margin-left" } else { "margin-right" };
     if c.get(long).is_some_and(|v| v.trim().eq_ignore_ascii_case("auto")) {
         return true;
@@ -784,7 +806,18 @@ struct BlockPatch {
 
 pub struct Layouter<'a> {
     doc: &'a Document,
+    /// sheet set (UA + external + <style>); shared with worker StyleCtxs
+    /// during the parallel pre-resolve
     sheets: Vec<&'a css::StyleSheet>,
+    /// style resolution context (candidate buffer + cached :root customs)
+    ctx: css::StyleCtx<'a>,
+    /// computed-style memo — table cells, flex children and shrink-width
+    /// probes all re-resolve the same nodes; the cascade is deterministic
+    /// per node so the result is shared (Rc) instead of recomputed.
+    style_cache: FxHashMap<NodeId, Rc<Props>>,
+    /// (family, bold, italic) → font index memo — FontCache::resolve scans
+    /// every installed face per call, so resolving once per style is a must.
+    font_memo: FxHashMap<String, [u32; 4]>,
     fonts: &'a mut FontCache,
     items: Vec<DisplayItem>,
     y: f32,
@@ -835,7 +868,10 @@ impl<'a> Layouter<'a> {
         sheets.extend(author.iter());
         let mut l = Layouter {
             doc,
+            ctx: css::StyleCtx::new(doc, &sheets),
             sheets,
+            style_cache: FxHashMap::default(),
+            font_memo: FxHashMap::default(),
             fonts,
             items: Vec::new(),
             y: 8.0 - scroll,
@@ -851,7 +887,8 @@ impl<'a> Layouter<'a> {
             anchors: Vec::new(),
             viewport_h,
         };
-        l.walk(doc.root, base_style());
+        l.preresolve_styles();
+        l.walk(doc.root, &base_style());
         l.flush_line();
         // floats don't consume vertical space at their site; make sure the
         // document is at least as tall as the deepest float
@@ -887,11 +924,64 @@ impl<'a> Layouter<'a> {
         self.margin_x + self.float_insets().0
     }
 
-    fn walk(&mut self, node: NodeId, style: Style) {
+    /// Resolve every element's computed style up front, fanning out across
+    /// cores for large documents — the cascade is deterministic per node, so
+    /// pre-filling `style_cache` doesn't change results; it just moves the
+    /// ~90%-of-layout style work off the serial walk.
+    fn preresolve_styles(&mut self) {
+        let elems: Vec<NodeId> = self
+            .doc
+            .descendants(self.doc.root)
+            .filter(|&id| self.doc.tag(id).is_some())
+            .collect();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+            .min(elems.len() / 256);
+        if workers <= 1 {
+            for id in elems {
+                self.style(id);
+            }
+            return;
+        }
+        let chunk = elems.len().div_ceil(workers);
+        let mut out: Vec<Option<Props>> =
+            std::iter::repeat_with(|| None).take(elems.len()).collect();
+        let doc = self.doc;
+        let sheets = &self.sheets[..];
+        std::thread::scope(|s| {
+            for (work, oc) in elems.chunks(chunk).zip(out.chunks_mut(chunk)) {
+                s.spawn(move || {
+                    let mut ctx = css::StyleCtx::new(doc, sheets);
+                    for (i, &id) in work.iter().enumerate() {
+                        oc[i] = Some(ctx.computed(id));
+                    }
+                });
+            }
+        });
+        for (id, p) in elems.into_iter().zip(out) {
+            if let Some(p) = p {
+                self.style_cache.insert(id, Rc::new(p));
+            }
+        }
+    }
+
+    /// Computed style for `node`, memoized per node.
+    fn style(&mut self, node: NodeId) -> Rc<Props> {
+        if let Some(c) = self.style_cache.get(&node) {
+            return Rc::clone(c);
+        }
+        let c = Rc::new(self.ctx.computed(node));
+        self.style_cache.insert(node, Rc::clone(&c));
+        c
+    }
+
+    fn walk(&mut self, node: NodeId, style: &Style) {
         match self.doc.kind(node) {
             NodeKind::Document => {
                 for &c in self.doc.children(node) {
-                    self.walk(c, style.clone());
+                    self.walk(c, style);
                 }
             }
             NodeKind::Text(t) => self.text(t, style),
@@ -902,7 +992,7 @@ impl<'a> Layouter<'a> {
                         self.anchors.push((id.to_string(), self.y + self.scroll));
                     }
                 }
-                let c = css::computed(self.doc, node, &self.sheets);
+                let c = self.style(node);
                 let mut st = style.clone();
                 self.apply_computed(&c, &mut st);
                 match c.get("display").map(String::as_str) {
@@ -917,7 +1007,7 @@ impl<'a> Layouter<'a> {
         }
     }
 
-    fn apply_computed(&mut self, c: &HashMap<String, String>, st: &mut Style) {
+    fn apply_computed(&mut self, c: &Props, st: &mut Style) {
         if let Some(v) = c.get("font-size") {
             st.size = parse_font_size(v, st.size);
         }
@@ -991,7 +1081,7 @@ impl<'a> Layouter<'a> {
         }
     }
 
-    fn block(&mut self, node: NodeId, tag: &str, c: &HashMap<String, String>, mut st: Style) {
+    fn block(&mut self, node: NodeId, tag: &str, c: &Props, mut st: Style) {
         self.flush_line();
         if tag == "table" {
             return self.table(node, c, st);
@@ -1140,13 +1230,13 @@ impl<'a> Layouter<'a> {
             self.y += st.size * 0.4 + 6.0;
         } else {
             if let Some(m) = marker {
-                self.word(&m, st.clone());
+                self.word(&m, &st);
             }
             if matches!(c.get("display").map(String::as_str), Some("flex")) {
                 self.flex_children(node, c, st);
             } else {
                 for &ch in self.doc.children(node) {
-                    self.walk(ch, st.clone());
+                    self.walk(ch, &st);
                 }
             }
             self.flush_line();
@@ -1203,7 +1293,7 @@ impl<'a> Layouter<'a> {
     fn float_block(
         &mut self,
         node: NodeId,
-        c: &HashMap<String, String>,
+        c: &Props,
         mut st: Style,
         mt: f32,
         mb: f32,
@@ -1269,7 +1359,7 @@ impl<'a> Layouter<'a> {
 
         self.y += pt + bw;
         for &ch in self.doc.children(node) {
-            self.walk(ch, st.clone());
+            self.walk(ch, &st);
         }
         self.flush_line();
         self.y += pb + bw;
@@ -1293,7 +1383,7 @@ impl<'a> Layouter<'a> {
     /// `display:inline-block`: a box sitting on the text line like a word.
     /// Content is laid out off-screen via `nest`, then emitted offset to the
     /// box's position on the line. Bottom of the box sits on the baseline.
-    fn inline_block(&mut self, node: NodeId, c: &HashMap<String, String>, mut st: Style) {
+    fn inline_block(&mut self, node: NodeId, c: &Props, mut st: Style) {
         let size = st.size;
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
         let [_t, mr, mb, ml] = box_sides(c, "margin", size);
@@ -1369,7 +1459,7 @@ impl<'a> Layouter<'a> {
     /// Each row is laid out cell-by-cell via `nest` at the column's x.
     /// Approximations: no colspan/rowspan, borders always drawn per-cell
     /// (border-collapse ≈ same visual since cells abut), rows don't wrap.
-    fn table(&mut self, node: NodeId, c: &HashMap<String, String>, mut st: Style) {
+    fn table(&mut self, node: NodeId, c: &Props, mut st: Style) {
         let size = st.size;
         let [mt, _mr, mb, ml] = box_sides(c, "margin", size);
         let bg = bg_color(c);
@@ -1417,7 +1507,7 @@ impl<'a> Layouter<'a> {
         let mut col_w = vec![0.0f32; ncols];
         for row in &rows {
             for (i, &cell) in row.iter().enumerate() {
-                let cs = css::computed(self.doc, cell, &self.sheets);
+                let cs = self.style(cell);
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
                 let [_t, pr, _b, pl] = box_sides(&cs, "padding", cst.size).map(|v| v.max(0.0));
@@ -1490,7 +1580,7 @@ impl<'a> Layouter<'a> {
             let mut row_h = 0.0f32;
             for (i, &cell) in row.iter().enumerate() {
                 let cw = col_w[i];
-                let cs = css::computed(self.doc, cell, &self.sheets);
+                let cs = self.style(cell);
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
                 cst.inline_bg = None; // cell bg paints the whole cell
@@ -1539,7 +1629,7 @@ impl<'a> Layouter<'a> {
         self.y += mb.max(0.0);
         // non-row children (captions, stray content) laid out after the grid
         for &e in &extra {
-            self.walk(e, st.clone());
+            self.walk(e, &st);
         }
     }
 
@@ -1547,7 +1637,7 @@ impl<'a> Layouter<'a> {
     /// Content box: origin (x0, y0), `avail` wide. Returns (items, bottom y).
     /// `display:flex` — element children laid as inline-block items on a
     /// row with `gap` spacing.
-    fn flex_children(&mut self, node: NodeId, c: &HashMap<String, String>, st: Style) {
+    fn flex_children(&mut self, node: NodeId, c: &Props, st: Style) {
         let gap = c
             .get("gap")
             .and_then(|v| parse_len(v, st.size))
@@ -1566,7 +1656,7 @@ impl<'a> Layouter<'a> {
                 if !first && gap > 0.0 {
                     self.y += gap;
                 }
-                self.walk(ch, st.clone());
+                self.walk(ch, &st);
                 first = false;
             }
             return;
@@ -1593,7 +1683,7 @@ impl<'a> Layouter<'a> {
         for &ch in self.doc.children(node) {
             match self.doc.kind(ch) {
                 NodeKind::Element { .. } => {
-                    let cc = css::computed(self.doc, ch, &self.sheets);
+                    let cc = self.style(ch);
                     if cc.get("display").map(String::as_str) == Some("none") {
                         continue;
                     }
@@ -1611,7 +1701,7 @@ impl<'a> Layouter<'a> {
                     }
                     first = false;
                 }
-                NodeKind::Text(t) => self.text(t, st.clone()),
+                NodeKind::Text(t) => self.text(t, &st),
                 _ => {}
             }
         }
@@ -1624,7 +1714,7 @@ impl<'a> Layouter<'a> {
         x0: f32,
         y0: f32,
         avail: f32,
-        c: &HashMap<String, String>,
+        c: &Props,
     ) -> (Vec<DisplayItem>, f32) {
         let saved_items = std::mem::take(&mut self.items);
         let saved_line = std::mem::take(&mut self.line);
@@ -1642,7 +1732,7 @@ impl<'a> Layouter<'a> {
             self.flex_children(node, c, st.clone());
         } else {
             for &ch in self.doc.children(node) {
-                self.walk(ch, st.clone());
+                self.walk(ch, st);
             }
         }
         self.flush_line();
@@ -1679,7 +1769,7 @@ impl<'a> Layouter<'a> {
 
     /// Intrinsic width of a flex container: children's widths + gaps + their
     /// own padding/margins — a max-content approximation.
-    fn flex_shrink_width(&mut self, node: NodeId, c: &HashMap<String, String>, st: &Style) -> f32 {
+    fn flex_shrink_width(&mut self, node: NodeId, c: &Props, st: &Style) -> f32 {
         let gap = c
             .get("gap")
             .and_then(|v| parse_len(v, st.size))
@@ -1698,7 +1788,7 @@ impl<'a> Layouter<'a> {
             if !matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
                 continue;
             }
-            let cc = css::computed(self.doc, ch, &self.sheets);
+            let cc = self.style(ch);
             if cc.get("display").map(String::as_str) == Some("none") {
                 continue;
             }
@@ -1800,7 +1890,7 @@ impl<'a> Layouter<'a> {
         }
     }
 
-    fn inline(&mut self, node: NodeId, tag: &str, c: &HashMap<String, String>, mut st: Style) {
+    fn inline(&mut self, node: NodeId, tag: &str, c: &Props, mut st: Style) {
         if tag == "a" {
             st.href = self.doc.attr(node, "href").map(String::from);
         }
@@ -1848,11 +1938,11 @@ impl<'a> Layouter<'a> {
                 self.y += h.max(line_h);
             }
             "input" | "textarea" | "select" | "button" => {
-                self.word("[control]", st.clone());
+                self.word("[control]", &st);
             }
             _ => {
                 for &ch in self.doc.children(node) {
-                    self.walk(ch, st.clone());
+                    self.walk(ch, &st);
                 }
             }
         }
@@ -1861,7 +1951,7 @@ impl<'a> Layouter<'a> {
         }
     }
 
-    fn text(&mut self, text: &str, st: Style) {
+    fn text(&mut self, text: &str, st: &Style) {
         if st.pre {
             for (i, seg) in text.split('\n').enumerate() {
                 if i > 0 {
@@ -1872,7 +1962,7 @@ impl<'a> Layouter<'a> {
                         self.pending_space = true;
                         continue;
                     }
-                    self.word_with_space(word, st.clone());
+                    self.word_with_space(word, st);
                     self.pending_space = true;
                 }
                 self.pending_space = false;
@@ -1887,16 +1977,31 @@ impl<'a> Layouter<'a> {
             if !first {
                 self.pending_space = true;
             }
-            self.word_with_space(word, st.clone());
+            self.word_with_space(word, st);
             first = false;
         }
         self.pending_space = text.chars().last().is_some_and(|c| c.is_whitespace());
     }
 
     fn resolve_font(&mut self, st: &Style) -> Option<usize> {
-        self.fonts
+        // FontCache::resolve scans every installed face; memoize per
+        // (family, bold, italic). Slots encode: u32::MAX = not computed,
+        // u32::MAX-1 = resolved-to-none, else font index.
+        let slot = (st.bold as usize) * 2 + st.italic as usize;
+        if let Some(slots) = self.font_memo.get(st.family.as_str()) {
+            let v = slots[slot];
+            if v != u32::MAX {
+                return if v == u32::MAX - 1 { None } else { Some(v as usize) };
+            }
+        }
+        let r = self
+            .fonts
             .resolve(&st.family, st.bold, st.italic)
-            .or_else(|| self.fonts.resolve("liberation sans", false, false))
+            .or_else(|| self.fonts.resolve("liberation sans", false, false));
+        self.font_memo
+            .entry(st.family.clone())
+            .or_insert([u32::MAX; 4])[slot] = r.map(|i| i as u32).unwrap_or(u32::MAX - 1);
+        r
     }
 
     /// Like resolve_font, but for `word` containing chars the primary font
@@ -1925,8 +2030,8 @@ impl<'a> Layouter<'a> {
         Some(primary)
     }
 
-    fn word_with_space(&mut self, word: &str, st: Style) {
-        let Some(font) = self.resolve_font_covering(word, &st) else { return };
+    fn word_with_space(&mut self, word: &str, st: &Style) {
+        let Some(font) = self.resolve_font_covering(word, st) else { return };
         let space_w = self
             .fonts
             .font(font)
@@ -1939,16 +2044,16 @@ impl<'a> Layouter<'a> {
             }
         }
         self.pending_space = false;
-        self.push_word(word, st.clone(), font);
+        self.push_word(word, st, font);
     }
 
-    fn word(&mut self, word: &str, st: Style) {
-        if let Some(font) = self.resolve_font(&st) {
-            self.push_word(word, st.clone(), font);
+    fn word(&mut self, word: &str, st: &Style) {
+        if let Some(font) = self.resolve_font(st) {
+            self.push_word(word, st, font);
         }
     }
 
-    fn push_word(&mut self, word: &str, st: Style, font: usize) {
+    fn push_word(&mut self, word: &str, st: &Style, font: usize) {
         let owned: String;
         let word = match st.transform {
             1 => { owned = word.to_uppercase(); &owned }

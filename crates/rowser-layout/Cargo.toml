@@ -8,6 +8,7 @@ license.workspace = true
 rowser-css = { path = "../rowser-css" }
 rowser-dom = { path = "../rowser-dom" }
 rowser-text = { path = "../rowser-text" }
+rustc-hash = "2"
 
 [dev-dependencies]
 rowser-html = { path = "../rowser-html" }

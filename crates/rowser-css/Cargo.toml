@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rowser-dom = { path = "../rowser-dom" }
+rustc-hash = "2"
 
 [dev-dependencies]
 rowser-html = { path = "../rowser-html" }
