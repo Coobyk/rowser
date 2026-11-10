@@ -135,7 +135,7 @@ struct Tables {
 /// A parsed TrueType font. Keeps the raw file bytes and resolves tables
 /// on demand — parsing is zero-copy apart from `loca`/`hmtx` caches.
 pub struct Font {
-    data: Vec<u8>,
+    data: &'static [u8],
     tables: Tables,
     units_per_em: u16,
     num_glyphs: u16,
@@ -219,7 +219,11 @@ impl Font {
             ascender: be_i16(d, tables.hhea + 4),
             descender: be_i16(d, tables.hhea + 6),
             line_gap: be_i16(d, tables.hhea + 8),
-            data: data.to_vec(),
+            data: {
+                // Leak the font bytes once: tables parse from it and swash's
+                // FontRef borrows it — fonts live for the process lifetime.
+                Box::leak(data.to_vec().into_boxed_slice())
+            },
             tables,
             loca: Vec::new(),
             hmtx: Vec::new(),
@@ -235,10 +239,7 @@ impl Font {
         if font.cmap4.is_none() && font.cmap12.is_none() {
             return None;
         }
-        // Leak a copy of the font bytes so swash's FontRef can outlive us —
-        // fonts live for the process lifetime anyway.
-        let leaked: &'static [u8] = Box::leak(font.data.clone().into_boxed_slice());
-        font.swash = swash::FontRef::from_index(leaked, 0);
+        font.swash = swash::FontRef::from_index(font.data, 0);
         Some(font)
     }
 

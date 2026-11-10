@@ -2,11 +2,11 @@
 //! gzip content-decoding included. TLS for `https://` lands in a sibling
 //! crate; `fetch` is the seam where it will plug in.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::inflate::inflate_gzip;
+use rowser_deflate::inflate_gzip;
 use crate::url::{Url, default_port};
 
 /// Redirect statuses we follow via `Location`, per fetch semantics.
@@ -217,7 +217,8 @@ fn invalid_data(msg: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil;
+    use rowser_deflate::testutil;
+    use std::io::Read;
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;

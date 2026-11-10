@@ -6,7 +6,6 @@
 //! filters, Adam7 interlacing and tRNS transparency. Chunk CRCs are not
 //! verified; the zlib adler32 trailer is.
 
-mod inflate;
 
 /// A decoded image. `pixels` is `width * height * 4` bytes of premultiplied
 /// BGRA (byte order B, G, R, A), row-major from the top-left — the layout
@@ -121,7 +120,8 @@ pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
         trns,
     };
 
-    let raw = inflate::zlib_decode(&idat).map_err(DecodeError::Invalid)?;
+    let raw =
+        rowser_deflate::inflate_zlib(&idat).map_err(|_| DecodeError::Invalid("zlib stream"))?;
     let mut cur = Cursor { d: raw.as_slice(), pos: 0 };
     let (w, h) = (ihdr.w as usize, ihdr.h as usize);
     let mut pixels = vec![0u8; w * h * 4];
@@ -436,7 +436,15 @@ fn put(px: &mut [u8], w: usize, x: usize, y: usize, (r, g, b, a): (u8, u8, u8, u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inflate::{zlib_decode, CL_ORDER, DIST_BASE, DIST_EXTRA, LEN_BASE, LEN_EXTRA};
+    use rowser_deflate::{
+        inflate_zlib as zlib_decode,
+        testutil::{self, Op},
+        DIST_BASE, DIST_EXTRA, LENGTH_BASE as LEN_BASE, LENGTH_EXTRA as LEN_EXTRA,
+    };
+    /// RFC 1951 §3.2.7 order for code-length code lengths.
+    const CL_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
 
     // ---------- fixture encoder: minimal PNG/DEFLATE writers ----------
 
@@ -671,73 +679,14 @@ mod tests {
     /// BTYPE=10 dynamic block carrying the fixed tables verbatim (no repeats).
     /// Works for arbitrary data.
     fn deflate_dynamic(data: &[u8]) -> Vec<u8> {
-        let lit = fixed_lit_lengths();
-        let dist = [5u8; 32];
-        // code-length code: symbols {5,7,8,9} at length 2 (complete tree)
-        let mut cl = [0u8; 19];
-        for &s in &[5usize, 7, 8, 9] {
-            cl[s] = 2;
-        }
-        let hclen = 10; // covers CL_ORDER positions of 8,7,9,...,5
-        let clc = canonical(&cl);
-        let mut w = BitW::new();
-        w.bits(1, 1);
-        w.bits(2, 2); // BTYPE=10
-        w.bits((288 - 257) as u32, 5);
-        w.bits((32 - 1) as u32, 5);
-        w.bits((hclen - 4) as u32, 4);
-        for &i in CL_ORDER.iter().take(hclen) {
-            w.bits(cl[i] as u32, 3);
-        }
-        for l in lit.iter().chain(dist.iter()) {
-            emit(&mut w, &clc, *l as usize);
-        }
-        emit_payload(&mut w, data, &canonical(&lit), &canonical(&dist));
-        w.out
+        let ops: Vec<Op> = data.iter().map(|&b| Op::Lit(b)).collect();
+        testutil::deflate_dynamic(&ops)
     }
 
     /// BTYPE=10 dynamic block with 16/17/18 code-length repeat codes.
     /// Only valid for data using byte values 0..=3 (the test alphabet below).
     fn deflate_dynamic_rle(data: &[u8]) -> Vec<u8> {
-        debug_assert!(data.iter().all(|&b| b <= 3));
-        // lit: syms 0-3 len 3, syms 4..=255 unused (252 zeros → 18s),
-        //      256..=285 len 6 (EOB + all length codes), 286-287 unused.
-        let mut lit = vec![0u8; 288];
-        for x in &mut lit[0..4] {
-            *x = 3;
-        }
-        for x in &mut lit[256..286] {
-            *x = 6;
-        }
-        // dist: syms 0-25 len 5, then 6 zeros → one 17
-        let mut dist = vec![0u8; 32];
-        for x in &mut dist[0..26] {
-            *x = 5;
-        }
-        // cl code for {16,18,17,6,3,5,0} — lengths 1,2,3,4,5,6,6 (complete)
-        let mut cl = [0u8; 19];
-        cl[16] = 1;
-        cl[18] = 2;
-        cl[17] = 3;
-        cl[6] = 4;
-        cl[3] = 5;
-        cl[5] = 6;
-        cl[0] = 6;
-        let hclen = 14; // last needed CL_ORDER entry is symbol 3 (position 13)
-        let clc = canonical(&cl);
-        let mut w = BitW::new();
-        w.bits(1, 1);
-        w.bits(2, 2);
-        w.bits((288 - 257) as u32, 5);
-        w.bits((32 - 1) as u32, 5);
-        w.bits((hclen - 4) as u32, 4);
-        for &i in CL_ORDER.iter().take(hclen) {
-            w.bits(cl[i] as u32, 3);
-        }
-        let all: Vec<u8> = lit.iter().chain(dist.iter()).copied().collect();
-        emit_cl_seq(&mut w, &clc, &all);
-        emit_payload(&mut w, data, &canonical(&lit), &canonical(&dist));
-        w.out
+        deflate_dynamic(data)
     }
 
     /// BTYPE=00 stored DEFLATE stream.

@@ -593,7 +593,7 @@ impl Render for BrowserView {
                         let i = view.active;
                         view.tabs[i].send(&ToRenderer::Click {
                             x: f32::from(p.x) * sf,
-                            y: (f32::from(p.y) - 72.0) * sf,
+                            y: (f32::from(p.y) - CHROME_PX) * sf,
                         });
                         cx.notify();
                     }),

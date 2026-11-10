@@ -57,7 +57,7 @@ fn main() {
                     page.repaint(&mut fonts);
                     let _ = send(&mut output, &frame_msg(&page));
                 } else {
-                    let pixels = test_pattern(width.max(1), height.max(1), "blank");
+                    let pixels = test_pattern(width.max(1), height.max(1));
                     let _ = send(
                         &mut output,
                         &ToBrowser::Frame {
@@ -121,11 +121,10 @@ fn send(w: &mut impl Write, msg: &ToBrowser) -> io::Result<()> {
 
 struct Page {
     doc: Option<rowser_dom::Document>,
-    url: String,
-    title: String,
     viewport: (u32, u32),
     scroll: f32,
     content_h: f32,
+    url_base: String,
     pixels: Vec<u8>,
     items: Vec<rowser_layout::DisplayItem>,
     images: std::collections::HashMap<String, rowser_image::Image>,
@@ -136,11 +135,10 @@ impl Page {
     fn new() -> Self {
         Self {
             doc: None,
-            url: "about:blank".into(),
-            title: String::new(),
             viewport: (800, 600),
             scroll: 0.0,
             content_h: 0.0,
+            url_base: "about:blank".into(),
             pixels: Vec::new(),
             items: Vec::new(),
             images: std::collections::HashMap::new(),
@@ -154,8 +152,7 @@ impl Page {
 
     fn load(&mut self, doc: rowser_dom::Document, url: String, title: String) {
         self.doc = Some(doc);
-        self.url = url;
-        self.title = title;
+        self.url_base = url;
         self.scroll = 0.0;
         self.images.clear();
         self.sheets.clear();
@@ -177,7 +174,7 @@ impl Page {
             }
         }
         for h in hrefs {
-            if let Some(text) = fetch_text(&self.url, &h) {
+            if let Some(text) = fetch_text(&self.url_base, &h) {
                 self.sheets.push(rowser_css::parse(&text));
             }
         }
@@ -200,7 +197,7 @@ impl Page {
             if self.images.contains_key(&src) {
                 continue;
             }
-            if let Some(bytes) = fetch_bytes(&self.url, &src) {
+            if let Some(bytes) = fetch_bytes(&self.url_base, &src) {
                 if let Ok(img) = rowser_image::decode(&bytes) {
                     self.images.insert(src, img);
                 }
@@ -241,7 +238,7 @@ fn frame_msg(page: &Page) -> ToBrowser {
 /// Resolve a URL to HTML text + the effective URL (after fallback).
 fn load_url(url: &str) -> (String, String) {
     if let Some(rest) = url.strip_prefix("file://") {
-        let path = percent_decode(rest);
+        let path = rowser_net::percent_decode(rest).unwrap_or_else(|_| rest.to_string());
         return match std::fs::read_to_string(&path) {
             Ok(html) => (html, url.to_string()),
             Err(e) => (error_page(url, &format!("cannot read {path}: {e}")), url.to_string()),
@@ -275,24 +272,6 @@ fn load_url(url: &str) -> (String, String) {
     (error_page(url, "unrecognized URL"), url.to_string())
 }
 
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v as char);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i] as char);
-        i += 1;
-    }
-    out
-}
-
 fn error_page(url: &str, why: &str) -> String {
     format!(
         "<html><body><h1>Cannot display page</h1><p><b>{url}</b></p><p>{why}</p><hr><p><small>rowser error page</small></p></body></html>"
@@ -300,7 +279,7 @@ fn error_page(url: &str, why: &str) -> String {
 }
 
 /// Premultiplied-BGRA checkerboard for the blank/no-document state.
-fn test_pattern(width: u32, height: u32, _seed: &str) -> Vec<u8> {
+fn test_pattern(width: u32, height: u32) -> Vec<u8> {
     let (w, h) = (width as usize, height as usize);
     let mut px = vec![0u8; w * h * 4];
     for y in 0..h {

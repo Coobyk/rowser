@@ -4365,6 +4365,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rowser-deflate"
+version = "0.0.0"
+
+[[package]]
 name = "rowser-dom"
 version = "0.0.0"
 
@@ -4378,6 +4382,9 @@ dependencies = [
 [[package]]
 name = "rowser-image"
 version = "0.0.0"
+dependencies = [
+ "rowser-deflate",
+]
 
 [[package]]
 name = "rowser-ipc"
@@ -4396,6 +4403,9 @@ dependencies = [
 [[package]]
 name = "rowser-net"
 version = "0.0.0"
+dependencies = [
+ "rowser-deflate",
+]
 
 [[package]]
 name = "rowser-paint"

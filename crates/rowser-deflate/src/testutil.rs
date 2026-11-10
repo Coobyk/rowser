@@ -2,7 +2,7 @@
 //! shelling out to gzip/python. It mirrors the decoder's canonical-Huffman
 //! construction, so a green round-trip cross-checks both directions.
 
-use crate::inflate::{DIST_BASE, DIST_EXTRA, LENGTH_BASE, LENGTH_EXTRA, adler32, crc32};
+use crate::{DIST_BASE, DIST_EXTRA, LENGTH_BASE, LENGTH_EXTRA, adler32, crc32};
 
 /// RFC 1951 §3.2.7 order for code-length code lengths (dup of the private
 /// constant in `inflate`).
@@ -11,7 +11,7 @@ const CL_ORDER: [usize; 19] = [
 ];
 
 /// A compressed-block instruction for [`deflate_dynamic`].
-pub(crate) enum Op {
+pub enum Op {
     /// Emit one literal byte.
     Lit(u8),
     /// Emit a length/distance back-reference.
@@ -19,26 +19,26 @@ pub(crate) enum Op {
 }
 
 /// LSB-first bit sink; Huffman codes go in most-significant-bit first.
-pub(crate) struct BitWriter {
+pub struct BitWriter {
     bytes: Vec<u8>,
     /// Bits used in the current (last) byte, 0..8.
     nbits: u8,
 }
 
 impl BitWriter {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { bytes: Vec::new(), nbits: 0 }
     }
 
     /// Append `n` bits, least-significant first (header fields, extra bits).
-    pub(crate) fn push_bits(&mut self, val: u32, n: u8) {
+    pub fn push_bits(&mut self, val: u32, n: u8) {
         for i in 0..n {
             self.push_bit((val >> i) & 1);
         }
     }
 
     /// Append a Huffman code most-significant-bit first (RFC 1951 §3.1.1).
-    pub(crate) fn push_code(&mut self, code: u16, len: u8) {
+    pub fn push_code(&mut self, code: u16, len: u8) {
         for i in (0..len).rev() {
             self.push_bit(u32::from(code >> i) & 1);
         }
@@ -54,7 +54,7 @@ impl BitWriter {
         self.nbits = (self.nbits + 1) % 8;
     }
 
-    pub(crate) fn finish(self) -> Vec<u8> {
+    pub fn finish(self) -> Vec<u8> {
         self.bytes
     }
 }
@@ -84,7 +84,7 @@ fn canonical_codes(lengths: &[u8]) -> Vec<(u16, u8)> {
 }
 
 /// Fixed-table literal/length code (RFC 1951 §3.2.6).
-pub(crate) fn fixed_lit(sym: usize) -> (u16, u8) {
+pub fn fixed_lit(sym: usize) -> (u16, u8) {
     match sym {
         0..=143 => (0x30 + sym as u16, 8),
         144..=255 => (0x190 + (sym - 144) as u16, 9),
@@ -94,7 +94,7 @@ pub(crate) fn fixed_lit(sym: usize) -> (u16, u8) {
 }
 
 /// A single fixed-Huffman block of literals only.
-pub(crate) fn deflate_fixed(data: &[u8]) -> Vec<u8> {
+pub fn deflate_fixed(data: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.push_bits(1, 1); // BFINAL
     w.push_bits(1, 2); // BTYPE=01
@@ -110,7 +110,7 @@ pub(crate) fn deflate_fixed(data: &[u8]) -> Vec<u8> {
 /// A single dynamic-Huffman block. Lit/len code lengths: 8 for symbols
 /// 0..226, 9 for 226..286 (Kraft-complete); two 1-bit distance codes.
 /// Code-length code: lengths {1: 1, 8: 2, 9: 2} — also complete.
-pub(crate) fn deflate_dynamic(ops: &[Op]) -> Vec<u8> {
+pub fn deflate_dynamic(ops: &[Op]) -> Vec<u8> {
     let mut lit_lengths = [0u8; 286];
     for l in &mut lit_lengths[..226] {
         *l = 8;
@@ -188,7 +188,7 @@ fn dist_sym(dist: usize) -> (usize, u32, u8) {
 }
 
 /// Literal-only dynamic deflate wrapped as a gzip member.
-pub(crate) fn gzip_dynamic(data: &[u8]) -> Vec<u8> {
+pub fn gzip_dynamic(data: &[u8]) -> Vec<u8> {
     let ops: Vec<Op> = data.iter().map(|&b| Op::Lit(b)).collect();
     let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
     out.extend_from_slice(&deflate_dynamic(&ops));
@@ -199,7 +199,7 @@ pub(crate) fn gzip_dynamic(data: &[u8]) -> Vec<u8> {
 
 /// Literal-only dynamic deflate wrapped as a zlib stream (`0x78 0x01`
 /// header: 32K window, check bits valid, no dictionary).
-pub(crate) fn zlib_dynamic(data: &[u8]) -> Vec<u8> {
+pub fn zlib_dynamic(data: &[u8]) -> Vec<u8> {
     let ops: Vec<Op> = data.iter().map(|&b| Op::Lit(b)).collect();
     let mut out = vec![0x78, 0x01];
     out.extend_from_slice(&deflate_dynamic(&ops));
