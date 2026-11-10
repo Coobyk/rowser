@@ -87,6 +87,10 @@ struct BrowserView {
     /// without access to a `Window`.
     url_focus_pending: bool,
     url_focus: FocusHandle,
+    /// Focused whenever the page (not the URL bar) should get keys —
+    /// the root div tracks it so unfocused-window keys land on the
+    /// shortcut handler instead of gpui's synthetic dispatch root.
+    page_focus: FocusHandle,
     inspector: bool,
     dom_dump: String,
     /// In-progress page-text drag: the anchor point in document-space
@@ -111,6 +115,7 @@ impl BrowserView {
             url_editing: false,
             url_focus_pending: false,
             url_focus: cx.focus_handle(),
+            page_focus: cx.focus_handle(),
             inspector: false,
             dom_dump: String::new(),
             drag: None,
@@ -352,7 +357,7 @@ impl BrowserView {
         }
         self.url_editing = false;
         self.url_anchor = None;
-        window.blur();
+        self.page_focus.focus(window);
         self.active = idx;
     }
 
@@ -687,14 +692,14 @@ impl Render for BrowserView {
                                 let url = normalize_url(&view.url_text);
                                 view.url_editing = false;
                                 view.url_anchor = None;
-                                window.blur();
+                                view.page_focus.focus(window);
                                 let i = view.active;
                                 view.tabs[i].navigate(&url);
                             }
                             "escape" => {
                                 view.url_editing = false;
                                 view.url_anchor = None;
-                                window.blur();
+                                view.page_focus.focus(window);
                             }
                             "backspace" => {
                                 if !view.url_delete_selection() && view.url_cursor > 0 {
@@ -828,7 +833,7 @@ impl Render for BrowserView {
                         // Clicking the page leaves URL-bar edit mode.
                         view.url_editing = false;
                         view.url_anchor = None;
-                        window.blur();
+                        view.page_focus.focus(window);
                         let p = e.position;
                         // webview starts below the 72px chrome; document space
                         // is device px (logical × scale factor)
@@ -911,6 +916,7 @@ impl Render for BrowserView {
             .flex()
             .flex_col()
             .bg(rgb(0x101013))
+            .track_focus(&self.page_focus)
             // Browser shortcuts. GPUI dispatches key events along the
             // focus path up to the root, so this fires both when nothing
             // is focused (page view) and — after the URL bar's own
@@ -931,7 +937,7 @@ impl Render for BrowserView {
                         // one (which re-enters edit mode itself).
                         view.url_editing = false;
                         view.url_anchor = None;
-                        window.blur();
+                        view.page_focus.focus(window);
                         view.close_tab(view.active);
                     }
                     "l" if ctrl && !m.alt && !m.shift => view.focus_url_bar(window),
