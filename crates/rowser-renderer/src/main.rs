@@ -115,6 +115,9 @@ fn main() {
             }
             ToRenderer::ResizeViewport { width, height } => {
                 page.viewport = (width.max(1), height.max(1));
+                if page.clear_sel() {
+                    let _ = send(&mut output, &ToBrowser::SelText(String::new()));
+                }
                 if page.has_doc() {
                     page.repaint(&mut fonts);
                     let _ = send(&mut output, &frame_msg(&page));
@@ -156,9 +159,47 @@ fn main() {
                         }
                     }
                 }
+                // A plain click collapses any selection — repaint to
+                // erase the baked-in highlight (a link hit repaints via
+                // the navigation it triggers instead).
                 if let Some(url) = found {
+                    page.clear_sel();
                     let _ = send(&mut output, &ToBrowser::NavigationRequest(url));
+                } else if page.clear_sel() && page.has_doc() {
+                    page.repaint_scrolled(&mut fonts);
+                    let _ = send(&mut output, &frame_msg(&page));
+                    let _ = send(&mut output, &ToBrowser::SelText(String::new()));
                 }
+            }
+            ToRenderer::Select { x0, y0, x1, y1 } => {
+                if !page.has_doc() {
+                    continue;
+                }
+                // Coalesce back-to-back drags like Scroll: intermediate
+                // frames are superseded, only the latest matters. The
+                // last Select's full tuple is used — anchors are constant
+                // within a drag, and this also survives two drags landing
+                // in the queue back-to-back.
+                let (mut ax, mut ay, mut fx, mut fy) = (x0, y0, x1, y1);
+                while let Ok(p) = rx.try_recv() {
+                    match ToRenderer::decode(&p) {
+                        Ok(ToRenderer::Select { x0, y0, x1, y1 }) => {
+                            ax = x0;
+                            ay = y0;
+                            fx = x1;
+                            fy = y1;
+                        }
+                        Ok(m) => {
+                            pending.push_back(m);
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                page.update_sel(&mut fonts, ax, ay, fx, fy);
+                page.repaint_scrolled(&mut fonts);
+                let _ = send(&mut output, &frame_msg(&page));
+                let _ = send(&mut output, &ToBrowser::SelText(page.sel_text.clone()));
             }
             ToRenderer::Scroll { dy } => {
                 // Coalesce any already-queued Scrolls into this repaint —
@@ -248,6 +289,11 @@ struct Page {
     /// First repaint after load waits for in-flight images; later repaints
     /// just drain whatever has arrived.
     img_waited: bool,
+    /// Text-selection highlight rects (x, y, w, h) in the same viewport
+    /// space as `items` — blended over `pixels` after every paint.
+    sel: Vec<(f32, f32, f32, f32)>,
+    /// Text covered by `sel`, for Ctrl+C. Kept in sync by `update_sel`.
+    sel_text: String,
 }
 
 impl Page {
@@ -274,6 +320,8 @@ impl Page {
             img_tx,
             img_rx,
             img_waited: false,
+            sel: Vec::new(),
+            sel_text: String::new(),
         }
     }
 
@@ -287,6 +335,8 @@ impl Page {
         self.cur_url = url;
         self.scroll = 0.0;
         self.items_scroll = 0.0;
+        self.sel.clear();
+        self.sel_text.clear();
         self.images.clear();
         self.img_failed.clear();
         self.img_waited = false;
@@ -643,6 +693,10 @@ impl Page {
             for it in &mut self.items {
                 shift_item_y(it, -dy);
             }
+            // Selection rects live in the same space — they follow the text.
+            for r in &mut self.sel {
+                r.1 -= dy;
+            }
             self.items_scroll = self.scroll;
         }
         self.load_images(false);
@@ -655,6 +709,7 @@ impl Page {
             bgra(0xff, 0xff, 0xff),
             &self.images,
         );
+        self.apply_sel();
         pt!(
             "[prof] scroll-repaint translate+images={:?} paint={:?}",
             t1 - t0,
@@ -693,6 +748,7 @@ impl Page {
             bgra(0xff, 0xff, 0xff),
             &self.images,
         );
+        self.apply_sel();
         pt!(
             "[prof] repaint layout={t_layout:?} images={t_img:?} paint={:?} items={} imgs={}",
             t2.elapsed(),
@@ -700,6 +756,231 @@ impl Page {
             self.images.len()
         );
     }
+
+    /// Recompute `sel`/`sel_text` for a drag from (x0,y0) to (x1,y1) —
+    /// viewport-space device px, same coordinates `Click` uses.
+    fn update_sel(&mut self, fonts: &mut FontCache, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let (rects, text) = compute_selection(&self.items, fonts, x0, y0, x1, y1);
+        self.sel = rects;
+        self.sel_text = text;
+    }
+
+    /// Drop the selection. Returns whether one existed (caller must
+    /// repaint to erase the baked-in highlight).
+    fn clear_sel(&mut self) -> bool {
+        let had = !self.sel.is_empty() || !self.sel_text.is_empty();
+        self.sel.clear();
+        self.sel_text.clear();
+        had
+    }
+
+    /// Blend the translucent selection tint over `pixels` at each `sel`
+    /// rect. Runs after every paint so the highlight survives repaints;
+    /// rects scroll with the items in `repaint_scrolled`.
+    fn apply_sel(&mut self) {
+        if self.sel.is_empty() {
+            return;
+        }
+        const A: u32 = 110; // ~43% — readable through, clearly marked
+        const R: u32 = 0x36;
+        const G: u32 = 0x6c;
+        const B: u32 = 0xd4;
+        let (w, h) = (self.viewport.0 as i32, self.viewport.1 as i32);
+        for &(x, y, sw, sh) in &self.sel {
+            let x0 = (x as i32).clamp(0, w);
+            let y0 = (y as i32).clamp(0, h);
+            let x1 = ((x + sw).ceil() as i32).clamp(0, w);
+            let y1 = ((y + sh).ceil() as i32).clamp(0, h);
+            for yy in y0..y1 {
+                let row = (yy * w + x0) as usize * 4;
+                for i in (row..row + ((x1 - x0) as usize) * 4).step_by(4) {
+                    let p = &mut self.pixels[i..i + 3];
+                    p[0] = ((B * A + p[0] as u32 * (255 - A)) / 255) as u8;
+                    p[1] = ((G * A + p[1] as u32 * (255 - A)) / 255) as u8;
+                    p[2] = ((R * A + p[2] as u32 * (255 - A)) / 255) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// One `DisplayItem::Text` (a laid-out word) flattened for hit-testing:
+/// its line box plus the x offset of every char boundary.
+struct TextBox<'a> {
+    text: &'a str,
+    x: f32,
+    baseline: f32,
+    top: f32,
+    bot: f32,
+    /// Char-boundary offsets relative to `x`; `starts.len() == chars + 1`.
+    starts: Vec<f32>,
+}
+
+impl TextBox<'_> {
+    fn nchars(&self) -> usize {
+        self.starts.len() - 1
+    }
+}
+
+/// Flatten the display list's Text items (already in reading order) into
+/// hit-testable boxes. Char boundaries use the same kern+advance walk the
+/// painter does, so clicks land where the ink actually is.
+fn text_boxes<'a>(
+    items: &'a [rowser_layout::DisplayItem],
+    fonts: &mut FontCache,
+) -> Vec<TextBox<'a>> {
+    let mut out = Vec::new();
+    for it in items {
+        let rowser_layout::DisplayItem::Text {
+            x,
+            baseline,
+            text,
+            font,
+            size,
+            ..
+        } = it
+        else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let (starts, top, bot) = match fonts.font(*font) {
+            Some(f) => {
+                let upem = f.units_per_em() as f32;
+                let mut starts = Vec::with_capacity(text.chars().count() + 1);
+                starts.push(0.0);
+                let (mut pen, mut prev) = (0.0f32, 0u16);
+                for c in text.chars() {
+                    let gid = f.glyph_id(c);
+                    pen += f.kern(prev, gid) as f32 * size / upem;
+                    pen += f.advance(gid, *size);
+                    starts.push(pen);
+                    prev = gid;
+                }
+                let ascent = f.ascent(*size);
+                (
+                    starts,
+                    baseline - ascent,
+                    baseline - ascent + f.line_height(*size),
+                )
+            }
+            // Font handle went missing — rough box so the item still selects.
+            None => (
+                (0..=text.chars().count())
+                    .map(|i| i as f32 * size * 0.5)
+                    .collect(),
+                baseline - size,
+                baseline + size * 0.4,
+            ),
+        };
+        out.push(TextBox {
+            text,
+            x: *x,
+            baseline: *baseline,
+            top,
+            bot,
+            starts,
+        });
+    }
+    out
+}
+
+/// Map a viewport-space point to a text position `(box, char boundary)`.
+/// Snaps to the closest line when the point isn't inside any line box;
+/// horizontally it lands on the nearest boundary of the closest word.
+fn hit_pos(boxes: &[TextBox], x: f32, y: f32) -> Option<(usize, usize)> {
+    // Best line band containing y: prefer the word whose x-range is
+    // nearest, then the closest baseline (bands of adjacent lines can
+    // overlap by a fraction of a px).
+    let mut best: Option<(usize, f32, f32)> = None; // (idx, x-dist, baseline-dist)
+    for (i, b) in boxes.iter().enumerate() {
+        if y < b.top || y > b.bot {
+            continue;
+        }
+        let xd = if x < b.x {
+            b.x - x
+        } else {
+            (x - (b.x + b.starts[b.nchars()])).max(0.0)
+        };
+        let bd = (b.baseline - y).abs();
+        if best.is_none_or(|(_, bx, bb)| xd < bx || (xd == bx && bd < bb)) {
+            best = Some((i, xd, bd));
+        }
+    }
+    let i = match best {
+        Some((i, _, _)) => i,
+        // No band contains y: snap to the closest line (nearest shared
+        // baseline), then the x-nearest word on that line.
+        None => {
+            let mut by_line: Option<(usize, f32, f32)> = None;
+            for (i, b) in boxes.iter().enumerate() {
+                let xd = if x < b.x {
+                    b.x - x
+                } else {
+                    (x - (b.x + b.starts[b.nchars()])).max(0.0)
+                };
+                let bd = (b.baseline - y).abs();
+                if by_line.is_none_or(|(_, bb, bx)| bd < bb - 1.0 || (bd <= bb + 1.0 && xd < bx))
+                {
+                    by_line = Some((i, bd, xd));
+                }
+            }
+            by_line?.0
+        }
+    };
+    let b = &boxes[i];
+    if x <= b.x {
+        return Some((i, 0));
+    }
+    let rel = x - b.x;
+    let mut k = b.nchars();
+    for j in 0..b.nchars() {
+        if (b.starts[j] - rel).abs() <= (b.starts[k] - rel).abs() {
+            k = j;
+        }
+    }
+    Some((i, k))
+}
+
+/// Char-level selection between two viewport-space points. Returns the
+/// highlight rects (line-height tall, kern-accurate width) and the
+/// covered text — words joined by ' ', line breaks by '\n'.
+fn compute_selection(
+    items: &[rowser_layout::DisplayItem],
+    fonts: &mut FontCache,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) -> (Vec<(f32, f32, f32, f32)>, String) {
+    let boxes = text_boxes(items, fonts);
+    let (Some(a), Some(b)) = (hit_pos(&boxes, x0, y0), hit_pos(&boxes, x1, y1)) else {
+        return (Vec::new(), String::new());
+    };
+    let (a, b) = if a <= b { (a, b) } else { (b, a) };
+    let mut rects = Vec::new();
+    let mut text = String::new();
+    let mut prev_baseline: Option<f32> = None;
+    for (i, bx) in boxes.iter().enumerate().take(b.0 + 1).skip(a.0) {
+        let s = if i == a.0 { a.1 } else { 0 };
+        let e = if i == b.0 { b.1 } else { bx.nchars() };
+        if s >= e {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(match prev_baseline {
+                Some(pb) if (bx.baseline - pb).abs() < 1.0 => ' ',
+                _ => '\n',
+            });
+        }
+        prev_baseline = Some(bx.baseline);
+        let sx = bx.x + bx.starts[s];
+        let ex = bx.x + bx.starts[e];
+        rects.push((sx.min(ex), bx.top, (ex - sx).abs(), bx.bot - bx.top));
+        text.extend(bx.text.chars().skip(s).take(e - s));
+    }
+    (rects, text)
 }
 
 /// True if `sheet` declares `position:fixed|sticky` (or `position:var(...)`,

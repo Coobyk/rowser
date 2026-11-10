@@ -126,6 +126,11 @@ pub enum ToRenderer {
     Scroll { dy: f32 },
     /// Mouse click at document-space coordinates (device px).
     Click { x: f32, y: f32 },
+    /// Text selection drag: anchor (x0,y0) to focus (x1,y1), same
+    /// document-space device px as `Click`. Sent on mouse move while the
+    /// left button is held; the renderer re-paints with the selected text
+    /// highlighted and replies with `ToBrowser::SelText`.
+    Select { x0: f32, y0: f32, x1: f32, y1: f32 },
     /// Request a text dump of the DOM tree (inspector).
     DomDump,
     Shutdown,
@@ -151,6 +156,9 @@ pub enum ToBrowser {
     NavigationRequest(String),
     /// Indented DOM tree text for the inspector.
     DomDump(String),
+    /// Currently selected page text ("" when the selection is empty) —
+    /// sent after each `Select` so the browser can copy on Ctrl+C.
+    SelText(String),
 }
 
 const TAG_PING: u8 = 0;
@@ -159,6 +167,7 @@ const TAG_RESIZE: u8 = 2;
 const TAG_SCROLL: u8 = 3;
 const TAG_CLICK: u8 = 5;
 const TAG_DOMDUMP: u8 = 6;
+const TAG_SELECT: u8 = 8;
 const TAG_SHUTDOWN: u8 = 4;
 
 const TAG_PONG: u8 = 0;
@@ -169,6 +178,7 @@ const TAG_LOAD_DONE: u8 = 4;
 const TAG_LOG: u8 = 5;
 const TAG_NAV_REQUEST: u8 = 6;
 const TAG_BDOMDUMP: u8 = 7;
+const TAG_SELTEXT: u8 = 8;
 
 impl ToRenderer {
     pub fn encode(&self) -> Vec<u8> {
@@ -196,6 +206,13 @@ impl ToRenderer {
                 w.u32(x.to_bits());
                 w.u32(y.to_bits());
             }
+            Self::Select { x0, y0, x1, y1 } => {
+                w.u8(TAG_SELECT);
+                w.u32(x0.to_bits());
+                w.u32(y0.to_bits());
+                w.u32(x1.to_bits());
+                w.u32(y1.to_bits());
+            }
             Self::DomDump => w.u8(TAG_DOMDUMP),
             Self::Shutdown => w.u8(TAG_SHUTDOWN),
         }
@@ -217,6 +234,12 @@ impl ToRenderer {
             TAG_CLICK => Self::Click {
                 x: f32::from_bits(r.u32()?) ,
                 y: f32::from_bits(r.u32()?),
+            },
+            TAG_SELECT => Self::Select {
+                x0: f32::from_bits(r.u32()?),
+                y0: f32::from_bits(r.u32()?),
+                x1: f32::from_bits(r.u32()?),
+                y1: f32::from_bits(r.u32()?),
             },
             TAG_DOMDUMP => Self::DomDump,
             TAG_SHUTDOWN => Self::Shutdown,
@@ -266,6 +289,10 @@ impl ToBrowser {
                 w.u8(TAG_BDOMDUMP);
                 w.string(text);
             }
+            Self::SelText(text) => {
+                w.u8(TAG_SELTEXT);
+                w.string(text);
+            }
         }
         w.into_payload()
     }
@@ -285,6 +312,7 @@ impl ToBrowser {
             TAG_LOG => Self::Log(r.string()?),
             TAG_NAV_REQUEST => Self::NavigationRequest(r.string()?),
             TAG_BDOMDUMP => Self::DomDump(r.string()?),
+            TAG_SELTEXT => Self::SelText(r.string()?),
             tag => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -310,6 +338,14 @@ mod tests {
                 height: 1080,
             },
             ToRenderer::Scroll { dy: -240.5 },
+            ToRenderer::Click { x: 10.0, y: 20.5 },
+            ToRenderer::Select {
+                x0: 1.0,
+                y0: 2.0,
+                x1: 30.5,
+                y1: 40.5,
+            },
+            ToRenderer::DomDump,
             ToRenderer::Shutdown,
         ];
         for msg in msgs {
@@ -330,6 +366,9 @@ mod tests {
             },
             ToBrowser::LoadDone,
             ToBrowser::Log("log line".into()),
+            ToBrowser::NavigationRequest("https://example.com".into()),
+            ToBrowser::DomDump("<html>".into()),
+            ToBrowser::SelText("selected words".into()),
         ];
         for msg in msgs {
             assert_eq!(ToBrowser::decode(&msg.encode()).unwrap(), msg);

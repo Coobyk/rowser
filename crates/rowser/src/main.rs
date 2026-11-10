@@ -35,6 +35,9 @@ struct Tab {
     alive: bool,
     history: Vec<String>,
     hist: usize,
+    /// Page text currently selected in this tab's renderer (kept in sync
+    /// by `ToBrowser::SelText`) — what Ctrl+C copies.
+    sel_text: String,
 }
 
 impl Tab {
@@ -47,6 +50,7 @@ impl Tab {
     /// Navigate, recording the visit in history (drops forward entries).
     fn navigate(&mut self, url: &str) {
         self.url = url.to_string();
+        self.sel_text.clear();
         self.history.truncate(self.hist + 1);
         self.history.push(url.to_string());
         self.hist = self.history.len() - 1;
@@ -58,6 +62,7 @@ impl Tab {
         if idx < self.history.len() {
             self.hist = idx;
             self.url = self.history[idx].clone();
+            self.sel_text.clear();
             self.send(&ToRenderer::Navigate(self.url.clone()));
         }
     }
@@ -84,6 +89,9 @@ struct BrowserView {
     url_focus: FocusHandle,
     inspector: bool,
     dom_dump: String,
+    /// In-progress page-text drag: the anchor point in document-space
+    /// device px (set on mouse-down, cleared on mouse-up).
+    drag: Option<(f32, f32)>,
 }
 
 impl BrowserView {
@@ -105,6 +113,7 @@ impl BrowserView {
             url_focus: cx.focus_handle(),
             inspector: false,
             dom_dump: String::new(),
+            drag: None,
         };
 
         // Drain renderer messages into the UI. Polling via gpui::Timer keeps
@@ -158,6 +167,7 @@ impl BrowserView {
             alive: false,
             history: vec![url.clone()],
             hist: 0,
+            sel_text: String::new(),
         };
 
         if let Some((child, out, reader)) = Self::spawn_renderer() {
@@ -283,6 +293,7 @@ impl BrowserView {
             alive: false,
             history: vec![url.clone()],
             hist: 0,
+            sel_text: String::new(),
         };
         if let Some((child, out, reader)) = Self::spawn_renderer() {
             fresh.child = Some(child);
@@ -401,6 +412,7 @@ impl BrowserView {
                             self.dom_dump = text;
                         }
                     }
+                    ToBrowser::SelText(t) => tab.sel_text = t,
                     ToBrowser::Log(m) => self.logs.push(format!("tab {id}: {m}")),
                 },
                 TabEvent::Disconnected => {
@@ -808,12 +820,57 @@ impl Render for BrowserView {
                         // webview starts below the 72px chrome; document space
                         // is device px (logical × scale factor)
                         let sf = window.scale_factor();
-                        let i = view.active;
-                        view.tabs[i].send(&ToRenderer::Click {
-                            x: f32::from(p.x) * sf,
-                            y: (f32::from(p.y) - CHROME_PX) * sf,
-                        });
+                        // Possible start of a text-selection drag — the
+                        // click itself is deferred to mouse-up so a drag
+                        // that begins on a link doesn't navigate.
+                        view.drag = Some((
+                            f32::from(p.x) * sf,
+                            (f32::from(p.y) - CHROME_PX) * sf,
+                        ));
                         cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(|view, e: &MouseMoveEvent, window, cx| {
+                    if e.pressed_button != Some(MouseButton::Left) {
+                        // Missed the up (released outside) — drop the drag.
+                        view.drag = None;
+                        return;
+                    }
+                    let Some((x0, y0)) = view.drag else { return };
+                    let sf = window.scale_factor();
+                    let i = view.active;
+                    view.tabs[i].send(&ToRenderer::Select {
+                        x0,
+                        y0,
+                        x1: f32::from(e.position.x) * sf,
+                        y1: (f32::from(e.position.y) - CHROME_PX) * sf,
+                    });
+                    cx.notify();
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|view, e: &MouseUpEvent, window, cx| {
+                        let Some((x0, y0)) = view.drag.take() else { return };
+                        let sf = window.scale_factor();
+                        let (x1, y1) = (
+                            f32::from(e.position.x) * sf,
+                            (f32::from(e.position.y) - CHROME_PX) * sf,
+                        );
+                        let i = view.active;
+                        if (x1 - x0).hypot(y1 - y0) < 4.0 * sf {
+                            // Didn't move — a plain click, not a drag.
+                            view.tabs[i].send(&ToRenderer::Click { x: x1, y: y1 });
+                        } else {
+                            // Final position may be past the last move event.
+                            view.tabs[i].send(&ToRenderer::Select { x0, y0, x1, y1 });
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|view, _e: &MouseUpEvent, _w, _cx| {
+                        view.drag = None;
                     }),
                 )
                 .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, _window, cx| {
@@ -865,6 +922,14 @@ impl Render for BrowserView {
                         view.close_tab(view.active);
                     }
                     "l" if ctrl && !m.alt && !m.shift => view.focus_url_bar(window),
+                    "c" if ctrl && !m.alt && !m.shift && !editing => {
+                        // Copy the page-text selection (the URL bar's own
+                        // handler covers Ctrl+C while editing).
+                        let text = view.tabs[view.active].sel_text.clone();
+                        if !text.is_empty() {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                    }
                     "r" if ctrl && !m.alt => view.reload_active(),
                     "f5" if !m.alt => view.reload_active(),
                     "tab" if ctrl && !m.alt => {
