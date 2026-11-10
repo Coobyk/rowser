@@ -318,6 +318,52 @@ impl BrowserView {
         }
     }
 
+    // --- Tab/page ops shared by buttons and keyboard shortcuts -----------
+
+    /// Switch to tab `idx`, leaving URL-bar edit mode so the bar reflects
+    /// the newly active tab.
+    fn activate_tab(&mut self, idx: usize, window: &mut Window) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.url_editing = false;
+        self.url_anchor = None;
+        window.blur();
+        self.active = idx;
+    }
+
+    /// Step back/forward in the active tab's history (the ◀ ▶ buttons).
+    fn history_step(&mut self, delta: isize) {
+        let i = self.active;
+        let next = self.tabs[i].hist as isize + delta;
+        if next >= 0 {
+            self.tabs[i].go(next as usize); // go() bounds-checks the top end
+        }
+    }
+
+    /// Reload the active tab by re-navigating to its current URL (the ⟳
+    /// button); a dead renderer is respawned instead.
+    fn reload_active(&mut self) {
+        let i = self.active;
+        if self.tabs[i].alive {
+            let url = self.tabs[i].url.clone();
+            self.tabs[i].send(&ToRenderer::Navigate(url));
+        } else {
+            self.respawn_tab(i);
+        }
+    }
+
+    /// Focus the URL bar with its contents selected — Ctrl+L. A typed
+    /// in-progress edit is kept; otherwise the active tab's URL is shown.
+    fn focus_url_bar(&mut self, window: &mut Window) {
+        if !self.url_editing {
+            self.url_text = self.tabs[self.active].url.clone();
+        }
+        self.url_editing = true;
+        self.url_select_all();
+        self.url_focus.focus(window);
+    }
+
     fn drain_inbox(&mut self) {
         while let Ok((id, event)) = self.inbox.try_recv() {
             let is_active = self.tabs.get(self.active).is_some_and(|t| t.id == id);
@@ -448,12 +494,7 @@ impl Render for BrowserView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, _e, window, _cx| {
-                        // Switching tabs leaves URL-bar edit mode so the
-                        // bar reflects the newly active tab.
-                        view.url_editing = false;
-                        view.url_anchor = None;
-                        window.blur();
-                        view.active = i;
+                        view.activate_tab(i, window);
                     }),
                 )
                 .child(div().flex_1().overflow_hidden().child(if tab.alive {
@@ -549,12 +590,8 @@ impl Render for BrowserView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, _e, _w, cx| {
-                            let i = view.active;
-                            let h = view.tabs[i].hist;
-                            if h > 0 {
-                                view.tabs[i].go(h - 1);
-                                cx.notify();
-                            }
+                            view.history_step(-1);
+                            cx.notify();
                         }),
                     )
                     .child("◀"),
@@ -573,9 +610,7 @@ impl Render for BrowserView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, _e, _w, cx| {
-                            let i = view.active;
-                            let h = view.tabs[i].hist;
-                            view.tabs[i].go(h + 1);
+                            view.history_step(1);
                             cx.notify();
                         }),
                     )
@@ -589,13 +624,7 @@ impl Render for BrowserView {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, _e, _w, cx| {
-                            let i = view.active;
-                            if view.tabs[i].alive {
-                                let url = view.tabs[i].url.clone();
-                                view.tabs[i].send(&ToRenderer::Navigate(url));
-                            } else {
-                                view.respawn_tab(i);
-                            }
+                            view.reload_active();
                             cx.notify();
                         }),
                     )
@@ -812,6 +841,52 @@ impl Render for BrowserView {
             .flex()
             .flex_col()
             .bg(rgb(0x101013))
+            // Browser shortcuts. GPUI dispatches key events along the
+            // focus path up to the root, so this fires both when nothing
+            // is focused (page view) and — after the URL bar's own
+            // handler — while the bar is focused. While editing, the
+            // shortcuts that would collide with its caret/clipboard keys
+            // (Alt+arrows) are skipped; tab ops and Ctrl+L still fire.
+            .on_key_down(cx.listener(|view, e: &KeyDownEvent, window, cx| {
+                let ks = &e.keystroke;
+                let m = ks.modifiers;
+                // Ctrl on Linux/Windows, Cmd on macOS — same as the URL bar.
+                let ctrl = m.control || m.platform;
+                let editing = view.url_editing;
+                match ks.key.as_str() {
+                    "t" if ctrl && !m.alt && !m.shift => view.open_tab(),
+                    "w" if ctrl && !m.alt && !m.shift => {
+                        // Leave edit mode first so the bar reflects the
+                        // next tab; closing the last tab opens a fresh
+                        // one (which re-enters edit mode itself).
+                        view.url_editing = false;
+                        view.url_anchor = None;
+                        window.blur();
+                        view.close_tab(view.active);
+                    }
+                    "l" if ctrl && !m.alt && !m.shift => view.focus_url_bar(window),
+                    "r" if ctrl && !m.alt => view.reload_active(),
+                    "f5" if !m.alt => view.reload_active(),
+                    "tab" if ctrl && !m.alt => {
+                        let n = view.tabs.len();
+                        let step = if m.shift { n - 1 } else { 1 };
+                        view.activate_tab((view.active + step) % n, window);
+                    }
+                    "left" if m.alt && !ctrl && !editing => view.history_step(-1),
+                    "right" if m.alt && !ctrl && !editing => view.history_step(1),
+                    k if ctrl && !m.alt && !m.shift => {
+                        // Ctrl+1..8 jumps to tab N; Ctrl+9 to the last tab.
+                        if let Ok(n) = k.parse::<usize>() {
+                            if (1..=9).contains(&n) {
+                                let idx = if n == 9 { view.tabs.len() - 1 } else { n - 1 };
+                                view.activate_tab(idx, window);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            }))
             .child(tab_strip)
             .child(nav)
             .child({
