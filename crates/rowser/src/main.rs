@@ -598,7 +598,7 @@ impl Render for BrowserView {
                         cx.notify();
                     }),
                 )
-                .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, window, cx| {
+                .on_scroll_wheel(cx.listener(|view, e: &ScrollWheelEvent, _window, cx| {
                     // GPUI reports content deltas (natural-scroll style):
                     // wheel up yields positive y. Our scroll offset is
                     // document-space, so negate it.
@@ -606,7 +606,6 @@ impl Render for BrowserView {
                     let i = view.active;
                     view.tabs[i].send(&ToRenderer::Scroll { dy });
                     cx.notify();
-                    let _ = window;
                 }))
                 .child(img(frame.clone()).size_full().object_fit(ObjectFit::Fill))
         } else {

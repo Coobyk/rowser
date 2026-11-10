@@ -350,6 +350,7 @@ fn list_page(name: &str) -> String {
 fn fetch_bytes(base_url: &str, resource: &str) -> Option<Vec<u8>> {
     let url = resolve_url(base_url, resource)?;
     if let Some(path) = url.strip_prefix("file://") {
+        let path = rowser_net::percent_decode(path).unwrap_or_else(|_| path.to_string());
         return std::fs::read(path).ok();
     }
     if url.starts_with("http") {
