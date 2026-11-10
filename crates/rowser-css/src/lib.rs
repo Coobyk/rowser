@@ -59,12 +59,18 @@ pub struct StyleSheet {
 }
 
 pub fn parse(css: &str) -> StyleSheet {
-    let mut p = CssParser { s: css.as_bytes(), pos: 0 };
+    parse_vw(css, 1024.0)
+}
+
+pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
+    let mut p = CssParser { s: css.as_bytes(), pos: 0, vw };
     let mut rules = Vec::new();
     p.skip_ws_comments();
     while !p.eof() {
         if p.peek() == Some(b'@') {
-            p.skip_at_rule();
+            if let Some(mut inner) = p.at_rule_rules() {
+                rules.append(&mut inner);
+            }
         } else if let Some(r) = p.rule() {
             rules.push(r);
         }
@@ -76,6 +82,7 @@ pub fn parse(css: &str) -> StyleSheet {
 struct CssParser<'a> {
     s: &'a [u8],
     pos: usize,
+    vw: f32,
 }
 
 impl<'a> CssParser<'a> {
@@ -108,6 +115,63 @@ impl<'a> CssParser<'a> {
             }
         }
     }
+    /// @media/@supports/@layer are unwrapped — inner rules returned when
+    /// the condition passes. Others are skipped. Returns rules to append.
+    fn at_rule_rules(&mut self) -> Option<Vec<Rule>> {
+        self.pos += 1; // '@'
+        let name = self.ident();
+        self.skip_ws_comments();
+        let st = self.pos;
+        while !self.eof() && self.peek() != Some(b'{') && self.peek() != Some(b';') {
+            self.pos += 1;
+        }
+        let prelude = String::from_utf8_lossy(&self.s[st..self.pos]).trim().to_lowercase();
+        let has_block = self.peek() == Some(b'{');
+        if has_block {
+            self.pos += 1;
+        }
+        let include = match name.as_str() {
+            "media" => media_matches(&prelude, self.vw),
+            "supports" => supports_matches(&prelude),
+            "layer" => true,
+            _ => false,
+        };
+        let mut rules = Vec::new();
+        if has_block {
+            // parse inner rule list until matching '}' (nesting is possible)
+            loop {
+                self.skip_ws_comments();
+                match self.peek() {
+                    None | Some(b'}') => {
+                        self.pos = (self.pos + 1).min(self.s.len());
+                        break;
+                    }
+                    Some(b'@') => {
+                        if let Some(mut r) = self.at_rule_rules() {
+                            if include {
+                                rules.append(&mut r);
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(r) = self.rule() {
+                            if include {
+                                rules.push(r);
+                            }
+                        } else {
+                            self.pos += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if include {
+            Some(rules)
+        } else {
+            Some(Vec::new())
+        }
+    }
+
     /// Skip an @-rule: either `;`-terminated or a `{...}` block.
     fn skip_at_rule(&mut self) {
         while !self.eof() {
@@ -573,6 +637,11 @@ fn resolve_vars(value: &str, customs: &HashMap<String, String>) -> String {
 
 /// Collect <style> element texts from the document → parsed sheets.
 pub fn document_sheets(doc: &Document) -> Vec<StyleSheet> {
+    document_sheets_vw(doc, 1024.0)
+}
+
+/// Like `document_sheets` but evaluates @media against `viewport_w` px.
+pub fn document_sheets_vw(doc: &Document, viewport_w: f32) -> Vec<StyleSheet> {
     let mut sheets = Vec::new();
     for id in doc.descendants(doc.root) {
         if doc.tag(id) == Some("style") {
@@ -581,7 +650,7 @@ pub fn document_sheets(doc: &Document) -> Vec<StyleSheet> {
                 .iter()
                 .filter_map(|&c| doc.text(c))
                 .collect();
-            sheets.push(parse(&text));
+            sheets.push(parse_vw(&text, viewport_w));
         }
     }
     sheets
@@ -640,4 +709,60 @@ mod tests {
         let c = computed(&doc, p, &[&ua, &author]);
         assert_eq!(c.get("color").unwrap(), "red");
     }
+}
+
+
+fn media_matches(q: &str, vw: f32) -> bool {
+    let q = q.replace("screen", "");
+    let width_of = |q: &str, key: &str| -> Option<f32> {
+        q.split(key)
+            .nth(1)?
+            .split(')')
+            .next()?
+            .trim()
+            .trim_end_matches("px")
+            .parse::<f32>()
+            .ok()
+    };
+    if q.contains("min-width") {
+        if let Some(px) = width_of(&q, "min-width:") {
+            return vw >= px;
+        }
+    }
+    if q.contains("max-width") {
+        if let Some(px) = width_of(&q, "max-width:") {
+            return vw <= px;
+        }
+    }
+    if q.contains("prefers-color-scheme") {
+        return q.contains("dark");
+    }
+    if q.contains("prefers-reduced-motion") || q.contains("print") {
+        return false;
+    }
+    true
+}
+
+/// Very small @supports evaluator: true only if every "(prop: v)" property
+/// in the query is one layout understands (or it's a `not` of a known-prop).
+fn supports_matches(q: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "display", "color", "background", "background-color", "font-size", "font-weight",
+        "font-style", "font-family", "text-decoration", "text-align", "white-space",
+        "vertical-align", "margin", "margin-top", "margin-right", "margin-bottom",
+        "margin-left", "padding", "padding-top", "padding-right", "padding-bottom",
+        "padding-left", "border", "width", "height", "line-height", "float", "gap",
+        "border-collapse",
+    ];
+    let mut ok = true;
+    for part in q.split('(').skip(1) {
+        let Some(inner) = part.split(')').next() else { continue };
+        if let Some((prop, _)) = inner.split_once(':') {
+            let p = prop.trim();
+            if !p.starts_with("--") && !KNOWN.contains(&p) {
+                ok = false;
+            }
+        }
+    }
+    ok
 }
