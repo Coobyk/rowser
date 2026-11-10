@@ -48,6 +48,8 @@ pub enum Simple {
     AttrEquals(String, String),
     FirstChild,
     LastChild,
+    /// `:root` — the html element.
+    Root,
     /// Unsupported pseudo — selector fails quietly.
     Unsupported,
 }
@@ -265,6 +267,7 @@ impl<'a> CssParser<'a> {
                         simples.push(match name.as_str() {
                             "first-child" => Simple::FirstChild,
                             "last-child" => Simple::LastChild,
+                            "root" => Simple::Root,
                             _ => {
                                 // skip pseudo-args like :nth-child(2n)
                                 if self.peek() == Some(b'(') {
@@ -405,6 +408,7 @@ fn simple_matches(doc: &Document, node: NodeId, s: &Simple) -> bool {
         Simple::LastChild => doc
             .parent(node)
             .is_some_and(|p| doc.children(p).last().copied() == Some(node)),
+        Simple::Root => doc.tag(node) == Some("html"),
         Simple::Unsupported => false,
     }
 }
@@ -489,7 +493,82 @@ pub fn computed(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> HashMap
             order += 1;
         }
     }
-    out.into_iter().map(|(k, (v, _, _, _))| (k, v)).collect()
+    let mut props: HashMap<String, String> =
+        out.into_iter().map(|(k, (v, _, _, _))| (k, v)).collect();
+    // Custom properties: same cascade, resolved against this element's map
+    // and the :root element's globals.
+    if props.values().any(|v| v.contains("var(")) || has_custom_decl(doc, node, sheets) {
+        let mut customs = element_customs(doc, node, sheets);
+        if let Some(html) = doc.find_deep(doc.root, "html") {
+            for (k, v) in element_customs(doc, html, sheets) {
+                customs.entry(k).or_insert(v);
+            }
+        }
+        for v in props.values_mut() {
+            *v = resolve_vars(v, &customs);
+        }
+    }
+    props
+}
+
+fn has_custom_decl(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> bool {
+    sheets.iter().any(|sh| {
+        sh.rules.iter().any(|r| {
+            r.decls.iter().any(|d| d.prop.starts_with("--"))
+                && r.selectors.iter().any(|s| matches(doc, node, s))
+        })
+    })
+}
+
+/// Custom-property declarations (--x) matching this element.
+fn element_customs(
+    doc: &Document,
+    node: NodeId,
+    sheets: &[&StyleSheet],
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for sh in sheets {
+        for r in &sh.rules {
+            if !r.selectors.iter().any(|s| matches(doc, node, s)) {
+                continue;
+            }
+            for d in &r.decls {
+                if d.prop.starts_with("--") {
+                    out.insert(d.prop.clone(), d.value.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Substitute `var(--name)` and `var(--name, fallback)` recursively.
+fn resolve_vars(value: &str, customs: &HashMap<String, String>) -> String {
+    let mut out = value.to_string();
+    for _ in 0..8 {
+        let Some(start) = out.find("var(") else { break };
+        let mut depth = 1i32;
+        let mut end = start + 4;
+        while end < out.len() && depth > 0 {
+            match out.as_bytes()[end] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            end += 1;
+        }
+        if depth != 0 {
+            break;
+        }
+        let inner = out[start + 4..end - 1].trim();
+        let (name, fallback) = inner.split_once(',').map(|(a, b)| (a.trim(), b.trim())).unwrap_or((inner, ""));
+        let rep = customs
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(fallback);
+        out = format!("{}{}{}", &out[..start], rep, &out[end..]);
+    }
+    out
 }
 
 /// Collect <style> element texts from the document → parsed sheets.
