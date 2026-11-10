@@ -95,7 +95,7 @@ struct BrowserView {
 }
 
 impl BrowserView {
-    fn new(cx: &mut Context<Self>) -> Self {
+    fn new(cx: &mut Context<Self>, initial_url: Option<String>) -> Self {
         let (outbox, inbox) = mpsc::channel::<(usize, TabEvent)>();
         let mut view = Self {
             tabs: Vec::new(),
@@ -135,6 +135,11 @@ impl BrowserView {
         .detach();
 
         view.open_tab();
+        if let Some(url) = initial_url {
+            let url = normalize_url(&url);
+            view.url_text = url.clone();
+            view.tabs[0].navigate(&url);
+        }
         view
     }
 
@@ -1000,7 +1005,10 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| BrowserView::new(cx)),
+            |_, cx| {
+                let url = std::env::args().nth(1);
+                cx.new(|cx| BrowserView::new(cx, url))
+            },
         )
         .unwrap();
         cx.activate(true);
