@@ -690,6 +690,8 @@ pub struct Layouter<'a> {
     floats: Vec<Float>,
     /// current scroll offset — `position:fixed` anchors to the viewport
     scroll: f32,
+    /// element `id` → document-y, for #fragment navigation
+    anchors: Vec<(String, f32)>,
 }
 
 impl<'a> Layouter<'a> {
@@ -701,7 +703,7 @@ impl<'a> Layouter<'a> {
         width: f32,
         scroll: f32,
         external: &[css::StyleSheet],
-    ) -> (Vec<DisplayItem>, f32) {
+    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>) {
         let author = css::document_sheets(doc);
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
         sheets.extend(external.iter());
@@ -721,6 +723,7 @@ impl<'a> Layouter<'a> {
             list_stack: Vec::new(),
             floats: Vec::new(),
             scroll,
+            anchors: Vec::new(),
         };
         l.walk(doc.root, base_style());
         l.flush_line();
@@ -730,7 +733,7 @@ impl<'a> Layouter<'a> {
             l.y = l.y.max(f.bottom);
         }
         let h = l.y + scroll + 8.0;
-        (l.items, h)
+        (l.items, h, l.anchors)
     }
 
     /// Horizontal space taken by floats on (left, right) at the current y.
@@ -768,6 +771,11 @@ impl<'a> Layouter<'a> {
             NodeKind::Text(t) => self.text(t, style),
             NodeKind::Comment(_) => {}
             NodeKind::Element { tag, .. } => {
+                if let Some(id) = self.doc.attr(node, "id") {
+                    if !id.is_empty() {
+                        self.anchors.push((id.to_string(), self.y + self.scroll));
+                    }
+                }
                 let c = css::computed(self.doc, node, &self.sheets);
                 let mut st = style.clone();
                 self.apply_computed(&c, &mut st);
@@ -1872,7 +1880,7 @@ mod tests {
         rowser_html::parse(html)
     }
 
-    fn lay(html: &str) -> (Vec<DisplayItem>, f32) {
+    fn lay(html: &str) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>) {
         let d = doc(html);
         let mut fonts = FontCache::new();
         Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[])
@@ -1887,7 +1895,7 @@ mod tests {
 
     #[test]
     fn css_color_applies() {
-        let (items, _) = lay("<style>p{color:red}</style><p>hi</p>");
+        let (items, _, _) = lay("<style>p{color:red}</style><p>hi</p>");
         let t = texts(&items);
         if let DisplayItem::Text { color, .. } = t[0] {
             assert_eq!(*color, bgra(255, 0, 0));
@@ -1896,7 +1904,7 @@ mod tests {
 
     #[test]
     fn class_selector_styles() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<style>.big{font-size:40px}</style><p class=big>huge</p><p>small</p>",
         );
         let t = texts(&items);
@@ -1910,7 +1918,7 @@ mod tests {
 
     #[test]
     fn display_none_hides() {
-        let (items, _) = lay("<style>.hide{display:none}</style><p class=hide>gone</p><p>here</p>");
+        let (items, _, _) = lay("<style>.hide{display:none}</style><p class=hide>gone</p><p>here</p>");
         let all: String = texts(&items)
             .iter()
             .filter_map(|i| match i {
@@ -1924,7 +1932,7 @@ mod tests {
 
     #[test]
     fn background_rect_emitted() {
-        let (items, _) = lay("<style>div{background-color:#ff0000}</style><div>inside</div>");
+        let (items, _, _) = lay("<style>div{background-color:#ff0000}</style><div>inside</div>");
         assert!(items
             .iter()
             .any(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255,0,0))));
@@ -1932,7 +1940,7 @@ mod tests {
 
     #[test]
     fn text_align_center() {
-        let (items, _) =
+        let (items, _, _) =
             lay("<style>p{text-align:center}</style><p>mid</p>");
         let t = texts(&items);
         if let DisplayItem::Text { x, .. } = t[0] {
@@ -1942,7 +1950,7 @@ mod tests {
 
     #[test]
     fn headings_bigger() {
-        let (items, _) = lay("<h1>big</h1><p>small</p>");
+        let (items, _, _) = lay("<h1>big</h1><p>small</p>");
         let t = texts(&items);
         if let DisplayItem::Text { size, .. } = t[0] {
             assert!(*size > 30.0);
@@ -1962,7 +1970,7 @@ mod tests {
 
     #[test]
     fn inline_block_advances_line() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<style>.ib{display:inline-block;width:100px;height:12px}</style>\
              <p>a<span class=ib></span>b</p>",
         );
@@ -1973,7 +1981,7 @@ mod tests {
 
     #[test]
     fn inline_block_bg_and_border() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<style>.ib{display:inline-block;width:50px;height:20px;\
              background-color:#ff0000;border:2px solid blue}</style>\
              <p><span class=ib></span></p>",
@@ -1990,7 +1998,7 @@ mod tests {
 
     #[test]
     fn table_places_cells_in_columns() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<table><tr><td>a1</td><td>bbb1</td></tr>\
              <tr><td>a2</td><td>b2</td></tr></table>",
         );
@@ -2008,7 +2016,7 @@ mod tests {
 
     #[test]
     fn td_border_draws() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<style>td{border:2px solid #ff0000}</style>\
              <table><tr><td>x</td></tr></table>",
         );
@@ -2021,7 +2029,7 @@ mod tests {
 
     #[test]
     fn float_narrows_following_lines() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<style>.fl{float:left;width:200px}</style>\
              <div class=fl>nav</div><p>hello world</p>",
         );
@@ -2033,7 +2041,7 @@ mod tests {
 
     #[test]
     fn padding_expands_background_rect() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<style>div{background-color:#ff0000}.p{padding:20px}</style>\
              <div>a</div><div class=p>b</div>",
         );
@@ -2050,7 +2058,7 @@ mod tests {
 
     #[test]
     fn inline_margin_and_background() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<style>span{margin-left:50px;background-color:#00ff00}</style>\
              <p>a<span>b</span></p>",
         );
@@ -2067,7 +2075,7 @@ mod tests {
 
     #[test]
     fn line_height_grows_line_box() {
-        let (items, _) =
+        let (items, _, _) =
             lay("<style>.lh{line-height:3}</style><p class=lh>a</p><p>b</p>");
         let (_, ya) = text_pos(&items, "a");
         let (_, yb) = text_pos(&items, "b");
@@ -2076,7 +2084,7 @@ mod tests {
 
     #[test]
     fn width_caps_block_content() {
-        let (items, _) = lay(
+        let (items, _, _) = lay(
             "<style>.w{width:150px}</style>\
              <div class=w>aa bb cc dd ee ff gg hh ii jj kk ll</div>",
         );
@@ -2117,7 +2125,7 @@ mod dbg3 {
         eprintln!("TAGS: {:?}", tags);
         let sh2 = rowser_css::parse(&css);
         let mut fonts = FontCache::new();
-        let (items, _) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[sh2]);
+        let (items, _, _) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[sh2]);
         for it in &items {
             match it {
                 DisplayItem::Image { x, y, w, h, src } => eprintln!("IMG {x:.0},{y:.0} {w:.0}x{h:.0} {src}"),

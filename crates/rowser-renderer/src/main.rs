@@ -38,6 +38,18 @@ fn main() {
             }
             ToRenderer::Navigate(url) => {
                 let _ = send(&mut output, &ToBrowser::LoadStarted);
+                let (base, frag) = url.split_once('#').map(|(b, f)| (b, f)).unwrap_or((url.as_str(), ""));
+                let same_page = !page.cur_url.is_empty()
+                    && (base == page.cur_url || (base.is_empty() && !frag.is_empty()));
+                if same_page && !frag.is_empty() {
+                    if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
+                        page.scroll = (*y - 8.0).clamp(0.0, page.max_scroll());
+                        page.repaint(&mut fonts);
+                        let _ = send(&mut output, &frame_msg(&page));
+                    }
+                    let _ = send(&mut output, &ToBrowser::LoadDone);
+                    continue;
+                }
                 let (html, effective) = load_url(&url);
                 let doc = rowser_html::parse(&html);
                 let title = doc
@@ -47,6 +59,12 @@ fn main() {
                     .unwrap_or_else(|| effective.clone());
                 page.load(doc, effective, title.clone());
                 page.repaint(&mut fonts);
+                if !frag.is_empty() {
+                    if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
+                        page.scroll = (*y - 8.0).clamp(0.0, page.max_scroll());
+                        page.repaint(&mut fonts);
+                    }
+                }
                 let _ = send(&mut output, &ToBrowser::Title(title));
                 let _ = send(&mut output, &frame_msg(&page));
                 let _ = send(&mut output, &ToBrowser::LoadDone);
@@ -125,6 +143,8 @@ struct Page {
     scroll: f32,
     content_h: f32,
     url_base: String,
+    cur_url: String,
+    anchors: Vec<(String, f32)>,
     pixels: Vec<u8>,
     items: Vec<rowser_layout::DisplayItem>,
     images: std::collections::HashMap<String, rowser_image::Image>,
@@ -139,6 +159,8 @@ impl Page {
             scroll: 0.0,
             content_h: 0.0,
             url_base: "about:blank".into(),
+            cur_url: String::new(),
+            anchors: Vec::new(),
             pixels: Vec::new(),
             items: Vec::new(),
             images: std::collections::HashMap::new(),
@@ -152,7 +174,8 @@ impl Page {
 
     fn load(&mut self, doc: rowser_dom::Document, url: String, title: String) {
         self.doc = Some(doc);
-        self.url_base = url;
+        self.url_base = url.clone();
+        self.cur_url = url;
         self.scroll = 0.0;
         self.images.clear();
         self.sheets.clear();
@@ -211,10 +234,11 @@ impl Page {
 
     fn repaint(&mut self, fonts: &mut FontCache) {
         let Some(doc) = &self.doc else { return };
-        let (items, height) =
+        let (items, height, anchors) =
             Layouter::layout(doc, fonts, self.viewport.0 as f32, self.scroll, &self.sheets);
         self.content_h = height;
         self.items = items;
+        self.anchors = anchors;
         self.load_images();
         self.pixels = rowser_paint::paint(
             &self.items,
