@@ -585,7 +585,7 @@ impl<'a> Layouter<'a> {
                 self.apply_computed(&c, &mut st);
                 match c.get("display").map(String::as_str) {
                     Some("none") => return,
-                    Some("block") | Some("list-item") => {
+                    Some("block") | Some("list-item") | Some("flex") => {
                         self.block(node, tag, &c, st);
                     }
                     Some("inline-block") => self.inline_block(node, &c, st),
@@ -768,8 +768,35 @@ impl<'a> Layouter<'a> {
             if let Some(m) = marker {
                 self.word(&m, st.clone());
             }
-            for &ch in self.doc.children(node) {
-                self.walk(ch, st.clone());
+            if matches!(c.get("display").map(String::as_str), Some("flex")) {
+                let gap = c
+                    .get("gap")
+                    .and_then(|v| parse_len(v, st.size))
+                    .unwrap_or(0.0);
+                let mut first = true;
+                for &ch in self.doc.children(node) {
+                    match self.doc.kind(ch) {
+                        NodeKind::Element { .. } => {
+                            let cc = css::computed(self.doc, ch, &self.sheets);
+                            if cc.get("display").map(String::as_str) == Some("none") {
+                                continue;
+                            }
+                            if !first && gap > 0.0 {
+                                self.spacer(gap);
+                            }
+                            let mut cst = st.clone();
+                            self.apply_computed(&cc, &mut cst);
+                            self.inline_block(ch, &cc, cst);
+                            first = false;
+                        }
+                        NodeKind::Text(t) => self.text(t, st.clone()),
+                        _ => {}
+                    }
+                }
+            } else {
+                for &ch in self.doc.children(node) {
+                    self.walk(ch, st.clone());
+                }
             }
             self.flush_line();
         }
