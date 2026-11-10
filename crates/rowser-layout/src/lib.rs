@@ -282,14 +282,20 @@ pub fn parse_color(v: &str) -> Option<Color> {
     if let Some(hex) = v.strip_prefix('#') {
         let d = u32::from_str_radix(hex, 16).ok()?;
         return Some(match hex.len() {
-            3 | 4 => {
+            3 => {
+                let (r, g, b) = ((d >> 8) & 0xf, (d >> 4) & 0xf, d & 0xf);
+                bgra((r * 17) as u8, (g * 17) as u8, (b * 17) as u8)
+            }
+            4 => {
                 let (r, g, b, a) = (
                     (d >> 12) & 0xf,
                     (d >> 8) & 0xf,
                     (d >> 4) & 0xf,
-                    if hex.len() == 4 { d & 0xf } else { 0xf },
+                    d & 0xf,
                 );
-                bgra((r * 17) as u8, (g * 17) as u8, (b * 17) as u8)
+                // composite semi-transparent colors over white
+                let blend = |c: u32| ((c * 17 * a * 17 + 255 * (255 - a * 17)) / 255) as u8;
+                bgra(blend(r), blend(g), blend(b))
             }
             6 => bgra(((d >> 16) & 0xff) as u8, ((d >> 8) & 0xff) as u8, (d & 0xff) as u8),
             8 => {
