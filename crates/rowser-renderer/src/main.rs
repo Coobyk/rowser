@@ -1109,7 +1109,7 @@ fn dump_node(doc: &rowser_dom::Document, id: rowser_dom::NodeId, d: usize, out: 
         rowser_dom::NodeKind::Element { tag, attrs } => {
             let a: String = attrs
                 .iter()
-                .map(|(k, v)| format!(" {k}=\"{}\"", &v[..v.len().min(40)]))
+                .map(|(k, v)| format!(" {k}=\"{}\"", v.chars().take(40).collect::<String>()))
                 .collect();
             out.push_str(&format!("{pad}<{tag}{a}>\n"));
         }

@@ -144,11 +144,19 @@ impl BrowserView {
         let exe = std::env::current_exe()
             .ok()?
             .with_file_name("rowser-renderer");
-        let child = Command::new(exe)
-            .stdin(Stdio::from(OwnedFd::from(child_end)))
-            .stdout(Stdio::from(OwnedFd::from(child_out)))
-            .spawn()
-            .ok()?;
+        // Renderer stderr → a per-pid log so panics are diagnosable from a
+        // GUI launch (where stderr is otherwise lost).
+        let mut cmd = Command::new(exe);
+        cmd.stdin(Stdio::from(OwnedFd::from(child_end)))
+            .stdout(Stdio::from(OwnedFd::from(child_out)));
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/rowser-renderer-stderr.log")
+        {
+            cmd.stderr(Stdio::from(f));
+        }
+        let child = cmd.spawn().ok()?;
         Some((child, parent.try_clone().ok()?, parent))
     }
 
@@ -1047,3 +1055,4 @@ fn normalize_url(input: &str) -> String {
     }
     format!("https://{s}")
 }
+
