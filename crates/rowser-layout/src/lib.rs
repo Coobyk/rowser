@@ -252,6 +252,35 @@ pub fn parse_color(v: &str) -> Option<Color> {
     named_color(&v)
 }
 
+/// `background-color` or a color inside the `background` shorthand.
+fn bg_color(c: &HashMap<String, String>) -> Option<Color> {
+    if let Some(v) = c.get("background-color") {
+        if let Some(col) = parse_color(v) {
+            return Some(col);
+        }
+    }
+    let v = c.get("background")?;
+    // tokens: color | url() | position/size | repeat | attachment — take first color
+    for tok in v.split_whitespace() {
+        if let Some(col) = parse_color(tok.trim_end_matches(';')) {
+            return Some(col);
+        }
+        if let Some(inner) = tok.strip_prefix("linear-gradient(") {
+            let _ = inner;
+            // gradient → take first color stop as flat bg (approximation)
+            let rest = v[v.find('(')? + 1..].trim_end_matches(')');
+            for part in rest.split(',') {
+                let w = part.trim().split_whitespace().next().unwrap_or("");
+                if let Some(col) = parse_color(w) {
+                    return Some(col);
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
 /// CSS length → px. `em`/`%` resolve against `rel` (usually parent font size).
 fn parse_len(v: &str, rel: f32) -> Option<f32> {
     let v = v.trim().to_lowercase();
@@ -627,8 +656,8 @@ impl<'a> Layouter<'a> {
                 parse_len(v, st.size).map(LineH::Px)
             };
         }
-        if let Some(v) = c.get("background-color") {
-            st.inline_bg = parse_color(v);
+        if let Some(col) = bg_color(c) {
+            st.inline_bg = Some(col);
         }
     }
 
@@ -640,7 +669,7 @@ impl<'a> Layouter<'a> {
         let size = st.size;
         let [mt, mr, mb, ml] = box_sides(c, "margin", size);
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
-        let bg = c.get("background-color").and_then(|v| parse_color(v));
+        let bg = bg_color(c);
         let border = c.get("border").and_then(|v| parse_border(v, size));
         // the block's own background paints behind the whole box, not per word
         st.inline_bg = None;
@@ -774,7 +803,7 @@ impl<'a> Layouter<'a> {
         let size = st.size;
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
         let [_t, mr, _b, ml] = box_sides(c, "margin", size);
-        let bg = c.get("background-color").and_then(|v| parse_color(v));
+        let bg = bg_color(c);
         let border = c.get("border").and_then(|v| parse_border(v, size));
         st.inline_bg = None;
         let bw = border.map(|b| b.0).unwrap_or(0.0);
@@ -855,7 +884,7 @@ impl<'a> Layouter<'a> {
         let size = st.size;
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
         let [_t, mr, mb, ml] = box_sides(c, "margin", size);
-        let bg = c.get("background-color").and_then(|v| parse_color(v));
+        let bg = bg_color(c);
         let border = c.get("border").and_then(|v| parse_border(v, size));
         st.inline_bg = None; // the box paints its own bg
         let bw = border.map(|b| b.0).unwrap_or(0.0);
@@ -922,7 +951,7 @@ impl<'a> Layouter<'a> {
     fn table(&mut self, node: NodeId, c: &HashMap<String, String>, mut st: Style) {
         let size = st.size;
         let [mt, _mr, mb, ml] = box_sides(c, "margin", size);
-        let bg = c.get("background-color").and_then(|v| parse_color(v));
+        let bg = bg_color(c);
         let border = c.get("border").and_then(|v| parse_border(v, size));
         st.inline_bg = None;
         // <table border=N> fallback cell borders (border="0" = none)
