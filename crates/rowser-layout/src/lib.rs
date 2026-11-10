@@ -1344,7 +1344,13 @@ impl<'a> Layouter<'a> {
                     }
                     let mut cst = st.clone();
                     self.apply_computed(&cc, &mut cst);
-                    self.inline_block(ch, &cc, cst);
+                    // replaced elements (img etc.) emit their own item via inline()
+                    match self.doc.tag(ch) {
+                        Some(t @ ("img" | "input" | "select" | "textarea" | "video" | "canvas" | "iframe" | "object" | "embed" | "svg" | "br" | "hr")) => {
+                            self.inline(ch, t, &cc, cst)
+                        }
+                        _ => self.inline_block(ch, &cc, cst),
+                    }
                     first = false;
                 }
                 NodeKind::Text(t) => self.text(t, st.clone()),
@@ -2038,10 +2044,10 @@ mod dbg3 {
         let mut fonts = FontCache::new();
         let (items, _) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[sh2]);
         for it in &items {
-            if let DisplayItem::Text { x, baseline, text, size, .. } = it {
-                if text.contains("Coobyk") || text.contains("I do") {
-                    eprintln!("T {x:.0},{baseline:.0} size={size:.0} {text:?}");
-                }
+            match it {
+                DisplayItem::Image { x, y, w, h, src } => eprintln!("IMG {x:.0},{y:.0} {w:.0}x{h:.0} {src}"),
+                DisplayItem::Text { x, baseline, text, size, .. } if text.contains("Coobyk") || text.contains("I do") => eprintln!("T {x:.0},{baseline:.0} size={size:.0} {text:?}"),
+                _ => {}
             }
         }
         for id in d.descendants(d.root) {
