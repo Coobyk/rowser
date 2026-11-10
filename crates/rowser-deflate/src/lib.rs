@@ -592,3 +592,15 @@ mod tests {
 
 #[doc(hidden)]
 pub mod testutil;
+
+#[cfg(test)]
+mod wiki_probe {
+    #[test]
+    fn inflate_real_gzip() {
+        let gz = std::fs::read("/tmp/wiki.html").unwrap();
+        match crate::inflate_gzip(&gz) {
+            Ok(body) => eprintln!("INFLATED {} bytes, head={:?}", body.len(), String::from_utf8_lossy(&body[..body.len().min(80)])),
+            Err(e) => eprintln!("INFLATE ERR {e:?}"),
+        }
+    }
+}

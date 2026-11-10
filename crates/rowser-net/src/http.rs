@@ -113,7 +113,9 @@ pub fn request_over<S: std::io::Read + std::io::Write>(
         format!("{}:{}", url.host, url.port)
     };
     let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nAccept: */*\r\n\
+        "GET {} HTTP/1.1\r\nHost: {host_header}\r\n\
+         User-Agent: rowser/0.1 (https://github.com/Coobyk/rowser)\r\n\
+         Accept: */*\r\n\
          Accept-Encoding: gzip\r\nConnection: close\r\n\r\n",
         url.request_target()
     );

@@ -1065,3 +1065,17 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod wiki_probe {
+    #[test]
+    fn probe_wiki_parse() {
+        let html = std::fs::read_to_string("/tmp/wiki_dec.html").unwrap();
+        let doc = crate::parse(&html);
+        eprintln!("NODES: {}", doc.nodes.len());
+        eprintln!("root children: {}", doc.children(doc.root).len());
+        for &c in doc.children(doc.root).iter().take(5) {
+            eprintln!("  {:?} children={}", doc.tag(c), doc.children(c).len());
+        }
+    }
+}
