@@ -11,6 +11,8 @@
 //! and minimal auto table layout (table/tr/td/th with per-cell borders).
 
 use rowser_css as css;
+mod svg;
+
 use rowser_dom::{Document, NodeId, NodeKind};
 use rowser_text::FontCache;
 use std::collections::HashMap;
@@ -44,6 +46,14 @@ pub enum DisplayItem {
         w: f32,
         h: f32,
         color: Color,
+    },
+    /// Raw BGRA bitmap painted at (x,y,w,h) — for inline <svg>.
+    Raster {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        pixels: Vec<u8>,
     },
     /// Resolved image URL + rect (paint draws the decoded bitmap).
     Image {
@@ -615,6 +625,13 @@ struct Float {
 /// Translate a display item by (dx, dy).
 fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
     match it {
+        DisplayItem::Raster { x, y, w, h, pixels } => DisplayItem::Raster {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            pixels,
+        },
         DisplayItem::Text {
             x,
             baseline,
@@ -1622,6 +1639,22 @@ impl<'a> Layouter<'a> {
         }
         match tag {
             "br" => self.flush_line(),
+            "svg" => {
+                self.flush_line();
+                let size = side(c, "width", self.avail_w)
+                    .or_else(|| side(c, "height", self.avail_w))
+                    .unwrap_or(24.0);
+                let lh = self.eff_line_h(&st);
+                let color = st.color;
+                self.items.push(DisplayItem::Raster {
+                    x: self.line_origin(),
+                    y: self.y,
+                    w: size,
+                    h: size,
+                    pixels: svg::render(self.doc, node, size as u32, size as u32, color),
+                });
+                self.y += size.max(lh);
+            }
             "img" => {
                 self.flush_line();
                 let w = self.doc.attr(node, "width")

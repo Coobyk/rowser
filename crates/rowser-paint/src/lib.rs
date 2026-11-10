@@ -102,6 +102,9 @@ pub fn paint_into(
 ) {
     for item in items {
         match item {
+            DisplayItem::Raster { x, y, w, h, pixels } => {
+                canvas.blit_pixels(pixels, *x as i32, *y as i32, *w as i32, *h as i32);
+            }
             DisplayItem::Image { x, y, w, h, src } => {
                 if let Some(img) = images.get(src) {
                     canvas.blit(img, *x as i32, *y as i32, *w as i32, *h as i32);
@@ -217,6 +220,12 @@ mod tests {
 
 impl Canvas {
     /// Nearest-neighbor blit of a decoded BGRA image into a rect.
+    /// Blit a raw BGRA buffer of `dw`×`dh` pixels (no scaling).
+    pub fn blit_pixels(&mut self, pixels: &[u8], dx: i32, dy: i32, dw: i32, dh: i32) {
+        let img = Image { width: dw.max(0) as u32, height: dh.max(0) as u32, pixels: pixels.to_vec() };
+        self.blit(&img, dx, dy, dw, dh);
+    }
+
     fn blit(&mut self, img: &Image, dx: i32, dy: i32, dw: i32, dh: i32) {
         if img.width == 0 || img.height == 0 {
             return;
