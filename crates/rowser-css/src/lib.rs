@@ -505,6 +505,37 @@ fn simple_matches(doc: &Document, node: NodeId, s: &Simple) -> bool {
     }
 }
 
+/// Cheap bail: the rightmost compound's tag/classes/id must hold on `node`
+/// for the selector to match — lets computed() skip most rules without
+/// running the full matcher.
+fn rightmost_ok(doc: &Document, node: NodeId, s: &Selector) -> bool {
+    let Some((_, simples)) = s.parts.last() else { return false };
+    for sm in simples {
+        match sm {
+            Simple::Tag(t) => {
+                if doc.tag(node) != Some(t.as_str()) {
+                    return false;
+                }
+            }
+            Simple::Class(cl) => {
+                let has = doc
+                    .attr(node, "class")
+                    .is_some_and(|a| a.split_whitespace().any(|c| c == cl));
+                if !has {
+                    return false;
+                }
+            }
+            Simple::Id(i) => {
+                if doc.attr(node, "id") != Some(i.as_str()) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 fn compound_matches(doc: &Document, node: NodeId, simples: &[Simple]) -> bool {
     simples.iter().all(|s| simple_matches(doc, node, s))
 }
@@ -562,11 +593,16 @@ pub fn computed(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> HashMap
             let spec = rule
                 .selectors
                 .iter()
-                .filter(|s| matches(doc, node, s))
+                .filter(|s| rightmost_ok(doc, node, s) && matches(doc, node, s))
                 .map(specificity)
                 .max()
                 .unwrap_or((0, 0, 0));
-            if spec == (0, 0, 0) && !rule.selectors.iter().any(|s| matches(doc, node, s)) {
+            if spec == (0, 0, 0)
+                && !rule
+                    .selectors
+                    .iter()
+                    .any(|s| rightmost_ok(doc, node, s) && matches(doc, node, s))
+            {
                 continue;
             }
             for d in &rule.decls {
@@ -640,7 +676,10 @@ fn has_custom_decl(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> bool
     sheets.iter().any(|sh| {
         sh.rules.iter().any(|r| {
             r.decls.iter().any(|d| d.prop.starts_with("--"))
-                && r.selectors.iter().any(|s| matches(doc, node, s))
+                && r
+                    .selectors
+                    .iter()
+                    .any(|s| rightmost_ok(doc, node, s) && matches(doc, node, s))
         })
     })
 }
@@ -654,7 +693,11 @@ fn element_customs(
     let mut out = HashMap::new();
     for sh in sheets {
         for r in &sh.rules {
-            if !r.selectors.iter().any(|s| matches(doc, node, s)) {
+            if !r
+                .selectors
+                .iter()
+                .any(|s| rightmost_ok(doc, node, s) && matches(doc, node, s))
+            {
                 continue;
             }
             for d in &r.decls {
