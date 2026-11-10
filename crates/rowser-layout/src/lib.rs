@@ -222,6 +222,37 @@ pub fn parse_color(v: &str) -> Option<Color> {
     if v == "transparent" {
         return None;
     }
+    if v.starts_with("color-mix(") {
+        let inner = v[v.find('(')? + 1..v.rfind(')')?].trim();
+        // `in srgb,` prelude optional
+        let inner = inner.split_once(',').map(|(a, b)| {
+            if a.contains("srgb") || a.contains("oklab") { b } else { inner }
+        }).unwrap_or(inner);
+        let mut iter = inner.split(',');
+        let a = iter.next()?.trim();
+        let b = iter.next().map(str::trim).unwrap_or("transparent");
+        // each arm: color [pct]
+        let arm = |s: &str| -> Option<(Color, f32)> {
+            let mut parts = s.rsplitn(2, ' ');
+            let (pct, col) = match parts.next().unwrap_or("").strip_suffix('%') {
+                Some(p) => (p.trim().parse::<f32>().ok()? / 100.0, parts.next().unwrap_or("")),
+                None => (1.0, s.trim()),
+            };
+            Some((parse_color(col)?, pct))
+        };
+        let (ca, pa) = arm(a)?;
+        let (cb, pb) = if b == "transparent" {
+            (bgra(255, 255, 255), 0.0)
+        } else {
+            arm(b)?
+        };
+        let t = if pa + pb > 0.0 { pa / (pa + pb) } else { 0.5 };
+        let mix = |x: u8, y: u8| (x as f32 * t + y as f32 * (1.0 - t)) as u8;
+        let (_, g1, r1, a1) = ((ca >> 8) & 0xff, (ca >> 16) & 0xff, (ca >> 24) & 0xff, ca & 0xff);
+        let _ = (g1, r1, a1);
+        let mixc = |shift: u32| mix(((ca >> shift) & 0xff) as u8, ((cb >> shift) & 0xff) as u8);
+        return Some(bgra(mixc(16) as u8, mixc(8) as u8, mixc(0) as u8));
+    }
     if let Some(hex) = v.strip_prefix('#') {
         let d = u32::from_str_radix(hex, 16).ok()?;
         return Some(match hex.len() {
@@ -281,20 +312,158 @@ fn bg_color(c: &HashMap<String, String>) -> Option<Color> {
     None
 }
 
+/// `border-width`/`border-style`/`border-color` split properties.
+fn split_border(c: &HashMap<String, String>, size: f32) -> Option<(f32, Color)> {
+    let w = c.get("border-width").and_then(|v| parse_len(v, size))?;
+    if w <= 0.0 || c.get("border-style").map(String::as_str) == Some("none") {
+        return None;
+    }
+    let col = c.get("border-color").and_then(|v| parse_color(v))?;
+    Some((w, col))
+}
+
 /// CSS length → px. `em`/`%` resolve against `rel` (usually parent font size).
+/// Tiny `calc()` evaluator: numbers with units, + - * / and parens.
+/// `%` resolves against `rel`; unitless numbers pass through.
+fn calc_len(expr: &str, rel: f32) -> Option<f32> {
+    struct P<'a> {
+        t: Vec<Tok>,
+        i: usize,
+        rel: f32,
+        _m: std::marker::PhantomData<&'a ()>,
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Tok {
+        Num(f32, Unit),
+        Op(char),
+        L,
+        R,
+    }
+    #[derive(Clone, Copy, PartialEq)]
+    enum Unit {
+        None,
+        Px,
+        Em,
+        Pct,
+    }
+    fn toks(s: &str) -> Option<Vec<Tok>> {
+        let b = s.as_bytes();
+        let mut i = 0;
+        let mut out = Vec::new();
+        while i < b.len() {
+            let c = b[i] as char;
+            if c.is_whitespace() {
+                i += 1;
+            } else if c.is_ascii_digit() || c == '.' || (c == '-' && i + 1 < b.len() && b[i + 1].is_ascii_digit()) {
+                let st = i;
+                if c == '-' {
+                    i += 1;
+                }
+                while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                    i += 1;
+                }
+                let n: f32 = std::str::from_utf8(&b[st..i]).ok()?.parse().ok()?;
+                let mut u = Unit::None;
+                if b[i..].starts_with(b"px") {
+                    u = Unit::Px;
+                    i += 2;
+                } else if b[i..].starts_with(b"rem") || b[i..].starts_with(b"em") {
+                    let w = if b[i..].starts_with(b"rem") { 3 } else { 2 };
+                    u = Unit::Em;
+                    i += w;
+                } else if b[i..].starts_with(b"pt") {
+                    u = Unit::Px;
+                    i += 2;
+                } else if i < b.len() && b[i] == b'%' {
+                    u = Unit::Pct;
+                    i += 1;
+                }
+                out.push(Tok::Num(n, u));
+            } else if matches!(c, '+' | '-' | '*' | '/') {
+                out.push(Tok::Op(c));
+                i += 1;
+            } else if c == '(' {
+                out.push(Tok::L);
+                i += 1;
+            } else if c == ')' {
+                out.push(Tok::R);
+                i += 1;
+            } else {
+                return None;
+            }
+        }
+        Some(out)
+    }
+    // em/rem always mean root font size here; `rel` is the %-base.
+    fn px(n: f32, u: Unit, rel: f32) -> f32 {
+        match u {
+            Unit::Px | Unit::None => n,
+            Unit::Em => n * 16.0,
+            Unit::Pct => n * rel / 100.0,
+        }
+    }
+    impl P<'_> {
+        fn expr(&mut self) -> Option<f32> {
+            let mut v = self.term()?;
+            while let Some(Tok::Op(op @ ('+' | '-'))) = self.t.get(self.i).copied() {
+                self.i += 1;
+                let r = self.term()?;
+                v = if op == '+' { v + r } else { v - r };
+            }
+            Some(v)
+        }
+        fn term(&mut self) -> Option<f32> {
+            let mut v = self.factor()?;
+            while let Some(Tok::Op(op @ ('*' | '/'))) = self.t.get(self.i).copied() {
+                self.i += 1;
+                let r = self.factor()?;
+                v = if op == '*' { v * r } else { v / r };
+            }
+            Some(v)
+        }
+        fn factor(&mut self) -> Option<f32> {
+            match self.t.get(self.i).copied() {
+                Some(Tok::Num(n, u)) => {
+                    self.i += 1;
+                    Some(px(n, u, self.rel))
+                }
+                Some(Tok::L) => {
+                    self.i += 1;
+                    let v = self.expr();
+                    if self.t.get(self.i).copied() == Some(Tok::R) {
+                        self.i += 1;
+                    }
+                    v
+                }
+                Some(Tok::Op('-')) => {
+                    self.i += 1;
+                    self.factor().map(|v| -v)
+                }
+                _ => None,
+            }
+        }
+    }
+    let t = toks(&expr.to_lowercase())?;
+    let mut p = P { t, i: 0, rel, _m: std::marker::PhantomData };
+    p.expr()
+}
+
 fn parse_len(v: &str, rel: f32) -> Option<f32> {
     let v = v.trim().to_lowercase();
+    if let Some(inner) = v.strip_prefix("calc(").and_then(|x| x.strip_suffix(')')) {
+        return calc_len(inner, rel);
+    }
     let num = |s: &str| s.trim().parse::<f32>().ok();
     if let Some(x) = v.strip_suffix("px") {
         num(x)
+    } else if let Some(x) = v.strip_suffix("rem") {
+        num(x).map(|n| n * BASE_SIZE)
     } else if let Some(x) = v.strip_suffix("em") {
         num(x).map(|n| n * rel)
     } else if let Some(x) = v.strip_suffix('%') {
         num(x).map(|n| n * rel / 100.0)
     } else if let Some(x) = v.strip_suffix("pt") {
         num(x).map(|n| n * 96.0 / 72.0)
-    } else if let Some(x) = v.strip_suffix("rem") {
-        num(x).map(|n| n * BASE_SIZE)
     } else {
         num(&v)
     }
@@ -670,7 +839,10 @@ impl<'a> Layouter<'a> {
         let [mt, mr, mb, ml] = box_sides(c, "margin", size);
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
         let bg = bg_color(c);
-        let border = c.get("border").and_then(|v| parse_border(v, size));
+        let border = c
+            .get("border")
+            .and_then(|v| parse_border(v, size))
+            .or_else(|| split_border(c, size));
         // the block's own background paints behind the whole box, not per word
         st.inline_bg = None;
         let bw = border.map(|b| b.0).unwrap_or(0.0);
@@ -682,7 +854,7 @@ impl<'a> Layouter<'a> {
         // `width` caps the content box; `margin-?:auto` splits leftover space
         let mut ml = ml;
         let mut mr = mr;
-        let w_prop = side(c, "width", size);
+        let w_prop = side(c, "width", self.avail_w);
         if let Some(w) = w_prop {
             let extra = (self.avail_w - ml - mr - pl - pr - 2.0 * bw - w).max(0.0);
             match (margin_auto(c, true), margin_auto(c, false)) {
@@ -769,30 +941,7 @@ impl<'a> Layouter<'a> {
                 self.word(&m, st.clone());
             }
             if matches!(c.get("display").map(String::as_str), Some("flex")) {
-                let gap = c
-                    .get("gap")
-                    .and_then(|v| parse_len(v, st.size))
-                    .unwrap_or(0.0);
-                let mut first = true;
-                for &ch in self.doc.children(node) {
-                    match self.doc.kind(ch) {
-                        NodeKind::Element { .. } => {
-                            let cc = css::computed(self.doc, ch, &self.sheets);
-                            if cc.get("display").map(String::as_str) == Some("none") {
-                                continue;
-                            }
-                            if !first && gap > 0.0 {
-                                self.spacer(gap);
-                            }
-                            let mut cst = st.clone();
-                            self.apply_computed(&cc, &mut cst);
-                            self.inline_block(ch, &cc, cst);
-                            first = false;
-                        }
-                        NodeKind::Text(t) => self.text(t, st.clone()),
-                        _ => {}
-                    }
-                }
+                self.flex_children(node, c, st);
             } else {
                 for &ch in self.doc.children(node) {
                     self.walk(ch, st.clone());
@@ -831,12 +980,15 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
         let [_t, mr, _b, ml] = box_sides(c, "margin", size);
         let bg = bg_color(c);
-        let border = c.get("border").and_then(|v| parse_border(v, size));
+        let border = c
+            .get("border")
+            .and_then(|v| parse_border(v, size))
+            .or_else(|| split_border(c, size));
         st.inline_bg = None;
         let bw = border.map(|b| b.0).unwrap_or(0.0);
         let right = c.get("float").is_some_and(|v| v.trim() == "right");
 
-        let inner = if let Some(w) = side(c, "width", size) {
+        let inner = if let Some(w) = side(c, "width", self.avail_w) {
             w.max(1.0)
         } else {
             self.shrink_width(node, &st)
@@ -912,13 +1064,21 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
         let [_t, mr, mb, ml] = box_sides(c, "margin", size);
         let bg = bg_color(c);
-        let border = c.get("border").and_then(|v| parse_border(v, size));
+        let border = c
+            .get("border")
+            .and_then(|v| parse_border(v, size))
+            .or_else(|| split_border(c, size));
         st.inline_bg = None; // the box paints its own bg
         let bw = border.map(|b| b.0).unwrap_or(0.0);
 
-        // width property else shrink-wrap (min-content approx)
-        let inner = if let Some(w) = side(c, "width", size) {
+        // width property else shrink-wrap (min-content approx; flex sums children)
+        let inner = if let Some(w) = side(c, "width", self.avail_w) {
             w.max(1.0)
+        } else if matches!(
+            c.get("display").map(String::as_str),
+            Some("flex") | Some("inline-flex") | Some("inline-grid")
+        ) {
+            self.flex_shrink_width(node, c, &st)
         } else {
             self.shrink_width(node, &st)
         };
@@ -926,8 +1086,8 @@ impl<'a> Layouter<'a> {
         let box_w = (inner + pl + pr + 2.0 * bw).min(room);
         let inner = (box_w - pl - pr - 2.0 * bw).max(1.0);
 
-        let (items, y_end) = self.nest(node, &st, pl + bw, pt + bw, inner);
-        let box_h = side(c, "height", size).unwrap_or(y_end + pb + bw).max(1.0);
+        let (items, y_end) = self.nest(node, &st, pl + bw, pt + bw, inner, c);
+        let box_h = side(c, "height", self.avail_w).unwrap_or(y_end + pb + bw).max(1.0);
 
         let mut out: Vec<DisplayItem> = Vec::new();
         if let Some(col) = bg {
@@ -979,7 +1139,10 @@ impl<'a> Layouter<'a> {
         let size = st.size;
         let [mt, _mr, mb, ml] = box_sides(c, "margin", size);
         let bg = bg_color(c);
-        let border = c.get("border").and_then(|v| parse_border(v, size));
+        let border = c
+            .get("border")
+            .and_then(|v| parse_border(v, size))
+            .or_else(|| split_border(c, size));
         st.inline_bg = None;
         // <table border=N> fallback cell borders (border="0" = none)
         let attr_border = self
@@ -1103,7 +1266,7 @@ impl<'a> Layouter<'a> {
                 let bw = cborder.map(|b| b.0).unwrap_or(0.0);
                 let cbg = cs.get("background-color").and_then(|v| parse_color(v));
                 let inner = (cw - pl - pr - 2.0 * bw).max(1.0);
-                let (items, y_end) = self.nest(cell, &cst, pl + bw, pt + bw, inner);
+                let (items, y_end) = self.nest(cell, &cst, pl + bw, pt + bw, inner, &cs);
                 let min_h = self.eff_line_h(&cst);
                 let cell_h = (y_end + pb + bw).max(min_h);
                 boxes.push((x, cw, cell_h, cbg, cborder, items));
@@ -1146,6 +1309,50 @@ impl<'a> Layouter<'a> {
 
     /// Lay out `node`'s children off-screen into a private item list.
     /// Content box: origin (x0, y0), `avail` wide. Returns (items, bottom y).
+    /// `display:flex` — element children laid as inline-block items on a
+    /// row with `gap` spacing.
+    fn flex_children(&mut self, node: NodeId, c: &HashMap<String, String>, st: Style) {
+        let gap = c
+            .get("gap")
+            .and_then(|v| parse_len(v, st.size))
+            .unwrap_or(0.0);
+        // column direction: children stack as blocks, vertical gap
+        if c.get("flex-direction").map(String::as_str) == Some("column") {
+            let mut first = true;
+            for &ch in self.doc.children(node) {
+                if !matches!(self.doc.kind(ch), NodeKind::Element { .. } | NodeKind::Text(_)) {
+                    continue;
+                }
+                if !first && gap > 0.0 {
+                    self.y += gap;
+                }
+                self.walk(ch, st.clone());
+                first = false;
+            }
+            return;
+        }
+        let mut first = true;
+        for &ch in self.doc.children(node) {
+            match self.doc.kind(ch) {
+                NodeKind::Element { .. } => {
+                    let cc = css::computed(self.doc, ch, &self.sheets);
+                    if cc.get("display").map(String::as_str) == Some("none") {
+                        continue;
+                    }
+                    if !first && gap > 0.0 {
+                        self.spacer(gap);
+                    }
+                    let mut cst = st.clone();
+                    self.apply_computed(&cc, &mut cst);
+                    self.inline_block(ch, &cc, cst);
+                    first = false;
+                }
+                NodeKind::Text(t) => self.text(t, st.clone()),
+                _ => {}
+            }
+        }
+    }
+
     fn nest(
         &mut self,
         node: NodeId,
@@ -1153,6 +1360,7 @@ impl<'a> Layouter<'a> {
         x0: f32,
         y0: f32,
         avail: f32,
+        c: &HashMap<String, String>,
     ) -> (Vec<DisplayItem>, f32) {
         let saved_items = std::mem::take(&mut self.items);
         let saved_line = std::mem::take(&mut self.line);
@@ -1166,8 +1374,12 @@ impl<'a> Layouter<'a> {
         self.align = st.align;
         self.line_x = 0.0;
         self.pending_space = false;
-        for &ch in self.doc.children(node) {
-            self.walk(ch, st.clone());
+        if matches!(c.get("display").map(String::as_str), Some("flex")) {
+            self.flex_children(node, c, st.clone());
+        } else {
+            for &ch in self.doc.children(node) {
+                self.walk(ch, st.clone());
+            }
         }
         self.flush_line();
         let bottom = self.y;
@@ -1199,6 +1411,41 @@ impl<'a> Layouter<'a> {
             w = st.size * 4.0; // default for empty/image-ish content
         }
         w
+    }
+
+    /// Intrinsic width of a flex container: children's widths + gaps + their
+    /// own padding/margins — a max-content approximation.
+    fn flex_shrink_width(&mut self, node: NodeId, c: &HashMap<String, String>, st: &Style) -> f32 {
+        let gap = c
+            .get("gap")
+            .and_then(|v| parse_len(v, st.size))
+            .unwrap_or(0.0);
+        let mut w = 0.0;
+        let mut n = 0usize;
+        for &ch in self.doc.children(node) {
+            if let NodeKind::Text(t) = self.doc.kind(ch) {
+                if let Some(fi) = self.resolve_font(st) {
+                    if let Some(f) = self.fonts.font(fi) {
+                        w += f.measure(&t.split_whitespace().collect::<Vec<_>>().join(" "), st.size);
+                    }
+                }
+                continue;
+            }
+            if !matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
+                continue;
+            }
+            let cc = css::computed(self.doc, ch, &self.sheets);
+            if cc.get("display").map(String::as_str) == Some("none") {
+                continue;
+            }
+            let mut cst = st.clone();
+            self.apply_computed(&cc, &mut cst);
+            let [_t, pr, _b, pl] = box_sides(&cc, "padding", cst.size);
+            let [_t, mr, _b, ml] = box_sides(&cc, "margin", cst.size);
+            w += self.shrink_width(ch, &cst) + pl.max(0.0) + pr.max(0.0) + ml + mr;
+            n += 1;
+        }
+        (w + gap * n.saturating_sub(1) as f32).max(st.size)
     }
 
     /// Effective line height for a style: line-height override else font metric.
@@ -1767,6 +2014,39 @@ mod tests {
         for i in &t {
             if let DisplayItem::Text { x, .. } = i {
                 assert!(*x < 8.0 + 150.0 + 1.0, "word starts inside 150px box, x={x}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod dbg3 {
+    use super::*;
+    #[test]
+    fn dbg_nav() {
+        let css = std::fs::read_to_string("/tmp/coobyk.css").unwrap();
+        let sh = rowser_css::parse(&css);
+        let d = rowser_html::parse(&std::fs::read_to_string("/tmp/coobyk.html").unwrap());
+        let mut tags = std::collections::HashMap::<String, usize>::new();
+        for id in d.descendants(d.root) {
+            if let Some(t) = d.tag(id) {
+                *tags.entry(t.to_string()).or_insert(0) += 1;
+            }
+        }
+        eprintln!("TAGS: {:?}", tags);
+        let sh2 = rowser_css::parse(&css);
+        let mut fonts = FontCache::new();
+        let (items, _) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[sh2]);
+        for it in &items {
+            if let DisplayItem::Text { x, baseline, text, size, .. } = it {
+                if text.contains("Coobyk") || text.contains("I do") {
+                    eprintln!("T {x:.0},{baseline:.0} size={size:.0} {text:?}");
+                }
+            }
+        }
+        for id in d.descendants(d.root) {
+            if d.tag(id) == Some("h1") {
+                eprintln!("H1 computed: {:?}", rowser_css::computed(&d, id, &[&sh]).iter().filter(|(k,_)| k.starts_with("font")||k.starts_with("padding")).collect::<Vec<_>>());
             }
         }
     }

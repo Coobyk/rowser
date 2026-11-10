@@ -354,7 +354,7 @@ fn fetch_bytes(base_url: &str, resource: &str) -> Option<Vec<u8>> {
         return std::fs::read(path).ok();
     }
     if url.starts_with("http") {
-        return rowser_net::fetch(&url).ok().map(|r| r.body);
+        return web_fetch(&url).ok().map(|r| r.body);
     }
     std::fs::read(&url).ok()
 }

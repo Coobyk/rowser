@@ -194,14 +194,42 @@ impl<'a> CssParser<'a> {
         }
     }
 
+    /// Identifier with CSS escapes: `\x` → literal `x`, `\hhhhhh` → codepoint.
     fn ident(&mut self) -> String {
-        let start = self.pos;
-        while self.peek().is_some_and(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_') || c >= 0x80
-        }) {
-            self.pos += 1;
+        let mut out = String::new();
+        while let Some(c) = self.peek() {
+            if c == b'\\' {
+                self.pos += 1;
+                let st = self.pos;
+                while self.pos < self.s.len()
+                    && self.s[self.pos].is_ascii_hexdigit()
+                    && self.pos - st < 6
+                {
+                    self.pos += 1;
+                }
+                if self.pos > st {
+                    if let Ok(n) =
+                        u32::from_str_radix(&String::from_utf8_lossy(&self.s[st..self.pos]), 16)
+                    {
+                        if let Some(ch) = char::from_u32(n) {
+                            out.push(ch);
+                        }
+                    }
+                    if self.peek() == Some(b' ') {
+                        self.pos += 1;
+                    }
+                } else if let Some(lit) = self.peek() {
+                    out.push(lit as char);
+                    self.pos += 1;
+                }
+            } else if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_') || c >= 0x80 {
+                out.push((c as char).to_ascii_lowercase());
+                self.pos += 1;
+            } else {
+                break;
+            }
         }
-        String::from_utf8_lossy(&self.s[start..self.pos]).to_lowercase()
+        out
     }
 
     fn rule(&mut self) -> Option<Rule> {
@@ -544,14 +572,16 @@ pub fn computed(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> HashMap
             for d in &rule.decls {
                 // priority: important > normal; origin weight breaks ties
                 let pri: u8 = if d.important { 2 + origin as u8 } else { origin as u8 };
-                let e = out.entry(d.prop.clone()).or_insert((
-                    d.value.clone(),
-                    0,
-                    (0, 0, 0),
-                    0,
-                ));
-                if (pri, spec, order) >= (e.1, e.2, e.3) {
-                    *e = (d.value.clone(), pri, spec, order);
+                for prop in physical_props(&d.prop) {
+                    let e = out.entry(prop.to_string()).or_insert((
+                        d.value.clone(),
+                        0,
+                        (0, 0, 0),
+                        0,
+                    ));
+                    if (pri, spec, order) >= (e.1, e.2, e.3) {
+                        *e = (d.value.clone(), pri, spec, order);
+                    }
                 }
             }
             order += 1;
@@ -573,6 +603,37 @@ pub fn computed(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> HashMap
         }
     }
     props
+}
+
+/// Logical → physical property expansion (LTR horizontal writing mode).
+fn physical_props(prop: &str) -> Vec<&str> {
+    match prop {
+        "padding-inline" => vec!["padding-left", "padding-right"],
+        "padding-inline-start" => vec!["padding-left"],
+        "padding-inline-end" => vec!["padding-right"],
+        "padding-block" => vec!["padding-top", "padding-bottom"],
+        "padding-block-start" => vec!["padding-top"],
+        "padding-block-end" => vec!["padding-bottom"],
+        "margin-inline" => vec!["margin-left", "margin-right"],
+        "margin-inline-start" => vec!["margin-left"],
+        "margin-inline-end" => vec!["margin-right"],
+        "margin-block" => vec!["margin-top", "margin-bottom"],
+        "margin-block-start" => vec!["margin-top"],
+        "margin-block-end" => vec!["margin-bottom"],
+        "border-inline" => vec!["border-left", "border-right"],
+        "border-block" => vec!["border-top", "border-bottom"],
+        "border-inline-color" => vec!["border-color"],
+        "border-block-color" => vec!["border-color"],
+        "border-inline-width" => vec!["border-width"],
+        "border-block-width" => vec!["border-width"],
+        "inset-inline" => vec!["left", "right"],
+        "inset-block" => vec!["top", "bottom"],
+        "inset-inline-start" => vec!["left"],
+        "inset-inline-end" => vec!["right"],
+        "inset-block-start" => vec!["top"],
+        "inset-block-end" => vec!["bottom"],
+        p => vec![p],
+    }
 }
 
 fn has_custom_decl(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> bool {
@@ -765,4 +826,45 @@ fn supports_matches(q: &str) -> bool {
         }
     }
     ok
+}
+
+#[cfg(test)]
+mod dbg_tests {
+    use super::*;
+    #[test]
+    fn dbg_coobyk() {
+        let css = std::fs::read_to_string("/tmp/coobyk.css").unwrap();
+        let sh = parse(&css);
+        eprintln!("RULES: {}", sh.rules.len());
+        eprintln!("display:flex decls: {}", sh.rules.iter().filter(|r| r.decls.iter().any(|d| d.prop=="display" && d.value.contains("flex"))).count());
+        eprintln!("--spacing decls: {}", sh.rules.iter().filter(|r| r.decls.iter().any(|d| d.prop=="--spacing")).count());
+        eprintln!("gap decls: {}", sh.rules.iter().filter(|r| r.decls.iter().any(|d| d.prop=="gap")).count());
+    }
+}
+
+#[cfg(test)]
+mod dbg2 {
+    use super::*;
+    use rowser_dom::{Node, NodeKind};
+    fn el(d: &mut rowser_dom::Document, p: NodeId, tag: &str, cls: &str) -> NodeId {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("class".to_string(), cls.to_string());
+        d.nodes.push(Node { kind: NodeKind::Element { tag: tag.into(), attrs }, parent: None, children: vec![], sibling_index: 0 });
+        let id = d.nodes.len() - 1;
+        d.append(p, id);
+        id
+    }
+    #[test]
+    fn dbg_vars() {
+        let css = ":root,:host{--spacing:.25rem;--bg:#fff}.x{padding-left:calc(var(--spacing) * 2)}";
+        let sh = parse(css);
+        eprintln!("rules: {}", sh.rules.len());
+        let mut d = rowser_dom::Document::new();
+        let root = d.root;
+        let html = el(&mut d, root, "html", "");
+        let a = el(&mut d, html, "a", "x");
+        let c = computed(&d, a, &[&sh]);
+        eprintln!("computed: {:?}", c);
+        eprintln!("html customs: {:?}", element_customs(&d, html, &[&sh]));
+    }
 }
