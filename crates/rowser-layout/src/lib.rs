@@ -1943,8 +1943,15 @@ impl<'a> Layouter<'a> {
                 }
                 self.y += h.max(line_h);
             }
-            "input" | "textarea" | "select" | "button" => {
-                self.word("[control]", &st);
+            "input" | "textarea" | "select" => {
+                // Childless controls: show their value/placeholder, else a
+                // generic control label.
+                let label = self
+                    .doc
+                    .attr(node, "value")
+                    .or_else(|| self.doc.attr(node, "placeholder"))
+                    .unwrap_or("[control]");
+                self.word(label, &st);
             }
             _ => {
                 for &ch in self.doc.children(node) {
