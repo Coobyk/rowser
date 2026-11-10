@@ -379,7 +379,7 @@ fn dump_node(doc: &rowser_dom::Document, id: rowser_dom::NodeId, d: usize, out: 
         rowser_dom::NodeKind::Text(t) => {
             let t = t.trim();
             if !t.is_empty() {
-                out.push_str(&format!("{pad}\"{}\"\n", &t[..t.len().min(60)]));
+                out.push_str(&format!("{pad}\"{}\"\n", t.chars().take(60).collect::<String>()));
             }
         }
         rowser_dom::NodeKind::Element { tag, attrs } => {
