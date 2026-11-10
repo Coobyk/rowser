@@ -302,11 +302,16 @@ pub fn parse_color(v: &str) -> Option<Color> {
             _ => return None,
         });
     }
-    if let Some(inner) = v.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
+    let rgb_inner = v
+        .strip_prefix("rgb(")
+        .or_else(|| v.strip_prefix("rgba("))
+        .and_then(|s| s.strip_suffix(')'));
+    if let Some(inner) = rgb_inner {
+        // modern `r g b / a` and legacy `r,g,b[,a]`
         let parts: Vec<f32> = inner
-            .split(',')
+            .split(|c: char| c == ',' || c.is_whitespace() || c == '/')
+            .filter(|t| !t.is_empty())
             .filter_map(|p| {
-                let p = p.trim();
                 if let Some(pct) = p.strip_suffix('%') {
                     pct.parse::<f32>().ok().map(|x| x * 2.55)
                 } else {
@@ -315,7 +320,9 @@ pub fn parse_color(v: &str) -> Option<Color> {
             })
             .collect();
         if parts.len() >= 3 {
-            return Some(bgra(parts[0] as u8, parts[1] as u8, parts[2] as u8));
+            let a = parts.get(3).copied().unwrap_or(255.0).clamp(0.0, 255.0);
+            let blend = |c: f32| (c * a + 255.0 * (255.0 - a)) / 255.0;
+            return Some(bgra(blend(parts[0]) as u8, blend(parts[1]) as u8, blend(parts[2]) as u8));
         }
     }
     named_color(&v)
@@ -348,6 +355,44 @@ fn bg_color(c: &HashMap<String, String>) -> Option<Color> {
         }
     }
     None
+}
+
+/// `box-shadow: x y [blur] [spread] [color]` → (dx, dy, color); blur/spread
+/// ignored (flat shadow approximation).
+fn parse_shadow(c: &HashMap<String, String>, size: f32) -> Option<(f32, f32, Color)> {
+    let v = c.get("box-shadow")?;
+    if v.trim() == "none" {
+        return None;
+    }
+    // split on top-level commas (not inside parens) — take first shadow
+    let mut depth = 0i32;
+    let first = v
+        .split(|ch| {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            ch == ',' && depth <= 0
+        })
+        .next()?;
+    let mut nums = Vec::new();
+    let mut color = None;
+    for tok in first.split_whitespace() {
+        if let Some(n) = parse_len(tok, size) {
+            nums.push(n);
+        } else if let Some(col) = parse_color(tok.trim_end_matches(')')) {
+            color = Some(col);
+        } else if tok.starts_with("rgb") || tok.starts_with("#") {
+            color = parse_color(first[first.find(tok).unwrap_or(0)..].trim_end_matches(')'));
+            break;
+        }
+    }
+    if nums.len() >= 2 {
+        Some((nums[0], nums[1], color.unwrap_or(0x33000000)))
+    } else {
+        None
+    }
 }
 
 /// `border-radius` → uniform max radius (px).
@@ -734,6 +779,7 @@ struct BlockPatch {
     bg: Option<Color>,
     border: Option<(f32, Color)>,
     radius: f32,
+    shadow: Option<(f32, f32, Color)>,
 }
 
 pub struct Layouter<'a> {
@@ -1054,8 +1100,9 @@ impl<'a> Layouter<'a> {
         // background/border need the final rect — reserve placeholders.
         // The patch covers the border box (padding included).
         let patch = if bg.is_some() || border.is_some() {
+            let shadow = parse_shadow(c, size);
             let idx = self.items.len();
-            for _ in 0..5 {
+            for _ in 0..6 {
                 self.items.push(DisplayItem::FillRect {
                     x: 0.0,
                     y: 0.0,
@@ -1072,6 +1119,7 @@ impl<'a> Layouter<'a> {
                 bg,
                 border,
                 radius: parse_radius(c, size),
+                shadow,
             })
         } else {
             None
@@ -1213,6 +1261,7 @@ impl<'a> Layouter<'a> {
                 bg,
                 border,
                 radius: parse_radius(c, size),
+                shadow: None,
             })
         } else {
             None
@@ -1421,6 +1470,7 @@ impl<'a> Layouter<'a> {
                 bg,
                 border,
                 radius: parse_radius(c, st.size),
+                shadow: None,
             })
         } else {
             None
@@ -1725,6 +1775,16 @@ impl<'a> Layouter<'a> {
     fn finish_patch(&mut self, p: &BlockPatch) {
         let h = self.y - p.y;
         let mut put = |i: usize, it: DisplayItem| self.items[p.idx + i] = it;
+        if let Some((ox, oy, col)) = p.shadow {
+            put(5, DisplayItem::RoundedRect {
+                x: p.x + ox,
+                y: p.y + oy,
+                w: p.w,
+                h,
+                radius: p.radius,
+                color: col,
+            });
+        }
         if let Some(bg) = p.bg {
             if p.radius > 0.5 {
                 put(0, DisplayItem::RoundedRect { x: p.x, y: p.y, w: p.w, h, radius: p.radius, color: bg });
