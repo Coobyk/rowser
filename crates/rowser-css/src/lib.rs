@@ -243,6 +243,17 @@ impl<'a> CssParser<'a> {
             "layer" => true,
             _ => false,
         };
+        // At-rules we don't unwrap (@font-face, @keyframes, @charset...)
+        // hold declarations/frames, not rules — rule-parsing their block
+        // produces garbage selectors and can consume past the closing
+        // brace, eating the next real rule. Skip by brace depth instead.
+        if !include {
+            if has_block {
+                self.pos -= 1; // hand '{' back to the skip scanner
+                self.skip_at_rule();
+            }
+            return Some(Vec::new());
+        }
         let mut rules = Vec::new();
         if has_block {
             // parse inner rule list until matching '}' (nesting is possible)
@@ -491,15 +502,18 @@ impl<'a> CssParser<'a> {
             }
             parts.push((comb, simples));
             comb = Combinator::None;
+            let ws_before = self.pos;
             self.skip_ws_comments();
+            let trailing_ws = self.pos > ws_before;
             match self.peek() {
                 Some(b'>') => continue,
                 Some(b',') | Some(b'{') | None => break,
                 _ => {
-                    if self.pos > before {
-                        continue; // whitespace → descendant
+                    // whitespace between compounds → descendant combinator
+                    if trailing_ws {
+                        comb = Combinator::Descendant;
                     }
-                    break;
+                    continue;
                 }
             }
         }
@@ -1081,7 +1095,3 @@ mod dbg2 {
         eprintln!("html customs: {:?}", element_customs(&d, html, &[&sh]));
     }
 }
-
-
-
-
