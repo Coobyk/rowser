@@ -72,7 +72,15 @@ struct BrowserView {
     last_viewport: (u32, u32),
     logs: Vec<String>,
     url_text: String,
+    /// Caret position in `url_text`, as a *char* index.
+    url_cursor: usize,
+    /// Selection anchor (char index); `Some(anchor) != url_cursor` means the
+    /// range between anchor and cursor is selected.
+    url_anchor: Option<usize>,
     url_editing: bool,
+    /// Focus the URL bar on the next render — set by `open_tab`, which runs
+    /// without access to a `Window`.
+    url_focus_pending: bool,
     url_focus: FocusHandle,
     inspector: bool,
     dom_dump: String,
@@ -90,7 +98,10 @@ impl BrowserView {
             last_viewport: (1280, 720),
             logs: Vec::new(),
             url_text: "rowser://newtab/0".into(),
+            url_cursor: 0,
+            url_anchor: None,
             url_editing: false,
+            url_focus_pending: false,
             url_focus: cx.focus_handle(),
             inspector: false,
             dom_dump: String::new(),
@@ -166,6 +177,96 @@ impl BrowserView {
 
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+
+        // A new tab puts its whole URL in the bar pre-selected, so typing
+        // immediately replaces it — like Ctrl+L + type in a real browser.
+        // `open_tab` has no `Window`, so the focus itself is deferred to
+        // `render` via `url_focus_pending`.
+        self.url_text = url;
+        self.url_editing = true;
+        self.url_select_all();
+        self.url_focus_pending = true;
+    }
+
+    // --- URL bar text editing -------------------------------------------
+    // Cursor/anchor are char indices into `url_text`, so multi-byte chars
+    // in a URL can't split mid-codepoint.
+
+    fn url_len(&self) -> usize {
+        self.url_text.chars().count()
+    }
+
+    /// Byte offset of char index `i` in `url_text`, clamped to the end.
+    fn url_byte(&self, i: usize) -> usize {
+        self.url_text
+            .char_indices()
+            .nth(i)
+            .map(|(b, _)| b)
+            .unwrap_or(self.url_text.len())
+    }
+
+    /// Selected char range `(start, end)`, end exclusive — `None` when the
+    /// caret is collapsed.
+    fn url_selection(&self) -> Option<(usize, usize)> {
+        let a = self.url_anchor?;
+        if a == self.url_cursor {
+            None
+        } else {
+            Some((a.min(self.url_cursor), a.max(self.url_cursor)))
+        }
+    }
+
+    fn url_select_all(&mut self) {
+        self.url_anchor = Some(0);
+        self.url_cursor = self.url_len();
+    }
+
+    /// Delete the selected range if there is one. Returns whether a
+    /// selection existed.
+    fn url_delete_selection(&mut self) -> bool {
+        let Some((s, e)) = self.url_selection() else {
+            self.url_anchor = None;
+            return false;
+        };
+        self.url_text.drain(self.url_byte(s)..self.url_byte(e));
+        self.url_cursor = s;
+        self.url_anchor = None;
+        true
+    }
+
+    /// Insert text at the caret, replacing any selection.
+    fn url_insert(&mut self, s: &str) {
+        self.url_delete_selection();
+        let b = self.url_byte(self.url_cursor);
+        self.url_text.insert_str(b, s);
+        self.url_cursor += s.chars().count();
+    }
+
+    /// Move the caret by `delta` chars. With shift the selection is
+    /// extended; without, a selection collapses to its near/far edge.
+    fn url_move(&mut self, delta: isize, shift: bool) {
+        let len = self.url_len() as isize;
+        let next = (self.url_cursor as isize + delta).clamp(0, len) as usize;
+        if shift {
+            self.url_anchor.get_or_insert(self.url_cursor);
+            self.url_cursor = next;
+        } else if let Some((s, e)) = self.url_selection() {
+            self.url_cursor = if delta < 0 { s } else { e };
+            self.url_anchor = None;
+        } else {
+            self.url_cursor = next;
+        }
+    }
+
+    /// Jump the caret to `pos` (clamped); shift extends the selection.
+    fn url_jump(&mut self, pos: usize, shift: bool) {
+        let pos = pos.min(self.url_len());
+        if shift {
+            self.url_anchor.get_or_insert(self.url_cursor);
+        } else {
+            self.url_anchor = None;
+        }
+        self.url_cursor = pos;
     }
 
     fn respawn_tab(&mut self, idx: usize) {
@@ -290,6 +391,13 @@ fn reader_loop(id: usize, mut reader: UnixStream, tx: mpsc::Sender<(usize, TabEv
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Deferred URL-bar focus from `open_tab` — it runs without a
+        // `Window`, so the flag is consumed here on the next frame.
+        if self.url_focus_pending {
+            self.url_focus_pending = false;
+            self.url_focus.focus(window);
+        }
+
         // Propagate viewport changes to every live renderer. Frames are
         // painted at *device* pixels (logical size × scale factor) so text
         // isn't bilinearly blurred when GPUI composites the bitmap.
@@ -339,7 +447,12 @@ impl Render for BrowserView {
                 .overflow_hidden()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |view, _e, _w, _cx| {
+                    cx.listener(move |view, _e, window, _cx| {
+                        // Switching tabs leaves URL-bar edit mode so the
+                        // bar reflects the newly active tab.
+                        view.url_editing = false;
+                        view.url_anchor = None;
+                        window.blur();
                         view.active = i;
                     }),
                 )
@@ -384,10 +497,35 @@ impl Render for BrowserView {
 
         // Nav bar
         let active = &self.tabs[self.active];
-        let url = if self.url_editing {
-            format!("{}▍", self.url_text)
+        // URL bar contents: while editing, draw the text in segments so the
+        // selection is highlighted and the caret sits at `url_cursor`.
+        let url_el = if self.url_editing {
+            let len = self.url_len();
+            let cur = self.url_cursor.min(len);
+            let mut row = div().flex().flex_row().items_center();
+            if let Some((s, e)) = self.url_selection() {
+                let (bs, be) = (self.url_byte(s.min(len)), self.url_byte(e.min(len)));
+                row = row.child(self.url_text[..bs].to_string());
+                if cur == s {
+                    row = row.child("▍");
+                }
+                row = row.child(
+                    div()
+                        .bg(rgb(0x2b5fb8))
+                        .text_color(rgb(0xffffff))
+                        .child(self.url_text[bs..be].to_string()),
+                );
+                if cur == e {
+                    row = row.child("▍");
+                }
+                row = row.child(self.url_text[be..].to_string());
+            } else {
+                let bc = self.url_byte(cur);
+                row = row.child(format!("{}▍{}", &self.url_text[..bc], &self.url_text[bc..]));
+            }
+            row.into_any_element()
         } else {
-            active.url.clone()
+            div().child(active.url.clone()).into_any_element()
         };
         let starred = bookmarks().iter().any(|b| *b == active.url);
         let alive = active.alive;
@@ -480,36 +618,83 @@ impl Render for BrowserView {
                             view.url_editing = true;
                             let i = view.active;
                             view.url_text = view.tabs[i].url.clone();
+                            view.url_cursor = view.url_len();
+                            view.url_anchor = None;
                             cx.notify();
                         }),
                     )
                     .on_key_down(cx.listener(|view, e: &KeyDownEvent, window, cx| {
-                        match e.keystroke.key.as_str() {
+                        let ks = &e.keystroke;
+                        let shift = ks.modifiers.shift;
+                        // Ctrl on Linux/Windows, Cmd on macOS.
+                        let accel = ks.modifiers.control || ks.modifiers.platform;
+                        match ks.key.as_str() {
                             "enter" => {
                                 let url = normalize_url(&view.url_text);
                                 view.url_editing = false;
+                                view.url_anchor = None;
                                 window.blur();
                                 let i = view.active;
                                 view.tabs[i].navigate(&url);
                             }
                             "escape" => {
                                 view.url_editing = false;
+                                view.url_anchor = None;
                                 window.blur();
                             }
                             "backspace" => {
-                                view.url_text.pop();
+                                if !view.url_delete_selection() && view.url_cursor > 0 {
+                                    let (s, e) = (
+                                        view.url_byte(view.url_cursor - 1),
+                                        view.url_byte(view.url_cursor),
+                                    );
+                                    view.url_text.drain(s..e);
+                                    view.url_cursor -= 1;
+                                }
+                            }
+                            "delete" => {
+                                if !view.url_delete_selection() && view.url_cursor < view.url_len()
+                                {
+                                    let (s, e) = (
+                                        view.url_byte(view.url_cursor),
+                                        view.url_byte(view.url_cursor + 1),
+                                    );
+                                    view.url_text.drain(s..e);
+                                }
+                            }
+                            "left" => view.url_move(-1, shift),
+                            "right" => view.url_move(1, shift),
+                            "home" => view.url_jump(0, shift),
+                            "end" => view.url_jump(usize::MAX, shift),
+                            "a" if accel => view.url_select_all(),
+                            "c" | "x" if accel => {
+                                if let Some((s, e)) = view.url_selection() {
+                                    let text = view.url_text[view.url_byte(s)..view.url_byte(e)]
+                                        .to_string();
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                    if ks.key == "x" {
+                                        view.url_delete_selection();
+                                    }
+                                }
+                            }
+                            "v" if accel => {
+                                if let Some(text) =
+                                    cx.read_from_clipboard().and_then(|item| item.text())
+                                {
+                                    view.url_insert(&text);
+                                }
                             }
                             _ => {
-                                if let Some(c) = &e.keystroke.key_char {
-                                    if !e.keystroke.modifiers.control {
-                                        view.url_text.push_str(c);
+                                if let Some(c) = &ks.key_char {
+                                    if !ks.modifiers.control && !ks.modifiers.platform {
+                                        view.url_insert(c);
                                     }
                                 }
                             }
                         }
                         cx.notify();
                     }))
-                    .child(url),
+                    .child(url_el),
             )
             .child(
                 div()
@@ -586,6 +771,10 @@ impl Render for BrowserView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|view, e: &MouseDownEvent, window, cx| {
+                        // Clicking the page leaves URL-bar edit mode.
+                        view.url_editing = false;
+                        view.url_anchor = None;
+                        window.blur();
                         let p = e.position;
                         // webview starts below the 72px chrome; document space
                         // is device px (logical × scale factor)
