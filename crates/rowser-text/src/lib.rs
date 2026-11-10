@@ -826,31 +826,57 @@ impl FontCache {
         }
     }
 
-    /// Resolve (family, bold, italic) → index of the loaded font, if found.
+    /// Resolve `family` (a CSS comma-separated list) to a font index. Each
+    /// candidate substring-matches face families; generic keywords expand to
+    /// preferred concrete families.
     pub fn resolve(&mut self, family: &str, bold: bool, italic: bool) -> Option<usize> {
-        let want = family.to_lowercase();
-        let mut best: Option<(usize, u32)> = None;
-        for (i, f) in self.faces.iter().enumerate() {
-            if !f.family.to_lowercase().contains(&want) {
-                continue;
+        let generics = |g: &str| -> &[&str] {
+            match g {
+                "monospace" | "ui-monospace" | "mono" => {
+                    &["geist mono", "jetbrains", "noto sans mono", "dejavu sans mono", "mono"]
+                }
+                "sans-serif" | "sans" | "system-ui" => {
+                    &["liberation sans", "noto sans", "dejavu sans", "geist"]
+                }
+                "serif" | "ui-serif" => &["liberation serif", "noto serif", "dejavu serif"],
+                "cursive" | "fantasy" => &["comic", "liberation sans"],
+                _ => &[],
             }
-            let mut score = 1u32;
-            if f.bold == bold {
-                score += 4;
-            }
-            if f.italic == italic {
-                score += 2;
-            }
-            if best.is_none_or(|(_, s)| score > s) {
-                best = Some((i, score));
+        };
+        for cand in family.split(',') {
+            let want = cand.trim().to_lowercase();
+            let wants: Vec<String> = {
+                let g = generics(want.as_str());
+                if g.is_empty() { vec![want] } else { g.iter().map(|s| s.to_string()).collect() }
+            };
+            for want in wants {
+                let mut best: Option<(usize, u32)> = None;
+                for (i, f) in self.faces.iter().enumerate() {
+                    if !f.family.to_lowercase().contains(&want) {
+                        continue;
+                    }
+                    let mut score = 1u32;
+                    if f.bold == bold {
+                        score += 4;
+                    }
+                    if f.italic == italic {
+                        score += 2;
+                    }
+                    if best.is_none_or(|(_, s)| score > s) {
+                        best = Some((i, score));
+                    }
+                }
+                if let Some((idx, _)) = best {
+                    if !self.fonts.contains_key(&idx) {
+                        if let Some(font) = Font::load(&self.faces[idx].path) {
+                            self.fonts.insert(idx, font);
+                        }
+                    }
+                    return Some(idx);
+                }
             }
         }
-        let idx = best?.0;
-        if !self.fonts.contains_key(&idx) {
-            let font = Font::load(&self.faces[idx].path)?;
-            self.fonts.insert(idx, font);
-        }
-        Some(idx)
+        None
     }
 
     pub fn font(&mut self, idx: usize) -> Option<&mut Font> {
