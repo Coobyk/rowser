@@ -688,6 +688,8 @@ pub struct Layouter<'a> {
     list_stack: Vec<(bool, usize)>,
     /// active floats; inset following lines until `y` passes `bottom`
     floats: Vec<Float>,
+    /// current scroll offset — `position:fixed` anchors to the viewport
+    scroll: f32,
 }
 
 impl<'a> Layouter<'a> {
@@ -718,6 +720,7 @@ impl<'a> Layouter<'a> {
             pending_space: false,
             list_stack: Vec::new(),
             floats: Vec::new(),
+            scroll,
         };
         l.walk(doc.root, base_style());
         l.flush_line();
@@ -851,6 +854,35 @@ impl<'a> Layouter<'a> {
         if tag == "table" {
             return self.table(node, c, st);
         }
+        // positioned boxes: fixed/sticky anchor to the viewport top, absolute
+        // and fixed take `left` against the containing width (approximation —
+        // flow space is still reserved, no z-order yet)
+        // positioned boxes leave no flow space: remember the flow y and
+        // restore it after the children are laid (block-end restore below)
+        let positioned = matches!(
+            c.get("position").map(String::as_str),
+            Some("fixed") | Some("sticky") | Some("absolute")
+        );
+        let flow_y = if positioned {
+            let fy = self.y;
+            let fmx = self.margin_x;
+            let pos = c.get("position").map(String::as_str);
+            if let Some(t) = c.get("top").and_then(|v| parse_len(v, st.size)) {
+                // y is viewport-mapped (scroll already baked in): fixed pins
+                // to `top`, sticky clamps at `top` once scrolled past
+                self.y = match pos {
+                    Some("absolute") => fy + t,
+                    Some("sticky") => self.y.max(t),
+                    _ => t,
+                };
+            }
+            if let Some(l) = c.get("left").and_then(|v| parse_len(v, self.avail_w)) {
+                self.margin_x = l.max(0.0);
+            }
+            Some((fy, fmx))
+        } else {
+            None
+        };
         let size = st.size;
         let [mt, mr, mb, ml] = box_sides(c, "margin", size);
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
@@ -974,6 +1006,11 @@ impl<'a> Layouter<'a> {
         self.margin_x = saved_mx;
         self.avail_w = saved_avail;
         self.align = saved_align;
+        // positioned elements reserve no flow space
+        if let Some((fy, fmx)) = flow_y {
+            self.y = fy;
+            self.margin_x = fmx;
+        }
         self.y += mb.max(0.0);
         if tag == "ul" || tag == "ol" || tag == "menu" || tag == "dir" {
             self.list_stack.pop();
