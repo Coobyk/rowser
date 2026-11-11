@@ -2,7 +2,7 @@
 //! gzip content-decoding included. TLS for `https://` lands in a sibling
 //! crate; `fetch` is the seam where it will plug in.
 
-use std::io::{self, Write};
+use std::io;
 use std::net::TcpStream;
 use std::time::Duration;
 
