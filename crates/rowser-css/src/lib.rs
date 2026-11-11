@@ -1661,13 +1661,265 @@ fn each_physical(prop: &str, mut f: impl FnMut(&str)) {
     }
 }
 
+/// Whitespace-separated tokens of a value, keeping `fn(...)` groups whole.
+/// A top-level `/` is emitted as its own token (the `background`
+/// shorthand's position/size separator).
+fn ws_tokens(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut st = 0usize;
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'/' if depth <= 0 => {
+                if st < i {
+                    out.push(&s[st..i]);
+                }
+                out.push(&s[i..i + 1]);
+                i += 1;
+                st = i;
+                continue;
+            }
+            c if (c as char).is_whitespace() && depth <= 0 => {
+                if st < i {
+                    out.push(&s[st..i]);
+                }
+                i += 1;
+                st = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if st < s.len() {
+        out.push(&s[st..]);
+    }
+    out
+}
+
+/// Does `t` look like a <length> or <percentage> (for shorthand token
+/// classification — units aren't validated beyond a numeric prefix)?
+fn is_len_or_pct(t: &str) -> bool {
+    let t = t.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return false;
+    }
+    if let Some(p) = t.strip_suffix('%') {
+        return p.trim().parse::<f32>().is_ok();
+    }
+    if ["calc(", "min(", "max(", "clamp(", "var("]
+        .iter()
+        .any(|p| t.starts_with(p))
+    {
+        return true;
+    }
+    for suf in [
+        "px", "em", "rem", "vw", "vh", "svw", "svh", "dvw", "dvh", "lvw", "lvh", "pt",
+        "pc", "in", "cm", "mm", "q", "ex", "ch", "lh", "rlh", "vmin", "vmax",
+    ] {
+        if let Some(p) = t.strip_suffix(suf) {
+            if p.parse::<f32>().is_ok() {
+                return true;
+            }
+        }
+    }
+    t.parse::<f32>().is_ok()
+}
+
+/// `background` shorthand → full longhand expansion (css-backgrounds-3
+/// §3.10). Each emitted longhand becomes a normalized comma list aligned
+/// to the layer count: a component a layer omits takes that longhand's
+/// initial value, and the shorthand resets every longhand (including a
+/// `background-color` of `transparent` when the shorthand has none).
+fn expand_background(value: &str, f: &mut impl FnMut(&str, &str)) {
+    #[derive(Default)]
+    struct BgLayer<'a> {
+        image: Option<&'a str>,
+        pos: Vec<&'a str>,
+        size: Vec<&'a str>,
+        rep: Vec<&'a str>,
+        att: Vec<&'a str>,
+        boxes: Vec<&'a str>,
+        color: Option<&'a str>,
+    }
+    let mut layers: Vec<BgLayer> = Vec::new();
+    for lay in split_top(value, ",") {
+        let mut l = BgLayer::default();
+        // after a `/`, the next <bg-size> tokens (max 2: auto, cover,
+        // contain, <length-percentage>) belong to background-size; the
+        // first non-size token ends size mode and classifies normally
+        let mut in_size = false;
+        for tok in ws_tokens(lay) {
+            if tok == "/" {
+                in_size = true;
+                continue;
+            }
+            let tl = tok.to_ascii_lowercase();
+            if in_size {
+                let is_sz = matches!(tl.as_str(), "auto" | "cover" | "contain")
+                    || is_len_or_pct(&tl);
+                if is_sz && l.size.len() < 2 {
+                    l.size.push(tok);
+                    continue;
+                }
+                in_size = false;
+            }
+            if tl.starts_with("url(")
+                || tl == "none"
+                || tl.contains("gradient(")
+                || tl.starts_with("image-set(")
+                || tl.starts_with("-webkit-image-set(")
+                || tl.starts_with("cross-fade(")
+                || tl.starts_with("element(")
+            {
+                l.image = Some(tok);
+            } else if matches!(
+                tl.as_str(),
+                "repeat" | "repeat-x" | "repeat-y" | "no-repeat" | "space" | "round"
+            ) {
+                l.rep.push(tok);
+            } else if matches!(tl.as_str(), "fixed" | "scroll" | "local") {
+                l.att.push(tok);
+            } else if matches!(
+                tl.as_str(),
+                "border-box" | "padding-box" | "content-box" | "text"
+            ) {
+                l.boxes.push(tok);
+            } else if matches!(tl.as_str(), "left" | "right" | "top" | "bottom" | "center")
+                || is_len_or_pct(&tl)
+            {
+                l.pos.push(tok);
+            } else {
+                l.color = Some(tok);
+            }
+        }
+        layers.push(l);
+    }
+    if layers.is_empty() {
+        return;
+    }
+    // The shorthand prop itself stays for readers that scan the raw value.
+    f("background", value);
+    let mut images = Vec::new();
+    let mut poss = Vec::new();
+    let mut poss_x = Vec::new();
+    let mut poss_y = Vec::new();
+    let mut sizes = Vec::new();
+    let mut reps = Vec::new();
+    let mut origins = Vec::new();
+    let mut clips = Vec::new();
+    let mut atts = Vec::new();
+    let mut color: Option<&str> = None;
+    for l in &layers {
+        images.push(l.image.unwrap_or("none").to_string());
+        poss.push(if l.pos.is_empty() {
+            "0% 0%".to_string()
+        } else {
+            l.pos.join(" ")
+        });
+        // split the layer's position tokens into per-axis values for the
+        // -x/-y longhands: an edge keyword binds a following length
+        let (mut xs, mut ys): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < l.pos.len() {
+            let tl = l.pos[i].to_ascii_lowercase();
+            match tl.as_str() {
+                "left" | "right" => {
+                    xs.push(l.pos[i]);
+                    if let Some(t2) = l.pos.get(i + 1) {
+                        if is_len_or_pct(t2) {
+                            xs.push(t2);
+                            i += 1;
+                        }
+                    }
+                }
+                "top" | "bottom" => {
+                    ys.push(l.pos[i]);
+                    if let Some(t2) = l.pos.get(i + 1) {
+                        if is_len_or_pct(t2) {
+                            ys.push(t2);
+                            i += 1;
+                        }
+                    }
+                }
+                _ => {
+                    if xs.is_empty() {
+                        xs.push(l.pos[i]);
+                    } else {
+                        ys.push(l.pos[i]);
+                    }
+                }
+            }
+            i += 1;
+        }
+        poss_x.push(if xs.is_empty() {
+            "0%".to_string()
+        } else {
+            xs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" ")
+        });
+        poss_y.push(if ys.is_empty() {
+            "center".to_string()
+        } else {
+            ys.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" ")
+        });
+        sizes.push(if l.size.is_empty() {
+            "auto".to_string()
+        } else {
+            l.size.join(" ")
+        });
+        reps.push(if l.rep.is_empty() {
+            "repeat".to_string()
+        } else {
+            l.rep.join(" ")
+        });
+        atts.push(if l.att.is_empty() {
+            "scroll".to_string()
+        } else {
+            l.att.join(" ")
+        });
+        origins.push(
+            l.boxes
+                .first()
+                .copied()
+                .unwrap_or("padding-box")
+                .to_string(),
+        );
+        clips.push(
+            l.boxes
+                .get(1)
+                .copied()
+                .unwrap_or("border-box")
+                .to_string(),
+        );
+        color = l.color.or(color);
+    }
+    f("background-image", &images.join(", "));
+    f("background-position", &poss.join(", "));
+    f("background-position-x", &poss_x.join(", "));
+    f("background-position-y", &poss_y.join(", "));
+    f("background-size", &sizes.join(", "));
+    f("background-repeat", &reps.join(", "));
+    f("background-origin", &origins.join(", "));
+    f("background-clip", &clips.join(", "));
+    f("background-attachment", &atts.join(", "));
+    f("background-color", color.unwrap_or("transparent"));
+}
+
 /// Expands a declaration into the physical longhands the engine reads, per
 /// the cascade: a rule's `margin:0` must beat a *less specific* rule's
 /// `margin-left:1.6em` — only per-side expansion makes that possible.
 /// `each_physical` maps 1:1 logical → physical; box shorthands
 /// (`margin`/`padding`/`inset`) additionally split their value across the
 /// four sides (the shorthand prop itself is also kept for direct readers).
-fn each_decl<'v>(prop: &str, value: &'v str, mut f: impl FnMut(&str, &'v str)) {
+fn each_decl(prop: &str, value: &str, mut f: impl FnMut(&str, &str)) {
+    if prop == "background" {
+        expand_background(value, &mut f);
+        return;
+    }
     let sides = match prop {
         "margin" => Some(("margin-top", "margin-right", "margin-bottom", "margin-left")),
         "padding" => Some(("padding-top", "padding-right", "padding-bottom", "padding-left")),
@@ -2153,6 +2405,10 @@ fn supports_leaf(inner: &str) -> bool {
         "column-gap", "place-items", "place-content", "place-self", "align-items",
         "justify-items", "align-content", "justify-content", "align-self",
         "justify-self", "aspect-ratio",
+        "object-fit", "object-position", "background-image", "background-position",
+        "background-position-x", "background-position-y", "background-size",
+        "background-repeat", "background-origin", "background-clip",
+        "background-attachment",
     ];
     match inner.trim().split_once(':') {
         Some((prop, _)) => {
@@ -2489,5 +2745,37 @@ mod sel4 {
         let p = doc.find_deep(doc.root, "p").unwrap();
         let c = computed(&doc, p, &[&sh]);
         eprintln!("  p computed props: {}", c.len());
+    }
+
+    #[test]
+    fn background_shorthand_expands_longhands() {
+        let doc = rowser_html::parse("<body><p id=a></p></body>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let sh = parse(
+            "p{background:url(a.png) center/cover no-repeat fixed #123456, url(b.png) repeat-x}",
+        );
+        let c = computed(&doc, p, &[&sh]);
+        assert_eq!(c.get("background-image").unwrap(), "url(a.png), url(b.png)");
+        assert_eq!(c.get("background-color").unwrap(), "#123456");
+        assert_eq!(c.get("background-size").unwrap(), "cover, auto");
+        assert_eq!(c.get("background-repeat").unwrap(), "no-repeat, repeat-x");
+        assert_eq!(c.get("background-position").unwrap(), "center, 0% 0%");
+        assert_eq!(c.get("background-attachment").unwrap(), "fixed, scroll");
+        assert_eq!(c.get("background-origin").unwrap(), "padding-box, padding-box");
+        assert_eq!(c.get("background-clip").unwrap(), "border-box, border-box");
+    }
+
+    #[test]
+    fn background_shorthand_boxes_and_reset() {
+        let doc = rowser_html::parse("<body><p id=a></p></body>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let sh = parse("p{background:url(x) content-box border-box round, url(y) local}");
+        let c = computed(&doc, p, &[&sh]);
+        assert_eq!(c.get("background-origin").unwrap(), "content-box, padding-box");
+        assert_eq!(c.get("background-clip").unwrap(), "border-box, border-box");
+        assert_eq!(c.get("background-repeat").unwrap(), "round, repeat");
+        assert_eq!(c.get("background-attachment").unwrap(), "scroll, local");
+        // shorthand without a color resets background-color
+        assert_eq!(c.get("background-color").unwrap(), "transparent");
     }
 }
