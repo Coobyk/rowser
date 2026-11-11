@@ -8,7 +8,10 @@
 //! pseudo-classes (`:nth-*`, `:first/last/only-*`, `:empty`, `:checked`,
 //! `:disabled`, `:enabled`), functional `:is`/`:where`/`:not`/`:has`, `:root`,
 //! `:host`, `&` (nesting ref — matches any element). Dynamic-state pseudos
-//! (`:hover` etc.) and `::pseudo-elements` parse as valid but never match.
+//! (`:hover` etc.) parse as valid but never match; `::before`/`::after`/
+//! `::marker`/`::first-letter`/`::first-line`/`::selection`/`::placeholder`
+//! parse to [`Simple::PseudoElem`] and style generated boxes via
+//! [`StyleCtx::computed_pseudo`]. Other `::pseudo-elements` never match.
 //!
 //! The cascade: user-agent sheet < author sheets, then !important author >
 //! !important UA; ties broken by specificity then source order.
@@ -17,6 +20,7 @@ use rowser_dom::{Document, NodeId};
 use rustc_hash::FxHashMap;
 
 pub mod cascade;
+mod pseudo;
 
 /// Property maps keyed by CSS property name — Fx-hashed (string keys are
 /// small and lookups/inserts dominate the cascade).
@@ -118,8 +122,24 @@ pub enum Simple {
     /// Valid-but-never-matching: dynamic-state pseudos (`:hover`, `:focus`,
     /// ...) and `::pseudo-elements` we don't generate boxes for.
     Never,
+    /// `::pseudo-element` in the rightmost compound — never matches a real
+    /// element; [`StyleCtx::computed_pseudo`] finds the rules styling an
+    /// element's generated box.
+    PseudoElem(PseudoElem),
     /// Unsupported pseudo — selector fails quietly.
     Unsupported,
+}
+
+/// Pseudo-elements that generate/style boxes in layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoElem {
+    Before,
+    After,
+    Marker,
+    FirstLetter,
+    FirstLine,
+    Selection,
+    Placeholder,
 }
 
 pub struct StyleSheet {
@@ -824,8 +844,9 @@ impl<'a> CssParser<'a> {
         let _ = self.bump();
     }
 
-    /// `:ident` / `::ident` pseudo. Double-colon (any pseudo-element) and
-    /// unknown/dynamic-state pseudos parse as [`Simple::Never`].
+    /// `:ident` / `::ident` pseudo. Known `::pseudo-elements` parse as
+    /// [`Simple::PseudoElem`]; unknown/dynamic-state pseudos as
+    /// [`Simple::Never`].
     fn pseudo_sel(&mut self) -> Option<Simple> {
         self.pos += 1; // ':'
         let dbl = if self.peek() == Some(b':') {
@@ -839,12 +860,28 @@ impl<'a> CssParser<'a> {
             return None;
         }
         let sm = if dbl {
-            // ::before, ::backdrop, ::-webkit-*, ::part(x)... valid but we
-            // generate no pseudo boxes — never matches.
-            self.skip_paren_arg();
-            Simple::Never
+            match name.as_str() {
+                "before" => Simple::PseudoElem(PseudoElem::Before),
+                "after" => Simple::PseudoElem(PseudoElem::After),
+                "marker" => Simple::PseudoElem(PseudoElem::Marker),
+                "first-letter" => Simple::PseudoElem(PseudoElem::FirstLetter),
+                "first-line" => Simple::PseudoElem(PseudoElem::FirstLine),
+                "selection" => Simple::PseudoElem(PseudoElem::Selection),
+                "placeholder" => Simple::PseudoElem(PseudoElem::Placeholder),
+                // ::backdrop, ::-webkit-*, ::part(x)... valid but we
+                // generate no pseudo boxes — never matches.
+                _ => {
+                    self.skip_paren_arg();
+                    Simple::Never
+                }
+            }
         } else {
             match name.as_str() {
+                // CSS2 allowed single-colon spellings for these four
+                "before" => Simple::PseudoElem(PseudoElem::Before),
+                "after" => Simple::PseudoElem(PseudoElem::After),
+                "first-letter" => Simple::PseudoElem(PseudoElem::FirstLetter),
+                "first-line" => Simple::PseudoElem(PseudoElem::FirstLine),
                 "first-child" => Simple::FirstChild,
                 "last-child" => Simple::LastChild,
                 "root" | "host" => {
@@ -1097,7 +1134,7 @@ fn specificity(sel: &Selector) -> (u32, u32, u32) {
                 | Simple::Root
                 | Simple::Never
                 | Simple::Unsupported => cls += 1,
-                Simple::Tag(_) => tag += 1,
+                Simple::Tag(_) | Simple::PseudoElem(_) => tag += 1,
                 Simple::Is(l) | Simple::Not(l) | Simple::Has(l) => {
                     if let Some((i, c, t)) = l.iter().map(specificity).max() {
                         id += i;
@@ -1261,7 +1298,7 @@ fn simple_matches(doc: &Document, node: NodeId, s: &Simple) -> bool {
         Simple::Is(l) | Simple::Where(l) => l.iter().any(|s| matches(doc, node, s)),
         Simple::Not(l) => !l.iter().any(|s| matches(doc, node, s)),
         Simple::Has(l) => l.iter().any(|rel| has_match(doc, node, rel)),
-        Simple::Never | Simple::Unsupported => false,
+        Simple::Never | Simple::Unsupported | Simple::PseudoElem(_) => false,
     }
 }
 
@@ -1885,6 +1922,24 @@ fn each_decl(prop: &str, value: &str, mut f: impl FnMut(&str, &str)) {
 
 /// Physical-property expansion shared by `each_decl` — see its docs.
 fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
+    if prop == "list-style" {
+        // `list-style: <type> <position> <image>` in any order — split into
+        // the longhands layout reads (quoted strings can hold spaces;
+        // `none` covers both type and image).
+        f(prop, value);
+        for t in cascade::split_ws_parens(value) {
+            match t {
+                "inside" | "outside" => f("list-style-position", t),
+                "none" => {
+                    f("list-style-type", "none");
+                    f("list-style-image", "none");
+                }
+                _ if t.starts_with("url(") => f("list-style-image", t),
+                _ => f("list-style-type", t),
+            }
+        }
+        return;
+    }
     let sides = match prop {
         "margin" => Some(("margin-top", "margin-right", "margin-bottom", "margin-left")),
         "padding" => Some((

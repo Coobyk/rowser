@@ -729,6 +729,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Pop until any of `tags` is popped (inclusive), but only when one is
+    /// open above every `stop` boundary — mirrors the spec's scoped close:
+    /// a `<li>` inside a nested list must not close an outer `<li>` (the
+    /// `ul`/`ol` between them shields it).
+    fn close_in_scope(&mut self, tags: &[&str], stops: &[&str]) {
+        for i in (0..self.stack.len()).rev() {
+            let t = self.doc.tag(self.stack[i]).unwrap_or("");
+            if tags.contains(&t) {
+                self.stack.truncate(i);
+                return;
+            }
+            if stops.contains(&t) {
+                return;
+            }
+        }
+    }
+
     /// Close <p> if one is open within button scope (approximated by the stack).
     fn close_p(&mut self) {
         if self.in_stack("p") {
@@ -941,17 +958,16 @@ impl<'a> Parser<'a> {
                         None
                     }
                     "li" => {
-                        self.close("li");
+                        // <li> closes a previous <li> only within the same
+                        // list — a nested ul/ol shields the outer item
+                        self.close_in_scope(&["li"], &["ul", "ol", "menu", "dir"]);
                         self.close_p();
                         self.push_element(&name, attrs);
                         None
                     }
                     "dd" | "dt" => {
-                        if self.in_stack("dd") {
-                            self.close("dd");
-                        } else {
-                            self.close("dt");
-                        }
+                        // same scoping for definition-list items
+                        self.close_in_scope(&["dd", "dt"], &["dl", "ul", "ol", "menu", "dir"]);
                         self.close_p();
                         self.push_element(&name, attrs);
                         None

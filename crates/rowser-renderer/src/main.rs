@@ -428,6 +428,9 @@ struct Page {
     sel: Vec<(f32, f32, f32, f32)>,
     /// Text covered by `sel`, for Ctrl+C. Kept in sync by `update_sel`.
     sel_text: String,
+    /// `::selection` background tint (r,g,b) resolved from the document's
+    /// stylesheets — lazily computed on the first apply_sel.
+    sel_tint: Option<(u32, u32, u32)>,
 }
 
 impl Page {
@@ -458,6 +461,7 @@ impl Page {
             img_waited: false,
             sel: Vec::new(),
             sel_text: String::new(),
+            sel_tint: None,
         }
     }
 
@@ -475,6 +479,7 @@ impl Page {
         self.items_scroll = 0.0;
         self.sel.clear();
         self.sel_text.clear();
+        self.sel_tint = None;
         self.images.clear();
         self.img_failed.clear();
         self.img_waited = false;
@@ -972,10 +977,19 @@ impl Page {
         if self.sel.is_empty() {
             return;
         }
+        // ::selection background-color (html/body ::selection rules) —
+        // falls back to the default blue when no rule declares one
+        if self.sel_tint.is_none() {
+            if let Some(doc) = &self.doc {
+                self.sel_tint = Some(
+                    Layouter::selection_tint(doc, &self.sheets, self.viewport.0 as f32)
+                        .map(|c| ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff))
+                        .unwrap_or((0x36, 0x6c, 0xd4)),
+                );
+            }
+        }
         const A: u32 = 110; // ~43% — readable through, clearly marked
-        const R: u32 = 0x36;
-        const G: u32 = 0x6c;
-        const B: u32 = 0xd4;
+        let (tr, tg, tb) = self.sel_tint.unwrap_or((0x36, 0x6c, 0xd4));
         let (w, h) = (self.viewport.0 as i32, self.viewport.1 as i32);
         for &(x, y, sw, sh) in &self.sel {
             let x0 = (x as i32).clamp(0, w);
@@ -986,9 +1000,9 @@ impl Page {
                 let row = (yy * w + x0) as usize * 4;
                 for i in (row..row + ((x1 - x0) as usize) * 4).step_by(4) {
                     let p = &mut self.pixels[i..i + 3];
-                    p[0] = ((B * A + p[0] as u32 * (255 - A)) / 255) as u8;
-                    p[1] = ((G * A + p[1] as u32 * (255 - A)) / 255) as u8;
-                    p[2] = ((R * A + p[2] as u32 * (255 - A)) / 255) as u8;
+                    p[0] = ((tb * A + p[0] as u32 * (255 - A)) / 255) as u8;
+                    p[1] = ((tg * A + p[1] as u32 * (255 - A)) / 255) as u8;
+                    p[2] = ((tr * A + p[2] as u32 * (255 - A)) / 255) as u8;
                 }
             }
         }

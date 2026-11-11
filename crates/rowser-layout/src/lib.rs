@@ -18,6 +18,7 @@ mod flexbox;
 mod multicol;
 mod stacking;
 
+mod generated;
 pub mod svg;
 
 use borderfx::{Borders, BoxShadow, Outline, RadiusSpec};
@@ -309,6 +310,9 @@ h5{font-size:.83em;font-weight:bold;margin-top:1.67em;margin-bottom:1.67em}
 h6{font-size:.67em;font-weight:bold;margin-top:2.33em;margin-bottom:2.33em}
 ul,ol,menu,dir{margin-top:1em;margin-bottom:1em;padding-left:40px}
 dd{padding-left:40px}
+li{display:list-item}
+q::before{content:open-quote}
+q::after{content:close-quote}
 blockquote{margin-top:1em;margin-bottom:1em;padding-left:40px;padding-right:40px}
 pre,listing{font-family:monospace;white-space:pre;margin-top:1em;margin-bottom:1em}
 b,strong{font-weight:bold}
@@ -2504,7 +2508,8 @@ pub struct Layouter<'a> {
     line: Vec<Word>,
     line_x: f32,
     pending_space: bool,
-    list_stack: Vec<(bool, bool, usize)>,
+    /// open ul/ol/menu/dir contexts — drives ::marker type + numbering
+    list_stack: Vec<generated::ListCtx>,
     /// active floats; inset following lines until `y` passes `bottom`
     floats: Vec<Float>,
     /// current scroll offset — `position:fixed` anchors to the viewport
@@ -2553,6 +2558,14 @@ pub struct Layouter<'a> {
     subgrid_cols: FxHashMap<NodeId, String>,
     /// same for `grid-template-rows:subgrid` (explicit row floors only)
     subgrid_rows: FxHashMap<NodeId, String>,
+    /// CSS counters — counter-reset scopes enter/leave with elements
+    counters: generated::Counters,
+    /// ::first-line style for the current block's not-yet-emitted first line
+    fl_style: Option<Style>,
+    /// ::first-letter style pending for the next text word
+    flet: Option<Style>,
+    /// open-quote nesting depth for `content:*-quote`
+    quote_depth: i32,
 }
 
 impl<'a> Layouter<'a> {
@@ -2613,6 +2626,10 @@ impl<'a> Layouter<'a> {
             cur_xf: None,
             subgrid_cols: FxHashMap::default(),
             subgrid_rows: FxHashMap::default(),
+            counters: generated::Counters::new(),
+            fl_style: None,
+            flet: None,
+            quote_depth: 0,
         };
         l.preresolve_styles();
         // css-backgrounds §2.11: the canvas takes the root element's
@@ -2985,6 +3002,13 @@ impl<'a> Layouter<'a> {
                 } else {
                     None
                 };
+                // CSS counters: resets open a scope popped when the
+                // element's subtree ends (display:none — no box, no effect)
+                let counter_scope = if visually_hidden || disp == Some("none") {
+                    Vec::new()
+                } else {
+                    self.counters.enter(&c)
+                };
                 match disp {
                     _ if visually_hidden => return,
                     Some("none") => return,
@@ -3090,6 +3114,7 @@ impl<'a> Layouter<'a> {
                 if !fx.is_empty() {
                     colorfx::wrap_vec(&mut self.items, i0, fx);
                 }
+                self.counters.leave(counter_scope);
             }
         }
     }
@@ -3350,34 +3375,15 @@ impl<'a> Layouter<'a> {
             }
         }
 
-        // `list-style[-type]:none` on the list or the item hides markers
-        let hide_marker = c.get("list-style-type").is_some_and(|v| v.trim() == "none")
-            || c.get("list-style").is_some_and(|v| v.contains("none"));
+        // ul/ol/menu/dir open a ::marker numbering/type context
         match tag {
-            "ul" | "menu" | "dir" => self.list_stack.push((hide_marker, false, 0)),
-            "ol" => self.list_stack.push((hide_marker, true, 0)),
+            "ul" | "menu" | "dir" => self.push_list_ctx(node, c, false),
+            "ol" => self.push_list_ctx(node, c, true),
             _ => {}
         }
-        // <ol>/<ul> counter only ticks on <li>
-        let marker = if (tag == "li" || c.get("display").map(String::as_str) == Some("list-item"))
-            && !hide_marker
-        {
-            let (hide, ordered, num) = match self.list_stack.last_mut() {
-                Some((h, o, n)) => {
-                    *n += 1;
-                    (*h, *o, *n)
-                }
-                None => (false, false, 1),
-            };
-            if hide {
-                None
-            } else {
-                Some(if ordered {
-                    format!("{num}. ")
-                } else {
-                    "•  ".to_string()
-                })
-            }
+        // display:list-item boxes carry a ::marker
+        let marker = if c.get("display").map(String::as_str) == Some("list-item") {
+            self.make_marker(node, c, &st)
         } else {
             None
         };
@@ -3419,6 +3425,7 @@ impl<'a> Layouter<'a> {
             }
         }
         self.margin_x += ml.max(0.0) + pl + bw_l;
+        let content_mx = self.margin_x; // outside-::marker anchor
         self.avail_w = inner_w;
         self.align = st.align;
 
@@ -3537,8 +3544,40 @@ impl<'a> Layouter<'a> {
             });
             self.y += st.size * 0.4 + 6.0;
         } else {
-            if let Some(m) = marker {
-                self.word(&m, &st);
+            // ::first-line/::first-letter: the element's own pseudo style
+            // overrides one propagated from a block ancestor; the propagated
+            // flags restore at the end if they went unconsumed
+            let prev_fl = self.fl_style.clone();
+            let prev_flet = self.flet.clone();
+            let fl_pp = self.ctx.computed_pseudo(node, css::PseudoElem::FirstLine);
+            if !fl_pp.is_empty() {
+                let mut fst = st.clone();
+                self.apply_computed(&fl_pp, &mut fst);
+                self.fl_style = Some(fst);
+            }
+            let flet_pp = self.ctx.computed_pseudo(node, css::PseudoElem::FirstLetter);
+            if !flet_pp.is_empty() {
+                let mut fst = st.clone();
+                self.apply_computed(&flet_pp, &mut fst);
+                self.flet = Some(fst);
+            }
+            // inside markers join the first line as a leading word (kept
+            // out of ::first-letter); outside markers place post-layout
+            if let Some((m, mst, true)) = &marker {
+                let keep = self.flet.take();
+                self.word(m, mst);
+                self.flet = keep;
+                self.pending_space = true;
+            }
+            // ::before generated box = the element's first child
+            self.emit_pseudo(node, css::PseudoElem::Before, c, &st);
+            // ::before text in a flex/grid container gets its own line
+            // rather than tail-laying after the items
+            if matches!(
+                c.get("display").map(String::as_str),
+                Some("flex") | Some("inline-flex") | Some("grid") | Some("inline-grid")
+            ) {
+                self.flush_line();
             }
             // containing-block height for positioned descendants: a box with
             // position + a definite height anchors `inset`-stretched children
@@ -3557,6 +3596,7 @@ impl<'a> Layouter<'a> {
                 .into_iter()
                 .chain(inset_h.map(|ih| ih - pt - pb - bw_v))
                 .fold(content_top, |b, h| b.max(content_top + h));
+            let st_tail = st.clone();
             match c.get("display").map(String::as_str) {
                 Some("flex") | Some("inline-flex") => self.flex_children(node, c, st),
                 Some("grid") | Some("inline-grid") => self.grid_children(node, c, &st),
@@ -3579,7 +3619,20 @@ impl<'a> Layouter<'a> {
             // sticky children of flex/grid paths didn't pass walk_children —
             // catch them here; item ranges are still in emission order
             self.drain_stickies(st0, content_top, self.y.max(sticky_bot));
+            // ::after generated box = the element's last child
+            self.emit_pseudo(node, css::PseudoElem::After, c, &st_tail);
             self.flush_line();
+            // un-consumed ::first-* flags propagate to the next sibling
+            if self.fl_style.is_some() {
+                self.fl_style = prev_fl;
+            }
+            if self.flet.is_some() {
+                self.flet = prev_flet;
+            }
+            // `list-style-position:outside` marker in the left gutter
+            if let Some((m, mst, false)) = &marker {
+                self.place_outside_marker(m, mst, content_top, children_items_start, content_mx);
+            }
             // grow the box to the content-height target computed above.
             // (flex alignment/justification is handled inside flex_layout —
             // no post-hoc shifting needed here)
@@ -3923,6 +3976,9 @@ impl<'a> Layouter<'a> {
             self.backdrop = b;
         }
         let children_hits_start = self.hits.len();
+        // ::first-line/::first-letter don't cross float boundaries
+        let saved_fl = self.fl_style.take();
+        let saved_flet = self.flet.take();
         if let Some((pw, ph, items, hits)) = payload {
             let (tx, ty) = translate_xy(c, pw, ph, size);
             for it in items {
@@ -3937,6 +3993,8 @@ impl<'a> Layouter<'a> {
         } else {
             self.walk_children(node, &st, content_top, content_top + mh_prop.unwrap_or(0.0));
         }
+        self.fl_style = saved_fl;
+        self.flet = saved_flet;
         if is_cb {
             self.cb_stack.pop();
         }
@@ -6038,6 +6096,17 @@ impl<'a> Layouter<'a> {
         // containers — a positioned descendant sets its own
         let saved_ih = self.inset_h;
         self.inset_h = None;
+        // ::first-line/::first-letter of the enclosing block don't cross
+        // into nested boxes (inline-block/cell/item = own flow root)
+        let saved_fl = self.fl_style.take();
+        let saved_flet = self.flet.take();
+        self.emit_pseudo(node, css::PseudoElem::Before, c, st);
+        if matches!(
+            c.get("display").map(String::as_str),
+            Some("flex") | Some("inline-flex") | Some("grid") | Some("inline-grid")
+        ) {
+            self.flush_line();
+        }
         match c.get("display").map(String::as_str) {
             Some("flex") | Some("inline-flex") => self.flex_children(node, c, st.clone()),
             Some("grid") | Some("inline-grid") => self.grid_children(node, c, st),
@@ -6051,6 +6120,7 @@ impl<'a> Layouter<'a> {
                 }
             }
         }
+        self.emit_pseudo(node, css::PseudoElem::After, c, st);
         self.cb_h = saved_cb_h;
         self.inset_h = saved_ih;
         if is_cb {
@@ -6062,6 +6132,8 @@ impl<'a> Layouter<'a> {
             .y
             .max(y0 + dim(c, "height", self.viewport_h, st.size).unwrap_or(0.0));
         self.drain_stickies(st0, y0, nest_bot);
+        self.fl_style = saved_fl;
+        self.flet = saved_flet;
         self.flush_line();
         // a nested box is a BFC: it contains its own floats (they're dropped
         // from the outer float list on restore, but extend this box's bottom)
@@ -6914,18 +6986,29 @@ impl<'a> Layouter<'a> {
             }
             "input" | "textarea" | "select" => {
                 // Childless controls: show their value/placeholder, else a
-                // generic control label.
-                let label = self
-                    .doc
-                    .attr(node, "value")
-                    .or_else(|| self.doc.attr(node, "placeholder"))
-                    .unwrap_or("[control]");
-                self.word(label, &st);
+                // generic control label. ::placeholder styles the hint.
+                let (label, ph) = match self.doc.attr(node, "value") {
+                    Some(v) => (v, false),
+                    None => match self.doc.attr(node, "placeholder") {
+                        Some(p) => (p, true),
+                        None => ("[control]", false),
+                    },
+                };
+                if ph {
+                    let pp = self.ctx.computed_pseudo(node, css::PseudoElem::Placeholder);
+                    let mut pst = st.clone();
+                    self.apply_computed(&pp, &mut pst);
+                    self.word(label, &pst);
+                } else {
+                    self.word(label, &st);
+                }
             }
             _ => {
+                self.emit_pseudo(node, css::PseudoElem::Before, c, &st);
                 for &ch in self.doc.children(node) {
                     self.walk(ch, &st);
                 }
+                self.emit_pseudo(node, css::PseudoElem::After, c, &st);
             }
         }
         if mr > 0.0 {
@@ -7079,6 +7162,69 @@ impl<'a> Layouter<'a> {
             }
             _ => word,
         };
+        // ::first-letter: the leading char becomes its own run under the
+        // pseudo's style (approximation — no drop-cap float)
+        let word = if let Some(fst) = self.flet.take() {
+            let mut chs = word.chars();
+            match chs.next() {
+                Some(fc) => {
+                    let fcs = fc.to_string();
+                    if let Some(ffont) = self.resolve_font_covering(&fcs, &fst) {
+                        let (fw, fascent, flh) = {
+                            let Some(f) = self.fonts.font(ffont) else {
+                                return;
+                            };
+                            let upem = f.units_per_em() as f32;
+                            (
+                                f.measure(&fcs, fst.size),
+                                f.ascender as f32 * fst.size / upem,
+                                match fst.line_h {
+                                    Some(LineH::Mul(m)) => fst.size * m,
+                                    Some(LineH::Px(p)) => p,
+                                    None => f.line_height(fst.size),
+                                },
+                            )
+                        };
+                        if !st.nowrap
+                            && self.line_x + fw > self.content_width() + 0.5
+                            && !self.line.is_empty()
+                        {
+                            self.flush_line();
+                        }
+                        self.line.push(Word {
+                            text: fcs,
+                            font: ffont,
+                            size: fst.size,
+                            color: fst.color,
+                            underline: fst.underline,
+                            strike: fst.strike,
+                            shift: fst.shift,
+                            href: fst.href.clone(),
+                            width: fw,
+                            ascent: fascent,
+                            line_h: flh,
+                            bg: fst.inline_bg,
+                            items: None,
+                            hits: Vec::new(),
+                            box_h: 0.0,
+                            dx: 0.0,
+                            dy: 0.0,
+                            xf: self.cur_xf.clone(),
+                        });
+                        self.line_x += fw;
+                        chs.as_str()
+                    } else {
+                        word
+                    }
+                }
+                None => word,
+            }
+        } else {
+            word
+        };
+        if word.is_empty() {
+            return;
+        }
         let (w, ascent, line_h) = {
             let Some(f) = self.fonts.font(font) else {
                 return;
@@ -7189,6 +7335,41 @@ impl<'a> Layouter<'a> {
             self.pending_space = false;
             return;
         }
+        // ::first-line: the first emitted line box re-resolves under the
+        // pseudo's style (approximation — style applies to the whole line
+        // box, not the truncated CSS-spec first line)
+        if let Some(fst) = self.fl_style.take() {
+            let mut line = std::mem::take(&mut self.line);
+            for w in line.iter_mut() {
+                if w.text.is_empty() || w.items.is_some() {
+                    continue;
+                }
+                let Some(fi) = self.resolve_font_covering(&w.text, &fst) else {
+                    continue;
+                };
+                let Some(f) = self.fonts.font(fi) else {
+                    continue;
+                };
+                let upem = f.units_per_em() as f32;
+                w.font = fi;
+                w.size = fst.size;
+                w.color = fst.color;
+                w.underline = fst.underline;
+                w.strike = fst.strike;
+                w.shift = fst.shift;
+                w.width = f.measure(&w.text, fst.size);
+                w.ascent = f.ascender as f32 * fst.size / upem;
+                w.line_h = match fst.line_h {
+                    Some(LineH::Mul(m)) => fst.size * m,
+                    Some(LineH::Px(p)) => p,
+                    None => f.line_height(fst.size),
+                };
+                if fst.inline_bg.is_some() {
+                    w.bg = fst.inline_bg;
+                }
+            }
+            self.line = line;
+        }
         let line_h = self
             .line
             .iter()
@@ -7284,6 +7465,255 @@ impl<'a> Layouter<'a> {
         self.y += line_h;
         self.line_x = 0.0;
         self.pending_space = false;
+    }
+
+    /// `::before`/`::after` generated content — emitted as the element's
+    /// first/last child inside block(), inline() and nest(). The pseudo
+    /// box inherits the element's text style plus its own computed props;
+    /// `quotes` is read from the element too (that's where it's declared).
+    /// `content` forms: strings, attr(), *-quote, counter()/counters();
+    /// none/normal → no box.
+    fn emit_pseudo(&mut self, node: NodeId, kind: css::PseudoElem, ec: &Props, st: &Style) {
+        // replaced elements can't host generated content
+        if matches!(
+            self.doc.tag(node),
+            Some(
+                "img"
+                    | "svg"
+                    | "input"
+                    | "select"
+                    | "textarea"
+                    | "video"
+                    | "canvas"
+                    | "iframe"
+                    | "object"
+                    | "embed"
+                    | "br"
+                    | "hr"
+            )
+        ) {
+            return;
+        }
+        let mut pp = self.ctx.computed_pseudo(node, kind);
+        if pp.is_empty() || pp.get("display").map(String::as_str) == Some("none") {
+            return;
+        }
+        if !pp.contains_key("quotes") {
+            if let Some(q) = ec.get("quotes") {
+                pp.insert("quotes".to_string(), q.clone());
+            }
+        }
+        let mut pst = st.clone();
+        self.apply_computed(&pp, &mut pst);
+        let mut depth = self.quote_depth;
+        let txt = generated::content_text(self.doc, node, &pp, &self.counters, &mut depth);
+        self.quote_depth = depth;
+        let Some(txt) = txt else { return };
+        // a block-level pseudo box gets its own line
+        let blockish = matches!(
+            pp.get("display").map(String::as_str),
+            Some("block") | Some("list-item") | Some("flex") | Some("grid") | Some("flow-root")
+        );
+        if blockish {
+            self.flush_line();
+        }
+        self.text(&txt, &pst);
+        if blockish {
+            self.flush_line();
+        }
+    }
+
+    /// Open a list context for ul/menu/dir (unordered) / ol (ordered).
+    /// Marker type: the element's list-style-type, else disc→circle→square
+    /// by unordered depth (decimal for ol). Honors start=, reversed, and
+    /// the `list-style[-type]:none` suppression.
+    fn push_list_ctx(&mut self, node: NodeId, c: &Props, ordered: bool) {
+        let hide = c.get("list-style-type").is_some_and(|v| v.trim() == "none")
+            || c.get("list-style").is_some_and(|v| v.contains("none"));
+        let (typ, pos) = generated::list_props(c);
+        let (mut next, mut step) = (1i32, 1i32);
+        if ordered {
+            let reversed = self.doc.attr(node, "reversed").is_some();
+            let n_items = self
+                .doc
+                .children(node)
+                .iter()
+                .filter(|&&ch| self.doc.tag(ch) == Some("li"))
+                .count() as i32;
+            let start = self
+                .doc
+                .attr(node, "start")
+                .and_then(|v| v.trim().parse::<i32>().ok());
+            next = start.unwrap_or(if reversed { n_items.max(1) } else { 1 });
+            step = if reversed { -1 } else { 1 };
+        }
+        let typ = typ.unwrap_or_else(|| {
+            if ordered {
+                generated::LType::Decimal
+            } else {
+                let depth = self.list_stack.iter().filter(|l| !l.ordered).count();
+                match depth % 3 {
+                    0 => generated::LType::Disc,
+                    1 => generated::LType::Circle,
+                    _ => generated::LType::Square,
+                }
+            }
+        });
+        self.list_stack.push(generated::ListCtx {
+            hide,
+            ordered,
+            typ,
+            inside: pos.unwrap_or(false),
+            next,
+            step,
+        });
+    }
+
+    /// A list-item's ::marker: (text, style, inside). Marker style = the
+    /// element's text style + ::marker computed props; `content` on
+    /// ::marker overrides the list glyph.
+    fn make_marker(
+        &mut self,
+        node: NodeId,
+        c: &Props,
+        st: &Style,
+    ) -> Option<(String, Style, bool)> {
+        let (own_typ, own_pos) = generated::list_props(c);
+        if own_typ == Some(generated::LType::None) {
+            return None;
+        }
+        // a numeric list-style-type (inherited from the list or set on the
+        // item) numbers the marker; glyph types show their glyph
+        let numbered = |t: &generated::LType| {
+            matches!(
+                t,
+                generated::LType::Decimal
+                    | generated::LType::DecimalZero
+                    | generated::LType::LowerAlpha
+                    | generated::LType::UpperAlpha
+                    | generated::LType::LowerRoman
+                    | generated::LType::UpperRoman
+            )
+        };
+        let (typ, inside, num, numeric) = match self.list_stack.last_mut() {
+            Some(lc) if lc.hide => return None,
+            Some(lc) => {
+                let t = own_typ.clone().unwrap_or_else(|| lc.typ.clone());
+                let numeric = lc.ordered || numbered(&t);
+                let num = if numeric {
+                    // <li value=N> overrides the running count
+                    let v = self
+                        .doc
+                        .attr(node, "value")
+                        .and_then(|v| v.trim().parse::<i32>().ok())
+                        .unwrap_or(lc.next);
+                    lc.next = v + lc.step;
+                    v
+                } else {
+                    0
+                };
+                (t, own_pos.unwrap_or(lc.inside), num, numeric)
+            }
+            // a list-item outside any list: UA default disc; a numeric
+            // list-style-type still numbers it (count = 1)
+            None => {
+                let t = own_typ.clone().unwrap_or(generated::LType::Disc);
+                let numeric = numbered(&t);
+                let num = if numeric {
+                    self.doc
+                        .attr(node, "value")
+                        .and_then(|v| v.trim().parse::<i32>().ok())
+                        .unwrap_or(1)
+                } else {
+                    0
+                };
+                (t, own_pos.unwrap_or(false), num, numeric)
+            }
+        };
+        let Some(mut text) = generated::marker_text(&typ, num, numeric) else {
+            return None;
+        };
+        let mut mst = st.clone();
+        let mp = self.ctx.computed_pseudo(node, css::PseudoElem::Marker);
+        if !mp.is_empty() {
+            self.apply_computed(&mp, &mut mst);
+            // ::marker{content:...} overrides the list glyph
+            let mut depth = self.quote_depth;
+            if let Some(t) =
+                generated::content_text(self.doc, node, &mp, &self.counters, &mut depth)
+            {
+                self.quote_depth = depth;
+                text = t;
+            }
+        }
+        Some((text, mst, inside))
+    }
+
+    /// `list-style-position:outside`: the marker box sits in the gutter to
+    /// the left of the content edge, aligned on the first line's baseline.
+    fn place_outside_marker(
+        &mut self,
+        m: &str,
+        mst: &Style,
+        content_top: f32,
+        items_start: usize,
+        content_mx: f32,
+    ) {
+        let baseline = self.items[items_start..]
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::Text { baseline, .. } => Some(*baseline),
+                _ => None,
+            })
+            .unwrap_or(content_top + mst.size);
+        let Some(font) = self.resolve_font_covering(m, mst) else {
+            return;
+        };
+        let Some(f) = self.fonts.font(font) else {
+            return;
+        };
+        let w = f.measure(m, mst.size);
+        // right-align ending ~0.4em left of the content edge
+        let x = content_mx - w - 0.4 * mst.size;
+        self.items.push(DisplayItem::Text {
+            x,
+            baseline,
+            text: m.to_string(),
+            font,
+            size: mst.size,
+            color: mst.color,
+            underline: mst.underline,
+            strike: mst.strike,
+            href: None,
+        });
+    }
+
+    /// `::selection` background-color for the document root, composited —
+    /// the renderer tints the selection highlight with it. `None` when no
+    /// ::selection rule supplies a background.
+    pub fn selection_tint(doc: &Document, external: &[css::StyleSheet], vw: f32) -> Option<Color> {
+        let author = css::document_sheets_vw(doc, vw);
+        let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
+        sheets.extend(external.iter());
+        sheets.extend(author.iter());
+        let mut ctx = css::StyleCtx::new(doc, &sheets);
+        for &el in doc.children(doc.root) {
+            if doc.tag(el) == Some("html") {
+                let sp = ctx.computed_pseudo(el, css::PseudoElem::Selection);
+                if let Some(col) = bg_color(&sp, None) {
+                    return Some(over(col, WHITE));
+                }
+                for &b in doc.children(el) {
+                    if doc.tag(b) == Some("body") {
+                        let sp = ctx.computed_pseudo(b, css::PseudoElem::Selection);
+                        if let Some(col) = bg_color(&sp, None) {
+                            return Some(over(col, WHITE));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -7727,6 +8157,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn has_text(items: &[DisplayItem], needle: &str) -> bool {
+        items.iter().any(|i| match i {
+            DisplayItem::Text { text, .. } => text.contains(needle),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn before_after_content() {
+        let (items, _, _) = lay(
+            "<style>.tag::before{content:'['}.tag::after{content:' ' attr(title) ']'}</style>             <p class=tag title=x>mid</p>",
+        );
+        assert!(has_text(&items, "["), "::before string missing");
+        assert!(has_text(&items, "x]"), "::after attr() missing: {items:?}");
+        // content:none generates nothing
+        let (items, _, _) = lay("<style>p::before{content:none}</style><p>mid</p>");
+        assert_eq!(texts(&items).len(), 1);
+        // unknown pseudo-elements still produce no box
+        let (items, _, _) = lay("<style>p::-webkit-x{content:'x'}</style><p>mid</p>");
+        assert_eq!(texts(&items).len(), 1);
+    }
+
+    #[test]
+    fn pseudo_styles_generated_text() {
+        let (items, _, _) =
+            lay("<style>p::before{content:'b ';color:red;font-size:40px}</style><p>rest</p>");
+        let t = texts(&items);
+        let (text, color, size) = match t[0] {
+            DisplayItem::Text {
+                text, color, size, ..
+            } => (text, *color, *size),
+            _ => unreachable!(),
+        };
+        assert_eq!(text, "b");
+        assert_eq!(color, bgra(255, 0, 0));
+        assert!((size - 40.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn markers_emit() {
+        // ol: numbered markers; ul: bullet glyph
+        let (items, _, _) = lay("<ol><li>a</li><li>b</li></ol><ul><li>c</li></ul>");
+        assert!(has_text(&items, "1."), "{items:?}");
+        assert!(has_text(&items, "2."), "{items:?}");
+        assert!(has_text(&items, "\u{2022}"), "{items:?}");
+        // start= / value= / reversed honored
+        let (items, _, _) = lay(
+            "<ol start=4><li>a</li></ol>             <ol><li value=9>b</li></ol>             <ol reversed><li>x</li><li>y</li></ol>",
+        );
+        assert!(has_text(&items, "4."));
+        assert!(has_text(&items, "9."));
+        // nested ul cycles disc → circle
+        let (items, _, _) = lay("<ul><li>a<ul><li>b</li></ul></li></ul>");
+        assert!(has_text(&items, "\u{2022}"));
+        assert!(has_text(&items, "\u{25e6}"), "nested marker should be ◦");
+        // list-style-type variants on the item
+        let (items, _, _) =
+            lay("<style>li{list-style-type:upper-roman}</style><ul><li>a</li><li>b</li></ul>");
+        assert!(has_text(&items, "I."), "{items:?}");
+        assert!(has_text(&items, "II."), "{items:?}");
+        // list-style:none suppresses
+        let (items, _, _) = lay("<ul style='list-style:none'><li>a</li></ul>");
+        assert!(!has_text(&items, "\u{2022}"));
+        // ::marker content + style
+        let (items, _, _) =
+            lay("<style>li::marker{content:'» ';color:red}</style><ul><li>a</li></ul>");
+        assert!(has_text(&items, "»"), "{items:?}");
+    }
+
+    #[test]
+    fn css_counters() {
+        let (items, _, _) = lay(
+            "<style>h1{counter-increment:sec}h1::before{content:counter(sec)'.'}</style>             <body style='counter-reset:sec'>             <h1>a</h1><h1>b</h1></body>",
+        );
+        assert!(has_text(&items, "1."), "{items:?}");
+        assert!(has_text(&items, "2."), "{items:?}");
+        // counters() joins nested scopes (the classic nested-ol example)
+        let (items, _, _) = lay(
+            "<style>ol{counter-reset:c}li{counter-increment:c}             li::marker{content:counters(c,'.') '. '}</style>             <ol><li>a<ol><li>b</li></ol></li></ol>",
+        );
+        assert!(has_text(&items, "1.1"), "{items:?}");
+        // counter-set and counter formats (4 → d)
+        let (items, _, _) = lay(
+            "<style>div{counter-set:n 4}div::before{content:counter(n,upper-alpha)}</style>             <div>x</div>",
+        );
+        assert!(has_text(&items, "D"), "{items:?}");
+    }
+
+    #[test]
+    fn first_letter_styles() {
+        let (items, _, _) =
+            lay("<style>p::first-letter{color:red;font-size:40px}</style><p>Hi there</p>");
+        let t = texts(&items);
+        let (mut fl, mut rest) = (None, None);
+        for i in &t {
+            if let DisplayItem::Text {
+                text, color, size, ..
+            } = i
+            {
+                if text == "H" {
+                    fl = Some((*color, *size));
+                } else {
+                    rest = Some((*color, *size));
+                }
+            }
+        }
+        let (fc, fs) = fl.expect("first-letter run");
+        assert_eq!(fc, bgra(255, 0, 0));
+        assert!((fs - 40.0).abs() < 0.5);
+        let (rc, rs) = rest.expect("rest run");
+        assert_eq!(rc, bgra(0x11, 0x11, 0x11));
+        assert!((rs - 16.0).abs() < 1.0);
     }
 
     // ---------- tables ----------
