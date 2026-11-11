@@ -16,6 +16,8 @@
 use rowser_dom::{Document, NodeId};
 use rustc_hash::FxHashMap;
 
+pub mod cascade;
+
 /// Property maps keyed by CSS property name — Fx-hashed (string keys are
 /// small and lookups/inserts dominate the cascade).
 pub type StrMap<V> = FxHashMap<String, V>;
@@ -133,6 +135,8 @@ pub struct StyleSheet {
     /// `@keyframes` name → declarations of its end (`to`/`100%`/last)
     /// frame, used to emulate animation-fill-mode resting state.
     pub keyframes: FxHashMap<String, Vec<Decl>>,
+    /// `@property --x {}` registrations: custom-prop name → descriptors.
+    pub properties: FxHashMap<String, cascade::PropertyDef>,
 }
 
 pub fn parse(css: &str) -> StyleSheet {
@@ -152,6 +156,7 @@ pub fn parse_selector(s: &str) -> Option<Selector> {
         layer_map: FxHashMap::default(),
         layer_count: 0,
         keyframes: Vec::new(),
+        properties: Vec::new(),
     };
     p.skip_ws_comments();
     let sel = p.selector()?;
@@ -173,6 +178,7 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         layer_map: FxHashMap::default(),
         layer_count: 0,
         keyframes: Vec::new(),
+        properties: Vec::new(),
     };
     let mut pairs: Vec<(u32, Rule)> = Vec::new();
     p.skip_ws_comments();
@@ -196,6 +202,11 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         by_id: FxHashMap::default(),
         plain: Vec::new(),
         keyframes: p.keyframes.into_iter().collect(),
+        properties: p
+            .properties
+            .into_iter()
+            .map(|d| (d.name.clone(), d))
+            .collect(),
     };
     sheet.reindex();
     sheet
@@ -302,6 +313,8 @@ struct CssParser<'a> {
     /// `@keyframes` name → decls of the end (`to`/`100%`) frame, captured
     /// for animation end-state emulation (non-animating engine).
     keyframes: Vec<(String, Vec<Decl>)>,
+    /// `@property` registrations collected while parsing.
+    properties: Vec<cascade::PropertyDef>,
 }
 
 impl<'a> CssParser<'a> {
@@ -348,6 +361,7 @@ impl<'a> CssParser<'a> {
             self.pos += 1;
         }
         let prelude = String::from_utf8_lossy(&self.s[st..self.pos]).trim().to_lowercase();
+        let raw_prelude = String::from_utf8_lossy(&self.s[st..self.pos]).trim().to_string();
         let has_block = self.peek() == Some(b'{');
         if has_block {
             self.pos += 1;
@@ -386,6 +400,26 @@ impl<'a> CssParser<'a> {
             }
             if !kf_name.is_empty() {
                 self.keyframes.push((kf_name, end_decls));
+            }
+            return Some(Vec::new());
+        }
+        // `@property --x { syntax: "..."; inherits: bool; initial-value: v }`
+        // — a declaration block, not a rule list; register and move on.
+        if name == "property" && has_block {
+            let decls = self.decl_block();
+            let get = |n: &str| {
+                decls.iter().find(|d| d.prop == n).map(|d| d.value.clone())
+            };
+            let pname = raw_prelude.trim().to_string();
+            if pname.starts_with("--") {
+                self.properties.push(cascade::PropertyDef {
+                    name: pname,
+                    syntax: get("syntax")
+                        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                        .unwrap_or_else(|| "*".to_string()),
+                    inherits: get("inherits").is_some_and(|v| v.trim() == "true"),
+                    initial: get("initial-value"),
+                });
             }
             return Some(Vec::new());
         }
@@ -1350,6 +1384,11 @@ pub struct StyleCtx<'a> {
     buf: Vec<u32>,
     /// html element's `--*` decls, resolved on first var() use.
     root_customs: Option<StrMap<String>>,
+    /// Resolved outputs of ancestor elements, memoized for the parent
+    /// lookups done by inherit/unset/all:inherit and the inherited-prop
+    /// pass. Queried nodes themselves are not stored (layout has its own
+    /// Rc'd style_cache).
+    node_memo: FxHashMap<NodeId, cascade::NodeOut>,
 }
 
 /// Cascade ordering of declaration keys (important, origin, layer, spec,
@@ -1392,6 +1431,7 @@ impl<'a> StyleCtx<'a> {
             sheets: sheets.to_vec(),
             buf: Vec::new(),
             root_customs: None,
+            node_memo: FxHashMap::default(),
         }
     }
 
@@ -1410,198 +1450,17 @@ impl<'a> StyleCtx<'a> {
         self.root_customs.as_ref().unwrap()
     }
 
+    /// Cascaded + resolved computed style for `node`: winning declaration
+    /// per property, with `var()`/`env()`, `all`, and the CSS-wide keywords
+    /// resolved, custom properties inherited down the tree (with
+    /// `@property` semantics), and the standard inherited-property set
+    /// filled from the parent's computed values. Ancestor results are
+    /// memoized in `node_memo` for the parent lookups.
     pub fn computed(&mut self, node: NodeId) -> StrMap<String> {
-        let doc = self.doc;
-        // value + ordering key: (important, origin, layer, spec, order)
-        let mut out: StrMap<(String, bool, u8, u32, (u32, u32, u32), usize)> =
-            StrMap::default();
-        // `--*` decls from rules matching this node (element_customs folded
-        // into the main match pass — one selector match per rule, not two).
-        let mut customs: StrMap<String> = StrMap::default();
-        // props whose winning decl is !important — the inline style
-        // attribute may only override those with !important of its own
-        let mut important_props: rustc_hash::FxHashSet<String> =
-            rustc_hash::FxHashSet::default();
-        let mut order = 0usize;
-        for (origin, sheet) in self.sheets.iter().enumerate() {
-            // origin 0 = UA (weakest), later = author
-            sheet.candidates_into(doc, node, &mut self.buf);
-            for &ri in &self.buf {
-                let rule = &sheet.rules[ri as usize];
-                let layer = sheet
-                    .layers
-                    .get(ri as usize)
-                    .copied()
-                    .unwrap_or(u32::MAX);
-                // best specificity across matching selectors — and whether
-                // any matched at all — in one pass over the selector list
-                let mut spec = (0u32, 0u32, 0u32);
-                let mut matched = false;
-                for s in &rule.selectors {
-                    if rightmost_ok(doc, node, s) && matches(doc, node, s) {
-                        matched = true;
-                        let sp = specificity(s);
-                        if sp > spec {
-                            spec = sp;
-                        }
-                    }
-                }
-                if !matched {
-                    continue;
-                }
-                for d in &rule.decls {
-                    if d.prop.starts_with("--") {
-                        customs.insert(d.prop.clone(), d.value.clone());
-                    }
-                    let nk = (d.important, origin as u8, layer, spec, order);
-                    each_decl(&d.prop, &d.value, |prop, val| {
-                        if d.important {
-                            important_props.insert(prop.to_string());
-                        }
-                        match out.get_mut(prop) {
-                            Some(e) => {
-                                if decl_wins(nk, (e.1, e.2, e.3, e.4, e.5)) {
-                                    *e = (
-                                        val.to_string(),
-                                        d.important,
-                                        origin as u8,
-                                        layer,
-                                        spec,
-                                        order,
-                                    );
-                                }
-                            }
-                            None => {
-                                out.insert(
-                                    prop.to_string(),
-                                    (
-                                        val.to_string(),
-                                        d.important,
-                                        origin as u8,
-                                        layer,
-                                        spec,
-                                        order,
-                                    ),
-                                );
-                            }
-                        }
-                    });
-                }
-                order += 1;
-            }
+        if let Some(o) = self.node_memo.get(&node) {
+            return o.props.clone();
         }
-        // The inline `style` attribute is the strongest normal source: it
-        // beats author rules but loses to author !important; an !important
-        // decl inside it behaves as an author-origin !important (and so
-        // still loses to a UA !important, per Cascade 5).
-        if let Some(s) = doc.attr(node, "style") {
-            for d in inline_decls(s) {
-                if d.prop.starts_with("--") {
-                    customs.insert(d.prop.clone(), d.value.clone());
-                    continue;
-                }
-                if d.important {
-                    // Merge through decl_wins rather than stomping: a UA
-                    // !important (origin 0) and layered author !important
-                    // still beat the unlayered author-level inline decl.
-                    let nk = (
-                        true,
-                        1u8,
-                        u32::MAX,
-                        (u32::MAX, u32::MAX, u32::MAX),
-                        usize::MAX,
-                    );
-                    each_decl(&d.prop, &d.value, |prop, val| {
-                        important_props.insert(prop.to_string());
-                        match out.get_mut(prop) {
-                            Some(e) => {
-                                if decl_wins(nk, (e.1, e.2, e.3, e.4, e.5)) {
-                                    *e = (
-                                        val.to_string(),
-                                        true,
-                                        1,
-                                        u32::MAX,
-                                        (u32::MAX, u32::MAX, u32::MAX),
-                                        usize::MAX,
-                                    );
-                                }
-                            }
-                            None => {
-                                out.insert(
-                                    prop.to_string(),
-                                    (
-                                        val.to_string(),
-                                        true,
-                                        1,
-                                        u32::MAX,
-                                        (u32::MAX, u32::MAX, u32::MAX),
-                                        usize::MAX,
-                                    ),
-                                );
-                            }
-                        }
-                    });
-                } else {
-                    each_decl(&d.prop, &d.value, |prop, val| {
-                        if !important_props.contains(prop) {
-                            out.insert(
-                                prop.to_string(),
-                                (
-                                    val.to_string(),
-                                    false,
-                                    u8::MAX,
-                                    u32::MAX,
-                                    (u32::MAX, u32::MAX, u32::MAX),
-                                    usize::MAX,
-                                ),
-                            );
-                        }
-                    });
-                }
-            }
-        }
-        let mut props: StrMap<String> =
-            out.into_iter().map(|(k, (v, _, _, _, _, _))| (k, v)).collect();
-        // Custom properties: resolve var() only when a value actually uses
-        // it — collecting the customs map is free (folded above), and the
-        // :root globals are cached on the ctx rather than re-matched per node.
-        if props.values().any(|v| v.contains("var(")) {
-            for (k, v) in self.root_customs().iter() {
-                customs.entry(k.clone()).or_insert_with(|| v.clone());
-            }
-            for v in props.values_mut() {
-                *v = resolve_vars(v, &customs);
-            }
-        }
-        // Emulate animation end-state: a named animation rests at its
-        // keyframes' end frame (approximates `forwards`/completed anims —
-        // sites using `opacity-0` + `animate-*` still become visible).
-        if let Some(v) = props
-            .get("animation-name")
-            .or_else(|| props.get("animation"))
-            .cloned()
-        {
-            if let Some(name) = v
-                .split([',', ' '])
-                .map(str::trim)
-                .find(|t| !t.is_empty())
-            {
-                for sheet in &self.sheets {
-                    if let Some(decls) = sheet.keyframes.get(name) {
-                        for d in decls {
-                            if d.prop.starts_with("--") {
-                                continue;
-                            }
-                            let val = resolve_vars(&d.value, &customs);
-                            each_decl(&d.prop, &val, |p, v| {
-                                props.insert(p.to_string(), v.to_string());
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        props
+        self.node_style(node).props
     }
 }
 
@@ -1675,7 +1534,7 @@ fn each_decl<'v>(prop: &str, value: &'v str, mut f: impl FnMut(&str, &'v str)) {
         _ => None,
     };
     if let Some((t, r, b, l)) = sides {
-        let v: Vec<&str> = value.split_whitespace().collect();
+        let v: Vec<&str> = cascade::split_ws_parens(value);
         let vt = v.first().copied().unwrap_or("0");
         let vr = v.get(1).copied().unwrap_or(vt);
         let vb = v.get(2).copied().unwrap_or(vt);
@@ -1755,33 +1614,13 @@ fn inline_decls(style: &str) -> Vec<Decl> {
     out
 }
 
-/// Substitute `var(--name)` and `var(--name, fallback)` recursively.
+/// Substitute `var(--name)`/`var(--name, fallback)`/`env()` recursively —
+/// delegates to the cycle-safe resolver; on guaranteed-invalid the raw
+/// text is left in place (downstream parsers treat it as unresolvable).
 fn resolve_vars(value: &str, customs: &StrMap<String>) -> String {
-    let mut out = value.to_string();
-    for _ in 0..8 {
-        let Some(start) = out.find("var(") else { break };
-        let mut depth = 1i32;
-        let mut end = start + 4;
-        while end < out.len() && depth > 0 {
-            match out.as_bytes()[end] {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {}
-            }
-            end += 1;
-        }
-        if depth != 0 {
-            break;
-        }
-        let inner = out[start + 4..end - 1].trim();
-        let (name, fallback) = inner.split_once(',').map(|(a, b)| (a.trim(), b.trim())).unwrap_or((inner, ""));
-        let rep = customs
-            .get(name)
-            .map(String::as_str)
-            .unwrap_or(fallback);
-        out = format!("{}{}{}", &out[..start], rep, &out[end..]);
-    }
-    out
+    cascade::VarResolver::new(customs)
+        .subst(value)
+        .unwrap_or_else(|| value.to_string())
 }
 
 /// Collect <style> element texts from the document → parsed sheets.
@@ -1951,13 +1790,16 @@ fn media_feature(f: &str, vw: f32, dark: bool) -> bool {
             "grid" | "monochrome" => val == "0",
             "scripting" => val == "enabled" || val == "initial-only",
             "hover" | "any-hover" => val == "hover",
-            "pointer" | "any-pointer" => val == "fine" || val == "coarse",
+            "pointer" | "any-pointer" => val == "fine",
             // lenient: unknown features resolve true so their rules apply
-            _ => true,
+            _ => cascade::media_extra(name, val, vw),
         };
     }
     // bare feature name: truthiness — most are "capability exists" → true
-    !matches!(f, "monochrome" | "grid" | "print")
+    !matches!(
+        f,
+        "monochrome" | "grid" | "print" | "forced-colors" | "inverted-colors" | "color-index"
+    )
 }
 
 /// `(width >= 400px)` / `(400px <= width <= 800px)` range comparisons;
@@ -1991,12 +1833,29 @@ fn media_range(f: &str, vw: f32) -> bool {
         matches!(
             t.as_str(),
             "width" | "height" | "min-width" | "max-width" | "min-height" | "max-height"
+                | "aspect-ratio" | "min-aspect-ratio" | "max-aspect-ratio"
+                | "resolution" | "min-resolution" | "max-resolution"
+                | "color" | "min-color" | "max-color"
+                | "color-index" | "min-color-index" | "max-color-index"
+                | "monochrome" | "min-monochrome" | "max-monochrome"
         )
     }) else {
         return true;
     };
-    let dim = if toks[wpos].contains("height") { VH } else { vw };
-    let px = |t: &String| css_len_px(t);
+    let feat = toks[wpos].as_str();
+    let (dim, px): (f32, fn(&String) -> Option<f32>) = if feat.contains("aspect-ratio") {
+        (vw / VH, |t| cascade::parse_ratio(t))
+    } else if feat.contains("resolution") {
+        (1.0, |t| cascade::parse_dppx(t))
+    } else if feat.contains("color-index") || feat.contains("monochrome") {
+        (0.0, |t| t.trim().parse::<f32>().ok())
+    } else if feat.contains("color") {
+        (8.0, |t| t.trim().parse::<f32>().ok())
+    } else if feat.contains("height") {
+        (VH, |t| css_len_px(t))
+    } else {
+        (vw, |t| css_len_px(t))
+    };
     let cmp = |a: f32, op: &str, b: f32| match op {
         "<" => a < b,
         "<=" => a <= b,
