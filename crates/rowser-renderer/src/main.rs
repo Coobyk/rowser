@@ -107,10 +107,10 @@ fn main() {
                 // JS: run page scripts against the parsed DOM (SPAs build
                 // their UI this way). Errors are logged, never fatal.
                 let t_js = std::time::Instant::now();
-                let (doc, js_logs) = if js_enabled() {
+                let (doc, js_logs, js) = if js_enabled() {
                     run_page_scripts(doc, &effective, page.viewport)
                 } else {
-                    (doc, Vec::new())
+                    (doc, Vec::new(), None)
                 };
                 if !js_logs.is_empty() {
                     pt!("[prof] js exec {:?} ({} log lines)", t_js.elapsed(), js_logs.len());
@@ -124,6 +124,7 @@ fn main() {
                     .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| effective.clone());
                 page.load(doc, effective, title.clone());
+                page.js = js;
                 page.repaint(&mut fonts);
                 if !frag.is_empty() {
                     if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
@@ -187,10 +188,60 @@ fn main() {
                 if let Some(url) = found {
                     page.clear_sel();
                     let _ = send(&mut output, &ToBrowser::NavigationRequest(url));
-                } else if page.clear_sel() && page.has_doc() {
-                    page.repaint_scrolled(&mut fonts);
-                    let _ = send(&mut output, &frame_msg(&page));
-                    let _ = send(&mut output, &ToBrowser::SelText(String::new()));
+                } else {
+                    // Dispatch a synthetic click into the live JS context:
+                    // hit-test picks the deepest (smallest) element box,
+                    // the event bubbles to delegated listeners (React
+                    // attaches at the root container), handlers mutate the
+                    // DOM, and we repaint the fresh snapshot.
+                    let target = page
+                        .hits
+                        .iter()
+                        .filter(|(hx, hy, hw, hh, _)| {
+                            x >= *hx && x <= hx + hw && y >= *hy && y <= hy + hh
+                        })
+                        .min_by(|a, b| {
+                            (a.2 * a.3)
+                                .partial_cmp(&(b.2 * b.3))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|h| h.4);
+                    let mut dispatched = false;
+                    if let (Some(js), Some(nid)) = (&page.js, target) {
+                        let (rtx, rrx) = std::sync::mpsc::channel();
+                        if js
+                            .send(JsJob::Event {
+                                nid,
+                                ty: "click".into(),
+                                client: (x as f64, y as f64),
+                                reply: rtx,
+                            })
+                            .is_ok()
+                        {
+                            match rrx.recv() {
+                                Ok(rep) => {
+                                    dispatched = true;
+                                    page.doc = Some(rep.doc);
+                                    for l in rep.logs {
+                                        let _ = send(&mut output, &ToBrowser::Log(l));
+                                    }
+                                    page.clear_sel();
+                                    page.start_image_prefetch();
+                                    page.repaint(&mut fonts);
+                                    let _ = send(&mut output, &frame_msg(&page));
+                                    let _ = send(&mut output, &ToBrowser::SelText(String::new()));
+                                }
+                                Err(_) => {
+                                    page.js = None; // interpreter thread died
+                                }
+                            }
+                        }
+                    }
+                    if !dispatched && page.clear_sel() && page.has_doc() {
+                        page.repaint_scrolled(&mut fonts);
+                        let _ = send(&mut output, &frame_msg(&page));
+                        let _ = send(&mut output, &ToBrowser::SelText(String::new()));
+                    }
                 }
             }
             ToRenderer::Select { x0, y0, x1, y1 } => {
@@ -276,8 +327,29 @@ enum ImgMsg {
 type ImgRx = std::sync::mpsc::Receiver<(String, ImgMsg)>;
 type ImgTx = std::sync::mpsc::Sender<(String, ImgMsg)>;
 
+/// A job for the persistent JS interpreter thread: dispatch a DOM event
+/// at `nid` and reply with the post-event document snapshot + log lines.
+enum JsJob {
+    Event {
+        nid: rowser_dom::NodeId,
+        ty: String,
+        client: (f64, f64),
+        reply: std::sync::mpsc::Sender<JsReply>,
+    },
+}
+
+struct JsReply {
+    doc: rowser_dom::Document,
+    logs: Vec<String>,
+}
+
 struct Page {
     doc: Option<rowser_dom::Document>,
+    /// Live page-JS job channel — the interpreter thread owns the real
+    /// document; `doc` is a snapshot refreshed after each dispatched event.
+    js: Option<std::sync::mpsc::Sender<JsJob>>,
+    /// Element border boxes (x, y, w, h, node) for click hit-testing.
+    hits: Vec<(f32, f32, f32, f32, rowser_dom::NodeId)>,
     viewport: (u32, u32),
     scroll: f32,
     content_h: f32,
@@ -323,6 +395,8 @@ impl Page {
         let (img_tx, img_rx) = std::sync::mpsc::channel();
         Self {
             doc: None,
+            js: None,
+            hits: Vec::new(),
             viewport: (800, 600),
             scroll: 0.0,
             content_h: 0.0,
@@ -353,6 +427,8 @@ impl Page {
 
     fn load(&mut self, doc: rowser_dom::Document, url: String, _title: String) {
         self.doc = Some(doc);
+        self.js = None; // dropping the channel ends the old JS thread
+        self.hits.clear();
         self.url_base = url.clone();
         self.cur_url = url;
         self.scroll = 0.0;
@@ -753,6 +829,9 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
             for r in &mut self.sel {
                 r.1 -= dy;
             }
+            for h in &mut self.hits {
+                h.1 -= dy;
+            }
             self.items_scroll = self.scroll;
         }
         self.load_images(false);
@@ -776,7 +855,7 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
     fn repaint(&mut self, fonts: &mut FontCache) {
         let Some(doc) = &self.doc else { return };
         let t0 = std::time::Instant::now();
-        let (items, height, anchors) =
+        let (items, height, anchors, hits) =
             Layouter::layout_vh(
                 doc,
                 fonts,
@@ -788,6 +867,7 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
         let t_layout = t0.elapsed();
         self.content_h = height;
         self.items = items;
+        self.hits = hits;
         self.items_scroll = self.scroll;
         self.anchors = anchors;
         let wait = !self.img_waited;
@@ -1135,7 +1215,7 @@ fn run_page_scripts(
     doc: rowser_dom::Document,
     page_url: &str,
     viewport: (u32, u32),
-) -> (rowser_dom::Document, Vec<String>) {
+) -> (rowser_dom::Document, Vec<String>, Option<std::sync::mpsc::Sender<JsJob>>) {
     struct Script {
         src: Option<String>,
         body: String,
@@ -1170,7 +1250,7 @@ fn run_page_scripts(
         scripts.push(Script { src, body });
     }
     if scripts.is_empty() {
-        return (doc, Vec::new());
+        return (doc, Vec::new(), None);
     }
     // Resolve + fetch external bodies in parallel (same pool/deadline as CSS).
     let resolved: Vec<String> = scripts
@@ -1198,11 +1278,15 @@ fn run_page_scripts(
             None => sources.push(Some(s.body.clone())),
         }
     }
-    // 32+ MiB stack: deep call chains in framework bundles would overflow
-    // the default thread stack.
+    // The interpreter owns the live document for the page's lifetime: it
+    // reports an initial snapshot after scripts run, then services DOM
+    // event jobs (clicks) until the channel closes.
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<JsJob>();
+    let (init_tx, init_rx) =
+        std::sync::mpsc::channel::<(rowser_dom::Document, Vec<String>)>();
     let (vw, vh) = (viewport.0 as f64, viewport.1 as f64);
     let url = page_url.to_string();
-    let handle = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("rowser-js".into())
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
@@ -1227,20 +1311,56 @@ fn run_page_scripts(
             for line in dc.ctx.take_output() {
                 logs.push(format!("[js console] {line}"));
             }
-            (dc.take_document(), logs)
+            if init_tx.send((dc.snapshot_document(), logs)).is_err() {
+                return;
+            }
+            // Event loop: each job dispatches a DOM event into the live
+            // context and replies with the mutated snapshot + new logs.
+            while let Ok(job) = job_rx.recv() {
+                match job {
+                    JsJob::Event { nid, ty, client, reply } => {
+                        let mut logs = Vec::new();
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Err(e) = dc.dispatch_event(nid, &ty, client) {
+                                let msg = dc.ctx.interp.inspect(&e, 0);
+                                logs.push(format!("[js] event {ty}: {msg}"));
+                            }
+                            dc.flush_raf();
+                            dc.run_timers();
+                        }));
+                        for e in dc.errors.drain(..) {
+                            logs.push(format!("[js] {e}"));
+                        }
+                        for line in dc.ctx.take_output() {
+                            logs.push(format!("[js console] {line}"));
+                        }
+                        if reply
+                            .send(JsReply {
+                                doc: dc.snapshot_document(),
+                                logs,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
         });
-    match handle {
-        Ok(h) => h.join().unwrap_or_else(|_| {
-            // thread itself died (spawn-side panic before catch_unwind) —
-            // we can't recover the Document; rebuild an empty-ish one.
-            (rowser_html::parse("<html><body></body></html>"), vec![
-                "[js] interpreter thread panicked — page rendered without JS DOM".to_string(),
-            ])
-        }),
+    match spawned {
+        Ok(_) => match init_rx.recv() {
+            Ok((doc, logs)) => (doc, logs, Some(job_tx)),
+            Err(_) => (
+                rowser_html::parse("<html><body></body></html>"),
+                vec!["[js] interpreter thread died before initial snapshot".to_string()],
+                None,
+            ),
+        },
         Err(e) => (
             // doc moved into the (failed) spawn — render a fallback
             rowser_html::parse("<html><body></body></html>"),
             vec![format!("[js] could not spawn interpreter thread: {e}")],
+            None,
         ),
     }
 }

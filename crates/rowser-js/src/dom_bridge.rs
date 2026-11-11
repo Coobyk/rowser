@@ -510,6 +510,15 @@ fn el_dispatch_event(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         i.set_prop(&ev, pk("target"), this.clone())?;
         i.set_prop(&ev, pk("srcElement"), this.clone())?;
     }
+    run_event_path(i, &this, &ev)
+}
+
+/// The capture→target→bubble dispatch walk shared by `dispatchEvent` and
+/// embedder-driven events (clicks). Returns `false` when the event was
+/// cancelled (preventDefault).
+fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
+    let tyv = i.get_prop(ev, &pk("type"))?;
+    let ty = i.to_str(&tyv)?;
     let bv = i.get_prop(&ev, &pk("bubbles"))?;
     let bubbles = i.to_bool(&bv);
 
@@ -3740,6 +3749,56 @@ impl DomContext {
             std::mem::replace(&mut ds.docs[0], Document::new())
         })
     }
+
+    /// A snapshot of the live document (side effects synced first) — JS
+    /// keeps mutating its own copy. Used by the renderer after each
+    /// dispatched event.
+    pub fn snapshot_document(&mut self) -> Document {
+        sync_dom_side_effects(&mut self.ctx.interp);
+        with_ds(&mut self.ctx.interp, |ds| ds.docs[0].clone())
+    }
+
+    /// Embedder-driven event: fire `ty` (e.g. "click") at the element
+    /// `nid` in the page document with mouse coordinates. React-style
+    /// delegated listeners see a bubbling event with a real target.
+    pub fn dispatch_event(
+        &mut self,
+        nid: NodeId,
+        ty: &str,
+        client: (f64, f64),
+    ) -> Result<bool, crate::Value> {
+        let i = &mut self.ctx.interp;
+        // detached/invalid nodes: dispatch on document itself
+        let exists = with_ds(i, |ds| {
+            ds.docs[0].nodes.get(nid).is_some()
+                && !matches!(ds.docs[0].nodes[nid].kind, NodeKind::Document)
+        });
+        let target = if exists {
+            wrap_node(i, 0, nid)
+        } else {
+            let root = ds_root(i);
+            wrap_node(i, 0, root)
+        };
+        let ev = make_event(i, ty, true, true);
+        i.set_prop(&ev, pk("target"), target.clone())?;
+        i.set_prop(&ev, pk("srcElement"), target.clone())?;
+        i.set_prop(&ev, pk("clientX"), Value::Num(client.0))?;
+        i.set_prop(&ev, pk("clientY"), Value::Num(client.1))?;
+        i.set_prop(&ev, pk("pageX"), Value::Num(client.0))?;
+        i.set_prop(&ev, pk("pageY"), Value::Num(client.1))?;
+        i.set_prop(&ev, pk("screenX"), Value::Num(client.0))?;
+        i.set_prop(&ev, pk("screenY"), Value::Num(client.1))?;
+        i.set_prop(&ev, pk("button"), Value::Num(0.0))?;
+        i.set_prop(&ev, pk("buttons"), Value::Num(1.0))?;
+        i.set_prop(&ev, pk("detail"), Value::Num(1.0))?;
+        let r = run_event_path(i, &target, &ev)?;
+        Ok(matches!(r, Value::Bool(true)))
+    }
+}
+
+/// Root node of the page document (docs[0]).
+fn ds_root(i: &mut Interp) -> NodeId {
+    with_ds(i, |ds| ds.docs[0].root)
 }
 
 // ---------------------------------------------------------------------------

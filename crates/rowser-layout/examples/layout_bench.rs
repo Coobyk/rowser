@@ -102,7 +102,7 @@ fn main() {
     let mut best = std::time::Duration::MAX;
     for i in 0..iters {
         let t = Instant::now();
-        let (items, h, anchors) =
+        let (items, h, anchors, _) =
             Layouter::layout_vh(&doc, &mut fonts, 1024.0, 0.0, 768.0, &external);
         let el = t.elapsed();
         best = best.min(el);

@@ -19,7 +19,7 @@ pub enum NodeKind {
     Comment(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
     pub kind: NodeKind,
     pub parent: Option<NodeId>,
@@ -28,6 +28,7 @@ pub struct Node {
     pub sibling_index: usize,
 }
 
+#[derive(Debug, Clone)]
 pub struct Document {
     pub nodes: Vec<Node>,
     pub root: NodeId,

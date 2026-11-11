@@ -72,7 +72,7 @@ fn main() {
         }
     }
     let mut fonts = FontCache::new();
-    let (items, h, _) = Layouter::layout_vh(&d, &mut fonts, 1920.0, 0.0, 1080.0, &[sheet]);
+    let (items, h, _, _) = Layouter::layout_vh(&d, &mut fonts, 1920.0, 0.0, 1080.0, &[sheet]);
     eprintln!("doc height {h}, {} display items", items.len());
     let mut kinds = std::collections::HashMap::new();
     for it in &items {

@@ -990,6 +990,8 @@ struct Word {
     bg: Option<Color>,
     /// inline-block payload: display items in box-local coords (origin top-left)
     items: Option<Vec<DisplayItem>>,
+    /// element boxes inside the payload — same coord space as `items`
+    hits: Vec<(f32, f32, f32, f32, NodeId)>,
     /// inline-block height (baseline alignment: box bottom sits on baseline)
     box_h: f32,
 }
@@ -1119,6 +1121,9 @@ pub struct Layouter<'a> {
     /// `top`+`bottom` stretch of the block currently laying its children —
     /// feeds `grid_children`'s definite container height
     inset_h: Option<f32>,
+    /// element border boxes (x, y, w, h, node) in paint order — hit-testing
+    /// for click dispatch; later entries paint above earlier ones
+    hits: Vec<(f32, f32, f32, f32, NodeId)>,
 }
 
 impl<'a> Layouter<'a> {
@@ -1130,7 +1135,7 @@ impl<'a> Layouter<'a> {
         width: f32,
         scroll: f32,
         external: &[css::StyleSheet],
-    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>) {
+    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<(f32, f32, f32, f32, NodeId)>) {
         Self::layout_vh(doc, fonts, width, scroll, 768.0, external)
     }
 
@@ -1142,7 +1147,7 @@ impl<'a> Layouter<'a> {
         scroll: f32,
         viewport_h: f32,
         external: &[css::StyleSheet],
-    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>) {
+    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<(f32, f32, f32, f32, NodeId)>) {
         let author = css::document_sheets(doc);
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
         sheets.extend(external.iter());
@@ -1169,6 +1174,7 @@ impl<'a> Layouter<'a> {
             viewport_h,
             cb_h: None,
             inset_h: None,
+            hits: Vec::new(),
         };
         l.preresolve_styles();
         l.walk(doc.root, &base_style());
@@ -1179,7 +1185,7 @@ impl<'a> Layouter<'a> {
             l.y = l.y.max(f.bottom);
         }
         let h = l.y + scroll + 8.0;
-        (l.items, h, l.anchors)
+        (l.items, h, l.anchors, l.hits)
     }
 
     /// Horizontal space taken by floats on (left, right) at the current y.
@@ -1278,7 +1284,13 @@ impl<'a> Layouter<'a> {
                 let c = self.style(node);
                 let mut st = style.clone();
                 self.apply_computed(&c, &mut st);
+                // the `.sr-only` a11y pattern — a 1x1 overflow:hidden clip.
+                // Laying it out would wrap its text into a visible strip.
+                let visually_hidden = c.get("overflow").map(String::as_str) == Some("hidden")
+                    && side(c.as_ref(), "width", self.avail_w).is_some_and(|w| w <= 2.0)
+                    && side(c.as_ref(), "height", self.avail_w).is_some_and(|h| h <= 2.0);
                 match c.get("display").map(String::as_str) {
+                    _ if visually_hidden => return,
                     Some("none") => return,
                     Some("block") | Some("list-item") | Some("flex") | Some("grid") => {
                         self.block(node, tag, &c, st);
@@ -1600,6 +1612,14 @@ impl<'a> Layouter<'a> {
         if let Some(p) = patch {
             self.finish_patch(&p);
         }
+        // element border box → click hit-test map
+        self.hits.push((
+            self.margin_x - pl - bw,
+            content_top - pt - bw,
+            inner_w + pl + pr + 2.0 * bw,
+            self.y - content_top + pt + bw,
+            node,
+        ));
         self.margin_x = saved_mx;
         self.avail_w = saved_avail;
         self.align = saved_align;
@@ -1738,7 +1758,7 @@ impl<'a> Layouter<'a> {
         let box_w = (inner + pl + pr + 2.0 * bw).min(room);
         let inner = (box_w - pl - pr - 2.0 * bw).max(1.0);
 
-        let (items, y_end) = self.nest(node, &st, pl + bw, pt + bw, inner, c);
+        let (items, y_end, nhits) = self.nest(node, &st, pl + bw, pt + bw, inner, c);
         let box_h = side(c, "height", self.avail_w)
             .or_else(|| aspect_ratio(c).map(|r| box_w / r))
             .unwrap_or(y_end + pb + bw)
@@ -1779,7 +1799,7 @@ impl<'a> Layouter<'a> {
         if ml > 0.0 {
             self.spacer(ml);
         }
-        self.push_box(box_w, box_h, out, mb.max(0.0));
+        self.push_box(box_w, box_h, out, nhits, mb.max(0.0));
         if mr > 0.0 {
             self.spacer(mr);
         }
@@ -1906,6 +1926,7 @@ impl<'a> Layouter<'a> {
                 Option<Color>,
                 Option<(f32, Color)>,
                 Vec<DisplayItem>,
+                Vec<(f32, f32, f32, f32, NodeId)>,
             )> = Vec::new();
             let mut x = self.margin_x;
             let mut row_h = 0.0f32;
@@ -1923,15 +1944,15 @@ impl<'a> Layouter<'a> {
                 let bw = cborder.map(|b| b.0).unwrap_or(0.0);
                 let cbg = cs.get("background-color").and_then(|v| parse_color(v));
                 let inner = (cw - pl - pr - 2.0 * bw).max(1.0);
-                let (items, y_end) = self.nest(cell, &cst, pl + bw, pt + bw, inner, &cs);
+                let (items, y_end, nhits) = self.nest(cell, &cst, pl + bw, pt + bw, inner, &cs);
                 let min_h = self.eff_line_h(&cst);
                 let cell_h = (y_end + pb + bw).max(min_h);
-                boxes.push((x, cw, cell_h, cbg, cborder, items));
+                boxes.push((x, cw, cell_h, cbg, cborder, items, nhits));
                 x += cw;
                 row_h = row_h.max(cell_h);
             }
             // second pass: stretch cell bg/borders to row height, place content
-            for (cx, cw, _ch, cbg, cborder, items) in boxes {
+            for (cx, cw, _ch, cbg, cborder, items, nhits) in boxes {
                 if let Some(col) = cbg {
                     self.items.push(DisplayItem::FillRect {
                         x: cx,
@@ -1946,6 +1967,9 @@ impl<'a> Layouter<'a> {
                 }
                 for it in items {
                     self.items.push(offset_item(it, cx, self.y));
+                }
+                for h in nhits {
+                    self.hits.push((h.0 + cx, h.1 + self.y, h.2, h.3, h.4));
                 }
             }
             self.y += row_h;
@@ -2069,6 +2093,9 @@ impl<'a> Layouter<'a> {
             just: GAlign,
             al: GAlign,
             laid: Vec<DisplayItem>,
+            /// child element boxes laid relative to the item's content box —
+            /// offset to (ix, iy+dy) at emit for click hit-testing
+            hits: Vec<(f32, f32, f32, f32, NodeId)>,
             /// border-box height of the laid content (pre-stretch)
             box_h_intr: f32,
         }
@@ -2327,6 +2354,7 @@ impl<'a> Layouter<'a> {
                 just,
                 al,
                 laid: Vec::new(),
+                hits: Vec::new(),
                 box_h_intr: 0.0,
             });
         }
@@ -2384,7 +2412,7 @@ impl<'a> Layouter<'a> {
                     _ => it.intrinsic_w.min(inner_w),
                 })
                 .max(1.0);
-            let (laid, bottom) = self.nest(
+            let (laid, bottom, nhits) = self.nest(
                 it.id,
                 &it.st,
                 it.p[3] + it.bw,
@@ -2393,6 +2421,7 @@ impl<'a> Layouter<'a> {
                 &it.cc,
             );
             it.laid = laid;
+            it.hits = nhits;
             let content_h = bottom + it.p[2] + it.bw; // border-box height
             let box_w = content_w + it.p[1] + it.p[3] + 2.0 * it.bw;
             let mut box_h = it
@@ -2595,6 +2624,10 @@ impl<'a> Layouter<'a> {
             for di in it.laid.drain(..) {
                 self.items.push(offset_item(di, ix, iy + dy));
             }
+            self.hits.push((ix, iy, box_w, box_h, it.id));
+            for h in it.hits.drain(..) {
+                self.hits.push((h.0 + ix, h.1 + iy + dy, h.2, h.3, h.4));
+            }
         }
 
         // the container consumes max(content, declared height) in flow
@@ -2609,8 +2642,9 @@ impl<'a> Layouter<'a> {
         y0: f32,
         avail: f32,
         c: &Props,
-    ) -> (Vec<DisplayItem>, f32) {
+    ) -> (Vec<DisplayItem>, f32, Vec<(f32, f32, f32, f32, NodeId)>) {
         let saved_items = std::mem::take(&mut self.items);
+        let saved_hits = std::mem::take(&mut self.hits);
         let saved_line = std::mem::take(&mut self.line);
         let saved_floats = std::mem::take(&mut self.floats);
         let saved = (self.y, self.margin_x, self.avail_w, self.align);
@@ -2645,6 +2679,7 @@ impl<'a> Layouter<'a> {
         self.flush_line();
         let bottom = self.y;
         let items = std::mem::replace(&mut self.items, saved_items);
+        let hits = std::mem::replace(&mut self.hits, saved_hits);
         self.y = saved.0;
         self.margin_x = saved.1;
         self.avail_w = saved.2;
@@ -2653,7 +2688,7 @@ impl<'a> Layouter<'a> {
         self.line_x = saved_lx;
         self.pending_space = saved_ps;
         self.floats = saved_floats;
-        (items, bottom)
+        (items, bottom, hits)
     }
 
     /// min-content width approximation: the longest word inside `node`
@@ -2795,13 +2830,21 @@ impl<'a> Layouter<'a> {
             href: None,
             bg: None,
             items: None,
+            hits: Vec::new(),
             box_h: 0.0,
         });
         self.line_x += w;
     }
 
     /// Push an inline-block box (pre-rendered items) onto the line like a word.
-    fn push_box(&mut self, w: f32, h: f32, items: Vec<DisplayItem>, mb: f32) {
+    fn push_box(
+        &mut self,
+        w: f32,
+        h: f32,
+        items: Vec<DisplayItem>,
+        hits: Vec<(f32, f32, f32, f32, NodeId)>,
+        mb: f32,
+    ) {
         if self.line_x + w > self.content_width() && !self.line.is_empty() {
             self.flush_line();
         }
@@ -2819,6 +2862,7 @@ impl<'a> Layouter<'a> {
             href: None,
             bg: None,
             items: Some(items),
+            hits,
             box_h: h,
         });
         self.line_x += w;
@@ -3076,6 +3120,7 @@ impl<'a> Layouter<'a> {
                         line_h,
                         bg: st.inline_bg,
                         items: None,
+            hits: Vec::new(),
                         box_h: 0.0,
                     });
                     self.flush_line();
@@ -3100,6 +3145,7 @@ impl<'a> Layouter<'a> {
                     line_h,
                     bg: st.inline_bg,
                     items: None,
+            hits: Vec::new(),
                     box_h: 0.0,
                 });
                 self.line_x += cw;
@@ -3120,6 +3166,7 @@ impl<'a> Layouter<'a> {
             line_h,
             bg: st.inline_bg,
             items: None,
+            hits: Vec::new(),
             box_h: 0.0,
         });
         self.line_x += w;
@@ -3155,6 +3202,9 @@ impl<'a> Layouter<'a> {
                 let dy = baseline - w.box_h;
                 for it in items {
                     self.items.push(offset_item(it, x, dy));
+                }
+                for h in w.hits {
+                    self.hits.push((h.0 + x, h.1 + dy, h.2, h.3, h.4));
                 }
             } else if !w.text.is_empty() {
                 if let Some(bg) = w.bg {
@@ -3199,7 +3249,8 @@ mod tests {
     fn lay(html: &str) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>) {
         let d = doc(html);
         let mut fonts = FontCache::new();
-        Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[])
+        let (items, h, anchors, _) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[]);
+        (items, h, anchors)
     }
 
     fn texts(items: &[DisplayItem]) -> Vec<&DisplayItem> {
@@ -3618,7 +3669,7 @@ mod dbg3 {
         eprintln!("TAGS: {:?}", tags);
         let sh2 = rowser_css::parse(&css);
         let mut fonts = FontCache::new();
-        let (items, _, _) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[sh2]);
+        let (items, _, _, _) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[sh2]);
         for it in &items {
             match it {
                 DisplayItem::Image { x, y, w, h, src } => eprintln!("IMG {x:.0},{y:.0} {w:.0}x{h:.0} {src}"),
