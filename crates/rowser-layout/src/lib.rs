@@ -111,6 +111,11 @@ struct Style {
     /// background-color of the nearest inline ancestor; painted per-word.
     /// Cleared when a block/inline-box paints its own background rect.
     inline_bg: Option<Color>,
+    /// resolved numeric font-weight (100–900); `bold` stays as the ≥600
+    /// mirror for callers still keyed on the bool
+    weight: u16,
+    /// font-stretch percentage for face matching (100 = normal width)
+    stretch: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +144,8 @@ fn base_style() -> Style {
         href: None,
         line_h: None,
         inline_bg: None,
+        weight: 400,
+        stretch: 100,
     }
 }
 
@@ -1057,6 +1064,42 @@ fn parse_font_size(v: &str, parent: f32) -> f32 {
     }
 }
 
+/// font-weight → 100–900; `bolder`/`lighter` step from the parent's
+/// resolved weight (CSS Fonts 4 coarse mapping).
+fn font_weight_value(v: &str, parent: u16) -> u16 {
+    match v.trim().to_lowercase().as_str() {
+        "normal" => 400,
+        "bold" => 700,
+        "bolder" => match parent {
+            ..=349 => 400,
+            350..=549 => 700,
+            _ => 900,
+        },
+        "lighter" => match parent {
+            ..=549 => 100,
+            550..=749 => 400,
+            _ => 700,
+        },
+        other => other.parse::<u16>().map(|n| n.clamp(1, 1000)).unwrap_or(400),
+    }
+}
+
+/// font-stretch keyword or `n%` → percentage for face scoring.
+fn font_stretch_value(v: &str) -> u16 {
+    match v.trim().to_lowercase().as_str() {
+        "ultra-condensed" => 50,
+        "extra-condensed" => 63,
+        "condensed" => 75,
+        "semi-condensed" => 88,
+        "normal" => 100,
+        "semi-expanded" => 113,
+        "expanded" => 125,
+        "extra-expanded" => 150,
+        "ultra-expanded" => 200,
+        other => other.trim_end_matches('%').parse::<u16>().unwrap_or(100),
+    }
+}
+
 /// Shorthand sides (top, right, bottom, left) from 1–4 values.
 fn sides(c: &Props, name: &str, rel: f32, em: f32) -> [Option<f32>; 4] {
     if let Some(v) = c.get(name) {
@@ -1843,9 +1886,10 @@ pub struct Layouter<'a> {
     /// probes all re-resolve the same nodes; the cascade is deterministic
     /// per node so the result is shared (Rc) instead of recomputed.
     style_cache: FxHashMap<NodeId, Rc<Props>>,
-    /// (family, bold, italic) → font index memo — FontCache::resolve scans
-    /// every installed face per call, so resolving once per style is a must.
-    font_memo: FxHashMap<String, [u32; 4]>,
+    /// (family, weight, italic, first-char) → font index memo —
+    /// FontCache::resolve scans every installed face per call, so
+    /// resolving once per style is a must. u32::MAX = resolved-to-none.
+    font_memo: FxHashMap<(String, u16, bool, u32), u32>,
     fonts: &'a mut FontCache,
     items: Vec<DisplayItem>,
     y: f32,
@@ -2157,11 +2201,16 @@ impl<'a> Layouter<'a> {
             st.size = parse_font_size(v, st.size);
         }
         if let Some(v) = c.get("font-weight") {
-            st.bold = matches!(v.as_str(), "bold" | "bolder")
-                || v.parse::<u32>().is_ok_and(|n| n >= 600);
+            st.weight = font_weight_value(v, st.weight);
+            st.bold = st.weight >= 600;
         }
         if let Some(v) = c.get("font-style") {
-            st.italic = matches!(v.as_str(), "italic" | "oblique");
+            let v = v.trim().to_lowercase();
+            st.italic = v.starts_with("italic")
+                || (v.starts_with("oblique") && !v.starts_with("oblique 0"));
+        }
+        if let Some(v) = c.get("font-stretch") {
+            st.stretch = font_stretch_value(v);
         }
         if let Some(v) = c.get("text-transform") {
             st.transform = match v.trim() {
@@ -2172,18 +2221,9 @@ impl<'a> Layouter<'a> {
             };
         }
         if let Some(v) = c.get("font-family") {
-            let first = v.split(',').next().unwrap_or("").trim().trim_matches('"').trim_matches('\'').to_lowercase();
-            // generic families map to our bundled Liberation set; anything
-            // else is passed through so FontCache::resolve can fuzzy-match
-            // real installed family names (e.g. "DejaVu Sans")
-            st.family = match first.as_str() {
-                "monospace" | "mono" | "fixed" | "fixed-width" => {
-                    "liberation mono".to_string()
-                }
-                "serif" => "liberation serif".to_string(),
-                "" | "sans" | "sans-serif" | "system-ui" => "liberation sans".to_string(),
-                other => other.to_string(),
-            };
+            // keep the whole comma list — FontCache::resolve tries each
+            // name in order and expands generic keywords itself
+            st.family = v.trim().to_lowercase();
         }
         if let Some(v) = c.get("color") {
             if let Some(col) = parse_color(v) {
@@ -4852,23 +4892,30 @@ impl<'a> Layouter<'a> {
     }
 
     fn resolve_font(&mut self, st: &Style) -> Option<usize> {
+        self.resolve_font_ch(st, None)
+    }
+
+    /// Font resolution with the run's first char for unicode-range gating
+    /// (@font-face approximation — per-run, no mid-run segmentation).
+    /// `ch` None resolves purely on family/weight/stretch/style.
+    fn resolve_font_ch(&mut self, st: &Style, ch: Option<char>) -> Option<usize> {
         // FontCache::resolve scans every installed face; memoize per
-        // (family, bold, italic). Slots encode: u32::MAX = not computed,
-        // u32::MAX-1 = resolved-to-none, else font index.
-        let slot = (st.bold as usize) * 2 + st.italic as usize;
-        if let Some(slots) = self.font_memo.get(st.family.as_str()) {
-            let v = slots[slot];
-            if v != u32::MAX {
-                return if v == u32::MAX - 1 { None } else { Some(v as usize) };
-            }
+        // (family, weight, italic, first char). u32::MAX = resolved-none.
+        let key = (
+            st.family.clone(),
+            st.weight,
+            st.italic,
+            ch.map_or(0, |c| c as u32),
+        );
+        if let Some(&v) = self.font_memo.get(&key) {
+            return if v == u32::MAX { None } else { Some(v as usize) };
         }
         let r = self
             .fonts
-            .resolve(&st.family, st.bold, st.italic)
+            .resolve_face(&st.family, st.weight, st.stretch, st.italic, ch)
             .or_else(|| self.fonts.resolve("liberation sans", false, false));
         self.font_memo
-            .entry(st.family.clone())
-            .or_insert([u32::MAX; 4])[slot] = r.map(|i| i as u32).unwrap_or(u32::MAX - 1);
+            .insert(key, r.map(|i| i as u32).unwrap_or(u32::MAX));
         r
     }
 
@@ -4880,7 +4927,7 @@ impl<'a> Layouter<'a> {
                 .font(idx)
                 .is_some_and(|f| w.chars().all(|c| f.glyph_id(c) != 0))
         };
-        let primary = self.resolve_font(st)?;
+        let primary = self.resolve_font_ch(st, word.chars().next())?;
         if covers(&mut self.fonts, primary, word) {
             return Some(primary);
         }
@@ -4916,7 +4963,7 @@ impl<'a> Layouter<'a> {
     }
 
     fn word(&mut self, word: &str, st: &Style) {
-        if let Some(font) = self.resolve_font(st) {
+        if let Some(font) = self.resolve_font_ch(st, word.chars().next()) {
             self.push_word(word, st, font);
         }
     }
@@ -5507,6 +5554,89 @@ mod tests {
                 assert!(*x < 8.0 + 150.0 + 1.0, "word starts inside 150px box, x={x}");
             }
         }
+    }
+
+    // ---------- @font-face / family fallback ----------
+
+    fn lay_fc(html: &str, fonts: &mut FontCache, external: &[css::StyleSheet]) -> Vec<DisplayItem> {
+        let d = doc(html);
+        let (items, _, _, _) = Layouter::layout(&d, fonts, 800.0, 0.0, external);
+        items
+    }
+
+    fn first_font(items: &[DisplayItem]) -> Option<usize> {
+        items.iter().find_map(|i| match i {
+            DisplayItem::Text { font, .. } => Some(*font),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn family_fallback_order() {
+        // first unresolvable name is skipped; the second wins
+        let mut fonts = FontCache::new();
+        let want = fonts.resolve("liberation serif", false, false);
+        let items = lay_fc(
+            "<p style=\"font-family:'no such family xyz','Liberation Serif',monospace\">hi</p>",
+            &mut fonts,
+            &[],
+        );
+        if let Some(w) = want {
+            assert_eq!(first_font(&items), Some(w));
+        }
+    }
+
+    #[test]
+    fn registered_webfont_wins() {
+        let bytes =
+            std::fs::read("/usr/share/fonts/liberation/LiberationSerif-Regular.ttf").unwrap();
+        let mut fonts = FontCache::new();
+        let idx = fonts
+            .register_bytes("My Web Face", &bytes, 400, false, vec![])
+            .unwrap();
+        let items = lay_fc(
+            "<p style=\"font-family:'My Web Face',serif\">hi</p>",
+            &mut fonts,
+            &[],
+        );
+        // declared family resolves to the registered bytes, not generics
+        assert_eq!(first_font(&items), Some(idx));
+    }
+
+    #[test]
+    fn unicode_range_picks_per_run_face() {
+        let bytes =
+            std::fs::read("/usr/share/fonts/liberation/LiberationSans-Regular.ttf").unwrap();
+        let mut fonts = FontCache::new();
+        let up = fonts
+            .register_bytes("Ranged", &bytes, 400, false, vec![(0x41, 0x5a)])
+            .unwrap();
+        let lo = fonts
+            .register_bytes("Ranged", &bytes, 400, false, vec![(0x61, 0x7a)])
+            .unwrap();
+        let items = lay_fc(
+            "<style>p{font-family:Ranged}</style><p>ABC</p><p>abc</p>",
+            &mut fonts,
+            &[],
+        );
+        let got: Vec<usize> = items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Text { font, .. } => Some(*font),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![up, lo]);
+    }
+
+    #[test]
+    fn weight_and_stretch_map_to_numbers() {
+        assert_eq!(font_weight_value("bold", 400), 700);
+        assert_eq!(font_weight_value("600", 400), 600);
+        assert_eq!(font_weight_value("bolder", 400), 700);
+        assert_eq!(font_weight_value("lighter", 900), 700);
+        assert_eq!(font_stretch_value("condensed"), 75);
+        assert_eq!(font_stretch_value("120%"), 120);
     }
 }
 
