@@ -574,17 +574,43 @@ fn install_globals(i: &mut Interp) {
         define_global(i, "Promise", ctor);
     }
 
-    // -- Date (minimal) --
+    // -- Date --
     {
         let dp = i.new_obj();
         method(i, &dp, "getTime", date_get_time);
         method(i, &dp, "valueOf", date_get_time);
         method(i, &dp, "toString", date_to_string);
-        method(i, &dp, "toISOString", date_to_string);
-        method(i, &dp, "getTime", date_get_time);
+        method(i, &dp, "toISOString", date_to_iso);
+        method(i, &dp, "toJSON", date_to_iso);
+        method(i, &dp, "toUTCString", date_to_utc);
+        method(i, &dp, "toGMTString", date_to_utc);
+        method(i, &dp, "toDateString", date_to_datestr);
+        method(i, &dp, "toTimeString", date_to_timestr);
+        method(i, &dp, "toLocaleString", date_to_utc);
+        method(i, &dp, "toLocaleDateString", date_to_datestr);
+        method(i, &dp, "toLocaleTimeString", date_to_timestr);
+        method(i, &dp, "getFullYear", |i, t, _| date_getter(i, t, |d| d.0 as f64));
+        method(i, &dp, "getMonth", |i, t, _| date_getter(i, t, |d| (d.1 - 1) as f64));
+        method(i, &dp, "getDate", |i, t, _| date_getter(i, t, |d| d.2 as f64));
+        method(i, &dp, "getDay", |i, t, _| date_getter(i, t, |d| d.3 as f64));
+        method(i, &dp, "getHours", |i, t, _| date_getter(i, t, |d| d.4 as f64));
+        method(i, &dp, "getMinutes", |i, t, _| date_getter(i, t, |d| d.5 as f64));
+        method(i, &dp, "getSeconds", |i, t, _| date_getter(i, t, |d| d.6 as f64));
+        method(i, &dp, "getMilliseconds", |i, t, _| date_getter(i, t, |d| d.7 as f64));
+        method(i, &dp, "getUTCFullYear", |i, t, _| date_getter(i, t, |d| d.0 as f64));
+        method(i, &dp, "getUTCMonth", |i, t, _| date_getter(i, t, |d| (d.1 - 1) as f64));
+        method(i, &dp, "getUTCDate", |i, t, _| date_getter(i, t, |d| d.2 as f64));
+        method(i, &dp, "getUTCDay", |i, t, _| date_getter(i, t, |d| d.3 as f64));
+        method(i, &dp, "getUTCHours", |i, t, _| date_getter(i, t, |d| d.4 as f64));
+        method(i, &dp, "getUTCMinutes", |i, t, _| date_getter(i, t, |d| d.5 as f64));
+        method(i, &dp, "getUTCSeconds", |i, t, _| date_getter(i, t, |d| d.6 as f64));
+        method(i, &dp, "getUTCMilliseconds", |i, t, _| date_getter(i, t, |d| d.7 as f64));
+        method(i, &dp, "getTimezoneOffset", |_i, _t, _| Ok(Value::Num(0.0)));
         let ctor = make_ctor(i, "Date", date_ctor, dp.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         i.set_builtin(o, "now", native(i, "now", date_now));
+        i.set_builtin(o, "UTC", native(i, "UTC", date_utc));
+        i.set_builtin(o, "parse", native(i, "parse", date_parse));
         define_global(i, "Date", ctor);
     }
 
@@ -3288,6 +3314,13 @@ fn date_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let ms = match arg(args, 0) {
         Value::Und => now_millis(),
         Value::Num(n) => n,
+        Value::Str(_) => {
+            let v = arg(args, 0);
+            match date_parse(i, &Value::Und, &[v]) {
+                Ok(Value::Num(n)) => n,
+                _ => f64::NAN,
+            }
+        }
         v => i.to_num(&v).unwrap_or(f64::NAN),
     };
     if let Value::Obj(o) = this {
@@ -3305,8 +3338,8 @@ fn date_get_time(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Num(f64::NAN))
 }
 
-fn date_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let ms = if let Value::Obj(o) = this {
+fn date_ms(i: &mut Interp, this: &Value) -> f64 {
+    if let Value::Obj(o) = this {
         i.obj_get_raw(o, &PropKey::from_str("$ms"))
             .and_then(|v| match v {
                 Value::Num(n) => Some(n),
@@ -3315,8 +3348,193 @@ fn date_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             .unwrap_or(f64::NAN)
     } else {
         f64::NAN
+    }
+}
+
+/// (year, month 1-12, day, weekday 0=Sun, hour, min, sec, ms) for UTC epoch ms.
+/// Howard Hinnant's civil-from-days algorithm.
+fn date_parts(ms: f64) -> (i64, u32, u32, u32, u32, u32, u32, u32) {
+    if !ms.is_finite() {
+        return (0, 0, 0, 0, 0, 0, 0, 0);
+    }
+    let ms_i = ms.floor() as i64;
+    let days = ms_i.div_euclid(86_400_000);
+    let sod = ms_i.rem_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    let wd = ((days + 4).rem_euclid(7)) as u32; // epoch day = Thursday
+    let h = (sod / 3_600_000) as u32;
+    let mi = (sod % 3_600_000 / 60_000) as u32;
+    let s = (sod % 60_000 / 1000) as u32;
+    let msec = (sod % 1000) as u32;
+    (y, m, d, wd, h, mi, s, msec)
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+fn date_getter(
+    i: &mut Interp,
+    this: &Value,
+    f: impl Fn((i64, u32, u32, u32, u32, u32, u32, u32)) -> f64,
+) -> NResult {
+    let ms = date_ms(i, this);
+    if !ms.is_finite() {
+        return Ok(Value::Num(f64::NAN));
+    }
+    Ok(Value::Num(f(date_parts(ms))))
+}
+
+fn date_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let ms = date_ms(i, this);
+    if !ms.is_finite() {
+        return Ok(Value::Str(Rc::from("Invalid Date")));
+    }
+    let (y, m, d, wd, h, mi, s, _) = date_parts(ms);
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    Ok(Value::Str(Rc::from(format!(
+        "{} {} {:02} {} {:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+        WD[wd as usize],
+        MO[(m - 1) as usize],
+        d,
+        y,
+        h,
+        mi,
+        s
+    )
+    .as_str())))
+}
+
+fn date_to_utc(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let ms = date_ms(i, this);
+    if !ms.is_finite() {
+        return Ok(Value::Str(Rc::from("Invalid Date")));
+    }
+    let (y, m, d, wd, h, mi, s, _) = date_parts(ms);
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    Ok(Value::Str(Rc::from(format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        WD[wd as usize],
+        d,
+        MO[(m - 1) as usize],
+        y,
+        h,
+        mi,
+        s
+    )
+    .as_str())))
+}
+
+fn date_to_iso(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let ms = date_ms(i, this);
+    if !ms.is_finite() {
+        return Ok(Value::Str(Rc::from("Invalid Date")));
+    }
+    let (y, m, d, _, h, mi, s, msec) = date_parts(ms);
+    Ok(Value::Str(Rc::from(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, m, d, h, mi, s, msec
+    )
+    .as_str())))
+}
+
+fn date_to_datestr(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let ms = date_ms(i, this);
+    if !ms.is_finite() {
+        return Ok(Value::Str(Rc::from("Invalid Date")));
+    }
+    let (y, m, d, wd, _, _, _, _) = date_parts(ms);
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    Ok(Value::Str(Rc::from(format!(
+        "{} {} {:02} {}",
+        WD[wd as usize],
+        MO[(m - 1) as usize],
+        d,
+        y
+    )
+    .as_str())))
+}
+
+fn date_to_timestr(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let ms = date_ms(i, this);
+    if !ms.is_finite() {
+        return Ok(Value::Str(Rc::from("Invalid Date")));
+    }
+    let (_, _, _, _, h, mi, s, _) = date_parts(ms);
+    Ok(Value::Str(Rc::from(format!("{:02}:{:02}:{:02}", h, mi, s).as_str())))
+}
+
+fn date_utc(_i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
+    let num = |k: usize, d: f64| match arg(a, k) {
+        Value::Num(n) => n,
+        _ => d,
     };
-    Ok(Value::Str(Rc::from(format!("{ms} ms since epoch").as_str())))
+    let y = num(0, 0.0) as i64;
+    let y = if (0..=99).contains(&y) { 1900 + y } else { y };
+    let days = days_from_civil(y, num(1, 0.0) as u32 + 1, num(2, 1.0) as u32);
+    let ms = days as f64 * 86_400_000.0
+        + num(3, 0.0) * 3_600_000.0
+        + num(4, 0.0) * 60_000.0
+        + num(5, 0.0) * 1000.0
+        + num(6, 0.0);
+    Ok(Value::Num(ms))
+}
+
+fn date_parse(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
+    let s = match arg(a, 0) {
+        Value::Str(s) => s.to_string(),
+        _ => return Ok(Value::Num(f64::NAN)),
+    };
+    // ISO-ish: YYYY-MM-DD[THH:MM[:SS[.mmm]]][Z]
+    let s = s.trim();
+    let (dpart, tpart) = s.split_once(['T', ' ']).map(|(d, t)| (d, Some(t))).unwrap_or((s, None));
+    let dsegs: Vec<i64> = dpart.split('-').filter_map(|x| x.parse().ok()).collect();
+    if dsegs.len() < 3 {
+        return Ok(Value::Num(f64::NAN));
+    }
+    let mut ms = days_from_civil(dsegs[0], dsegs[1] as u32, dsegs[2] as u32) as f64 * 86_400_000.0;
+    if let Some(t) = tpart {
+        let t = t.trim_end_matches('Z');
+        let tsegs: Vec<f64> = t
+            .split(':')
+            .map(|x| x.parse().unwrap_or(0.0))
+            .collect();
+        if !tsegs.is_empty() {
+            ms += tsegs[0] * 3_600_000.0;
+        }
+        if tsegs.len() > 1 {
+            ms += tsegs[1] * 60_000.0;
+        }
+        if tsegs.len() > 2 {
+            ms += tsegs[2] * 1000.0;
+        }
+    }
+    let _ = i;
+    Ok(Value::Num(ms))
 }
 
 // ===========================================================================

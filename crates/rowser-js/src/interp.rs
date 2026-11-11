@@ -486,6 +486,10 @@ pub struct Interp {
     pub ext: Option<Box<dyn std::any::Any>>,
     /// ring buffer of recent call sites (debug aid for bundle triage)
     pub call_trace: std::collections::VecDeque<String>,
+    /// call_trace snapshot at the most recent `throw` statement
+    pub last_throw_trace: Vec<String>,
+    /// recorded `x.$$typeof` reads: "value <- object" (debug)
+    pub typeof_reads: Vec<String>,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -535,6 +539,8 @@ impl Interp {
             },
             ext: None,
             call_trace: std::collections::VecDeque::new(),
+            last_throw_trace: Vec::new(),
+            typeof_reads: Vec::new(),
         }
     }
 
@@ -768,7 +774,23 @@ impl Interp {
                     if matches!(base, Value::Und) { "undefined" } else { "null" }
                 )))
             }
-            Value::Obj(o) => self.obj_get(o, key, base),
+            Value::Obj(o) => {
+                let r = self.obj_get(o, key, base);
+                // debug hook: watch $$typeof reads to triage element-type errors
+                if let PropKey::S(k) = key {
+                    if k.as_ref() == "$$typeof" {
+                        let got = match &r {
+                            Ok(v) => self.inspect(v, 0),
+                            Err(_e) => "<throw>".to_string(),
+                        };
+                        let obj_desc = self.inspect(base, 0);
+                        self.typeof_reads.push(format!(
+                            "{got} <- {obj_desc:.160}"
+                        ));
+                    }
+                }
+                r
+            }
             Value::Str(s) => {
                 if let PropKey::S(k) = key {
                     if k.as_ref() == "length" {
@@ -1984,10 +2006,10 @@ impl Interp {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
-                            if l.is_none() || self.labels.contains(&l.clone().unwrap_or_default()) {
-                                break;
+                            if l.is_some() {
+                                return Ok(Completion::Break(l));
                             }
-                            return Ok(Completion::Break(l));
+                            break;
                         }
                         Completion::Continue(l) => {
                             if l.is_none() || self.labels.contains(&l.clone().unwrap_or_default()) {
@@ -2007,10 +2029,10 @@ impl Interp {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
-                            if l.is_none() || self.labels.contains(&l.clone().unwrap_or_default()) {
-                                break;
+                            if l.is_some() {
+                                return Ok(Completion::Break(l));
                             }
-                            return Ok(Completion::Break(l));
+                            break;
                         }
                         Completion::Continue(l) => {
                             if !(l.is_none()
@@ -2074,10 +2096,10 @@ impl Interp {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
-                            if l.is_none() || self.labels.contains(&l.clone().unwrap_or_default()) {
-                                break;
+                            if l.is_some() {
+                                return Ok(Completion::Break(l));
                             }
-                            return Ok(Completion::Break(l));
+                            break;
                         }
                         Completion::Continue(l) => {
                             if !(l.is_none()
@@ -2105,10 +2127,10 @@ impl Interp {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
-                            if l.is_none() || self.labels.contains(&l.clone().unwrap_or_default()) {
-                                return Ok(Completion::Normal(last));
+                            if l.is_some() {
+                                return Ok(Completion::Break(l));
                             }
-                            return Ok(Completion::Break(l));
+                            return Ok(Completion::Normal(last));
                         }
                         Completion::Continue(l) => {
                             if !(l.is_none()
@@ -2133,10 +2155,10 @@ impl Interp {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
-                            if l.is_none() || self.labels.contains(&l.clone().unwrap_or_default()) {
-                                return Ok(Completion::Normal(last));
+                            if l.is_some() {
+                                return Ok(Completion::Break(l));
                             }
-                            return Ok(Completion::Break(l));
+                            return Ok(Completion::Normal(last));
                         }
                         Completion::Continue(l) => {
                             if !(l.is_none()
@@ -2198,12 +2220,7 @@ impl Interp {
                                 Completion::Normal(v) => last = v,
                                 Completion::Empty => {}
                                 Completion::Break(None) => break 'cases,
-                                Completion::Break(l) => {
-                                    if self.labels.contains(&l.clone().unwrap_or_default()) {
-                                        break 'cases;
-                                    }
-                                    return Ok(Completion::Break(l));
-                                }
+                                other @ Completion::Break(_) => return Ok(other),
                                 other => return Ok(other),
                             }
                         }
@@ -2246,6 +2263,8 @@ impl Interp {
             }
             Stmt::Throw(e) => {
                 let v = self.eval_expr(e, env)?;
+                self.last_throw_trace =
+                    self.call_trace.iter().cloned().collect::<Vec<_>>();
                 Err(v)
             }
             Stmt::Labeled(label, inner) => {
