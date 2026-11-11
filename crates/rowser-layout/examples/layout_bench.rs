@@ -110,6 +110,9 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 }
             }
             DisplayItem::PopClip => mix(&[10]),
+            _ => {
+                mix(&[9]);
+            }
         }
     }
     h

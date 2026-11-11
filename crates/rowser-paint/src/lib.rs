@@ -236,10 +236,12 @@ pub fn paint_into(
     images: &HashMap<String, Image>,
 ) {
     let ch = canvas.height as f32;
-    for item in items {
+    let mut i = 0;
+    while i < items.len() {
+        let item = &items[i];
         // Vertical cull: items fully off-canvas can't write visible pixels.
         // Text gets a ±4em band — glyph ink can overshoot the em box, but
-        // never by multiples of it.
+        // never by multiples of it. Effect markers never cull.
         let (top, bot) = match item {
             DisplayItem::FillRect { y, h, .. }
             | DisplayItem::RoundedRect { y, h, .. }
@@ -251,17 +253,29 @@ pub fn paint_into(
             DisplayItem::Text { baseline, size, .. } => {
                 (baseline - size * 4.0, baseline + size * 4.0)
             }
-            // PushClip/PopClip/Shadow are never culled — a skipped PushClip
-            // would un-clip its children, and a shadow's halo reaches
-            // beyond its box.
+            // PushClip/PopClip/Shadow/PushEffect/PopEffect are never culled
+            // — a skipped PushClip would un-clip its children, a shadow's
+            // halo reaches beyond its box, and an effect group's bounds
+            // can't be derived from a marker item.
             DisplayItem::PushClip { .. }
             | DisplayItem::PopClip
-            | DisplayItem::Shadow { .. } => (0.0, ch),
+            | DisplayItem::Shadow { .. }
+            | DisplayItem::PushEffect(_)
+            | DisplayItem::PopEffect => (f32::MIN, f32::MAX),
         };
         if bot < 0.0 || top > ch {
+            i += 1;
             continue;
         }
         match item {
+            DisplayItem::PushEffect(_) => {
+                i = fx::process(canvas, items, i, fonts, images);
+                continue;
+            }
+            DisplayItem::PopEffect => {
+                i += 1;
+                continue;
+            }
             DisplayItem::RoundedRect { x, y, w, h, radius, color } => {
                 canvas.fill_rounded(*x as i32, *y as i32, *w as u32, *h as u32, *radius, *color);
             }
@@ -380,6 +394,7 @@ pub fn paint_into(
                 }
             }
         }
+        i += 1;
     }
 }
 

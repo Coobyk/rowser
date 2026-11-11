@@ -1183,6 +1183,8 @@ fn shift_item_y(it: &mut rowser_layout::DisplayItem, dy: f32) {
             *py += dy;
         }
         D::PopClip => {}
+        D::PushEffect(e) => e.offset_mut(0.0, dy),
+        D::PopEffect => {}
     }
 }
 

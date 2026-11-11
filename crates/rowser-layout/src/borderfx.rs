@@ -3,7 +3,7 @@
 //! the block/float/inline-block/grid/table box paths.
 
 use crate::{
-    alpha, over, parse_color, parse_len, BorderEdge, BorderStyle, Color, DisplayItem, Props,
+    alpha, over, parse_color, parse_color_ctx, parse_len, BorderEdge, BorderStyle, Color, DisplayItem, Props,
     BLACK,
 };
 
@@ -92,10 +92,13 @@ pub fn border_parts(v: &str, em: f32) -> BorderParts {
     out
 }
 
-fn parts_color(p: &BorderParts) -> Option<Color> {
+fn parts_color(p: &BorderParts, cur: Color) -> Option<Color> {
     p.color
         .as_deref()
-        .and_then(|s| parse_color(s).or_else(|| s.split_whitespace().find_map(|t| parse_color(t))))
+        .and_then(|s| {
+            parse_color_ctx(s, Some(cur))
+                .or_else(|| s.split_whitespace().find_map(|t| parse_color_ctx(t, Some(cur))))
+        })
 }
 
 /// Per-side border widths/styles/colors — [top, right, bottom, left].
@@ -110,7 +113,7 @@ pub struct Borders {
 /// longhands. A side with no explicit style reads `solid` (matches the
 /// old lenient `border:2px` → painted edge behavior); `none`/`hidden`
 /// zeroes that side's width.
-pub fn borders(c: &Props, size: f32) -> Option<Borders> {
+pub fn borders(c: &Props, size: f32, cur: Color) -> Option<Borders> {
     let mut b = Borders {
         w: [0.0; 4],
         style: [BorderStyle::Solid; 4],
@@ -125,7 +128,7 @@ pub fn borders(c: &Props, size: f32) -> Option<Borders> {
             if let Some(s) = p.style {
                 b.style = [s; 4];
             }
-            if let Some(col) = parts_color(&p) {
+            if let Some(col) = parts_color(&p, cur) {
                 b.color = [col; 4];
             }
         }
@@ -165,9 +168,9 @@ pub fn borders(c: &Props, size: f32) -> Option<Borders> {
             }
         }
         if let Some(v) = c.get(cn) {
-            if let Some(col) = parse_color(v) {
+            if let Some(col) = parse_color_ctx(v, Some(cur)) {
                 b.color[i] = col;
-            } else if let Some(col) = parts_color(&border_parts(v, size)) {
+            } else if let Some(col) = parts_color(&border_parts(v, size), cur) {
                 b.color[i] = col;
             }
         }
@@ -462,8 +465,8 @@ pub fn outline(c: &Props, size: f32, bd: Color, def: Color) -> Option<Outline> {
     }
     if let Some(v) = c.get("outline-color") {
         let t = v.trim();
-        if !matches!(t, "auto" | "invert" | "currentcolor") {
-            if let Some(col) = parse_color(t).or_else(|| parts_color(&border_parts(t, size))) {
+        if !matches!(t, "auto" | "invert") {
+            if let Some(col) = parse_color_ctx(t, Some(def)).or_else(|| parts_color(&border_parts(t, size), def)) {
                 o.color = over(col, bd);
                 found = true;
             }
