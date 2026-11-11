@@ -13,6 +13,7 @@
 use rowser_css as css;
 mod borderfx;
 pub mod colorfx;
+mod stacking;
 pub mod svg;
 mod bgimg;
 
@@ -226,6 +227,10 @@ struct Style {
     weight: u16,
     /// font-stretch percentage for face matching (100 = normal width)
     stretch: u16,
+    /// accumulated `position:relative` inline offsets — painted position
+    /// shifts; flow geometry is unaffected
+    rel_x: f32,
+    rel_y: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -256,6 +261,8 @@ fn base_style() -> Style {
         inline_bg: None,
         weight: 400,
         stretch: 100,
+        rel_x: 0.0,
+        rel_y: 0.0,
     }
 }
 
@@ -2025,14 +2032,44 @@ struct Word {
     hits: Vec<(f32, f32, f32, f32, NodeId)>,
     /// inline-block height (baseline alignment: box bottom sits on baseline)
     box_h: f32,
+    /// painted-position shift from enclosing `position:relative` inlines —
+    /// applied at emit; doesn't affect line geometry
+    dx: f32,
+    dy: f32,
 }
 
-/// A floated box occupying [x .. x+w] horizontally until `bottom`.
-/// While `y < bottom`, lines inset by `w` on the float's side.
+/// A floated box: horizontal margin-box extent [x0,x1] (emission coords)
+/// intruding into line boxes while `top <= y < bottom`.
 struct Float {
     right: bool,
-    w: f32,
+    x0: f32,
+    x1: f32,
+    top: f32,
     bottom: f32,
+}
+
+/// Containing-block rect: a positioned ancestor's padding box in emission
+/// coords (`h` None while the box's height is still content-driven).
+#[derive(Clone, Copy)]
+struct CbRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: Option<f32>,
+}
+
+/// A `position:sticky` box's emitted range + flow edges, waiting for the
+/// enclosing block's bottom to clamp the stick offset against.
+struct StickyFix {
+    i0: usize,
+    i1: usize,
+    h0: usize,
+    h1: usize,
+    /// border-box top/bottom at its flow position (emission coords)
+    top: f32,
+    bottom: f32,
+    ins_t: Option<f32>,
+    ins_b: Option<f32>,
 }
 
 /// Translate a display item by (dx, dy).
@@ -2259,11 +2296,17 @@ pub struct Layouter<'a> {
     /// `h-full` chain still finds the nearest definite ancestor
     pct_h: Option<f32>,
     /// viewport width (the width passed to `layout`) for vw units and
-    /// `background-attachment:fixed` positioning areas
+    /// `background-attachment:fixed` positioning areas — also the initial
+    /// containing block for `position:fixed`/`absolute` at the root
     viewport_w: f32,
     /// element whose background propagated to the canvas (its own bg-image
     /// layers are skipped — they're already painted viewport-wide)
     canvas_bg_node: Option<NodeId>,
+    /// containing-block stack: padding box (emission coords) of each open
+    /// positioned ancestor — `absolute` descendants resolve insets here
+    cb_stack: Vec<CbRect>,
+    /// sticky boxes awaiting the enclosing block's bottom to clamp against
+    stickies: Vec<StickyFix>,
 }
 
 impl<'a> Layouter<'a> {
@@ -2319,6 +2362,8 @@ impl<'a> Layouter<'a> {
             pct_h: None,
             viewport_w: width,
             canvas_bg_node: None,
+            cb_stack: Vec::new(),
+            stickies: Vec::new(),
         };
         l.preresolve_styles();
         // css-backgrounds §2.11: the canvas takes the root element's
@@ -2385,23 +2430,155 @@ impl<'a> Layouter<'a> {
         for f in &l.floats {
             l.y = l.y.max(f.bottom);
         }
+        l.drain_stickies(0, f32::NEG_INFINITY, f32::INFINITY);
         let h = l.y + scroll;
         (l.items, h, l.anchors, l.hits)
     }
 
-    /// Horizontal space taken by floats on (left, right) at the current y.
+    /// Horizontal space taken by floats on (left, right) at the current y:
+    /// the intrusion into this block's line box [margin_x, margin_x+avail_w].
+    /// Same-side floats can't overlap, so the deepest intrusion wins.
     fn float_insets(&self) -> (f32, f32) {
         let (mut l, mut r) = (0.0f32, 0.0f32);
+        let (x0, x1) = (self.margin_x, self.margin_x + self.avail_w);
         for f in &self.floats {
-            if self.y < f.bottom {
-                if f.right {
-                    r += f.w;
-                } else {
-                    l += f.w;
+            if self.y < f.top || self.y >= f.bottom {
+                continue;
+            }
+            if f.right {
+                if f.x0 < x1 {
+                    r = r.max(x1 - f.x0);
                 }
+            } else if f.x1 > x0 {
+                l = l.max(f.x1 - x0);
             }
         }
         (l, r)
+    }
+
+    /// Bottom of the deepest float on `right`'s side — the `clear` target.
+    fn clear_below(&self, right: bool) -> f32 {
+        self.floats
+            .iter()
+            .filter(|f| f.right == right)
+            .map(|f| f.bottom)
+            .fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    /// Apply pending sticky offsets whose boxes are direct children of the
+    /// block spanning [parent_top, parent_bottom] (emission coords).
+    fn drain_stickies(&mut self, from: usize, parent_top: f32, parent_bottom: f32) {
+        for si in from..self.stickies.len() {
+            let (i0, i1, h0, h1, dy) = {
+                let s = &self.stickies[si];
+                let dy = if let Some(t) = s.ins_t {
+                    (t - s.top).clamp(0.0, (parent_bottom - s.bottom).max(0.0))
+                } else if let Some(b) = s.ins_b {
+                    (self.viewport_h - b - s.bottom)
+                        .min(0.0)
+                        .max(parent_top - s.top)
+                } else {
+                    0.0
+                };
+                (
+                    s.i0,
+                    s.i1.min(self.items.len()),
+                    s.h0,
+                    s.h1.min(self.hits.len()),
+                    dy,
+                )
+            };
+            if dy != 0.0 {
+                for i in i0..i1 {
+                    let it = std::mem::replace(
+                        &mut self.items[i],
+                        DisplayItem::FillRect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: 0.0,
+                            h: 0.0,
+                            color: 0,
+                        },
+                    );
+                    self.items[i] = offset_item(it, 0.0, dy);
+                }
+                for h in self.hits.iter_mut().skip(h0).take(h1 - h0) {
+                    h.1 += dy;
+                }
+            }
+        }
+        self.stickies.truncate(from);
+    }
+
+    /// `position:relative` inset offsets → (dx, dy); (0,0) otherwise.
+    fn rel_offset(&self, c: &Props, em: f32) -> (f32, f32) {
+        if c.get("position").map(String::as_str) != Some("relative") {
+            return (0.0, 0.0);
+        }
+        let hrel = self.cb_h.or(self.pct_h).unwrap_or(self.viewport_h);
+        let [t, r, b, l] = stacking::inset_sides(c, em, self.avail_w, hrel);
+        (
+            l.unwrap_or(0.0) - r.unwrap_or(0.0),
+            t.unwrap_or(0.0) - b.unwrap_or(0.0),
+        )
+    }
+
+    /// Containing block for a positioned element's insets: `fixed` →
+    /// viewport, `absolute` → nearest positioned ancestor's padding box,
+    /// in-flow → current content box / nearest definite height.
+    fn inset_cb(&self, fixed: bool, absolute: bool) -> CbRect {
+        let vp = CbRect {
+            x: 0.0,
+            y: 0.0,
+            w: self.viewport_w,
+            h: Some(self.viewport_h),
+        };
+        if fixed {
+            vp
+        } else if absolute {
+            self.cb_stack.last().copied().unwrap_or(vp)
+        } else {
+            CbRect {
+                x: self.margin_x,
+                y: self.y,
+                w: self.avail_w,
+                h: self.cb_h.or(self.pct_h),
+            }
+        }
+    }
+
+    /// Walk `node`'s children, cutting sibling paint-order segments at
+    /// block-level/positioned/float boundaries and reordering the emitted
+    /// runs into paint order (in-flow → floats → inline → positioned z).
+    /// `sticky_top`/`sticky_bot` are the parent's content-top and projected
+    /// content-bottom — explicit heights are applied after children are
+    /// laid, so the caller passes the target along for sticky clamps.
+    fn walk_children(&mut self, node: NodeId, st: &Style, sticky_top: f32, sticky_bot: f32) {
+        let st0 = self.stickies.len();
+        let mut segs: Vec<(usize, usize, i64)> =
+            vec![(self.items.len(), self.hits.len(), stacking::L_INLINE)];
+        for &ch in self.doc.children(node) {
+            let key = if matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
+                let cc = self.style(ch);
+                stacking::child_layer(&cc)
+            } else {
+                None
+            };
+            if let Some(key) = key {
+                // flush the pending line into the open segment, then give
+                // the block-level child a segment of its own
+                self.flush_line();
+                segs.push((self.items.len(), self.hits.len(), key));
+                self.walk(ch, st);
+                segs.push((self.items.len(), self.hits.len(), stacking::L_INLINE));
+            } else {
+                self.walk(ch, st);
+            }
+        }
+        self.flush_line();
+        // sticky fixups must apply before the reorder permutes ranges
+        self.drain_stickies(st0, sticky_top, self.y.max(sticky_bot));
+        stacking::reorder(&mut self.items, &mut self.hits, &segs);
     }
 
     fn content_width(&self) -> f32 {
@@ -2527,6 +2704,15 @@ impl<'a> Layouter<'a> {
                         c.get("position").map(String::as_str),
                         Some("absolute") | Some("fixed")
                     ) =>
+                    {
+                        self.block(node, tag, &c, st);
+                    }
+                    // floats blockify (CSS 2.1 §9.7); floated images go too —
+                    // other replaced tags keep the inline path
+                    _ if matches!(
+                        c.get("float").map(String::as_str),
+                        Some("left") | Some("right")
+                    ) && (!replaced || matches!(tag.as_str(), "img" | "svg")) =>
                     {
                         self.block(node, tag, &c, st);
                     }
@@ -2670,59 +2856,67 @@ impl<'a> Layouter<'a> {
         if tag == "table" {
             return self.table(node, c, st);
         }
-        // positioned boxes: fixed/sticky anchor to the viewport top, absolute
-        // and fixed take `left` against the containing width (approximation —
-        // flow space is still reserved, no z-order yet)
-        // positioned boxes leave no flow space: remember the flow y and
-        // restore it after the children are laid (block-end restore below)
-        let positioned = matches!(
-            c.get("position").map(String::as_str),
-            Some("fixed") | Some("sticky") | Some("absolute")
+        // positioning: `absolute`/`fixed` leave flow (space restored at the
+        // end); `sticky` stays in flow and clamps its painted y at the inset
+        // edge while the parent is on screen (StickyFix below); `relative`
+        // offsets post-layout. Insets resolve against the containing block:
+        // fixed → viewport, absolute → nearest positioned ancestor's
+        // padding box (cb_stack), in-flow → current box / definite height.
+        let pos_kind = c.get("position").map(String::as_str);
+        let fixed = pos_kind == Some("fixed");
+        let oof = fixed || pos_kind == Some("absolute");
+        let sticky = pos_kind == Some("sticky");
+        let is_cb = matches!(
+            pos_kind,
+            Some("relative") | Some("absolute") | Some("fixed") | Some("sticky")
         );
+        let cb = self.inset_cb(fixed, pos_kind == Some("absolute"));
+        let cb_h_res = cb.h.or(self.cb_h).or(self.pct_h).unwrap_or(self.viewport_h);
+        // `inset` shorthand + longhands + logical aliases → [t, r, b, l];
+        // % resolves against the containing block's dims
+        let [ins_t, ins_r, ins_b, ins_l] =
+            stacking::inset_sides(c, st.size, cb.w.max(1.0), cb_h_res);
         // explicit `height` — definite containing-block height for positioned
         // descendants and a floor for this box's own extent. % resolves
-        // against the nearest definite ancestor height, else the viewport.
-        let h_prop = dim(c, "height", self.pct_h.unwrap_or(self.viewport_h), st.size);
-        // `inset` shorthand + longhands merged into [top, right, bottom, left];
-        // % on the block axis resolves against the containing height
-        let hrel = self.cb_h.or(self.pct_h).unwrap_or(self.viewport_h);
-        let ish = sides(c, "inset", self.avail_w, st.size);
-        let ish_h = sides(c, "inset", hrel, st.size);
-        let inset_l = |name: &str, i: usize, rel: f32| {
-            c.get(name).and_then(|v| parse_len(v, rel, st.size)).or(if i % 2 == 0 { ish_h[i] } else { ish[i] })
-        };
-        let ins_t = inset_l("top", 0, hrel);
-        let ins_r = inset_l("right", 1, self.avail_w);
-        let ins_b = inset_l("bottom", 2, hrel);
-        let ins_l = inset_l("left", 3, self.avail_w);
-        let flow_y = if positioned {
-            let fy = self.y;
-            let fmx = self.margin_x;
-            let pos = c.get("position").map(String::as_str);
+        // against the containing block for positioned boxes, else the
+        // nearest definite ancestor height, else the viewport.
+        let h_prop = dim(
+            c,
+            "height",
+            if oof {
+                cb_h_res
+            } else {
+                self.pct_h.unwrap_or(self.viewport_h)
+            },
+            st.size,
+        );
+        // out-of-flow boxes leave no flow space: remember the flow position
+        // and restore it after the children are laid (block-end restore)
+        let flow = if oof {
+            let f = (self.y, self.margin_x, self.avail_w);
             if let Some(t) = ins_t {
-                // y is viewport-mapped (scroll already baked in): fixed pins
-                // to `top`, sticky clamps at `top` once scrolled past
-                self.y = match pos {
-                    Some("absolute") => fy + t,
-                    Some("sticky") => self.y.max(t),
-                    _ => t,
-                };
+                // `top` = margin-edge distance below the cb's padding top
+                self.y = cb.y + t;
+            } else if fixed {
+                // auto top: a fixed box keeps its static position in the
+                // viewport — emitted coords have scroll baked in, so re-add
+                // it to keep the box put at its original spot
+                self.y = f.0 + self.scroll;
             }
             if let Some(l) = ins_l {
-                self.margin_x = fmx + l.max(0.0);
+                self.margin_x = cb.x + l;
+                self.avail_w = (cb.x + cb.w - self.margin_x).max(1.0);
+            } else {
+                self.avail_w = cb.w.max(1.0);
             }
-            Some((fy, fmx))
+            Some(f)
         } else {
             None
         };
         // `left`+`right`/`top`+`bottom` on a positioned box stretch it to the
-        // containing block (approx: current available width / viewport height)
-        let inset_w = ins_l
-            .zip(ins_r)
-            .map(|(l, r)| (self.avail_w - l - r).max(0.0));
-        let inset_h = ins_t
-            .zip(ins_b)
-            .map(|(t, b)| (self.cb_h.unwrap_or(self.viewport_h) - t - b).max(0.0));
+        // containing block
+        let inset_w = ins_l.zip(ins_r).map(|(l, r)| (cb.w - l - r).max(0.0));
+        let inset_h = ins_t.zip(ins_b).map(|(t, b)| (cb_h_res - t - b).max(0.0));
         let size = st.size;
         let [mt, mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
@@ -2763,8 +2957,9 @@ impl<'a> Layouter<'a> {
             )
         };
 
-        if matches!(c.get("float").map(String::as_str), Some("left") | Some("right")) {
-            return self.float_block(node, c, st, mt, mb);
+        // floats blockify but out-of-flow boxes ignore `float` entirely
+        if !oof && matches!(c.get("float").map(String::as_str), Some("left") | Some("right")) {
+            return self.float_block(node, tag, c, st, mt, mb);
         }
 
         // `width` caps the content box; `margin-?:auto` splits leftover space
@@ -2783,10 +2978,17 @@ impl<'a> Layouter<'a> {
                 w_prop = Some(w_prop.unwrap_or(self.avail_w).max(mnw));
             }
         }
+        if oof && w_prop.is_none() {
+            // shrink-to-fit (CSS 2.1 §10.3.7): max-content clamped to the
+            // room from the box's left edge to the containing-block right
+            let room = (cb.x + cb.w - self.margin_x).max(1.0);
+            w_prop = Some(self.max_content_width(node, &st).min(room));
+        }
         let w_prop = w_prop;
-        // does `w_prop` already include padding+border? (border-box, or an
-        // inset stretch which is always a border-box length)
-        let w_is_outer = bb || w_explicit.is_none();
+        // does `w_prop` already include padding+border? border-box, an inset
+        // stretch (always a border-box length), or any non-oof auto width —
+        // an abspos shrink-to-fit width is a content-box length
+        let w_is_outer = bb || (w_explicit.is_none() && (inset_w.is_some() || !oof));
         if let Some(w) = w_prop {
             let outer = if w_is_outer { w } else { w + pl + pr + bw_h };
             let extra = (self.avail_w - ml - mr - outer).max(0.0);
@@ -2828,6 +3030,23 @@ impl<'a> Layouter<'a> {
         };
 
         self.y += mt.max(0.0);
+        // `clear`: the border edge drops below same-side floats (not oof)
+        if !oof {
+            match c.get("clear").map(String::as_str) {
+                Some("left") | Some("inline-start") => {
+                    self.y = self.y.max(self.clear_below(false))
+                }
+                Some("right") | Some("inline-end") => {
+                    self.y = self.y.max(self.clear_below(true))
+                }
+                Some("both") => {
+                    self.y = self
+                        .y
+                        .max(self.clear_below(false).max(self.clear_below(true)))
+                }
+                _ => {}
+            }
+        }
         let saved_mx = self.margin_x;
         let saved_avail = self.avail_w;
         let saved_align = self.align;
@@ -2906,6 +3125,21 @@ impl<'a> Layouter<'a> {
         let content_top = self.y;
         let mut children_items_start = self.items.len();
         let children_hits_start = self.hits.len();
+        let st0 = self.stickies.len();
+        // a positioned box is the containing block for positioned
+        // descendants: remember its padding box (emission coords) — height
+        // only when definite (explicit height or inset stretch)
+        if is_cb {
+            let pad_h = h_prop
+                .map(|h| if bb { h - bw_v } else { h + pt + pb })
+                .or_else(|| inset_h.map(|ih| ih - bw_v));
+            self.cb_stack.push(CbRect {
+                x: self.margin_x - pl,
+                y: content_top - pt,
+                w: pl + inner_w + pr,
+                h: pad_h.map(|h| h.max(0.0)),
+            });
+        }
         // descendants composite translucent paints over this box's bg
         let saved_bd = self.backdrop;
         if let Some(b) = bg {
@@ -2961,23 +3195,31 @@ impl<'a> Layouter<'a> {
             // position + a definite height anchors `inset`-stretched children
             let saved_cb_h = self.cb_h;
             let saved_inset = self.inset_h;
-            if positioned || c.get("position").map(String::as_str) == Some("relative") {
+            if is_cb {
                 if let Some(h) = h_prop {
                     self.cb_h = Some(h);
                 }
             }
             self.inset_h = inset_h;
+            // sticky children clamp against this box's content bottom —
+            // explicit heights apply after layout, so project the target now
+            let sticky_bot = mh_prop
+                .into_iter()
+                .chain(inset_h.map(|ih| ih - pt - pb - bw_v))
+                .fold(content_top, |b, h| b.max(content_top + h));
             match c.get("display").map(String::as_str) {
                 Some("flex") | Some("inline-flex") => self.flex_children(node, c, st),
                 Some("grid") | Some("inline-grid") => self.grid_children(node, c, &st),
-                _ => {
-                    for &ch in self.doc.children(node) {
-                        self.walk(ch, &st);
-                    }
-                }
+                _ => self.walk_children(node, &st, content_top, sticky_bot),
             }
             self.cb_h = saved_cb_h;
             self.inset_h = saved_inset;
+            if is_cb {
+                self.cb_stack.pop();
+            }
+            // sticky children of flex/grid paths didn't pass walk_children —
+            // catch them here; item ranges are still in emission order
+            self.drain_stickies(st0, content_top, self.y.max(sticky_bot));
             self.flush_line();
             // grow the box to the content-height target computed above;
             // centered flex content shifts down by half the surplus
@@ -3052,9 +3294,23 @@ impl<'a> Layouter<'a> {
             self.y - (content_top - pt - bw_t),
             size,
         );
-        if c.get("position").map(String::as_str) == Some("relative") {
+        if pos_kind == Some("relative") {
             tx += ins_l.unwrap_or(0.0) - ins_r.unwrap_or(0.0);
             ty += ins_t.unwrap_or(0.0) - ins_b.unwrap_or(0.0);
+        }
+        if oof {
+            // `right`/`bottom` without `left`/`top` anchor the far edge to
+            // the containing block now that the box's extent is known
+            if ins_l.is_none() {
+                if let Some(r) = ins_r {
+                    tx += cb.x + cb.w - r - (self.margin_x + inner_w + pr + bw_r);
+                }
+            }
+            if ins_t.is_none() {
+                if let Some(b) = ins_b {
+                    ty += cb.y + cb_h_res - b - self.y;
+                }
+            }
         }
         if tx != 0.0 || ty != 0.0 {
             for i in children_items_start..self.items.len() {
@@ -3078,13 +3334,29 @@ impl<'a> Layouter<'a> {
                 h.1 += ty;
             }
         }
+        if sticky {
+            // stays in flow; painted y clamps at the inset edge while the
+            // parent is on screen — applied by drain_stickies when the
+            // enclosing block finishes
+            self.stickies.push(StickyFix {
+                i0: patch.as_ref().map(|p| p.idx).unwrap_or(children_items_start),
+                i1: self.items.len(),
+                h0: children_hits_start,
+                h1: self.hits.len(),
+                top: content_top - pt - bw_t + ty,
+                bottom: self.y + ty,
+                ins_t,
+                ins_b,
+            });
+        }
         self.margin_x = saved_mx;
         self.avail_w = saved_avail;
         self.align = saved_align;
-        // positioned elements reserve no flow space
-        if let Some((fy, fmx)) = flow_y {
+        // out-of-flow boxes reserve no flow space
+        if let Some((fy, fmx, favail)) = flow {
             self.y = fy;
             self.margin_x = fmx;
+            self.avail_w = favail;
         }
         self.y += mb.max(0.0);
         if tag == "ul" || tag == "ol" || tag == "menu" || tag == "dir" {
@@ -3092,13 +3364,14 @@ impl<'a> Layouter<'a> {
         }
     }
 
-    /// `float:left|right` block: shrink-wrapped (or `width`-sized), placed at
-    /// the margin edge; following lines inset via `self.floats` until `bottom`.
-    /// Approximations: shrink-wrap = longest word (min-content); no stacking
-    /// when floats don't fit; floats don't consume vertical space in flow.
+    /// `float:left|right` block: shrink-to-fit (or `width`-sized), placed at
+    /// the margin edge; a float that doesn't fit beside earlier floats drops
+    /// below them. Following lines inset via `self.floats` until `bottom`.
+    /// The float is a BFC — it contains floats of its own.
     fn float_block(
         &mut self,
         node: NodeId,
+        tag: &str,
         c: &Props,
         mut st: Style,
         mt: f32,
@@ -3118,6 +3391,7 @@ impl<'a> Layouter<'a> {
         st.inline_bg = None;
         let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let bw_h = bw_l + bw_r;
+        let bw_v = bw_t + bw_b;
         let right = c.get("float").is_some_and(|v| v.trim() == "right");
         let bgl = if self.canvas_bg_node == Some(node) {
             None
@@ -3133,19 +3407,92 @@ impl<'a> Layouter<'a> {
             )
         };
 
-        let inner = if let Some(w) = dim(c, "width", self.avail_w, size) {
+        // replaced floats (floated images) size from their payload box
+        let w_prop = dim(c, "width", self.avail_w, size);
+        let payload = self.replaced_payload(node, tag, c, &st);
+        let inner = if let Some(w) = w_prop {
             let w = if border_box(c) { w - pl - pr - bw_h } else { w };
             w.max(1.0)
+        } else if let Some((w, _, _, _)) = &payload {
+            *w
         } else {
-            self.shrink_width(node, &st)
+            // shrink-to-fit: max-content, clamped to the room below
+            self.max_content_width(node, &st)
         };
+
+        self.y += mt.max(0.0);
+        // `clear`: drop below same-side floats first
+        match c.get("clear").map(String::as_str) {
+            Some("left") | Some("inline-start") => {
+                self.y = self.y.max(self.clear_below(false))
+            }
+            Some("right") | Some("inline-end") => {
+                self.y = self.y.max(self.clear_below(true))
+            }
+            Some("both") => {
+                self.y = self
+                    .y
+                    .max(self.clear_below(false).max(self.clear_below(true)))
+            }
+            _ => {}
+        }
+        // a float that doesn't fit beside earlier floats drops below the
+        // shallowest blocker (explicit/payload width must fit whole; auto
+        // fits at min-content); an empty float list ends the descent
+        let need = if w_prop.is_some() || payload.is_some() {
+            inner + pl + pr + bw_h
+        } else {
+            (self.shrink_width(node, &st) + pl + pr + bw_h).min(inner + pl + pr + bw_h)
+        };
+        for _ in 0..16 {
+            let (li, ri) = self.float_insets();
+            if need <= self.avail_w - li - ri + 0.5 {
+                break;
+            }
+            let next = self
+                .floats
+                .iter()
+                .filter(|f| self.y >= f.top && self.y < f.bottom)
+                .map(|f| f.bottom)
+                .fold(f32::INFINITY, f32::min);
+            if !next.is_finite() || next <= self.y {
+                break;
+            }
+            self.y = next;
+        }
         let (li, ri) = self.float_insets();
         let room = (self.avail_w - li - ri).max(1.0);
         let box_w = (inner + pl + pr + bw_h).min(room);
         let inner = (box_w - pl - pr - bw_h).max(1.0);
+        // content-height target: height/min-height/max-height (border-box
+        // strips padding+border) or aspect-ratio over the final width
+        let ht = |v: f32| if border_box(c) { v - pt - pb - bw_v } else { v };
+        let hrel = self.pct_h.unwrap_or(self.viewport_h);
+        let mut h_prop = dim(c, "height", hrel, size);
+        if let Some(mn) = c
+            .get("min-height")
+            .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
+        {
+            h_prop = Some(h_prop.map_or(mn, |h| h.max(mn)));
+        }
+        if let Some(mx) = c
+            .get("max-height")
+            .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
+        {
+            h_prop = h_prop.map(|h| h.min(mx));
+        }
+        let mh_prop = h_prop.map(ht).or_else(|| {
+            aspect_ratio(c).map(|r| {
+                if border_box(c) {
+                    box_w / r - pt - pb - bw_v
+                } else {
+                    inner / r
+                }
+            })
+        });
 
-        self.y += mt.max(0.0);
         let top = self.y;
+        let f0 = self.floats.len();
         let saved = (self.margin_x, self.avail_w, self.align);
         let outer_x = if right {
             self.margin_x + self.avail_w - ri - box_w - mr.max(0.0)
@@ -3200,16 +3547,54 @@ impl<'a> Layouter<'a> {
         };
 
         self.y += pt + bw_t;
+        let content_top = self.y;
+        // a positioned float is the containing block for positioned
+        // descendants — its padding box (emission coords)
+        let is_cb = matches!(
+            c.get("position").map(String::as_str),
+            Some("relative") | Some("absolute") | Some("fixed") | Some("sticky")
+        );
+        if is_cb {
+            let ph = dim(c, "height", self.pct_h.unwrap_or(self.viewport_h), size)
+                .map(|h| if border_box(c) { h - bw_v } else { h + pt + pb });
+            self.cb_stack.push(CbRect {
+                x: self.margin_x - pl,
+                y: content_top - pt,
+                w: pl + inner + pr,
+                h: ph.map(|h| h.max(0.0)),
+            });
+        }
         let saved_bd = self.backdrop;
         if let Some(b) = bg {
             self.backdrop = b;
         }
         let children_hits_start = self.hits.len();
-        for &ch in self.doc.children(node) {
-            self.walk(ch, &st);
+        if let Some((pw, ph, items, hits)) = payload {
+            let (tx, ty) = translate_xy(c, pw, ph, size);
+            for it in items {
+                self.items
+                    .push(offset_item(it, self.margin_x + tx, self.y + ty));
+            }
+            for h in hits {
+                self.hits
+                    .push((h.0 + self.margin_x + tx, h.1 + self.y + ty, h.2, h.3, h.4));
+            }
+            self.y += ph;
+        } else {
+            self.walk_children(
+                node,
+                &st,
+                content_top,
+                content_top + mh_prop.unwrap_or(0.0),
+            );
         }
-        self.flush_line();
+        if is_cb {
+            self.cb_stack.pop();
+        }
         self.backdrop = saved_bd;
+        if let Some(mh) = mh_prop {
+            self.y = self.y.max(content_top + mh);
+        }
         self.y += pb + bw_b;
         if let Some(mut p) = patch {
             self.finish_patch(&mut p);
@@ -3220,7 +3605,12 @@ impl<'a> Layouter<'a> {
                 clip_hits(&mut self.hits, children_hits_start, cx, cy, cw, chh);
             }
         }
-        let bottom = self.y + mb.max(0.0);
+        // floats contain their own floats: the bottom covers nested ones
+        let mut bottom = self.y;
+        for f in &self.floats[f0..] {
+            bottom = bottom.max(f.bottom);
+        }
+        let bottom = bottom + mb.max(0.0);
 
         self.margin_x = saved.0;
         self.avail_w = saved.1;
@@ -3229,7 +3619,9 @@ impl<'a> Layouter<'a> {
         self.y = top;
         self.floats.push(Float {
             right,
-            w: box_w + ml.max(0.0) + mr.max(0.0),
+            x0: outer_x - ml.max(0.0),
+            x1: outer_x + box_w + mr.max(0.0),
+            top,
             bottom,
         });
     }
@@ -3418,7 +3810,7 @@ impl<'a> Layouter<'a> {
         if ml > 0.0 {
             self.spacer(ml);
         }
-        self.push_box(box_w, box_h, out, nhits, mb.max(0.0));
+        self.push_box(box_w, box_h, out, nhits, mb.max(0.0), self.rel_offset(c, size));
         if mr > 0.0 {
             self.spacer(mr);
         }
@@ -3659,7 +4051,7 @@ impl<'a> Layouter<'a> {
 
         for row in &rows {
             // (x, cell w, cell h, bg, border, items in cell-local coords,
-            //  hits, element effects)
+            //  hits, element effects, rel offsets)
             let mut boxes: Vec<(
                 f32,
                 f32,
@@ -3670,6 +4062,7 @@ impl<'a> Layouter<'a> {
                 Vec<DisplayItem>,
                 Vec<(f32, f32, f32, f32, NodeId)>,
                 Vec<colorfx::Effect>,
+                (f32, f32),
             )> = Vec::new();
             let mut x = self.margin_x;
             let mut row_h = 0.0f32;
@@ -3730,15 +4123,28 @@ impl<'a> Layouter<'a> {
                 // element effects wrap the whole cell (bg rect + borders +
                 // content); the span's own bbox is the reference box
                 let cfx = colorfx::element_fx(&cs, cst.size, cst.color, None);
-                boxes.push((x, cw, cell_h, cbg, cborder, cell_clip, items, nhits, cfx));
+                boxes.push((
+                    x,
+                    cw,
+                    cell_h,
+                    cbg,
+                    cborder,
+                    cell_clip,
+                    items,
+                    nhits,
+                    cfx,
+                    self.rel_offset(&cs, cst.size),
+                ));
+
                 x += cw;
                 row_h = row_h.max(cell_h);
             }
             // second pass: stretch cell bg/borders to row height, place content
-            for (i, (cx, cw, _ch, cbg, cborder, cell_clip, items, mut nhits, cfx)) in
+            for (i, (cx, cw, _ch, cbg, cborder, cell_clip, items, mut nhits, cfx, (rx, ry))) in
                 boxes.into_iter().enumerate()
             {
                 let i0 = self.items.len();
+
                 if let Some(col) = cbg {
                     self.items.push(DisplayItem::FillRect {
                         x: cx,
@@ -3774,13 +4180,14 @@ impl<'a> Layouter<'a> {
                     clip_hits(&mut nhits, 0, lx, ly, lw, lh);
                 }
                 for it in items {
-                    self.items.push(offset_item(it, cx, self.y));
+                    self.items.push(offset_item(it, cx + rx, self.y + ry));
                 }
                 if cell_clip {
                     self.items.push(DisplayItem::PopClip);
                 }
                 for h in nhits {
-                    self.hits.push((h.0 + cx, h.1 + self.y, h.2, h.3, h.4));
+                    self.hits
+                        .push((h.0 + cx + rx, h.1 + self.y + ry, h.2, h.3, h.4));
                 }
                 if !cfx.is_empty() {
                     colorfx::wrap_vec(&mut self.items, i0, cfx);
@@ -4090,7 +4497,14 @@ impl<'a> Layouter<'a> {
                                 };
                                 let mb =
                                     box_sides(&cc, "margin", self.avail_w, cst.size)[2].max(0.0);
-                                self.push_box(w, h, items, hits, mb);
+                                self.push_box(
+                                    w,
+                                    h,
+                                    items,
+                                    hits,
+                                    mb,
+                                    self.rel_offset(&cc, cst.size),
+                                );
                             }
                         }
                         Some(t @ ("input" | "select" | "textarea" | "video" | "canvas" | "iframe" | "object" | "embed" | "br" | "hr")) => {
@@ -4132,9 +4546,11 @@ impl<'a> Layouter<'a> {
             }
         }
         // out-of-flow children paint last, as plain blocks (position
-        // offsets resolve against the nearest positioned ancestor's cb)
+        // offsets resolve against the nearest positioned ancestor's cb),
+        // in z-index order
         if !oof.is_empty() {
             self.flush_line();
+            oof.sort_by_key(|&ch| stacking::item_layer(&self.style(ch)));
             for ch in oof {
                 let cc = self.style(ch);
                 let mut cst = st.clone();
@@ -4787,7 +5203,14 @@ impl<'a> Layouter<'a> {
             row_y[i + 1] = row_y[i] + rh[i] + egy;
         }
 
+        // each item emits a sibling paint-order segment for the post-pass
+        let mut gsegs: Vec<(usize, usize, i64)> = Vec::new();
         for it in items.iter_mut() {
+            gsegs.push((
+                self.items.len(),
+                self.hits.len(),
+                stacking::item_layer(&it.cc),
+            ));
             let cell_x = x0 + off_x + col_x[it.c];
             let cell_w = cw[it.c..it.c + it.cs].iter().sum::<f32>() + egx * (it.cs - 1) as f32;
             let cell_y = y0 + off_y + row_y[it.r];
@@ -4843,9 +5266,11 @@ impl<'a> Layouter<'a> {
                     GAlign::Center => ((room_h - box_h) / 2.0).max(0.0),
                     _ => 0.0,
                 };
-            // translate/transform shifts the painted box + its hit rects
+            // translate/transform + position:relative shift the painted
+            // box + its hit rects
             let (tx, ty) = translate_xy(&it.cc, box_w, box_h, it.st.size);
-            let (ix, iy) = (ix + tx, iy + ty);
+            let (rx, ry) = self.rel_offset(&it.cc, it.st.size);
+            let (ix, iy) = (ix + tx + rx, iy + ty + ry);
             let gi0 = self.items.len();
             let radii = it.radius.resolve(box_w, box_h, it.st.size);
             let layers = it
@@ -4855,6 +5280,7 @@ impl<'a> Layouter<'a> {
                     bgimg::items_for(bgl, ix, iy, box_w, box_h, (self.viewport_w, self.viewport_h))
                 })
                 .unwrap_or_default();
+
             // `align-items:center` on the item centers its content inside the
             // (possibly stretched) box
             let dy = if matches!(
@@ -4907,6 +5333,7 @@ impl<'a> Layouter<'a> {
             }
             self.hits.extend(hv);
         }
+        stacking::reorder(&mut self.items, &mut self.hits, &gsegs);
 
         // the container consumes max(content, declared height) in flow
         self.y = y0 + tracks_h.max(cont_h.unwrap_or(0.0));
@@ -4934,15 +5361,28 @@ impl<'a> Layouter<'a> {
         self.align = st.align;
         self.line_x = 0.0;
         self.pending_space = false;
+        let st0 = self.stickies.len();
         // containing-block height for positioned descendants
         let saved_cb_h = self.cb_h;
-        if matches!(
+        let is_cb = matches!(
             c.get("position").map(String::as_str),
             Some("relative") | Some("absolute") | Some("fixed") | Some("sticky")
-        ) {
-            if let Some(h) = dim(c, "height", self.viewport_h, st.size) {
+        );
+        if is_cb {
+            let h = dim(c, "height", self.viewport_h, st.size);
+            if let Some(h) = h {
                 self.cb_h = Some(h);
             }
+            // positioned descendants resolve insets against the padding box
+            // (x0/y0 are the content origin in box-local coords)
+            let [cpt, cpr, _cpb, cpl] =
+                box_sides(c, "padding", avail, st.size).map(|v| v.max(0.0));
+            self.cb_stack.push(CbRect {
+                x: x0 - cpl,
+                y: y0 - cpt,
+                w: cpl + avail.max(1.0) + cpr,
+                h,
+            });
         }
         // the enclosing block's inset stretch must not leak into nested
         // containers — a positioned descendant sets its own
@@ -4959,8 +5399,22 @@ impl<'a> Layouter<'a> {
         }
         self.cb_h = saved_cb_h;
         self.inset_h = saved_ih;
+        if is_cb {
+            self.cb_stack.pop();
+        }
+        // sticky children clamp against this box's bottom — project the
+        // explicit-height target since `self.y` only saw the content
+        let nest_bot = self.y.max(
+            y0 + dim(c, "height", self.viewport_h, st.size).unwrap_or(0.0),
+        );
+        self.drain_stickies(st0, y0, nest_bot);
         self.flush_line();
-        let bottom = self.y;
+        // a nested box is a BFC: it contains its own floats (they're dropped
+        // from the outer float list on restore, but extend this box's bottom)
+        let mut bottom = self.y;
+        for f in &self.floats {
+            bottom = bottom.max(f.bottom);
+        }
         let items = std::mem::replace(&mut self.items, saved_items);
         let hits = std::mem::replace(&mut self.hits, saved_hits);
         self.y = saved.0;
@@ -5327,6 +5781,8 @@ impl<'a> Layouter<'a> {
             items: None,
             hits: Vec::new(),
             box_h: 0.0,
+            dx: 0.0,
+            dy: 0.0,
         });
         self.line_x += w;
     }
@@ -5339,6 +5795,7 @@ impl<'a> Layouter<'a> {
         items: Vec<DisplayItem>,
         hits: Vec<(f32, f32, f32, f32, NodeId)>,
         mb: f32,
+        rel: (f32, f32),
     ) {
         if self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line();
@@ -5359,6 +5816,8 @@ impl<'a> Layouter<'a> {
             items: Some(items),
             hits,
             box_h: h,
+            dx: rel.0,
+            dy: rel.1,
         });
         self.line_x += w;
     }
@@ -5538,6 +5997,11 @@ impl<'a> Layouter<'a> {
         if tag == "a" {
             st.href = self.doc.attr(node, "href").map(String::from);
         }
+        // position:relative on an inline box shifts its painted runs only —
+        // the offset rides each emitted word; flow geometry is unaffected
+        let (rx, ry) = self.rel_offset(c, st.size);
+        st.rel_x += rx;
+        st.rel_y += ry;
         // inline margins become spacing around the element's runs
         let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, st.size);
         if ml > 0.0 {
@@ -5749,8 +6213,10 @@ impl<'a> Layouter<'a> {
                         line_h,
                         bg: st.inline_bg,
                         items: None,
-            hits: Vec::new(),
+                        hits: Vec::new(),
                         box_h: 0.0,
+                        dx: st.rel_x,
+                        dy: st.rel_y,
                     });
                     self.flush_line();
                     chunk.clear();
@@ -5774,8 +6240,10 @@ impl<'a> Layouter<'a> {
                     line_h,
                     bg: st.inline_bg,
                     items: None,
-            hits: Vec::new(),
+                    hits: Vec::new(),
                     box_h: 0.0,
+                    dx: st.rel_x,
+                    dy: st.rel_y,
                 });
                 self.line_x += cw;
             }
@@ -5797,6 +6265,8 @@ impl<'a> Layouter<'a> {
             items: None,
             hits: Vec::new(),
             box_h: 0.0,
+            dx: st.rel_x,
+            dy: st.rel_y,
         });
         self.line_x += w;
     }
@@ -5827,28 +6297,30 @@ impl<'a> Layouter<'a> {
             };
         for w in self.line.drain(..) {
             if let Some(items) = w.items {
-                // inline-block: box bottom sits on the baseline
+                // inline-block: box bottom sits on the baseline; w.dx/dy are
+                // enclosing `position:relative` inline shifts (painted only)
                 let dy = baseline - w.box_h;
                 for it in items {
-                    self.items.push(offset_item(it, x, dy));
+                    self.items.push(offset_item(it, x + w.dx, dy + w.dy));
                 }
                 for h in w.hits {
-                    self.hits.push((h.0 + x, h.1 + dy, h.2, h.3, h.4));
+                    self.hits
+                        .push((h.0 + x + w.dx, h.1 + dy + w.dy, h.2, h.3, h.4));
                 }
             } else if !w.text.is_empty() {
                 if let Some(bg) = w.bg {
                     // inline background: rect behind the word's extent
                     self.items.push(DisplayItem::FillRect {
-                        x,
-                        y: baseline - w.ascent,
+                        x: x + w.dx,
+                        y: baseline - w.ascent + w.dy,
                         w: w.width,
                         h: w.ascent + w.size * 0.3,
                         color: bg,
                     });
                 }
                 self.items.push(DisplayItem::Text {
-                    x,
-                    baseline: baseline - w.shift * w.size,
+                    x: x + w.dx,
+                    baseline: baseline - w.shift * w.size + w.dy,
                     text: w.text,
                     font: w.font,
                     size: w.size,
@@ -6557,5 +7029,173 @@ mod tests {
             }
             _ => panic!("canvas BgImage missing"),
         }
+    }
+
+    fn lay_scroll(html: &str, scroll: f32) -> Vec<DisplayItem> {
+        let d = doc(html);
+        let mut fonts = FontCache::new();
+        Layouter::layout(&d, &mut fonts, 800.0, scroll, &[]).0
+    }
+
+    fn rect_index(items: &[DisplayItem], color: u32) -> Option<usize> {
+        items.iter().position(|i| match i {
+            DisplayItem::FillRect { color: c, .. }
+            | DisplayItem::RoundedRect { color: c, .. } => *c == color,
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn float_wraps_inline_text() {
+        // a left float indents the lines it overlaps but not lines below it
+        let (items, _, _) = lay(
+            "<style>.fl{float:left;width:200px;height:30px}</style>\
+             <div class=fl></div>\
+             <p>aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz \
+                aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz</p>",
+        );
+        let t = texts(&items);
+        let mut by_x: Vec<(f32, f32)> = t
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::Text { x, baseline, .. } => Some((*x, *baseline)),
+                _ => None,
+            })
+            .collect();
+        by_x.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // first line starts right of the float (body margin 8 + float 200)
+        assert!(by_x[0].0 > 200.0, "line 0 insets past the float, x={}", by_x[0].0);
+        // the deepest line is back at the left margin once past the float's
+        // bottom — check the leftmost word on that line
+        let deep_y = by_x.last().unwrap().1;
+        let deep_x = by_x
+            .iter()
+            .filter(|w| (w.1 - deep_y).abs() < 1.0)
+            .map(|w| w.0)
+            .fold(f32::INFINITY, f32::min);
+        assert!(deep_x < 20.0, "line below the float returns to the left edge");
+    }
+
+    #[test]
+    fn clear_drops_below_float() {
+        let (items, _, _) = lay(
+            "<style>.fl{float:left;width:200px;height:80px}.cl{clear:left}</style>\
+             <div class=fl></div><div class=cl>below</div>",
+        );
+        let (_, by) = text_pos(&items, "below");
+        assert!(by >= 60.0, "cleared block below the 80px float, baseline={by}");
+    }
+
+    #[test]
+    fn float_drops_when_no_room() {
+        let (items, _, _) = lay(
+            "<style>.f{float:left;width:60%;height:50px}</style>\
+             <div class=f style=background:#111></div>\
+             <div class=f style=background:#222></div>",
+        );
+        let a = rect_index(&items, bgra(17, 17, 17)).expect("first float bg");
+        let b = rect_index(&items, bgra(34, 34, 34)).expect("second float bg");
+        let (xa, ya, xb, yb) = match (&items[a], &items[b]) {
+            (
+                DisplayItem::FillRect { x: xa, y: ya, .. },
+                DisplayItem::FillRect { x: xb, y: yb, .. },
+            ) => (*xa, *ya, *xb, *yb),
+            _ => panic!("float bgs are fill rects"),
+        };
+        assert!((xb - xa).abs() < 1.0, "second float returns to the left edge");
+        assert!(yb > ya + 40.0, "second float drops below the first");
+    }
+
+    #[test]
+    fn float_shrink_to_fit() {
+        // auto-width float hugs its max-content, not the longest word
+        let (items, _, _) = lay(
+            "<div style=\"float:left;background:#112233\">aa bbbbbbbb</div>",
+        );
+        let i = rect_index(&items, bgra(0x11, 0x22, 0x33)).expect("float bg");
+        let w = match items[i] {
+            DisplayItem::FillRect { w, .. } | DisplayItem::RoundedRect { w, .. } => w,
+            _ => panic!(),
+        };
+        assert!(w > 60.0, "float width covers both words, w={w}");
+        assert!(w < 400.0, "shrink-wrapped, not full width, w={w}");
+    }
+
+    #[test]
+    fn sticky_clamps_at_top_on_scroll() {
+        let html = "<style>.wrap{height:2000px}.hd{position:sticky;top:0;height:40px}</style>\
+                    <div class=wrap><div class=hd>hdr</div></div>";
+        let at0 = lay_scroll(html, 0.0);
+        let (_, y0) = text_pos(&at0, "hdr");
+        let at200 = lay_scroll(html, 200.0);
+        let (_, y200) = text_pos(&at200, "hdr");
+        assert!(y200 >= 0.0, "sticky stays at/under the top inset, y={y200}");
+        assert!(y200 < 60.0, "sticky pins near the viewport top, y={y200}");
+        // without sticking the header would have scrolled far off-screen
+        assert!(y200 > y0 - 60.0, "stuck below its flow position");
+    }
+
+    #[test]
+    fn sticky_unsticks_past_parent() {
+        // the stick is bounded by the parent's bottom — scroll far past and
+        // the header rides up with the wrapper's end
+        let html = "<style>.wrap{height:100px}.hd{position:sticky;top:0;height:40px}</style>\
+                    <div class=wrap><div class=hd>hdr</div></div>\
+                    <div style=height:2000px></div>";
+        let items = lay_scroll(html, 500.0);
+        let (_, y) = text_pos(&items, "hdr");
+        assert!(y < -20.0, "sticky scrolls off with its parent, y={y}");
+    }
+
+    #[test]
+    fn z_index_reorders_paint() {
+        let (items, _, _) = lay(
+            "<style>\
+             .a{position:absolute;top:0;left:0;width:100px;height:100px;background:#111111}\
+             .b{position:absolute;top:0;left:0;width:50px;height:50px;background:#222222;z-index:2}\
+             </style>\
+             <div class=a></div><div class=b></div><p>text here</p>",
+        );
+        let a = rect_index(&items, bgra(0x11, 0x11, 0x11)).expect("a rect");
+        let b = rect_index(&items, bgra(0x22, 0x22, 0x22)).expect("b rect");
+        assert!(b > a, "z-index:2 paints after z-auto even though DOM-later");
+        let ti = items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::Text { .. }))
+            .expect("text");
+        assert!(a > ti && b > ti, "positioned boxes paint above in-flow text");
+    }
+
+    #[test]
+    fn negative_z_below_flow() {
+        let (items, _, _) = lay(
+            "<div>\
+             <div style=\"background:#222222;height:50px\"></div>\
+             <div style=\"position:absolute;z-index:-1;background:#111111;top:0;left:0;width:100px;height:100px\"></div>\
+             </div>",
+        );
+        let flow = rect_index(&items, bgra(0x22, 0x22, 0x22)).expect("flow bg");
+        let neg = rect_index(&items, bgra(0x11, 0x11, 0x11)).expect("neg-z bg");
+        assert!(neg < flow, "z-index:-1 paints below in-flow siblings");
+    }
+
+    #[test]
+    fn absolute_resolves_against_positioned_ancestor() {
+        let (items, _, _) = lay(
+            "<style>\
+             .rel{position:relative;margin:100px 0 0 50px;width:300px;height:200px}\
+             .ab{position:absolute;top:10px;left:20px;width:30px;height:30px;background:#123456}\
+             </style>\
+             <div class=rel><div class=ab></div></div>",
+        );
+        let i = rect_index(&items, bgra(0x12, 0x34, 0x56)).expect("abspos bg");
+        let (x, y) = match items[i] {
+            DisplayItem::FillRect { x, y, .. } | DisplayItem::RoundedRect { x, y, .. } => (x, y),
+            _ => panic!(),
+        };
+        // body margin 8 + rel margin-left 50 + left 20 = 78
+        assert!((x - 78.0).abs() < 2.0, "abspos x in the ancestor's cb, x={x}");
+        // body margin 8 + rel margin-top 100 + top 10 = 118
+        assert!((y - 118.0).abs() < 2.0, "abspos y in the ancestor's cb, y={y}");
     }
 }
