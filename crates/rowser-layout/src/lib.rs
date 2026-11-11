@@ -1379,6 +1379,17 @@ fn dim(c: &Props, name: &str, rel: f32, em: f32) -> Option<f32> {
     })
 }
 
+/// `dim` for heights — a %-value with no definite containing-block height
+/// (`None` base) computes to `auto` in normal flow (CSS2.1 §10.5: an auto
+/// CB height makes % heights evaluate to `auto`).
+fn hdim_pct(c: &Props, name: &str, hrel: f32, em: f32, base: Option<f32>) -> Option<f32> {
+    if base.is_none() && c.get(name).is_some_and(|v| v.contains('%')) {
+        None
+    } else {
+        dim(c, name, hrel, em)
+    }
+}
+
 /// `dim` for intrinsic sizing: a percentage width has an indefinite basis
 /// while measuring intrinsic sizes, so it's treated as `auto` (content
 /// sized). Without this `nav{width:100%}` inside a flex item reports the
@@ -3270,16 +3281,6 @@ impl<'a> Layouter<'a> {
         // a fresh block box isn't part of an enclosing inline's transformed
         // run — its own transform (if any) wraps via walk's wrap_span
         let saved_xf = self.cur_xf.take();
-        if tag == "table"
-            || matches!(
-                c.get("display").map(String::as_str),
-                Some("table") | Some("inline-table")
-            )
-        {
-            self.table(node, c, st);
-            self.cur_xf = saved_xf;
-            return;
-        }
         // positioning: `absolute`/`fixed` leave flow (space restored at the
         // end); `sticky` stays in flow and clamps its painted y at the inset
         // edge while the parent is on screen (StickyFix below); `relative`
@@ -3304,7 +3305,7 @@ impl<'a> Layouter<'a> {
         // descendants and a floor for this box's own extent. % resolves
         // against the containing block for positioned boxes, else the
         // nearest definite ancestor height, else the viewport.
-        let h_prop = dim(
+        let h_prop = hdim_pct(
             c,
             "height",
             if oof {
@@ -3313,6 +3314,7 @@ impl<'a> Layouter<'a> {
                 self.pct_h.unwrap_or(self.viewport_h)
             },
             st.size,
+            if oof { Some(cb_h_res) } else { self.pct_h },
         );
         // out-of-flow boxes leave no flow space: remember the flow position
         // and restore it after the children are laid (block-end restore)
@@ -3392,6 +3394,19 @@ impl<'a> Layouter<'a> {
             )
         {
             self.float_block(node, tag, c, st, mt, mb);
+            self.cur_xf = saved_xf;
+            return;
+        }
+
+        // `display:table` lays its grid — a floated or out-of-flow table
+        // already diverted above (floats blockify per CSS 2.1 §9.7)
+        if tag == "table"
+            || matches!(
+                c.get("display").map(String::as_str),
+                Some("table") | Some("inline-table")
+            )
+        {
+            self.table(node, c, st);
             self.cur_xf = saved_xf;
             return;
         }
@@ -3573,18 +3588,25 @@ impl<'a> Layouter<'a> {
         // Under border-box these are border-box lengths → strip padding+border.
         let ht = |v: f32| if bb { v - pt - pb - bw_v } else { v };
         let hrel = self.pct_h.unwrap_or(self.viewport_h);
+        let pct_h_definite = oof || self.pct_h.is_some();
         let mut mh_prop = h_prop;
+        // `height`/`max-height` clamp the box to the target even when content
+        // overflows; `min-height` (and aspect-ratio) only floor it
+        let mut h_clamped = h_prop.is_some();
         if let Some(mn) = c
             .get("min-height")
+            .filter(|v| pct_h_definite || !v.contains('%'))
             .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
         {
             mh_prop = Some(mh_prop.map_or(mn, |h| h.max(mn)));
         }
         if let Some(mx) = c
             .get("max-height")
+            .filter(|v| pct_h_definite || !v.contains('%'))
             .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
         {
-            mh_prop = mh_prop.map(|h| h.min(mx));
+            mh_prop = Some(mh_prop.map_or(mx, |h| h.min(mx)));
+            h_clamped = true;
         }
         let mh_prop = mh_prop.map(ht).or_else(|| {
             // aspect-ratio applies to the box-size the element uses
@@ -3701,26 +3723,27 @@ impl<'a> Layouter<'a> {
             if let Some((m, mst, false)) = &marker {
                 self.place_outside_marker(m, mst, content_top, children_items_start, content_mx);
             }
-            // grow the box to the content-height target computed above.
+            // settle the box at the content-height target: `height`/
+            // `max-height` pin it exactly (content may overflow), a lone
+            // `min-height` or aspect-ratio only raises the floor.
             // (flex alignment/justification is handled inside flex_layout —
             // no post-hoc shifting needed here)
             if let Some(mh) = mh_prop {
-                let extra = mh - (self.y - content_top);
-                if extra > 0.0 {
-                    self.y += extra;
-                }
+                self.y = if h_clamped {
+                    content_top + mh
+                } else {
+                    self.y.max(content_top + mh)
+                };
             }
         }
         self.backdrop = saved_bd;
         self.pct_h = saved_ph;
-        // positioned box with `top`+`bottom` (e.g. `inset:0`): stretch to the
-        // containing height even when content is shorter. The inset extent is
-        // a border-box length.
+        // positioned box with `top`+`bottom` (e.g. `inset:0`): the box is
+        // exactly the containing height minus insets — overflowing content
+        // spills rather than stretching it. The inset extent is a
+        // border-box length.
         if let Some(ih) = inset_h {
-            let extra = ih - pt - pb - bw_v - (self.y - content_top);
-            if extra > 0.0 {
-                self.y += extra;
-            }
+            self.y = content_top + ih - pt - pb - bw_v;
         }
         // padding-bottom + border extend the painted box below content
         self.y += pb + bw_b;
@@ -3938,18 +3961,23 @@ impl<'a> Layouter<'a> {
         // strips padding+border) or aspect-ratio over the final width
         let ht = |v: f32| if border_box(c) { v - pt - pb - bw_v } else { v };
         let hrel = self.pct_h.unwrap_or(self.viewport_h);
-        let mut h_prop = dim(c, "height", hrel, size);
+        let pct_h_definite = self.pct_h.is_some();
+        let mut h_prop = hdim_pct(c, "height", hrel, size, self.pct_h);
+        let mut h_clamped = h_prop.is_some();
         if let Some(mn) = c
             .get("min-height")
+            .filter(|v| pct_h_definite || !v.contains('%'))
             .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
         {
             h_prop = Some(h_prop.map_or(mn, |h| h.max(mn)));
         }
         if let Some(mx) = c
             .get("max-height")
+            .filter(|v| pct_h_definite || !v.contains('%'))
             .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
         {
-            h_prop = h_prop.map(|h| h.min(mx));
+            h_prop = Some(h_prop.map_or(mx, |h| h.min(mx)));
+            h_clamped = true;
         }
         let mh_prop = h_prop.map(ht).or_else(|| {
             aspect_ratio(c).map(|r| {
@@ -4025,13 +4053,21 @@ impl<'a> Layouter<'a> {
             Some("relative") | Some("absolute") | Some("fixed") | Some("sticky")
         );
         if is_cb {
-            let ph = dim(c, "height", self.pct_h.unwrap_or(self.viewport_h), size).map(|h| {
-                if border_box(c) {
-                    h - bw_v
-                } else {
-                    h + pt + pb
-                }
+            let pos_base = self.pct_h.or_else(|| {
+                matches!(
+                    c.get("position").map(String::as_str),
+                    Some("absolute") | Some("fixed")
+                )
+                .then_some(self.viewport_h)
             });
+            let ph = hdim_pct(
+                c,
+                "height",
+                pos_base.unwrap_or(self.viewport_h),
+                size,
+                pos_base,
+            )
+            .map(|h| if border_box(c) { h - bw_v } else { h + pt + pb });
             self.cb_stack.push(CbRect {
                 x: self.margin_x - pl,
                 y: content_top - pt,
@@ -4058,6 +4094,15 @@ impl<'a> Layouter<'a> {
                     .push(xform::off_hit(h, self.margin_x + tx, self.y + ty));
             }
             self.y += ph;
+        } else if tag == "table"
+            || matches!(
+                c.get("display").map(String::as_str),
+                Some("table") | Some("inline-table")
+            )
+        {
+            // a floated table still lays out as a table — the float only
+            // contributes the outer box (position, width, margins)
+            self.table_inner(node, c, st.clone(), true);
         } else {
             self.walk_children(node, &st, content_top, content_top + mh_prop.unwrap_or(0.0));
         }
@@ -4068,7 +4113,11 @@ impl<'a> Layouter<'a> {
         }
         self.backdrop = saved_bd;
         if let Some(mh) = mh_prop {
-            self.y = self.y.max(content_top + mh);
+            self.y = if h_clamped {
+                content_top + mh
+            } else {
+                self.y.max(content_top + mh)
+            };
         }
         self.y += pb + bw_b;
         if let Some(mut p) = patch {
@@ -5542,14 +5591,17 @@ impl<'a> Layouter<'a> {
                     v
                 }
             };
-            let ihrel = cont_h.or(self.pct_h).unwrap_or(avail);
-            let h_prop = dim(&cc, "height", ihrel, cst.size).map(hconv);
+            let ihbase = cont_h.or(self.pct_h);
+            let ihrel = ihbase.unwrap_or(avail);
+            let h_prop = hdim_pct(&cc, "height", ihrel, cst.size, ihbase).map(hconv);
             let min_h = cc
                 .get("min-height")
+                .filter(|v| ihbase.is_some() || !v.contains('%'))
                 .and_then(|v| parse_len_vp(v, ihrel, cst.size, self.viewport_h, avail))
                 .map(hconv);
             let max_h = cc
                 .get("max-height")
+                .filter(|v| ihbase.is_some() || !v.contains('%'))
                 .and_then(|v| parse_len_vp(v, ihrel, cst.size, self.viewport_h, avail))
                 .map(hconv);
             let ratio = aspect_ratio(&cc);
@@ -5631,17 +5683,21 @@ impl<'a> Layouter<'a> {
                 let have: f32 =
                     cw[it.c..it.c + it.cs].iter().sum::<f32>() + col_gap * (it.cs - 1) as f32;
                 if need > have {
-                    // growable (intrinsic) tracks absorb the deficit first;
-                    // only if none span does the whole span share it
-                    let mut targets: Vec<usize> = (it.c..it.c + it.cs)
-                        .filter(|&i| matches!(col_spec[i], GTrack::Auto(..) | GTrack::C { .. }))
+                    // growable (intrinsic) tracks absorb the deficit; a
+                    // fixed track never grows — the content overflows it
+                    let targets: Vec<usize> = (it.c..it.c + it.cs)
+                        .filter(|&i| {
+                            matches!(
+                                col_spec[i],
+                                GTrack::Auto(..) | GTrack::C { .. } | GTrack::Fr(..)
+                            )
+                        })
                         .collect();
-                    if targets.is_empty() {
-                        targets = (it.c..it.c + it.cs).collect();
-                    }
-                    let add = (need - have) / targets.len() as f32;
-                    for i in targets {
-                        cw[i] += add;
+                    if !targets.is_empty() {
+                        let add = (need - have) / targets.len() as f32;
+                        for i in targets {
+                            cw[i] += add;
+                        }
                     }
                 }
             }
@@ -6923,7 +6979,7 @@ impl<'a> Layouter<'a> {
                             .and_then(|v| v.trim_end_matches("px").parse().ok())
                     })
                     .unwrap_or(300.0f32);
-                let h = dim(c, "height", hrel, st.size)
+                let h = hdim_pct(c, "height", hrel, st.size, self.pct_h)
                     .or_else(|| {
                         self.doc
                             .attr(node, "height")
@@ -6945,9 +7001,9 @@ impl<'a> Layouter<'a> {
             }
             "svg" => {
                 let w = dim(c, "width", self.avail_w, st.size)
-                    .or_else(|| dim(c, "height", hrel, st.size))
+                    .or_else(|| hdim_pct(c, "height", hrel, st.size, self.pct_h))
                     .unwrap_or(24.0);
-                let h = dim(c, "height", hrel, st.size).unwrap_or(w);
+                let h = hdim_pct(c, "height", hrel, st.size, self.pct_h).unwrap_or(w);
                 let color = st.color;
                 let pixels =
                     svg::render(self.doc, node, w.max(1.0) as u32, h.max(1.0) as u32, color);
@@ -6975,12 +7031,12 @@ impl<'a> Layouter<'a> {
                     })
                     .or_else(|| {
                         // only height given + aspect-ratio/intrinsic guess
-                        dim(c, "height", hrel, st.size)
+                        hdim_pct(c, "height", hrel, st.size, self.pct_h)
                             .filter(|_| aspect_ratio(c).is_some())
                             .map(|h| h * aspect_ratio(c).unwrap())
                     })
                     .unwrap_or(64.0f32);
-                let h = dim(c, "height", hrel, st.size)
+                let h = hdim_pct(c, "height", hrel, st.size, self.pct_h)
                     .or_else(|| {
                         self.doc
                             .attr(node, "height")
