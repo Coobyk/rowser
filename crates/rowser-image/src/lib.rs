@@ -6,7 +6,6 @@
 //! filters, Adam7 interlacing and tRNS transparency. Chunk CRCs are not
 //! verified; the zlib adler32 trailer is.
 
-
 /// A decoded image. `pixels` is `width * height * 4` bytes of premultiplied
 /// BGRA (byte order B, G, R, A), row-major from the top-left — the layout
 /// GPUI's `RenderImage` expects.
@@ -51,7 +50,10 @@ pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
     if bytes.len() < 8 || &bytes[..8] != SIG {
         return Err(DecodeError::NotPng);
     }
-    let mut cur = Cursor { d: &bytes[8..], pos: 0 };
+    let mut cur = Cursor {
+        d: &bytes[8..],
+        pos: 0,
+    };
     let mut ihdr: Option<Ihdr> = None;
     let mut plte: Vec<[u8; 3]> = Vec::new();
     let mut trns_raw: Vec<u8> = Vec::new();
@@ -122,7 +124,10 @@ pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
 
     let raw =
         rowser_deflate::inflate_zlib(&idat).map_err(|_| DecodeError::Invalid("zlib stream"))?;
-    let mut cur = Cursor { d: raw.as_slice(), pos: 0 };
+    let mut cur = Cursor {
+        d: raw.as_slice(),
+        pos: 0,
+    };
     let (w, h) = (ihdr.w as usize, ihdr.h as usize);
     let mut pixels = vec![0u8; w * h * 4];
     if ihdr.interlace == 0 {
@@ -142,7 +147,11 @@ pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
             })?;
         }
     }
-    Ok(Image { width: ihdr.w, height: ihdr.h, pixels })
+    Ok(Image {
+        width: ihdr.w,
+        height: ihdr.h,
+        pixels,
+    })
 }
 
 /// Adam7 pass origins and strides: (x0, y0, dx, dy).
@@ -218,12 +227,21 @@ impl Ihdr {
         if !ok {
             return Err(DecodeError::Invalid("bad color type / bit depth"));
         }
-        if (w as u64).checked_mul(h as u64).and_then(|n| n.checked_mul(4)).is_none()
+        if (w as u64)
+            .checked_mul(h as u64)
+            .and_then(|n| n.checked_mul(4))
+            .is_none()
             || w as u64 * h as u64 > (usize::MAX / 4) as u64
         {
             return Err(DecodeError::Invalid("dimensions too large"));
         }
-        Ok(Self { w, h, depth, color, interlace: d[12] })
+        Ok(Self {
+            w,
+            h,
+            depth,
+            color,
+            interlace: d[12],
+        })
     }
 }
 
@@ -305,13 +323,7 @@ fn decode_rows(
 
 /// Reverse one scanline's filter into `out` (RFC 2083 §6).
 /// `raw` = filtered bytes, `prev` = previous reconstructed row (zeros at top).
-fn unfilter(
-    f: u8,
-    raw: &[u8],
-    prev: &[u8],
-    bpp: usize,
-    out: &mut [u8],
-) -> Result<(), DecodeError> {
+fn unfilter(f: u8, raw: &[u8], prev: &[u8], bpp: usize, out: &mut [u8]) -> Result<(), DecodeError> {
     match f {
         0 => out.copy_from_slice(raw),
         1 => {
@@ -453,7 +465,11 @@ mod tests {
         for &b in data {
             crc ^= b as u32;
             for _ in 0..8 {
-                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
             }
         }
         !crc
@@ -503,7 +519,10 @@ mod tests {
     }
     impl BitW {
         fn new() -> Self {
-            Self { out: Vec::new(), bit: 0 }
+            Self {
+                out: Vec::new(),
+                bit: 0,
+            }
         }
         /// write `n` bits of `v`, LSB first
         fn bits(&mut self, v: u32, n: u8) {
@@ -811,7 +830,9 @@ mod tests {
 
     /// RGBA8 tuples → premultiplied BGRA bytes.
     fn bgra(px: &[(u8, u8, u8, u8)]) -> Vec<u8> {
-        px.iter().flat_map(|&(r, g, b, a)| [pm(b, a), pm(g, a), pm(r, a), a]).collect()
+        px.iter()
+            .flat_map(|&(r, g, b, a)| [pm(b, a), pm(g, a), pm(r, a), a])
+            .collect()
     }
 
     /// deterministic colorful pixel
@@ -887,8 +908,12 @@ mod tests {
             (b"IDAT", zlib(&deflate_stored(&data), &data)),
         ]);
         let img = decode(&png).unwrap();
-        let want: Vec<(u8, u8, u8, u8)> =
-            (0..w * h).map(|i| { let (r, g, b, _) = pix(i); (r, g, b, 255) }).collect();
+        let want: Vec<(u8, u8, u8, u8)> = (0..w * h)
+            .map(|i| {
+                let (r, g, b, _) = pix(i);
+                (r, g, b, 255)
+            })
+            .collect();
         assert_eq!(img.pixels, bgra(&want));
     }
 
@@ -987,7 +1012,11 @@ mod tests {
             let max = (1u16 << depth) - 1;
             for (i, &v) in vals.iter().enumerate() {
                 let g = ((v * 255) / max) as u8;
-                assert_eq!(&img.pixels[i * 4..i * 4 + 4], &[g, g, g, 255], "d{depth} px{i}");
+                assert_eq!(
+                    &img.pixels[i * 4..i * 4 + 4],
+                    &[g, g, g, 255],
+                    "d{depth} px{i}"
+                );
             }
         }
     }
@@ -1046,10 +1075,7 @@ mod tests {
         let img = decode(&png).unwrap();
         // r=0xFF g=0x80 b=0x01 a=0x80 → premult: c*128/255 ≈ (c+1)/2 for odd c? exact via pm
         let a = 0x80u8;
-        assert_eq!(
-            img.pixels,
-            vec![pm(0x01, a), pm(0x80, a), pm(0xFF, a), a]
-        );
+        assert_eq!(img.pixels, vec![pm(0x01, a), pm(0x80, a), pm(0xFF, a), a]);
     }
 
     #[test]
@@ -1129,7 +1155,10 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(matches!(decode(b""), Err(DecodeError::NotPng)));
-        assert!(matches!(decode(b"\x89PNG\r\n\x1a"), Err(DecodeError::NotPng)));
+        assert!(matches!(
+            decode(b"\x89PNG\r\n\x1a"),
+            Err(DecodeError::NotPng)
+        ));
         assert!(matches!(decode(b"GIF89a......"), Err(DecodeError::NotPng)));
     }
 

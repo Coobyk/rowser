@@ -6,8 +6,8 @@ use std::io::{self, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use rowser_deflate::inflate_gzip;
 use crate::url::{Url, default_port};
+use rowser_deflate::inflate_gzip;
 
 /// Redirect statuses we follow via `Location`, per fetch semantics.
 const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
@@ -45,8 +45,7 @@ impl Response {
 /// `GET url` over HTTP/1.1, following up to 10 redirects.
 /// Errors on non-`http` schemes — use [`fetch`] for dispatch.
 pub fn http_get(url: &str) -> io::Result<Response> {
-    let mut parsed =
-        Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut parsed = Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     for _ in 0..=MAX_REDIRECTS {
         let resp = single_request(&parsed)?;
         if !REDIRECT_STATUSES.contains(&resp.status) {
@@ -72,8 +71,7 @@ pub fn http_get(url: &str) -> io::Result<Response> {
 /// Scheme-dispatching fetch. `https` is a clean seam: once the TLS sibling
 /// crate exists it gets called from here.
 pub fn fetch(url: &str) -> io::Result<Response> {
-    let parsed =
-        Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let parsed = Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     match parsed.scheme.as_str() {
         "http" => http_get(url),
         "https" => Err(io::Error::new(
@@ -159,20 +157,21 @@ fn parse_response(raw: &[u8], url: &Url) -> io::Result<Response> {
     };
 
     let mut body = raw[head_end + 4..].to_vec();
-    if get("transfer-encoding")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
-    {
+    if get("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
         body = dechunk(&body)?;
     } else if let Some(len) = get("content-length").and_then(|v| v.parse().ok()) {
         body.truncate(len);
     }
-    if get("content-encoding")
-        .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"))
-    {
+    if get("content-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("gzip")) {
         body = inflate_gzip(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     }
 
-    Ok(Response { url: url.to_string(), status, headers, body })
+    Ok(Response {
+        url: url.to_string(),
+        status,
+        headers,
+        body,
+    })
 }
 
 /// Undo `Transfer-Encoding: chunked` (RFC 9112 §7.1); trailers are skipped.
@@ -187,8 +186,8 @@ fn dechunk(data: &[u8]) -> io::Result<Vec<u8>> {
             .map_err(|_| invalid_data("chunk size not ASCII"))?;
         // Chunk extensions ("size;key=val") are ignored.
         let size_str = size_str.split(';').next().unwrap_or_default().trim();
-        let size = usize::from_str_radix(size_str, 16)
-            .map_err(|_| invalid_data("bad chunk size"))?;
+        let size =
+            usize::from_str_radix(size_str, 16).map_err(|_| invalid_data("bad chunk size"))?;
         pos = end + 2;
         if size == 0 {
             return Ok(out);
@@ -266,8 +265,14 @@ mod tests {
         assert_eq!(resp.body_text(), "hello");
 
         let req = rx.recv().unwrap();
-        assert!(req.starts_with("GET /some/path?x=1 HTTP/1.1\r\n"), "req={req:?}");
-        assert!(req.contains(&format!("Host: 127.0.0.1:{port}")), "req={req:?}");
+        assert!(
+            req.starts_with("GET /some/path?x=1 HTTP/1.1\r\n"),
+            "req={req:?}"
+        );
+        assert!(
+            req.contains(&format!("Host: 127.0.0.1:{port}")),
+            "req={req:?}"
+        );
         assert!(req.contains("Accept-Encoding: gzip"), "req={req:?}");
         assert!(req.contains("Connection: close"), "req={req:?}");
     }
@@ -312,8 +317,7 @@ mod tests {
 
     #[test]
     fn redirect_loop_errors() {
-        let raw =
-            b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let raw = b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n".to_vec();
         let (port, _rx) = serve(vec![raw; MAX_REDIRECTS + 1]);
         let err = http_get(&format!("http://127.0.0.1:{port}/again")).unwrap_err();
         assert_eq!(err.to_string(), "too many redirects");
@@ -321,8 +325,9 @@ mod tests {
 
     #[test]
     fn fetch_dispatches_on_scheme() {
-        let (port, _rx) =
-            serve(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec()]);
+        let (port, _rx) = serve(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        ]);
         let resp = fetch(&format!("http://127.0.0.1:{port}/")).unwrap();
         assert_eq!(resp.body, b"ok");
 

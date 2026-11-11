@@ -13,7 +13,10 @@ pub enum Tok {
     Punct(&'static str),
     /// regex literal `/pattern/flags` — produced when a `/` appears where an
     /// expression cannot continue (see `slash_is_regex`)
-    Regex { pattern: String, flags: String },
+    Regex {
+        pattern: String,
+        flags: String,
+    },
     Eof,
 }
 
@@ -185,63 +188,10 @@ pub struct Token {
 }
 
 const PUNCTS: &[&str] = &[
-    ">>>=",
-    "===",
-    "!==",
-    "**=",
-    "<<=",
-    ">>=",
-    "&&=",
-    "||=",
-    "??=",
-    "...",
-    ">>>",
-    "=>",
-    "==",
-    "!=",
-    "<=",
-    ">=",
-    "++",
-    "--",
-    "+=",
-    "-=",
-    "*=",
-    "/=",
-    "%=",
-    "&&",
-    "||",
-    "??",
-    "?.",
-    "**",
-    "<<",
-    ">>",
-    "&=",
-    "|=",
-    "^=",
-    "{",
-    "}",
-    "(",
-    ")",
-    "[",
-    "]",
-    ";",
-    ",",
-    "<",
-    ">",
-    "+",
-    "-",
-    "*",
-    "/",
-    "%",
-    "&",
-    "|",
-    "^",
-    "!",
-    "~",
-    "?",
-    ":",
-    ".",
-    "=",
+    ">>>=", "===", "!==", "**=", "<<=", ">>=", "&&=", "||=", "??=", "...", ">>>", "=>", "==", "!=",
+    "<=", ">=", "++", "--", "+=", "-=", "*=", "/=", "%=", "&&", "||", "??", "?.", "**", "<<", ">>",
+    "&=", "|=", "^=", "{", "}", "(", ")", "[", "]", ";", ",", "<", ">", "+", "-", "*", "/", "%",
+    "&", "|", "^", "!", "~", "?", ":", ".", "=",
 ];
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
@@ -305,7 +255,9 @@ impl Lexer {
                 Tok::Str(self.string(c)?)
             } else if c == '`' {
                 Tok::Template(self.template()?)
-            } else if c.is_ascii_digit() || (c == '.' && self.peek2().is_some_and(|d| d.is_ascii_digit())) {
+            } else if c.is_ascii_digit()
+                || (c == '.' && self.peek2().is_some_and(|d| d.is_ascii_digit()))
+            {
                 Tok::Num(self.number()?)
             } else if is_ident_start(c) {
                 let name = self.ident();
@@ -437,7 +389,10 @@ impl Lexer {
                     self.bump();
                     self.bump();
                     let mut v = String::new();
-                    while self.peek().is_some_and(|c| ('0'..='7').contains(&c) || c == '_') {
+                    while self
+                        .peek()
+                        .is_some_and(|c| ('0'..='7').contains(&c) || c == '_')
+                    {
                         let c = self.bump().unwrap();
                         if c != '_' {
                             v.push(c);
@@ -451,7 +406,10 @@ impl Lexer {
                     self.bump();
                     self.bump();
                     let mut v = String::new();
-                    while self.peek().is_some_and(|c| c == '0' || c == '1' || c == '_') {
+                    while self
+                        .peek()
+                        .is_some_and(|c| c == '0' || c == '1' || c == '_')
+                    {
                         let c = self.bump().unwrap();
                         if c != '_' {
                             v.push(c);
@@ -497,7 +455,8 @@ impl Lexer {
                 _ => break,
             }
         }
-        s.parse::<f64>().map_err(|_| self.err(format!("bad number literal `{s}`")))
+        s.parse::<f64>()
+            .map_err(|_| self.err(format!("bad number literal `{s}`")))
     }
 
     fn string(&mut self, quote: char) -> Result<String, Error> {
@@ -770,7 +729,12 @@ impl Lexer {
         for p in PUNCTS {
             if rest.starts_with(p) {
                 // `?.` must not match when followed by a digit (`a?.5:0` is `a ? .5 : 0`)
-                if *p == "?." && self.chars.get(self.i + 2).is_some_and(|c| c.is_ascii_digit()) {
+                if *p == "?."
+                    && self
+                        .chars
+                        .get(self.i + 2)
+                        .is_some_and(|c| c.is_ascii_digit())
+                {
                     continue;
                 }
                 for _ in 0..p.len() {
@@ -779,7 +743,10 @@ impl Lexer {
                 return Ok(Tok::Punct(p));
             }
         }
-        Err(self.err(format!("unexpected character `{}`", self.peek().unwrap_or('?'))))
+        Err(self.err(format!(
+            "unexpected character `{}`",
+            self.peek().unwrap_or('?')
+        )))
     }
 }
 

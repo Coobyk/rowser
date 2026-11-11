@@ -9,8 +9,8 @@ use gpui::{prelude::*, *};
 use rowser_ipc::{read_frame, write_frame, ToBrowser, ToRenderer};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command, Stdio};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -141,8 +141,8 @@ impl BrowserView {
 
         // Drain renderer messages into the UI. Polling via gpui::Timer keeps
         // this dep-free — no async channel crate needed.
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            loop {
+        cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
                 Timer::after(Duration::from_millis(4)).await;
                 if this
                     .update(&mut *cx, |view, cx| {
@@ -153,8 +153,8 @@ impl BrowserView {
                 {
                     break;
                 }
-            }
-        })
+            },
+        )
         .detach();
 
         view.open_tab();
@@ -538,7 +538,11 @@ impl Render for BrowserView {
                 } else {
                     rgb(0x888899)
                 })
-                .bg(if is_active { rgb(0x2e2e36) } else { rgb(0x1b1b1f) })
+                .bg(if is_active {
+                    rgb(0x2e2e36)
+                } else {
+                    rgb(0x1b1b1f)
+                })
                 .rounded_t_md()
                 .overflow_hidden()
                 .on_mouse_down(
@@ -779,7 +783,11 @@ impl Render for BrowserView {
                 div()
                     .px_2()
                     .rounded_md()
-                    .text_color(if starred { rgb(0xffcc44) } else { rgb(0x666677) })
+                    .text_color(if starred {
+                        rgb(0xffcc44)
+                    } else {
+                        rgb(0x666677)
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, _e, _w, cx| {
@@ -795,7 +803,11 @@ impl Render for BrowserView {
                 div()
                     .px_2()
                     .rounded_md()
-                    .text_color(if self.inspector { rgb(0x66ccff) } else { rgb(0x666677) })
+                    .text_color(if self.inspector {
+                        rgb(0x66ccff)
+                    } else {
+                        rgb(0x666677)
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|view, _e, _w, cx| {
@@ -861,10 +873,7 @@ impl Render for BrowserView {
                         // Possible start of a text-selection drag — the
                         // click itself is deferred to mouse-up so a drag
                         // that begins on a link doesn't navigate.
-                        view.drag = Some((
-                            f32::from(p.x) * sf,
-                            (f32::from(p.y) - CHROME_PX) * sf,
-                        ));
+                        view.drag = Some((f32::from(p.x) * sf, (f32::from(p.y) - CHROME_PX) * sf));
                         cx.notify();
                     }),
                 )
@@ -888,7 +897,9 @@ impl Render for BrowserView {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|view, e: &MouseUpEvent, window, cx| {
-                        let Some((x0, y0)) = view.drag.take() else { return };
+                        let Some((x0, y0)) = view.drag.take() else {
+                            return;
+                        };
                         let sf = window.scale_factor();
                         let (x1, y1) = (
                             f32::from(e.position.x) * sf,
@@ -949,7 +960,10 @@ impl Render for BrowserView {
             .on_key_down(cx.listener(|view, e: &KeyDownEvent, window, cx| {
                 let ks = &e.keystroke;
                 let m = ks.modifiers;
-                dlog(&format!("key {} mods c:{} a:{} s:{}", ks.key, m.control, m.alt, m.shift));
+                dlog(&format!(
+                    "key {} mods c:{} a:{} s:{}",
+                    ks.key, m.control, m.alt, m.shift
+                ));
                 // Ctrl on Linux/Windows, Cmd on macOS — same as the URL bar.
                 let ctrl = m.control || m.platform;
                 let editing = view.url_editing;
@@ -998,7 +1012,11 @@ impl Render for BrowserView {
             .child(tab_strip)
             .child(nav)
             .child({
-                let mut row = div().flex_1().min_h_0().flex().child(webview.flex_1().min_w_0());
+                let mut row = div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(webview.flex_1().min_w_0());
                 if self.inspector {
                     let mut panel = div()
                         .w(px(320.0))
@@ -1044,7 +1062,6 @@ fn main() {
         cx.activate(true);
     });
 }
-
 
 /// ~/.config/rowser, creating it on first use.
 fn config_dir() -> PathBuf {
@@ -1093,4 +1110,3 @@ fn normalize_url(input: &str) -> String {
     }
     format!("https://{s}")
 }
-

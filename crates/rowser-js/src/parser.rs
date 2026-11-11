@@ -93,7 +93,11 @@ impl Parser {
         if self.eat_kw(k) {
             Ok(())
         } else {
-            Err(self.err(format!("expected `{}`, found {}", k.name(), self.describe())))
+            Err(self.err(format!(
+                "expected `{}`, found {}",
+                k.name(),
+                self.describe()
+            )))
         }
     }
     fn describe(&self) -> String {
@@ -192,8 +196,10 @@ impl Parser {
             Tok::Kw(Kw::Let) => {
                 // `let` can be an identifier: `let = 5`, `let.x`, `let(x)` or
                 // a declaration `let x ...`. Disambiguate by lookahead.
-                if matches!(self.peek2().tok, Tok::Ident(_) | Tok::Punct("[") | Tok::Punct("{"))
-                    || matches!(&self.peek2().tok, Tok::Kw(k) if is_contextual_ident_kw(k))
+                if matches!(
+                    self.peek2().tok,
+                    Tok::Ident(_) | Tok::Punct("[") | Tok::Punct("{")
+                ) || matches!(&self.peek2().tok, Tok::Kw(k) if is_contextual_ident_kw(k))
                 {
                     let (kind, decls) = self.var_decl()?;
                     self.semi()?;
@@ -474,7 +480,10 @@ impl Parser {
         // for-in / for-of heads
         let init_is_decl = matches!(self.peek().tok, Tok::Kw(Kw::Var) | Tok::Kw(Kw::Const))
             || (matches!(self.peek().tok, Tok::Kw(Kw::Let))
-                && matches!(self.peek2().tok, Tok::Ident(_) | Tok::Punct("[") | Tok::Punct("{")))
+                && matches!(
+                    self.peek2().tok,
+                    Tok::Ident(_) | Tok::Punct("[") | Tok::Punct("{")
+                ))
             || matches!(&self.peek().tok, Tok::Kw(Kw::Let) if matches!(&self.peek2().tok, Tok::Kw(k) if is_contextual_ident_kw(k)));
 
         if init_is_decl {
@@ -783,8 +792,7 @@ impl Parser {
                 self.next();
                 let f = self.fn_tail(false)?;
                 ExportRec::Default(Expr::Fn(Rc::new(f)))
-            } else
-            if self.at_kw(Kw::Class) {
+            } else if self.at_kw(Kw::Class) {
                 self.next();
                 let c = self.class_tail(false)?;
                 ExportRec::Default(Expr::Class(Rc::new(c)))
@@ -932,7 +940,9 @@ impl Parser {
             let mut is_static = false;
             let mut is_async = false;
             // modifiers — `static` and `async` can also be member names
-            if self.at_kw(Kw::Static) && !matches!(self.peek2().tok, Tok::Punct("(") | Tok::Punct("=")) {
+            if self.at_kw(Kw::Static)
+                && !matches!(self.peek2().tok, Tok::Punct("(") | Tok::Punct("="))
+            {
                 self.next();
                 is_static = true;
             }
@@ -942,13 +952,20 @@ impl Parser {
                 let _ = self.block_body()?;
                 continue;
             }
-            if self.at_kw(Kw::Async) && !matches!(self.peek2().tok, Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(":")) && !self.peek2().newline_before {
+            if self.at_kw(Kw::Async)
+                && !matches!(
+                    self.peek2().tok,
+                    Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(":")
+                )
+                && !self.peek2().newline_before
+            {
                 self.next();
                 is_async = true;
             }
             // getter/setter (contextual)
             let mut kind = MemberKind::Method;
-            let is_getset_candidate = matches!(self.peek().tok, Tok::Kw(Kw::Get) | Tok::Kw(Kw::Set));
+            let is_getset_candidate =
+                matches!(self.peek().tok, Tok::Kw(Kw::Get) | Tok::Kw(Kw::Set));
             if is_getset_candidate
                 && !matches!(
                     self.peek2().tok,
@@ -1029,7 +1046,13 @@ impl Parser {
         if self.at_kw(Kw::Yield) {
             // `yield expr` — treat as plain expr (generators unsupported)
             self.next();
-            if !self.at_punct(")") && !self.at_punct("]") && !self.at_punct("}") && !self.at_punct(",") && !self.at_punct(";") && !self.at_eof() {
+            if !self.at_punct(")")
+                && !self.at_punct("]")
+                && !self.at_punct("}")
+                && !self.at_punct(",")
+                && !self.at_punct(";")
+                && !self.at_eof()
+            {
                 return self.assign_expr();
             }
             return Ok(Expr::Ident("undefined".into()));
@@ -1364,9 +1387,7 @@ impl Parser {
                     for p in parts {
                         match p {
                             crate::lexer::TemplPart::Str(s) => strings.push(Expr::Str(s)),
-                            crate::lexer::TemplPart::Expr(raw) => {
-                                exprs.push(parse_expr_src(&raw)?)
-                            }
+                            crate::lexer::TemplPart::Expr(raw) => exprs.push(parse_expr_src(&raw)?),
                         }
                     }
                     args.push(Arg::Expr(Expr::Array(
@@ -1541,7 +1562,16 @@ impl Parser {
             Tok::Kw(k)
                 if matches!(
                     k,
-                    Kw::Let | Kw::Get | Kw::Set | Kw::Static | Kw::Async | Kw::Of | Kw::Await | Kw::Yield | Kw::From | Kw::As
+                    Kw::Let
+                        | Kw::Get
+                        | Kw::Set
+                        | Kw::Static
+                        | Kw::Async
+                        | Kw::Of
+                        | Kw::Await
+                        | Kw::Yield
+                        | Kw::From
+                        | Kw::As
                 ) =>
             {
                 self.next();
@@ -1590,7 +1620,11 @@ impl Parser {
                     let is_getset = matches!(self.peek().tok, Tok::Kw(Kw::Get) | Tok::Kw(Kw::Set))
                         && !matches!(
                             self.peek2().tok,
-                            Tok::Punct(":") | Tok::Punct(",") | Tok::Punct("(") | Tok::Punct("}") | Tok::Punct("=")
+                            Tok::Punct(":")
+                                | Tok::Punct(",")
+                                | Tok::Punct("(")
+                                | Tok::Punct("}")
+                                | Tok::Punct("=")
                         );
                     if is_getset {
                         let is_get = self.at_kw(Kw::Get);
@@ -1625,7 +1659,10 @@ impl Parser {
                         continue;
                     }
                     if self.at_kw(Kw::Async)
-                        && !matches!(self.peek2().tok, Tok::Punct(":") | Tok::Punct(",") | Tok::Punct("(") | Tok::Punct("}"))
+                        && !matches!(
+                            self.peek2().tok,
+                            Tok::Punct(":") | Tok::Punct(",") | Tok::Punct("(") | Tok::Punct("}")
+                        )
                         && !self.peek2().newline_before
                     {
                         self.next();

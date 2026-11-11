@@ -74,8 +74,19 @@ impl Url {
 
         let (rest, fragment) = split_fragment(rest);
         let (path, query) = split_query(rest);
-        let path = if path.is_empty() { "/".to_string() } else { path.to_string() };
-        Ok(Url { scheme, host, port, path, query, fragment })
+        let path = if path.is_empty() {
+            "/".to_string()
+        } else {
+            path.to_string()
+        };
+        Ok(Url {
+            scheme,
+            host,
+            port,
+            path,
+            query,
+            fragment,
+        })
     }
 
     /// Resolve `relative` against this URL (RFC 3986 §5.2 basics): absolute
@@ -302,7 +313,10 @@ mod tests {
 
         assert_eq!(Url::parse("https://a.b/x").unwrap().port, 443);
         // Non-default ports round-trip through Display.
-        assert_eq!(Url::parse("http://a.b:81/").unwrap().to_string(), "http://a.b:81/");
+        assert_eq!(
+            Url::parse("http://a.b:81/").unwrap().to_string(),
+            "http://a.b:81/"
+        );
         // Userinfo is stripped.
         assert_eq!(Url::parse("http://u:p@host/x").unwrap().host, "host");
         // IPv6 literal.
@@ -322,10 +336,7 @@ mod tests {
         assert_eq!(percent_decode("%68ello%20w%6Frld").unwrap(), "hello world");
         assert_eq!(percent_decode("plain").unwrap(), "plain");
         assert_eq!(percent_decode("a+b").unwrap(), "a+b"); // '+' untouched
-        assert_eq!(
-            percent_decode("%zz"),
-            Err(UrlError::InvalidPercentEncoding)
-        );
+        assert_eq!(percent_decode("%zz"), Err(UrlError::InvalidPercentEncoding));
         assert_eq!(
             percent_decode("cut%4"),
             Err(UrlError::InvalidPercentEncoding)
@@ -342,8 +353,14 @@ mod tests {
 
     #[test]
     fn resolve_absolute() {
-        assert_eq!(base().resolve("https://x.org/y").unwrap().to_string(), "https://x.org/y");
-        assert_eq!(base().resolve("//x.org/y").unwrap().to_string(), "http://x.org/y");
+        assert_eq!(
+            base().resolve("https://x.org/y").unwrap().to_string(),
+            "https://x.org/y"
+        );
+        assert_eq!(
+            base().resolve("//x.org/y").unwrap().to_string(),
+            "http://x.org/y"
+        );
     }
 
     #[test]
@@ -368,7 +385,11 @@ mod tests {
             ("g/../h", "http://a/b/c/h"),
         ];
         for (rel, want) in cases {
-            assert_eq!(base().resolve(rel).unwrap().to_string(), want, "rel={rel:?}");
+            assert_eq!(
+                base().resolve(rel).unwrap().to_string(),
+                want,
+                "rel={rel:?}"
+            );
         }
     }
 

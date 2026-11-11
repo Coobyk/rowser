@@ -64,9 +64,14 @@ pub fn register_font_faces(faces: &[FontFace], base: &str, fonts: &mut FontCache
                         let rank: u8 = match format.as_deref() {
                             None | Some("") => 0,
                             Some(
-                                "truetype" | "opentype" | "woff" | "truetype-variations"
-                                | "opentype-variations" | "woff-variations"
-                                | "truetype-collection" | "opentype-collection"
+                                "truetype"
+                                | "opentype"
+                                | "woff"
+                                | "truetype-variations"
+                                | "opentype-variations"
+                                | "woff-variations"
+                                | "truetype-collection"
+                                | "opentype-collection"
                                 | "woff-collection",
                             ) => 0,
                             Some("woff2") => 1,
@@ -118,7 +123,9 @@ pub fn register_font_faces(faces: &[FontFace], base: &str, fonts: &mut FontCache
         let bodies = crate::fetch_pool(&round, FONT_FETCH_DEADLINE);
         for (i, u) in picks {
             let Some(body) = bodies.get(&u) else { continue };
-            let Some(sfnt) = decode_font_bytes(body) else { continue };
+            let Some(sfnt) = decode_font_bytes(body) else {
+                continue;
+            };
             let p = &pend[i];
             if fonts
                 .register_bytes(
@@ -155,9 +162,7 @@ fn decode_font_bytes(body: &[u8]) -> Option<Vec<u8>> {
 /// origChecksum); tables whose compLength < origLength are zlib streams.
 /// Table data is re-laid 4-byte-aligned behind a fresh sfnt directory.
 fn unwrap_woff(d: &[u8]) -> Option<Vec<u8>> {
-    let u16b = |o: usize| -> Option<u16> {
-        Some(u16::from_be_bytes([*d.get(o)?, *d.get(o + 1)?]))
-    };
+    let u16b = |o: usize| -> Option<u16> { Some(u16::from_be_bytes([*d.get(o)?, *d.get(o + 1)?])) };
     let u32b = |o: usize| -> Option<u32> {
         Some(u32::from_be_bytes([
             *d.get(o)?,

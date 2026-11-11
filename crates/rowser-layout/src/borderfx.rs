@@ -3,8 +3,8 @@
 //! the block/float/inline-block/grid/table box paths.
 
 use crate::{
-    alpha, over, parse_color, parse_color_ctx, parse_len, BorderEdge, BorderStyle, Color, DisplayItem, Props,
-    BLACK,
+    alpha, over, parse_color, parse_color_ctx, parse_len, BorderEdge, BorderStyle, Color,
+    DisplayItem, Props, BLACK,
 };
 
 /// Whitespace-split keeping `fn(...)` groups whole (`rgb(0 0 0)`).
@@ -93,12 +93,12 @@ pub fn border_parts(v: &str, em: f32) -> BorderParts {
 }
 
 fn parts_color(p: &BorderParts, cur: Color) -> Option<Color> {
-    p.color
-        .as_deref()
-        .and_then(|s| {
-            parse_color_ctx(s, Some(cur))
-                .or_else(|| s.split_whitespace().find_map(|t| parse_color_ctx(t, Some(cur))))
+    p.color.as_deref().and_then(|s| {
+        parse_color_ctx(s, Some(cur)).or_else(|| {
+            s.split_whitespace()
+                .find_map(|t| parse_color_ctx(t, Some(cur)))
         })
+    })
 }
 
 /// Per-side border widths/styles/colors — [top, right, bottom, left].
@@ -135,9 +135,21 @@ pub fn borders(c: &Props, size: f32, cur: Color) -> Option<Borders> {
     }
     const SIDES: [(&str, &str, &str); 4] = [
         ("border-top-width", "border-top-style", "border-top-color"),
-        ("border-right-width", "border-right-style", "border-right-color"),
-        ("border-bottom-width", "border-bottom-style", "border-bottom-color"),
-        ("border-left-width", "border-left-style", "border-left-color"),
+        (
+            "border-right-width",
+            "border-right-style",
+            "border-right-color",
+        ),
+        (
+            "border-bottom-width",
+            "border-bottom-style",
+            "border-bottom-color",
+        ),
+        (
+            "border-left-width",
+            "border-left-style",
+            "border-left-color",
+        ),
     ];
     for (i, (wn, sn, cn)) in SIDES.iter().copied().enumerate() {
         if let Some(v) = c.get(wn) {
@@ -237,7 +249,9 @@ pub fn radius_spec(c: &Props) -> RadiusSpec {
             if let Some(h) = t.first() {
                 out.0[i] = Some((
                     h.to_string(),
-                    t.get(1).map(|s| s.to_string()).unwrap_or_else(|| h.to_string()),
+                    t.get(1)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| h.to_string()),
                 ));
             }
         }
@@ -466,7 +480,9 @@ pub fn outline(c: &Props, size: f32, bd: Color, def: Color) -> Option<Outline> {
     if let Some(v) = c.get("outline-color") {
         let t = v.trim();
         if !matches!(t, "auto" | "invert") {
-            if let Some(col) = parse_color_ctx(t, Some(def)).or_else(|| parts_color(&border_parts(t, size), def)) {
+            if let Some(col) =
+                parse_color_ctx(t, Some(def)).or_else(|| parts_color(&border_parts(t, size), def))
+            {
                 o.color = over(col, bd);
                 found = true;
             }
@@ -521,10 +537,24 @@ pub fn padding_box(x: f32, y: f32, w: f32, h: f32, bw: [f32; 4]) -> (f32, f32, f
 pub fn bg_item(x: f32, y: f32, w: f32, h: f32, color: Color, r: &Radii) -> DisplayItem {
     if let Some(u) = r.uniform() {
         if u > 0.5 {
-            return DisplayItem::RoundedRect { x, y, w, h, radius: u, color };
+            return DisplayItem::RoundedRect {
+                x,
+                y,
+                w,
+                h,
+                radius: u,
+                color,
+            };
         }
     } else if r.any() {
-        return DisplayItem::RoundedRect2 { x, y, w, h, radii: r.0, color };
+        return DisplayItem::RoundedRect2 {
+            x,
+            y,
+            w,
+            h,
+            radii: r.0,
+            color,
+        };
     }
     DisplayItem::FillRect { x, y, w, h, color }
 }
@@ -553,7 +583,13 @@ pub fn emit_borders(out: &mut Vec<DisplayItem>, x: f32, y: f32, w: f32, h: f32, 
             continue;
         }
         if b.style[i] == BorderStyle::Solid {
-            out.push(DisplayItem::FillRect { x: ex, y: ey, w: ew, h: eh, color: b.color[i] });
+            out.push(DisplayItem::FillRect {
+                x: ex,
+                y: ey,
+                w: ew,
+                h: eh,
+                color: b.color[i],
+            });
         } else {
             out.push(DisplayItem::BorderSide {
                 x: ex,
@@ -602,7 +638,13 @@ pub fn emit_outline(out: &mut Vec<DisplayItem>, x: f32, y: f32, w: f32, h: f32, 
         (ox, oy, o.w, oh, BorderEdge::Left),
     ] {
         if o.style == BorderStyle::Solid {
-            out.push(DisplayItem::FillRect { x: ex, y: ey, w: ew, h: eh, color: o.color });
+            out.push(DisplayItem::FillRect {
+                x: ex,
+                y: ey,
+                w: ew,
+                h: eh,
+                color: o.color,
+            });
         } else {
             out.push(DisplayItem::BorderSide {
                 x: ex,
@@ -655,7 +697,13 @@ pub fn emit_box(
         let bw = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let (cx, cy, cw, ch) = padding_box(x, y, w, h, bw);
         let pr = radii.inset(bw);
-        out.push(DisplayItem::PushClip { x: cx, y: cy, w: cw, h: ch, radii: pr.0 });
+        out.push(DisplayItem::PushClip {
+            x: cx,
+            y: cy,
+            w: cw,
+            h: ch,
+            radii: pr.0,
+        });
     }
     out.extend(inner);
     if clip {

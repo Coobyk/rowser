@@ -184,7 +184,7 @@ fn area(
     which: u8,
 ) -> (f32, f32, f32, f32) {
     let (il, ir, it, ib) = match which {
-        0 => (0.0, 0.0, 0.0, 0.0), // border-box
+        0 => (0.0, 0.0, 0.0, 0.0),             // border-box
         1 => (brd[3], brd[1], brd[0], brd[2]), // padding-box
         _ => (
             brd[3] + pad[3],
@@ -265,8 +265,8 @@ fn is_lenpct(t: &str) -> bool {
         return true;
     }
     for suf in [
-        "px", "em", "rem", "vw", "vh", "svw", "svh", "dvw", "dvh", "lvw", "lvh", "pt",
-        "pc", "in", "cm", "mm", "q", "ex", "ch", "lh", "rlh", "vmin", "vmax",
+        "px", "em", "rem", "vw", "vh", "svw", "svh", "dvw", "dvh", "lvw", "lvh", "pt", "pc", "in",
+        "cm", "mm", "q", "ex", "ch", "lh", "rlh", "vmin", "vmax",
     ] {
         if let Some(p) = t.strip_suffix(suf) {
             if p.parse::<f32>().is_ok() {
@@ -801,8 +801,12 @@ fn parse_gradient(spec: &str, em: f32, vh: f32, vw: f32, current: u32) -> Option
         "radial-gradient" => {
             let prelude = matches!(
                 first_tok.as_str(),
-                "at" | "circle" | "ellipse" | "closest-side" | "farthest-side"
-                    | "closest-corner" | "farthest-corner"
+                "at" | "circle"
+                    | "ellipse"
+                    | "closest-side"
+                    | "farthest-side"
+                    | "closest-corner"
+                    | "farthest-corner"
             ) || is_lenpct(&first_tok);
             let mut circle = false;
             let mut size = RadSize::FarthestCorner;
@@ -888,7 +892,12 @@ fn parse_gradient(spec: &str, em: f32, vh: f32, vw: f32, current: u32) -> Option
             if stops.is_empty() {
                 return None;
             }
-            Some(Grad::Conic { from, c, stops, rep })
+            Some(Grad::Conic {
+                from,
+                c,
+                stops,
+                rep,
+            })
         }
         _ => None,
     }
@@ -909,7 +918,7 @@ fn resolve_stops(stops: &[Stop], axis_px: f32) -> Vec<(f32, u32)> {
                     } else {
                         0.0
                     }
-                },
+                }
             })
         })
         .collect();
@@ -1021,14 +1030,7 @@ enum RGrad {
     },
 }
 
-fn radial_radii(
-    size: &RadSize,
-    circle: bool,
-    cx: f32,
-    cy: f32,
-    tw: f32,
-    th: f32,
-) -> (f32, f32) {
+fn radial_radii(size: &RadSize, circle: bool, cx: f32, cy: f32, tw: f32, th: f32) -> (f32, f32) {
     match size {
         RadSize::Explicit(a, b) => {
             let rx = match a {
@@ -1370,7 +1372,19 @@ mod tests {
         let g = grad("linear-gradient(90deg, #ff0000, #0000ff)");
         let rg = resolve_grad(&g, 100.0, 10.0);
         let stops = resolve_stops(grad_stops(&g), 100.0);
-        let px = raster_band(&rg, &stops, 0.0, 0.0, 100, 10, 0.0, 0.0, 100.0, 10.0, (1, 1));
+        let px = raster_band(
+            &rg,
+            &stops,
+            0.0,
+            0.0,
+            100,
+            10,
+            0.0,
+            0.0,
+            100.0,
+            10.0,
+            (1, 1),
+        );
         assert_eq!(px.len(), 100 * 10 * 4);
         // left pixel ≈ red, right ≈ blue (BGRA)
         assert!(px[0] < 10 && px[1] < 10 && px[2] > 245 && px[3] == 255);

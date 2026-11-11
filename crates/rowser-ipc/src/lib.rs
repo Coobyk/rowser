@@ -24,10 +24,7 @@ impl<'a> Reader<'a> {
 
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
         let end = self.pos.checked_add(n).ok_or_else(bad)?;
-        let slice = self
-            .buf
-            .get(self.pos..end)
-            .ok_or_else(bad)?;
+        let slice = self.buf.get(self.pos..end).ok_or_else(bad)?;
         self.pos = end;
         Ok(slice)
     }
@@ -121,16 +118,29 @@ pub enum ToRenderer {
     /// Navigate to a URL (file://, http(s)://, or a synthetic scheme).
     Navigate(String),
     /// Viewport size changed; the renderer should produce a new frame.
-    ResizeViewport { width: u32, height: u32 },
+    ResizeViewport {
+        width: u32,
+        height: u32,
+    },
     /// Scroll the document by dy pixels (positive = down).
-    Scroll { dy: f32 },
+    Scroll {
+        dy: f32,
+    },
     /// Mouse click at document-space coordinates (device px).
-    Click { x: f32, y: f32 },
+    Click {
+        x: f32,
+        y: f32,
+    },
     /// Text selection drag: anchor (x0,y0) to focus (x1,y1), same
     /// document-space device px as `Click`. Sent on mouse move while the
     /// left button is held; the renderer re-paints with the selected text
     /// highlighted and replies with `ToBrowser::SelText`.
-    Select { x0: f32, y0: f32, x1: f32, y1: f32 },
+    Select {
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+    },
     /// Request a text dump of the DOM tree (inspector).
     DomDump,
     Shutdown,
@@ -229,10 +239,10 @@ impl ToRenderer {
                 height: r.u32()?,
             },
             TAG_SCROLL => Self::Scroll {
-                dy: f32::from_bits(r.u32()?)
+                dy: f32::from_bits(r.u32()?),
             },
             TAG_CLICK => Self::Click {
-                x: f32::from_bits(r.u32()?) ,
+                x: f32::from_bits(r.u32()?),
                 y: f32::from_bits(r.u32()?),
             },
             TAG_SELECT => Self::Select {

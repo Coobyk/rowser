@@ -337,7 +337,8 @@ fn parse_certificate_msg(body: &[u8]) -> Result<Vec<Certificate>> {
         return Err(Error::Decode("certificate: short"));
     }
     let mut pos = 1 + ctx_len;
-    let list_len = ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | body[pos + 2] as usize;
+    let list_len =
+        ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | body[pos + 2] as usize;
     pos += 3;
     if body.len() < pos + list_len {
         return Err(Error::Decode("certificate: list overrun"));
@@ -348,9 +349,8 @@ fn parse_certificate_msg(body: &[u8]) -> Result<Vec<Certificate>> {
         if pos + 3 > end {
             return Err(Error::Decode("certificate: entry len"));
         }
-        let clen = ((body[pos] as usize) << 16)
-            | ((body[pos + 1] as usize) << 8)
-            | body[pos + 2] as usize;
+        let clen =
+            ((body[pos] as usize) << 16) | ((body[pos + 1] as usize) << 8) | body[pos + 2] as usize;
         pos += 3;
         if pos + clen > end {
             return Err(Error::Decode("certificate: cert overrun"));
@@ -414,14 +414,22 @@ fn verify_cert_signature(
         }
         0x0403 | 0x0503 => {
             let (alg, curve, key) = match scheme {
-                0x0503 => (HashAlg::Sha384, ecdsa::p384(), match &cert.public_key {
-                    x509::PublicKey::EcP384(k) => k.clone(),
-                    _ => return Err(Error::Verify("certverify: not p384 key")),
-                }),
-                _ => (HashAlg::Sha256, ecdsa::p256(), match &cert.public_key {
-                    x509::PublicKey::EcP256(k) => k.clone(),
-                    _ => return Err(Error::Verify("certverify: not p256 key")),
-                }),
+                0x0503 => (
+                    HashAlg::Sha384,
+                    ecdsa::p384(),
+                    match &cert.public_key {
+                        x509::PublicKey::EcP384(k) => k.clone(),
+                        _ => return Err(Error::Verify("certverify: not p384 key")),
+                    },
+                ),
+                _ => (
+                    HashAlg::Sha256,
+                    ecdsa::p256(),
+                    match &cert.public_key {
+                        x509::PublicKey::EcP256(k) => k.clone(),
+                        _ => return Err(Error::Verify("certverify: not p256 key")),
+                    },
+                ),
             };
             let digest = alg.hash(&content);
             let (r, s) = decode_sig_der(sig)?;
@@ -756,9 +764,8 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
             _ => return Err(Error::Decode("unexpected record")),
         }
         if sh_buf.len() >= 4 {
-            let len = ((sh_buf[1] as usize) << 16)
-                | ((sh_buf[2] as usize) << 8)
-                | sh_buf[3] as usize;
+            let len =
+                ((sh_buf[1] as usize) << 16) | ((sh_buf[2] as usize) << 8) | sh_buf[3] as usize;
             if sh_buf.len() >= 4 + len {
                 if sh_buf[0] != HS_SERVER_HELLO {
                     return Err(Error::Decode("expected server hello"));
@@ -850,9 +857,7 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
             if hsbuf.len() < 4 {
                 break;
             }
-            let mlen = ((hsbuf[1] as usize) << 16)
-                | ((hsbuf[2] as usize) << 8)
-                | hsbuf[3] as usize;
+            let mlen = ((hsbuf[1] as usize) << 16) | ((hsbuf[2] as usize) << 8) | hsbuf[3] as usize;
             if hsbuf.len() < 4 + mlen {
                 break;
             }
@@ -1005,7 +1010,7 @@ mod tests {
         body.push(0x00); // session_id echo: empty
         body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
         body.push(0x00); // compression
-        // extensions: supported_versions + key_share
+                         // extensions: supported_versions + key_share
         let mut exts = Vec::new();
         exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
         let mut ks = vec![0x00, 0x33, 0x00, 0x24];
@@ -1026,11 +1031,7 @@ mod tests {
     #[ignore]
     fn live_handshake_example_com() {
         use std::net::ToSocketAddrs;
-        let addr = "example.com:443"
-            .to_socket_addrs()
-            .unwrap()
-            .next()
-            .unwrap();
+        let addr = "example.com:443".to_socket_addrs().unwrap().next().unwrap();
         let tcp = TcpStream::connect(addr).unwrap();
         let mut tls = TlsStream::connect("example.com", 443, tcp).unwrap();
         tls.verify_certificate().unwrap();

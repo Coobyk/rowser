@@ -128,7 +128,9 @@ impl PropMap {
     }
     /// iteration in insertion order
     pub fn iter(&self) -> impl Iterator<Item = (&PropKey, &Prop)> + '_ {
-        self.order.iter().filter_map(move |k| self.map.get_key_value(k))
+        self.order
+            .iter()
+            .filter_map(move |k| self.map.get_key_value(k))
     }
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Prop> + '_ {
         self.map.values_mut()
@@ -319,7 +321,12 @@ fn view_own_prop(o: &ObjRef, key: &PropKey) -> Option<Value> {
             }
             None
         }
-        ObjKind::Typed { buf, off, len, kind } => {
+        ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+        } => {
             if let PropKey::S(s) = key {
                 match s.as_ref() {
                     "length" => return Some(Value::Num(*len as f64)),
@@ -499,9 +506,7 @@ const MAX_DEPTH: usize = 400;
 
 impl Interp {
     pub fn new() -> Interp {
-        let mk = |proto: Option<ObjRef>| {
-            Rc::new(RefCell::new(Obj::new(proto, ObjKind::Ord)))
-        };
+        let mk = |proto: Option<ObjRef>| Rc::new(RefCell::new(Obj::new(proto, ObjKind::Ord)));
         let obj = mk(None);
         let func = mk(Some(obj.clone()));
         Interp {
@@ -621,27 +626,36 @@ impl Interp {
             cur = e.parent.clone();
         }
         // sloppy: create global; mirror onto global object
-        self.global
-            .vars
-            .borrow_mut()
-            .insert(Rc::from(name), Binding { val: v.clone(), mutable: true });
-        self.p.global.borrow_mut().props.insert(
-            PropKey::from_str(name),
-            Prop::data(v),
+        self.global.vars.borrow_mut().insert(
+            Rc::from(name),
+            Binding {
+                val: v.clone(),
+                mutable: true,
+            },
         );
+        self.p
+            .global
+            .borrow_mut()
+            .props
+            .insert(PropKey::from_str(name), Prop::data(v));
         Ok(())
     }
 
     /// declare in the given scope (let/const/block fns)
     pub fn declare(&mut self, env: &EnvRef, name: &str, v: Value, mutable: bool) {
-        env.vars
-            .borrow_mut()
-            .insert(Rc::from(name), Binding { val: v.clone(), mutable });
+        env.vars.borrow_mut().insert(
+            Rc::from(name),
+            Binding {
+                val: v.clone(),
+                mutable,
+            },
+        );
         if Rc::ptr_eq(env, &self.global) {
-            self.p.global.borrow_mut().props.insert(
-                PropKey::from_str(name),
-                Prop::data(v),
-            );
+            self.p
+                .global
+                .borrow_mut()
+                .props
+                .insert(PropKey::from_str(name), Prop::data(v));
         }
     }
 
@@ -668,10 +682,11 @@ impl Interp {
             cur.vars.borrow_mut().get_mut(name).unwrap().val = v.clone();
         }
         if Rc::ptr_eq(&cur, &self.global) {
-            self.p.global.borrow_mut().props.insert(
-                PropKey::from_str(name),
-                Prop::data(v),
-            );
+            self.p
+                .global
+                .borrow_mut()
+                .props
+                .insert(PropKey::from_str(name), Prop::data(v));
         }
     }
 
@@ -702,7 +717,10 @@ impl Interp {
 
     // -- object helpers -------------------------------------------------------
     pub fn new_obj(&self) -> ObjRef {
-        Rc::new(RefCell::new(Obj::new(Some(self.p.obj.clone()), ObjKind::Ord)))
+        Rc::new(RefCell::new(Obj::new(
+            Some(self.p.obj.clone()),
+            ObjKind::Ord,
+        )))
     }
     pub fn new_arr(&self, items: Vec<Value>) -> ObjRef {
         Rc::new(RefCell::new(Obj::new(
@@ -724,9 +742,7 @@ impl Interp {
                 );
                 Ok(Value::Obj(o))
             }
-            Err(e) => Err(
-                self.syntax_err(format!("Invalid regular expression: /{pattern}/: {e}"))
-            ),
+            Err(e) => Err(self.syntax_err(format!("Invalid regular expression: /{pattern}/: {e}"))),
         }
     }
     pub fn set_data(&self, o: &ObjRef, key: &str, v: Value) {
@@ -771,7 +787,11 @@ impl Interp {
                 let k = self.key_str(key);
                 Err(self.type_err(format!(
                     "Cannot read properties of {} (reading '{k}')",
-                    if matches!(base, Value::Und) { "undefined" } else { "null" }
+                    if matches!(base, Value::Und) {
+                        "undefined"
+                    } else {
+                        "null"
+                    }
                 )))
             }
             Value::Obj(o) => {
@@ -784,9 +804,7 @@ impl Interp {
                             Err(_e) => "<throw>".to_string(),
                         };
                         let obj_desc = self.inspect(base, 0);
-                        self.typeof_reads.push(format!(
-                            "{got} <- {obj_desc:.160}"
-                        ));
+                        self.typeof_reads.push(format!("{got} <- {obj_desc:.160}"));
                     }
                 }
                 r
@@ -857,7 +875,11 @@ impl Interp {
                 let k = self.key_str(&key);
                 Err(self.type_err(format!(
                     "Cannot set properties of {} (setting '{k}')",
-                    if matches!(base, Value::Und) { "undefined" } else { "null" }
+                    if matches!(base, Value::Und) {
+                        "undefined"
+                    } else {
+                        "null"
+                    }
                 )))
             }
             Value::Obj(o) => self.obj_set(o, key, v, base),
@@ -886,12 +908,23 @@ impl Interp {
         }
     }
 
-    fn obj_set(&mut self, o: &ObjRef, key: PropKey, v: Value, receiver: &Value) -> Result<(), Value> {
+    fn obj_set(
+        &mut self,
+        o: &ObjRef,
+        key: PropKey,
+        v: Value,
+        receiver: &Value,
+    ) -> Result<(), Value> {
         // integer-indexed writes + read-only virtuals on binary views
         {
             let b = o.borrow();
             match &b.kind {
-                ObjKind::Typed { buf, off, len, kind } => {
+                ObjKind::Typed {
+                    buf,
+                    off,
+                    len,
+                    kind,
+                } => {
                     if let PropKey::S(s) = &key {
                         if let Some(idx) = arr_index(s) {
                             let (buf, off, len, kind) = (buf.clone(), *off, *len, *kind);
@@ -905,7 +938,10 @@ impl Interp {
                             }
                             return Ok(());
                         }
-                        if matches!(s.as_ref(), "length" | "byteLength" | "byteOffset" | "buffer") {
+                        if matches!(
+                            s.as_ref(),
+                            "length" | "byteLength" | "byteOffset" | "buffer"
+                        ) {
                             return Ok(()); // accessor-only props: sloppy no-op
                         }
                     }
@@ -1010,7 +1046,10 @@ impl Interp {
                     }
                     ObjKind::Typed { len, .. } => {
                         if let PropKey::S(s) = key {
-                            if matches!(s.as_ref(), "length" | "byteLength" | "byteOffset" | "buffer") {
+                            if matches!(
+                                s.as_ref(),
+                                "length" | "byteLength" | "byteOffset" | "buffer"
+                            ) {
                                 return true;
                             }
                             if let Some(i) = arr_index(s) {
@@ -1206,7 +1245,9 @@ impl Interp {
             }
             Value::Num(n) => *n,
             Value::Str(s) => js_str_to_num(s),
-            Value::Sym(..) => return Err(self.type_err("Cannot convert a Symbol value to a number")),
+            Value::Sym(..) => {
+                return Err(self.type_err("Cannot convert a Symbol value to a number"))
+            }
             Value::Obj(_) => {
                 let p = self.to_primitive(v)?;
                 self.to_num(&p)?
@@ -1349,10 +1390,8 @@ impl Interp {
                         if depth > 3 {
                             return "[…]".into();
                         }
-                        let inner: Vec<String> = items
-                            .iter()
-                            .map(|i| self.inspect(i, depth + 1))
-                            .collect();
+                        let inner: Vec<String> =
+                            items.iter().map(|i| self.inspect(i, depth + 1)).collect();
                         format!("[{}]", inner.join(", "))
                     }
                     ObjKind::Func(Func::User { def, .. }) => {
@@ -1555,7 +1594,11 @@ impl Interp {
                 let nt = new_target.unwrap_or_else(|| f.clone());
                 // prototype for the new object: new_target.prototype or obj proto
                 let proto = {
-                    let nt_obj = if let Value::Obj(no) = &nt { Some(no.clone()) } else { None };
+                    let nt_obj = if let Value::Obj(no) = &nt {
+                        Some(no.clone())
+                    } else {
+                        None
+                    };
                     match nt_obj {
                         Some(no) => {
                             let pp = self.obj_get_raw(&no, &PropKey::from_str("prototype"));
@@ -1569,10 +1612,7 @@ impl Interp {
                 };
                 let this = match ctor {
                     CtorKind::Derived => Value::Und, // allocated at super()
-                    _ => Value::Obj(Rc::new(RefCell::new(Obj::new(
-                        proto,
-                        ObjKind::Ord,
-                    )))),
+                    _ => Value::Obj(Rc::new(RefCell::new(Obj::new(proto, ObjKind::Ord)))),
                 };
                 let scope = Scope::new(Some(env), true);
                 *scope.thisv.borrow_mut() = this;
@@ -1593,7 +1633,9 @@ impl Interp {
                 self.depth -= 1;
                 let this_out = scope.thisv.borrow().clone();
                 match r {
-                    Ok(Completion::Return(v)) if self.is_callable(&v) || matches!(v, Value::Obj(_)) => {
+                    Ok(Completion::Return(v))
+                        if self.is_callable(&v) || matches!(v, Value::Obj(_)) =>
+                    {
                         Ok(v)
                     }
                     Ok(Completion::Return(_)) | Ok(_) => {
@@ -1617,7 +1659,12 @@ impl Interp {
         }
     }
 
-    fn bind_params(&mut self, scope: &EnvRef, params: &[Param], args: &[Value]) -> Result<(), Value> {
+    fn bind_params(
+        &mut self,
+        scope: &EnvRef,
+        params: &[Param],
+        args: &[Value],
+    ) -> Result<(), Value> {
         let mut i = 0;
         for p in params {
             match p {
@@ -1625,7 +1672,10 @@ impl Interp {
                     let v = args.get(i).cloned().unwrap_or(Value::Und);
                     scope.vars.borrow_mut().insert(
                         Rc::from(name.as_str()),
-                        Binding { val: v, mutable: true },
+                        Binding {
+                            val: v,
+                            mutable: true,
+                        },
                     );
                     i += 1;
                 }
@@ -1716,7 +1766,9 @@ impl Interp {
                                     .collect();
                                 for k in keys {
                                     if !taken.contains(&k) {
-                                        let val = self.obj_get_raw(src, &PropKey::from_str(&k)).unwrap_or(Value::Und);
+                                        let val = self
+                                            .obj_get_raw(src, &PropKey::from_str(&k))
+                                            .unwrap_or(Value::Und);
                                         self.set_data(&rest, &k, val);
                                     }
                                 }
@@ -1797,7 +1849,9 @@ impl Interp {
                                     .collect();
                                 for k in keys {
                                     if !taken.contains(&k) {
-                                        let val = self.obj_get_raw(src, &PropKey::from_str(&k)).unwrap_or(Value::Und);
+                                        let val = self
+                                            .obj_get_raw(src, &PropKey::from_str(&k))
+                                            .unwrap_or(Value::Und);
                                         self.set_data(&rest, &k, val);
                                     }
                                 }
@@ -1832,7 +1886,10 @@ impl Interp {
     /// Convert an iterable to a Vec of values (for-of, spread, destructuring).
     pub fn iter_values(&mut self, v: &Value) -> Result<Vec<Value>, Value> {
         match v {
-            Value::Str(s) => Ok(s.chars().map(|c| Value::Str(Rc::from(c.to_string().as_str()))).collect()),
+            Value::Str(s) => Ok(s
+                .chars()
+                .map(|c| Value::Str(Rc::from(c.to_string().as_str())))
+                .collect()),
             Value::Obj(o) => {
                 // Symbol.iterator protocol
                 let m = self.get_prop(v, &PropKey::Sym(SYM_ITERATOR))?;
@@ -2068,12 +2125,7 @@ impl Interp {
                                 match pat {
                                     Pattern::Ident(n) => match kind {
                                         VarKind::Var => self.declare_var(&scope, n, v),
-                                        _ => self.declare(
-                                            &scope,
-                                            n,
-                                            v,
-                                            *kind != VarKind::Const,
-                                        ),
+                                        _ => self.declare(&scope, n, v, *kind != VarKind::Const),
                                     },
                                     other => self.bind_pattern(&scope, other, v, *kind, true)?,
                                 }
@@ -2263,8 +2315,7 @@ impl Interp {
             }
             Stmt::Throw(e) => {
                 let v = self.eval_expr(e, env)?;
-                self.last_throw_trace =
-                    self.call_trace.iter().cloned().collect::<Vec<_>>();
+                self.last_throw_trace = self.call_trace.iter().cloned().collect::<Vec<_>>();
                 Err(v)
             }
             Stmt::Labeled(label, inner) => {
@@ -2284,9 +2335,7 @@ impl Interp {
                     self.labels.pop();
                 }
                 match res {
-                    Ok(Completion::Break(Some(n))) if n == *label => {
-                        Ok(Completion::Empty)
-                    }
+                    Ok(Completion::Break(Some(n))) if n == *label => Ok(Completion::Empty),
                     other => other,
                 }
             }
@@ -2361,7 +2410,13 @@ impl Interp {
         }
     }
 
-    fn bind_pattern_iter(&mut self, scope: &EnvRef, pat: &Pattern, v: Value, kind: VarKind) -> Result<(), Value> {
+    fn bind_pattern_iter(
+        &mut self,
+        scope: &EnvRef,
+        pat: &Pattern,
+        v: Value,
+        kind: VarKind,
+    ) -> Result<(), Value> {
         // like bind_pattern but overwrites let/const bindings each iteration
         match pat {
             Pattern::Ident(n) => {
@@ -2437,10 +2492,7 @@ impl Interp {
         let (super_ctor, super_proto) = match &superclass {
             Some(Value::Null) | None => (None, self.p.obj.clone()),
             Some(Value::Obj(sc)) => {
-                let sp = self.get_prop(
-                    &Value::Obj(sc.clone()),
-                    &PropKey::from_str("prototype"),
-                )?;
+                let sp = self.get_prop(&Value::Obj(sc.clone()), &PropKey::from_str("prototype"))?;
                 let sp = match sp {
                     Value::Obj(p) => p,
                     _ => {
@@ -2451,9 +2503,7 @@ impl Interp {
                 };
                 (Some(sc.clone()), sp)
             }
-            Some(_) => {
-                return Err(self.type_err("Class extends value is not a constructor"))
-            }
+            Some(_) => return Err(self.type_err("Class extends value is not a constructor")),
         };
 
         // find or synthesize constructor
@@ -2496,7 +2546,11 @@ impl Interp {
             ctor_def,
             &class_env,
             Some(proto.clone()),
-            if derived { CtorKind::Derived } else { CtorKind::Base },
+            if derived {
+                CtorKind::Derived
+            } else {
+                CtorKind::Base
+            },
         );
         let Value::Obj(ctor_obj) = ctor_fn.clone() else {
             unreachable!()
@@ -2533,7 +2587,11 @@ impl Interp {
                     let f = self.make_fn_home(
                         m.func.clone(),
                         &class_env,
-                        Some(if m.is_static { ctor_obj.clone() } else { proto.clone() }),
+                        Some(if m.is_static {
+                            ctor_obj.clone()
+                        } else {
+                            proto.clone()
+                        }),
                         CtorKind::NotClass,
                     );
                     target.borrow_mut().props.insert(key, Prop::builtin(f));
@@ -2542,7 +2600,11 @@ impl Interp {
                     let f = self.make_fn_home(
                         m.func.clone(),
                         &class_env,
-                        Some(if m.is_static { ctor_obj.clone() } else { proto.clone() }),
+                        Some(if m.is_static {
+                            ctor_obj.clone()
+                        } else {
+                            proto.clone()
+                        }),
                         CtorKind::NotClass,
                     );
                     let mut b = target.borrow_mut();
@@ -2558,10 +2620,13 @@ impl Interp {
         }
 
         if let Some(n) = &c.name {
-            class_env
-                .vars
-                .borrow_mut()
-                .insert(Rc::from(n.as_str()), Binding { val: ctor_fn.clone(), mutable: false });
+            class_env.vars.borrow_mut().insert(
+                Rc::from(n.as_str()),
+                Binding {
+                    val: ctor_fn.clone(),
+                    mutable: false,
+                },
+            );
         }
         Ok(ctor_fn)
     }
@@ -2653,7 +2718,9 @@ impl Interp {
                         }
                         _ => {
                             let key = match &p.key {
-                                ast::PropKey::Ident(s) | ast::PropKey::Str(s) => PropKey::from_str(s),
+                                ast::PropKey::Ident(s) | ast::PropKey::Str(s) => {
+                                    PropKey::from_str(s)
+                                }
                                 ast::PropKey::Num(n) => PropKey::from_str(&js_num_str(*n)),
                                 ast::PropKey::Computed(ex) => {
                                     let kv = self.eval_expr(ex, env)?;
@@ -2682,9 +2749,8 @@ impl Interp {
                                         CtorKind::NotClass,
                                     );
                                     let mut b = o.borrow_mut();
-                                    let ent = b
-                                        .props
-                                        .or_insert_with(key, || Prop::accessor(None, None));
+                                    let ent =
+                                        b.props.or_insert_with(key, || Prop::accessor(None, None));
                                     if matches!(&p.val, PropVal::Get(_)) {
                                         ent.get = Some(f);
                                     } else {
@@ -2740,7 +2806,11 @@ impl Interp {
                 let n = self.to_num(&cur)?;
                 let new = if *inc { n + 1.0 } else { n - 1.0 };
                 self.assign_target(env, target, Value::Num(new))?;
-                Ok(if *prefix { Value::Num(new) } else { Value::Num(n) })
+                Ok(if *prefix {
+                    Value::Num(new)
+                } else {
+                    Value::Num(n)
+                })
             }
             Expr::Binary { op, l, r } => {
                 let lv = self.eval_expr(l, env)?;
@@ -3063,12 +3133,14 @@ impl Interp {
                         }
                         self.get_prop(&cur, &PropKey::from_str("prototype"))?
                     }
-                    _ => return Err(self.type_err("Right-hand side of 'instanceof' is not an object")),
+                    _ => {
+                        return Err(
+                            self.type_err("Right-hand side of 'instanceof' is not an object")
+                        )
+                    }
                 };
                 let Value::Obj(want) = proto else {
-                    return Err(
-                        self.type_err("Right-hand side of 'instanceof' is not callable")
-                    );
+                    return Err(self.type_err("Right-hand side of 'instanceof' is not callable"));
                 };
                 let mut found = false;
                 if let Value::Obj(mut cur) = l.clone() {
@@ -3210,9 +3282,7 @@ impl Interp {
     pub fn throw_to_error(&mut self, v: Value) -> Error {
         let msg = match &v {
             Value::Obj(_) => self.inspect(&v, 0),
-            other => {
-                self.to_str(other).unwrap_or_else(|_| "<exception>".into())
-            }
+            other => self.to_str(other).unwrap_or_else(|_| "<exception>".into()),
         };
         Error::new(format!("Uncaught {msg}"), 0, 0)
     }
@@ -3269,13 +3339,19 @@ pub fn js_str_to_num(s: &str) -> f64 {
         _ => {}
     }
     if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        return u64::from_str_radix(h, 16).map(|v| v as f64).unwrap_or(f64::NAN);
+        return u64::from_str_radix(h, 16)
+            .map(|v| v as f64)
+            .unwrap_or(f64::NAN);
     }
     if let Some(h) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
-        return u64::from_str_radix(h, 8).map(|v| v as f64).unwrap_or(f64::NAN);
+        return u64::from_str_radix(h, 8)
+            .map(|v| v as f64)
+            .unwrap_or(f64::NAN);
     }
     if let Some(h) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
-        return u64::from_str_radix(h, 2).map(|v| v as f64).unwrap_or(f64::NAN);
+        return u64::from_str_radix(h, 2)
+            .map(|v| v as f64)
+            .unwrap_or(f64::NAN);
     }
     // reject bigint-style trailing n and weird chars
     let cleaned = t.trim_end_matches('n');

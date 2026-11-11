@@ -8,7 +8,6 @@
 //! siblings into that order — stable, so equal keys keep tree order.
 
 use crate::{parse_len, side, sides, DisplayItem, Props};
-use rowser_dom::NodeId;
 
 /// Sibling paint-layer keys — lower paints earlier.
 /// Negative-z positioned siblings paint below in-flow content (real CSS
@@ -30,7 +29,10 @@ pub fn blockish(c: &Props) -> bool {
     ) {
         return true;
     }
-    if matches!(c.get("float").map(String::as_str), Some("left") | Some("right")) {
+    if matches!(
+        c.get("float").map(String::as_str),
+        Some("left") | Some("right")
+    ) {
         return true;
     }
     matches!(
@@ -60,7 +62,10 @@ pub fn item_layer(c: &Props) -> i64 {
         } else {
             L_POS + z
         }
-    } else if matches!(c.get("float").map(String::as_str), Some("left") | Some("right")) {
+    } else if matches!(
+        c.get("float").map(String::as_str),
+        Some("left") | Some("right")
+    ) {
         L_FLOAT
     } else {
         L_BLOCK
@@ -83,7 +88,7 @@ pub fn child_layer(c: &Props) -> Option<i64> {
 /// keep DOM order.
 pub fn reorder(
     items: &mut Vec<DisplayItem>,
-    hits: &mut Vec<(f32, f32, f32, f32, NodeId)>,
+    hits: &mut Vec<crate::Hit>,
     segs: &[(usize, usize, i64)],
 ) {
     let n = segs.len();
@@ -97,13 +102,17 @@ pub fn reorder(
     }
     let seg_range = |i: usize| -> (usize, usize, usize, usize) {
         let i0 = segs[i].0;
-        let i1 = if i + 1 < n { segs[i + 1].0 } else { items.len() };
+        let i1 = if i + 1 < n {
+            segs[i + 1].0
+        } else {
+            items.len()
+        };
         let h0 = segs[i].1;
         let h1 = if i + 1 < n { segs[i + 1].1 } else { hits.len() };
         (i0, i1, h0, h1)
     };
     let mut items_out: Vec<DisplayItem> = Vec::new();
-    let mut hits_out: Vec<(f32, f32, f32, f32, NodeId)> = Vec::new();
+    let mut hits_out: Vec<crate::Hit> = Vec::new();
     for &i in &order {
         let (i0, i1, h0, h1) = seg_range(i);
         items_out.extend_from_slice(&items[i0..i1]);

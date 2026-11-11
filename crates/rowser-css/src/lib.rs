@@ -200,8 +200,7 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         }
         p.skip_ws_comments();
     }
-    let (rules, layers): (Vec<Rule>, Vec<u32>) =
-        pairs.into_iter().map(|(l, r)| (r, l)).unzip();
+    let (rules, layers): (Vec<Rule>, Vec<u32>) = pairs.into_iter().map(|(l, r)| (r, l)).unzip();
     let mut sheet = StyleSheet {
         rules,
         layers,
@@ -262,7 +261,10 @@ impl StyleSheet {
                         bucketed = true;
                     }
                     Some(("class", k)) => {
-                        self.by_class.entry(k.to_string()).or_default().push(i as u32);
+                        self.by_class
+                            .entry(k.to_string())
+                            .or_default()
+                            .push(i as u32);
                         bucketed = true;
                     }
                     Some(("tag", k)) => {
@@ -371,8 +373,12 @@ impl<'a> CssParser<'a> {
         while !self.eof() && self.peek() != Some(b'{') && self.peek() != Some(b';') {
             self.pos += 1;
         }
-        let prelude = String::from_utf8_lossy(&self.s[st..self.pos]).trim().to_lowercase();
-        let raw_prelude = String::from_utf8_lossy(&self.s[st..self.pos]).trim().to_string();
+        let prelude = String::from_utf8_lossy(&self.s[st..self.pos])
+            .trim()
+            .to_lowercase();
+        let raw_prelude = String::from_utf8_lossy(&self.s[st..self.pos])
+            .trim()
+            .to_string();
         let has_block = self.peek() == Some(b'{');
         if has_block {
             self.pos += 1;
@@ -418,9 +424,7 @@ impl<'a> CssParser<'a> {
         // — a declaration block, not a rule list; register and move on.
         if name == "property" && has_block {
             let decls = self.decl_block();
-            let get = |n: &str| {
-                decls.iter().find(|d| d.prop == n).map(|d| d.value.clone())
-            };
+            let get = |n: &str| decls.iter().find(|d| d.prop == n).map(|d| d.value.clone());
             let pname = raw_prelude.trim().to_string();
             if pname.starts_with("--") {
                 self.properties.push(cascade::PropertyDef {
@@ -647,10 +651,7 @@ impl<'a> CssParser<'a> {
             // precedes and no explicit combinator is pending
             let before = self.pos;
             self.skip_ws_comments();
-            if self.pos > before
-                && !parts.is_empty()
-                && comb == Combinator::None
-            {
+            if self.pos > before && !parts.is_empty() && comb == Combinator::None {
                 comb = Combinator::Descendant;
             }
             match self.peek() {
@@ -796,7 +797,9 @@ impl<'a> CssParser<'a> {
                 while self.peek().is_some_and(|c| !Self::is_ws(c) && c != b']') {
                     self.pos += 1;
                 }
-                String::from_utf8_lossy(&self.s[st..self.pos]).trim().to_owned()
+                String::from_utf8_lossy(&self.s[st..self.pos])
+                    .trim()
+                    .to_owned()
             }
         };
         self.skip_ws_comments();
@@ -1042,8 +1045,9 @@ impl<'a> CssParser<'a> {
                         }
                         self.pos += 1;
                     }
-                    let mut value =
-                        String::from_utf8_lossy(&self.s[st..self.pos]).trim().to_string();
+                    let mut value = String::from_utf8_lossy(&self.s[st..self.pos])
+                        .trim()
+                        .to_string();
                     let important = if value.to_lowercase().ends_with("!important") {
                         value = value[..value.len() - 10].trim().to_string();
                         true
@@ -1127,11 +1131,7 @@ fn parse_nth(arg: &str) -> Option<(i32, i32)> {
                     s => s.parse().ok()?,
                 };
                 let b_s = &rest[1..];
-                let b = if b_s.is_empty() {
-                    0
-                } else {
-                    b_s.parse().ok()?
-                };
+                let b = if b_s.is_empty() { 0 } else { b_s.parse().ok()? };
                 Some((a, b))
             } else {
                 a.parse::<i32>().ok().map(|b| (0, b))
@@ -1171,7 +1171,11 @@ fn elem_pos(doc: &Document, node: NodeId, of_type: bool, from_end: bool) -> (usi
             pos = count;
         }
     }
-    let pos = if from_end && pos > 0 { count + 1 - pos } else { pos };
+    let pos = if from_end && pos > 0 {
+        count + 1 - pos
+    } else {
+        pos
+    };
     (pos, count)
 }
 
@@ -1236,9 +1240,10 @@ fn simple_matches(doc: &Document, node: NodeId, s: &Simple) -> bool {
         Simple::NthLastChild(a, b) => nth_matches(elem_pos(doc, node, false, true).0, *a, *b),
         Simple::NthOfType(a, b) => nth_matches(elem_pos(doc, node, true, false).0, *a, *b),
         Simple::NthLastOfType(a, b) => nth_matches(elem_pos(doc, node, true, true).0, *a, *b),
-        Simple::Empty => doc.children(node).iter().all(|&c| {
-            doc.tag(c).is_none() && doc.text(c).map_or(true, |t| t.trim().is_empty())
-        }),
+        Simple::Empty => doc
+            .children(node)
+            .iter()
+            .all(|&c| doc.tag(c).is_none() && doc.text(c).map_or(true, |t| t.trim().is_empty())),
         Simple::Checked => {
             doc.attr(node, "checked").is_some()
                 || (doc.tag(node) == Some("option") && doc.attr(node, "selected").is_some())
@@ -1300,7 +1305,9 @@ fn rel_step(doc: &Document, from: NodeId, rel: &Selector, i: usize) -> bool {
 /// for the selector to match — lets computed() skip most rules without
 /// running the full matcher.
 fn rightmost_ok(doc: &Document, node: NodeId, s: &Selector) -> bool {
-    let Some((_, simples)) = s.parts.last() else { return false };
+    let Some((_, simples)) = s.parts.last() else {
+        return false;
+    };
     for sm in simples {
         match sm {
             Simple::Tag(t) => {
@@ -1349,14 +1356,18 @@ pub fn matches(doc: &Document, node: NodeId, sel: &Selector) -> bool {
         let simples = &sel.parts[i - 1].1;
         match comb {
             Combinator::Child => {
-                let Some(p) = doc.parent(cur) else { return false };
+                let Some(p) = doc.parent(cur) else {
+                    return false;
+                };
                 if doc.tag(p).is_none() || !compound_matches(doc, p, simples) {
                     return false;
                 }
                 cur = p;
             }
             Combinator::NextSibling => {
-                let Some(s) = prev_elem_sibling(doc, cur) else { return false };
+                let Some(s) = prev_elem_sibling(doc, cur) else {
+                    return false;
+                };
                 if !compound_matches(doc, s, simples) {
                     return false;
                 }
@@ -1636,7 +1647,11 @@ fn radius_corners(value: &str) -> [Option<String>; 4] {
     }
     for i in 0..4 {
         let (hc, vc) = (nth4(&hs, i), nth4(&vs, i));
-        out[i] = Some(if hc == vc { hc.to_string() } else { format!("{hc} {vc}") });
+        out[i] = Some(if hc == vc {
+            hc.to_string()
+        } else {
+            format!("{hc} {vc}")
+        });
     }
     out
 }
@@ -1658,8 +1673,8 @@ fn is_len_or_pct(t: &str) -> bool {
         return true;
     }
     for suf in [
-        "px", "em", "rem", "vw", "vh", "svw", "svh", "dvw", "dvh", "lvw", "lvh", "pt",
-        "pc", "in", "cm", "mm", "q", "ex", "ch", "lh", "rlh", "vmin", "vmax",
+        "px", "em", "rem", "vw", "vh", "svw", "svh", "dvw", "dvh", "lvw", "lvh", "pt", "pc", "in",
+        "cm", "mm", "q", "ex", "ch", "lh", "rlh", "vmin", "vmax",
     ] {
         if let Some(p) = t.strip_suffix(suf) {
             if p.parse::<f32>().is_ok() {
@@ -1700,8 +1715,8 @@ fn expand_background(value: &str, f: &mut impl FnMut(&str, &str)) {
             }
             let tl = tok.to_ascii_lowercase();
             if in_size {
-                let is_sz = matches!(tl.as_str(), "auto" | "cover" | "contain")
-                    || is_len_or_pct(&tl);
+                let is_sz =
+                    matches!(tl.as_str(), "auto" | "cover" | "contain") || is_len_or_pct(&tl);
                 if is_sz && l.size.len() < 2 {
                     l.size.push(tok);
                     continue;
@@ -1799,12 +1814,18 @@ fn expand_background(value: &str, f: &mut impl FnMut(&str, &str)) {
         poss_x.push(if xs.is_empty() {
             "0%".to_string()
         } else {
-            xs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" ")
+            xs.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
         });
         poss_y.push(if ys.is_empty() {
             "center".to_string()
         } else {
-            ys.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(" ")
+            ys.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
         });
         sizes.push(if l.size.is_empty() {
             "auto".to_string()
@@ -1828,13 +1849,7 @@ fn expand_background(value: &str, f: &mut impl FnMut(&str, &str)) {
                 .unwrap_or("padding-box")
                 .to_string(),
         );
-        clips.push(
-            l.boxes
-                .get(1)
-                .copied()
-                .unwrap_or("border-box")
-                .to_string(),
-        );
+        clips.push(l.boxes.get(1).copied().unwrap_or("border-box").to_string());
         color = l.color.or(color);
     }
     f("background-image", &images.join(", "));
@@ -1872,7 +1887,12 @@ fn each_decl(prop: &str, value: &str, mut f: impl FnMut(&str, &str)) {
 fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
     let sides = match prop {
         "margin" => Some(("margin-top", "margin-right", "margin-bottom", "margin-left")),
-        "padding" => Some(("padding-top", "padding-right", "padding-bottom", "padding-left")),
+        "padding" => Some((
+            "padding-top",
+            "padding-right",
+            "padding-bottom",
+            "padding-left",
+        )),
         "inset" => Some(("top", "right", "bottom", "left")),
         "border-width" => Some((
             "border-top-width",
@@ -1998,7 +2018,11 @@ fn inline_decls(style: &str) -> Vec<Decl> {
             };
             let prop = p.trim().to_lowercase();
             if !prop.is_empty() && !value.is_empty() {
-                out.push(Decl { prop, value, important });
+                out.push(Decl {
+                    prop,
+                    value,
+                    important,
+                });
             }
         }
     };
@@ -2115,7 +2139,6 @@ mod tests {
         assert_eq!(c.get("color").unwrap(), "red");
     }
 }
-
 
 /// `prefers-color-scheme` resolution: dark when `ROWSER_COLOR_SCHEME=dark`
 /// (or `ROWSER_DARK=1/true`), light otherwise.
@@ -2236,12 +2259,27 @@ fn media_range(f: &str, vw: f32) -> bool {
     let Some(wpos) = toks.iter().position(|t| {
         matches!(
             t.as_str(),
-            "width" | "height" | "min-width" | "max-width" | "min-height" | "max-height"
-                | "aspect-ratio" | "min-aspect-ratio" | "max-aspect-ratio"
-                | "resolution" | "min-resolution" | "max-resolution"
-                | "color" | "min-color" | "max-color"
-                | "color-index" | "min-color-index" | "max-color-index"
-                | "monochrome" | "min-monochrome" | "max-monochrome"
+            "width"
+                | "height"
+                | "min-width"
+                | "max-width"
+                | "min-height"
+                | "max-height"
+                | "aspect-ratio"
+                | "min-aspect-ratio"
+                | "max-aspect-ratio"
+                | "resolution"
+                | "min-resolution"
+                | "max-resolution"
+                | "color"
+                | "min-color"
+                | "max-color"
+                | "color-index"
+                | "min-color-index"
+                | "max-color-index"
+                | "monochrome"
+                | "min-monochrome"
+                | "max-monochrome"
         )
     }) else {
         return true;
@@ -2293,9 +2331,7 @@ fn media_and(q: &str, vw: f32, dark: bool) -> bool {
 
 /// One media query's condition (`a or b` → any).
 fn media_or(q: &str, vw: f32, dark: bool) -> bool {
-    split_top(q, " or ")
-        .iter()
-        .any(|p| media_and(p, vw, dark))
+    split_top(q, " or ").iter().any(|p| media_and(p, vw, dark))
 }
 
 /// A media-query atom: parenthesized feature (possibly nested boolean) or
@@ -2404,21 +2440,68 @@ fn supports_atom(a: &str) -> bool {
 /// `(prop: value)` leaf test — see [`supports_matches`] for the policy.
 fn supports_leaf(inner: &str) -> bool {
     const KNOWN: &[&str] = &[
-        "display", "color", "background", "background-color", "font-size", "font-weight",
-        "font-style", "font-family", "text-decoration", "text-align", "white-space",
-        "vertical-align", "margin", "margin-top", "margin-right", "margin-bottom",
-        "margin-left", "padding", "padding-top", "padding-right", "padding-bottom",
-        "padding-left", "border", "width", "height", "line-height", "float", "gap",
+        "display",
+        "color",
+        "background",
+        "background-color",
+        "font-size",
+        "font-weight",
+        "font-style",
+        "font-family",
+        "text-decoration",
+        "text-align",
+        "white-space",
+        "vertical-align",
+        "margin",
+        "margin-top",
+        "margin-right",
+        "margin-bottom",
+        "margin-left",
+        "padding",
+        "padding-top",
+        "padding-right",
+        "padding-bottom",
+        "padding-left",
+        "border",
+        "width",
+        "height",
+        "line-height",
+        "float",
+        "gap",
         "border-collapse",
-        "grid-template-columns", "grid-template-rows", "grid-column", "grid-row",
-        "grid-column-start", "grid-column-end", "grid-row-start", "grid-row-end",
-        "grid-auto-flow", "grid-auto-rows", "grid-auto-columns", "row-gap",
-        "column-gap", "place-items", "place-content", "place-self", "align-items",
-        "justify-items", "align-content", "justify-content", "align-self",
-        "justify-self", "aspect-ratio",
-        "object-fit", "object-position", "background-image", "background-position",
-        "background-position-x", "background-position-y", "background-size",
-        "background-repeat", "background-origin", "background-clip",
+        "grid-template-columns",
+        "grid-template-rows",
+        "grid-column",
+        "grid-row",
+        "grid-column-start",
+        "grid-column-end",
+        "grid-row-start",
+        "grid-row-end",
+        "grid-auto-flow",
+        "grid-auto-rows",
+        "grid-auto-columns",
+        "row-gap",
+        "column-gap",
+        "place-items",
+        "place-content",
+        "place-self",
+        "align-items",
+        "justify-items",
+        "align-content",
+        "justify-content",
+        "align-self",
+        "justify-self",
+        "aspect-ratio",
+        "object-fit",
+        "object-position",
+        "background-image",
+        "background-position",
+        "background-position-x",
+        "background-position-y",
+        "background-size",
+        "background-repeat",
+        "background-origin",
+        "background-clip",
         "background-attachment",
     ];
     match inner.trim().split_once(':') {
@@ -2439,9 +2522,30 @@ mod dbg_tests {
         let css = std::fs::read_to_string("/tmp/coobyk.css").unwrap();
         let sh = parse(&css);
         eprintln!("RULES: {}", sh.rules.len());
-        eprintln!("display:flex decls: {}", sh.rules.iter().filter(|r| r.decls.iter().any(|d| d.prop=="display" && d.value.contains("flex"))).count());
-        eprintln!("--spacing decls: {}", sh.rules.iter().filter(|r| r.decls.iter().any(|d| d.prop=="--spacing")).count());
-        eprintln!("gap decls: {}", sh.rules.iter().filter(|r| r.decls.iter().any(|d| d.prop=="gap")).count());
+        eprintln!(
+            "display:flex decls: {}",
+            sh.rules
+                .iter()
+                .filter(|r| r
+                    .decls
+                    .iter()
+                    .any(|d| d.prop == "display" && d.value.contains("flex")))
+                .count()
+        );
+        eprintln!(
+            "--spacing decls: {}",
+            sh.rules
+                .iter()
+                .filter(|r| r.decls.iter().any(|d| d.prop == "--spacing"))
+                .count()
+        );
+        eprintln!(
+            "gap decls: {}",
+            sh.rules
+                .iter()
+                .filter(|r| r.decls.iter().any(|d| d.prop == "gap"))
+                .count()
+        );
     }
 }
 
@@ -2452,14 +2556,23 @@ mod dbg2 {
     fn el(d: &mut rowser_dom::Document, p: NodeId, tag: &str, cls: &str) -> NodeId {
         let mut attrs = std::collections::HashMap::new();
         attrs.insert("class".to_string(), cls.to_string());
-        d.nodes.push(Node { kind: NodeKind::Element { tag: tag.into(), attrs }, parent: None, children: vec![], sibling_index: 0 });
+        d.nodes.push(Node {
+            kind: NodeKind::Element {
+                tag: tag.into(),
+                attrs,
+            },
+            parent: None,
+            children: vec![],
+            sibling_index: 0,
+        });
         let id = d.nodes.len() - 1;
         d.append(p, id);
         id
     }
     #[test]
     fn dbg_vars() {
-        let css = ":root,:host{--spacing:.25rem;--bg:#fff}.x{padding-left:calc(var(--spacing) * 2)}";
+        let css =
+            ":root,:host{--spacing:.25rem;--bg:#fff}.x{padding-left:calc(var(--spacing) * 2)}";
         let sh = parse(css);
         eprintln!("rules: {}", sh.rules.len());
         let mut d = rowser_dom::Document::new();
@@ -2711,7 +2824,9 @@ mod sel4 {
         let sh = parse("@layer a { p { color: red } } @layer b { p { color: blue } }");
         assert_eq!(computed(&doc, p, &[&sh]).get("color").unwrap(), "blue");
         // layered !important: earlier layer wins (inversion)
-        let sh = parse("@layer a { p { color: red !important } } @layer b { p { color: blue !important } }");
+        let sh = parse(
+            "@layer a { p { color: red !important } } @layer b { p { color: blue !important } }",
+        );
         assert_eq!(computed(&doc, p, &[&sh]).get("color").unwrap(), "red");
     }
 
@@ -2739,7 +2854,10 @@ mod sel4 {
         eprintln!("  has: {}", counts(|s| matches!(s, Simple::Has(_))));
         eprintln!("  never: {}", counts(|s| matches!(s, Simple::Never)));
         eprintln!("  attrop: {}", counts(|s| matches!(s, Simple::AttrOp(..))));
-        eprintln!("  unsupported: {}", counts(|s| matches!(s, Simple::Unsupported)));
+        eprintln!(
+            "  unsupported: {}",
+            counts(|s| matches!(s, Simple::Unsupported))
+        );
         let functional = counts(|s| {
             matches!(
                 s,
@@ -2749,7 +2867,10 @@ mod sel4 {
         eprintln!("  functional total: {functional}");
         // the sheet is known to carry :is/:where/:has/attr-op selectors —
         // before this work they were Unsupported (dead). Now they parse.
-        assert!(sh.rules.len() > 200, "Tailwind sheet should yield many rules");
+        assert!(
+            sh.rules.len() > 200,
+            "Tailwind sheet should yield many rules"
+        );
         assert!(functional > 0, "functional pseudos should survive parse");
         // The preflight `*,:before,:after,::backdrop` rule must match via `*`
         let doc = rowser_html::parse("<html><body><p></p></body></html>");
@@ -2818,7 +2939,10 @@ mod sel4 {
         assert_eq!(c.get("background-repeat").unwrap(), "no-repeat, repeat-x");
         assert_eq!(c.get("background-position").unwrap(), "center, 0% 0%");
         assert_eq!(c.get("background-attachment").unwrap(), "fixed, scroll");
-        assert_eq!(c.get("background-origin").unwrap(), "padding-box, padding-box");
+        assert_eq!(
+            c.get("background-origin").unwrap(),
+            "padding-box, padding-box"
+        );
         assert_eq!(c.get("background-clip").unwrap(), "border-box, border-box");
     }
 
@@ -2828,7 +2952,10 @@ mod sel4 {
         let p = doc.find_deep(doc.root, "p").unwrap();
         let sh = parse("p{background:url(x) content-box border-box round, url(y) local}");
         let c = computed(&doc, p, &[&sh]);
-        assert_eq!(c.get("background-origin").unwrap(), "content-box, padding-box");
+        assert_eq!(
+            c.get("background-origin").unwrap(),
+            "content-box, padding-box"
+        );
         assert_eq!(c.get("background-clip").unwrap(), "border-box, border-box");
         assert_eq!(c.get("background-repeat").unwrap(), "round, repeat");
         assert_eq!(c.get("background-attachment").unwrap(), "scroll, local");

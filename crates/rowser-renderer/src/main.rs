@@ -66,8 +66,7 @@ fn main() {
 
     let mut fonts = FontCache::new();
     let mut page = Page::new();
-    let mut pending: std::collections::VecDeque<ToRenderer> =
-        std::collections::VecDeque::new();
+    let mut pending: std::collections::VecDeque<ToRenderer> = std::collections::VecDeque::new();
 
     loop {
         let msg = if let Some(m) = pending.pop_front() {
@@ -88,7 +87,10 @@ fn main() {
             }
             ToRenderer::Navigate(url) => {
                 let _ = send(&mut output, &ToBrowser::LoadStarted);
-                let (base, frag) = url.split_once('#').map(|(b, f)| (b, f)).unwrap_or((url.as_str(), ""));
+                let (base, frag) = url
+                    .split_once('#')
+                    .map(|(b, f)| (b, f))
+                    .unwrap_or((url.as_str(), ""));
                 let same_page = !page.cur_url.is_empty()
                     && (base == page.cur_url || (base.is_empty() && !frag.is_empty()));
                 if same_page && !frag.is_empty() {
@@ -115,7 +117,11 @@ fn main() {
                     (doc, Vec::new(), None)
                 };
                 if !js_logs.is_empty() {
-                    pt!("[prof] js exec {:?} ({} log lines)", t_js.elapsed(), js_logs.len());
+                    pt!(
+                        "[prof] js exec {:?} ({} log lines)",
+                        t_js.elapsed(),
+                        js_logs.len()
+                    );
                     for l in js_logs {
                         let _ = send(&mut output, &ToBrowser::Log(l));
                     }
@@ -160,9 +166,23 @@ fn main() {
                 }
             }
             ToRenderer::Click { x, y } => {
-                // hit-test link regions in document space
+                // hit-test link regions in document space — the transform
+                // stack maps each item's coords to painted position, so
+                // the click is inverse-mapped back into that space
                 let mut found = None;
+                let mut xf: Vec<rowser_layout::xform::Mat> = Vec::new();
                 for it in &page.items {
+                    match it {
+                        rowser_layout::DisplayItem::PushTransform { m } => {
+                            xf.push(*m);
+                            continue;
+                        }
+                        rowser_layout::DisplayItem::PopTransform => {
+                            xf.pop();
+                            continue;
+                        }
+                        _ => {}
+                    }
                     if let rowser_layout::DisplayItem::Text {
                         x: tx,
                         baseline,
@@ -178,8 +198,18 @@ fn main() {
                             .font(*font)
                             .map(|f| f.measure(text, *size))
                             .unwrap_or(0.0);
+                        let (cx, cy) = xf
+                            .iter()
+                            .fold(rowser_layout::xform::Mat::IDENTITY, |a, m| a.mul(m))
+                            .inverse()
+                            .map(|inv| inv.apply(x, y))
+                            .unwrap_or((x, y));
                         // rough hit box: from x to x+width, baseline-ascent to baseline+descent
-                        if x >= *tx && x <= *tx + w && y >= baseline - size && y <= *baseline + size * 0.4 {
+                        if cx >= *tx
+                            && cx <= *tx + w
+                            && cy >= baseline - size
+                            && cy <= *baseline + size * 0.4
+                        {
                             found = Some(href.clone());
                             break;
                         }
@@ -200,8 +230,13 @@ fn main() {
                     let target = page
                         .hits
                         .iter()
-                        .filter(|(hx, hy, hw, hh, _)| {
-                            x >= *hx && x <= hx + hw && y >= *hy && y <= hy + hh
+                        .filter(|(hx, hy, hw, hh, _, m)| {
+                            // inverse-map the click into the hit's
+                            // pre-transform space — exact for rotated /
+                            // skewed / scaled elements, not just a bbox
+                            let Some(inv) = m.inverse() else { return false };
+                            let (px, py) = inv.apply(x, y);
+                            px >= *hx && px <= hx + hw && py >= *hy && py <= hy + hh
                         })
                         .min_by(|a, b| {
                             (a.2 * a.3)
@@ -351,8 +386,10 @@ struct Page {
     /// Live page-JS job channel — the interpreter thread owns the real
     /// document; `doc` is a snapshot refreshed after each dispatched event.
     js: Option<std::sync::mpsc::Sender<JsJob>>,
-    /// Element border boxes (x, y, w, h, node) for click hit-testing.
-    hits: Vec<(f32, f32, f32, f32, rowser_dom::NodeId)>,
+    /// Element border boxes (x, y, w, h, node, transform) for click
+    /// hit-testing — the rect is in pre-transform space; the matrix maps
+    /// it to painted position (inverse-mapped against click points).
+    hits: Vec<rowser_layout::Hit>,
     viewport: (u32, u32),
     scroll: f32,
     content_h: f32,
@@ -475,7 +512,11 @@ impl Page {
         }
         let t = std::time::Instant::now();
         let bodies = fetch_pool(&resolved, CSS_FETCH_DEADLINE);
-        pt!("[prof] css fetch {} urls in {:?}", resolved.len(), t.elapsed());
+        pt!(
+            "[prof] css fetch {} urls in {:?}",
+            resolved.len(),
+            t.elapsed()
+        );
         for u in &resolved {
             if let Some(b) = bodies.get(u) {
                 self.sheets.push(rowser_css::parse_vw(
@@ -499,7 +540,9 @@ impl Page {
             if doc.tag(id) != Some("img") {
                 continue;
             }
-            let Some(src) = doc.attr(id, "src") else { continue };
+            let Some(src) = doc.attr(id, "src") else {
+                continue;
+            };
             if seen.iter().any(|s| s == src) {
                 continue;
             }
@@ -553,39 +596,39 @@ impl Page {
         }
     }
 
-/// Rasterize an SVG document body to an Image — `<img src="*.svg">` pieces
-/// and icons. Rendered at 4× natural size for downscale antialiasing.
-fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
-    let text = std::str::from_utf8(body).ok()?;
-    if !text.trim_start().starts_with('<') || !text[..text.len().min(512)].contains("<svg") {
-        return None;
+    /// Rasterize an SVG document body to an Image — `<img src="*.svg">` pieces
+    /// and icons. Rendered at 4× natural size for downscale antialiasing.
+    fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
+        let text = std::str::from_utf8(body).ok()?;
+        if !text.trim_start().starts_with('<') || !text[..text.len().min(512)].contains("<svg") {
+            return None;
+        }
+        let doc = rowser_html::parse(text);
+        let svg = doc.find_deep(doc.root, "svg")?;
+        let dim = |name: &str| -> Option<f32> {
+            doc.attr(svg, name)
+                .and_then(|v| v.trim_end_matches("px").parse().ok())
+        };
+        let (w, h) = match (dim("width"), dim("height")) {
+            (Some(w), Some(h)) => (w, h),
+            _ => doc
+                .attr(svg, "viewBox")
+                .or_else(|| doc.attr(svg, "viewbox"))
+                .and_then(|v| {
+                    let n: Vec<f32> = v
+                        .split(|c: char| c.is_whitespace() || c == ',')
+                        .filter_map(|t| t.parse().ok())
+                        .collect();
+                    (n.len() >= 4).then(|| (n[2], n[3]))
+                })?,
+        };
+        let (rw, rh) = ((w * 4.0) as u32, (h * 4.0) as u32);
+        Some(rowser_image::Image {
+            width: rw,
+            height: rh,
+            pixels: rowser_layout::svg::render(&doc, svg, rw, rh, 0xff000000),
+        })
     }
-    let doc = rowser_html::parse(text);
-    let svg = doc.find_deep(doc.root, "svg")?;
-    let dim = |name: &str| -> Option<f32> {
-        doc.attr(svg, name)
-            .and_then(|v| v.trim_end_matches("px").parse().ok())
-    };
-    let (w, h) = match (dim("width"), dim("height")) {
-        (Some(w), Some(h)) => (w, h),
-        _ => doc
-            .attr(svg, "viewBox")
-            .or_else(|| doc.attr(svg, "viewbox"))
-            .and_then(|v| {
-                let n: Vec<f32> = v
-                    .split(|c: char| c.is_whitespace() || c == ',')
-                    .filter_map(|t| t.parse().ok())
-                    .collect();
-                (n.len() >= 4).then(|| (n[2], n[3]))
-            })?,
-    };
-    let (rw, rh) = ((w * 4.0) as u32, (h * 4.0) as u32);
-    Some(rowser_image::Image {
-        width: rw,
-        height: rh,
-        pixels: rowser_layout::svg::render(&doc, svg, rw, rh, 0xff000000),
-    })
-}
 
     /// Spawn a worker pool decoding fetched bodies to Images — CPU-heavy,
     /// so it only runs at fill time when nothing else is on the main thread.
@@ -602,7 +645,9 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
             std::thread::spawn(move || loop {
                 let job = queue.lock().unwrap().pop_front();
                 let Some((url, body)) = job else { break };
-                let img = rowser_image::decode(&body).ok().or_else(|| Self::decode_svg(&body));
+                let img = rowser_image::decode(&body)
+                    .ok()
+                    .or_else(|| Self::decode_svg(&body));
                 if tx.send((url, ImgMsg::Decoded(img))).is_err() {
                     break;
                 }
@@ -699,7 +744,11 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
     /// Block until every URL in `need` has a fetch result (`img_bodies` or
     /// `img_by_url`) or `deadline` expires. Decode jobs are kicked by the
     /// surrounding sync loop and report into `img_by_url` the same way.
-    fn wait_images(&mut self, need: &std::collections::HashSet<String>, deadline: std::time::Duration) {
+    fn wait_images(
+        &mut self,
+        need: &std::collections::HashSet<String>,
+        deadline: std::time::Duration,
+    ) {
         let start = std::time::Instant::now();
         while need
             .iter()
@@ -747,9 +796,7 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
             // repaint without stalling this one.
             let extra: Vec<String> = outstanding
                 .iter()
-                .filter(|u| {
-                    !self.img_inflight.contains(*u) && !self.img_bodies.contains_key(*u)
-                })
+                .filter(|u| !self.img_inflight.contains(*u) && !self.img_bodies.contains_key(*u))
                 .cloned()
                 .collect();
             if !extra.is_empty() {
@@ -839,6 +886,7 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
             }
             for h in &mut self.hits {
                 h.1 -= dy;
+                h.5 = h.5.conjugated(0.0, -dy);
             }
             self.items_scroll = self.scroll;
         }
@@ -863,15 +911,14 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
     fn repaint(&mut self, fonts: &mut FontCache) {
         let Some(doc) = &self.doc else { return };
         let t0 = std::time::Instant::now();
-        let (items, height, anchors, hits) =
-            Layouter::layout_vh(
-                doc,
-                fonts,
-                self.viewport.0 as f32,
-                self.scroll,
-                self.viewport.1 as f32,
-                &self.sheets,
-            );
+        let (items, height, anchors, hits) = Layouter::layout_vh(
+            doc,
+            fonts,
+            self.viewport.0 as f32,
+            self.scroll,
+            self.viewport.1 as f32,
+            &self.sheets,
+        );
         let t_layout = t0.elapsed();
         self.content_h = height;
         self.items = items;
@@ -1065,8 +1112,7 @@ fn hit_pos(boxes: &[TextBox], x: f32, y: f32) -> Option<(usize, usize)> {
                     (x - (b.x + b.starts[b.nchars()])).max(0.0)
                 };
                 let bd = (b.baseline - y).abs();
-                if by_line.is_none_or(|(_, bb, bx)| bd < bb - 1.0 || (bd <= bb + 1.0 && xd < bx))
-                {
+                if by_line.is_none_or(|(_, bb, bx)| bd < bb - 1.0 || (bd <= bb + 1.0 && xd < bx)) {
                     by_line = Some((i, bd, xd));
                 }
             }
@@ -1135,9 +1181,7 @@ fn sheet_pins_scroll(sheet: &rowser_css::StyleSheet) -> bool {
             let p = d.prop.trim().to_ascii_lowercase();
             let v = d.value.trim().to_ascii_lowercase();
             match p.as_str() {
-                "position" => {
-                    matches!(v.as_str(), "fixed" | "sticky") || v.contains("var(")
-                }
+                "position" => matches!(v.as_str(), "fixed" | "sticky") || v.contains("var("),
                 // background-attachment:fixed pins the same way — the page
                 // must relayout on scroll for the fixed positioning area
                 "background" | "background-attachment" => v
@@ -1152,7 +1196,9 @@ fn sheet_pins_scroll(sheet: &rowser_css::StyleSheet) -> bool {
 /// Same check for an inline `style="..."` attribute.
 fn style_attr_pins(style: &str) -> bool {
     style.split(';').any(|d| {
-        let Some((k, v)) = d.split_once(':') else { return false };
+        let Some((k, v)) = d.split_once(':') else {
+            return false;
+        };
         let k = k.trim().to_ascii_lowercase();
         let v = v.trim().to_ascii_lowercase();
         match k.as_str() {
@@ -1184,7 +1230,10 @@ fn shift_item_y(it: &mut rowser_layout::DisplayItem, dy: f32) {
         }
         D::PopClip => {}
         D::PushEffect(e) => e.offset_mut(0.0, dy),
-        D::PopEffect => {}
+        D::PopEffect => {} // the wrapped items' coords shift too — conjugate so painted
+        // output moves by the same dy (T(d)·M·T(-d) ∘ p+d = M(p)+d)
+        D::PushTransform { m } => *m = m.conjugated(0.0, dy),
+        D::PopTransform => {}
     }
 }
 
@@ -1229,7 +1278,10 @@ fn load_url(url: &str) -> (String, String) {
         let path = rowser_net::percent_decode(rest).unwrap_or_else(|_| rest.to_string());
         return match std::fs::read_to_string(&path) {
             Ok(html) => (html, url.to_string()),
-            Err(e) => (error_page(url, &format!("cannot read {path}: {e}")), url.to_string()),
+            Err(e) => (
+                error_page(url, &format!("cannot read {path}: {e}")),
+                url.to_string(),
+            ),
         };
     }
     if url.starts_with("rowser://") {
@@ -1245,7 +1297,10 @@ fn load_url(url: &str) -> (String, String) {
                 String::from_utf8_lossy(&res.body).into_owned(),
                 res.url.to_string(),
             ),
-            Err(e) => (error_page(url, &format!("network error: {e}")), url.to_string()),
+            Err(e) => (
+                error_page(url, &format!("network error: {e}")),
+                url.to_string(),
+            ),
         };
     }
     if url == "about:blank" {
@@ -1274,7 +1329,11 @@ fn run_page_scripts(
     doc: rowser_dom::Document,
     page_url: &str,
     viewport: (u32, u32),
-) -> (rowser_dom::Document, Vec<String>, Option<std::sync::mpsc::Sender<JsJob>>) {
+) -> (
+    rowser_dom::Document,
+    Vec<String>,
+    Option<std::sync::mpsc::Sender<JsJob>>,
+) {
     struct Script {
         src: Option<String>,
         body: String,
@@ -1285,7 +1344,11 @@ fn run_page_scripts(
             continue;
         }
         // only executable types — skip json-ld, importmap, templates, etc.
-        let ty = doc.attr(id, "type").unwrap_or("").trim().to_ascii_lowercase();
+        let ty = doc
+            .attr(id, "type")
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         let js_type = matches!(
             ty.as_str(),
             "" | "text/javascript"
@@ -1341,8 +1404,7 @@ fn run_page_scripts(
     // reports an initial snapshot after scripts run, then services DOM
     // event jobs (clicks) until the channel closes.
     let (job_tx, job_rx) = std::sync::mpsc::channel::<JsJob>();
-    let (init_tx, init_rx) =
-        std::sync::mpsc::channel::<(rowser_dom::Document, Vec<String>)>();
+    let (init_tx, init_rx) = std::sync::mpsc::channel::<(rowser_dom::Document, Vec<String>)>();
     let (vw, vh) = (viewport.0 as f64, viewport.1 as f64);
     let url = page_url.to_string();
     let spawned = std::thread::Builder::new()
@@ -1377,7 +1439,12 @@ fn run_page_scripts(
             // context and replies with the mutated snapshot + new logs.
             while let Ok(job) = job_rx.recv() {
                 match job {
-                    JsJob::Event { nid, ty, client, reply } => {
+                    JsJob::Event {
+                        nid,
+                        ty,
+                        client,
+                        reply,
+                    } => {
                         let mut logs = Vec::new();
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if let Err(e) = dc.dispatch_event(nid, &ty, client) {
@@ -1437,7 +1504,11 @@ fn test_pattern(width: u32, height: u32) -> Vec<u8> {
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) * 4;
-            let v = if ((x / 32) + (y / 32)) % 2 == 0 { 40u8 } else { 48u8 };
+            let v = if ((x / 32) + (y / 32)) % 2 == 0 {
+                40u8
+            } else {
+                48u8
+            };
             px[i] = v;
             px[i + 1] = v;
             px[i + 2] = v + 8;
@@ -1446,7 +1517,6 @@ fn test_pattern(width: u32, height: u32) -> Vec<u8> {
     }
     px
 }
-
 
 fn dom_dump(doc: &rowser_dom::Document) -> String {
     let mut s = String::new();
@@ -1462,7 +1532,10 @@ fn dump_node(doc: &rowser_dom::Document, id: rowser_dom::NodeId, d: usize, out: 
         rowser_dom::NodeKind::Text(t) => {
             let t = t.trim();
             if !t.is_empty() {
-                out.push_str(&format!("{pad}\"{}\"\n", t.chars().take(60).collect::<String>()));
+                out.push_str(&format!(
+                    "{pad}\"{}\"\n",
+                    t.chars().take(60).collect::<String>()
+                ));
             }
         }
         rowser_dom::NodeKind::Element { tag, attrs } => {
@@ -1480,7 +1553,10 @@ fn dump_node(doc: &rowser_dom::Document, id: rowser_dom::NodeId, d: usize, out: 
 
 /// rowser://bookmarks and rowser://history — built from ~/.config/rowser files.
 fn list_page(name: &str) -> String {
-    let file = format!("{}/.config/rowser/{name}.txt", std::env::var("HOME").unwrap_or_default());
+    let file = format!(
+        "{}/.config/rowser/{name}.txt",
+        std::env::var("HOME").unwrap_or_default()
+    );
     let mut items = String::new();
     if let Ok(text) = std::fs::read_to_string(&file) {
         for line in text.lines().rev() {
@@ -1496,7 +1572,6 @@ fn list_page(name: &str) -> String {
     }
     format!("<html><body><h1>rowser:{name}</h1><ul>{items}</ul></body></html>")
 }
-
 
 /// Fetch a fully-resolved URL — http(s), file://, or plain path.
 fn fetch_resolved(url: &str) -> Option<Vec<u8>> {
@@ -1523,9 +1598,7 @@ fn fetch_pool(
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Instant;
 
-    let queue = Arc::new(Mutex::new(
-        urls.iter().cloned().collect::<VecDeque<_>>(),
-    ));
+    let queue = Arc::new(Mutex::new(urls.iter().cloned().collect::<VecDeque<_>>()));
     let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>();
     for _ in 0..urls.len().min(SUBRESOURCE_WORKERS) {
         let queue = Arc::clone(&queue);
@@ -1581,12 +1654,11 @@ fn resolve_url(base: &str, resource: &str) -> Option<String> {
     Some(resolved.to_string())
 }
 
-
 /// http/https fetch with cross-scheme redirect handling.
 fn web_fetch(url: &str) -> io::Result<rowser_net::Response> {
     use std::net::TcpStream;
-    let mut parsed = rowser_net::Url::parse(url)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut parsed =
+        rowser_net::Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     for _ in 0..10 {
         let resp = match parsed.scheme.as_str() {
             "http" => {
@@ -1601,8 +1673,7 @@ fn web_fetch(url: &str) -> io::Result<rowser_net::Response> {
                 // effect once `tcp` is moved into the TlsStream.
                 tcp.set_read_timeout(Some(FETCH_IO_TIMEOUT))?;
                 tcp.set_write_timeout(Some(FETCH_IO_TIMEOUT))?;
-                let mut tls =
-                    rowser_tls::TlsStream::connect(&parsed.host, parsed.port, tcp)?;
+                let mut tls = rowser_tls::TlsStream::connect(&parsed.host, parsed.port, tcp)?;
                 if let Err(e) = tls.verify_certificate() {
                     return Ok(rowser_net::Response {
                         url: parsed.to_string(),

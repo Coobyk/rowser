@@ -304,16 +304,14 @@ mod tests {
         let aad = hex("50515253c0c1c2c3c4c5c6c7");
         let pt = b"Ladies and Gentlemen of the class of '99: If I could offer you \
                    only one tip for the future, sunscreen would be it.";
-        let want_ct = hex(
-            "d31a8d34648e60db7b86afbc53ef7ec2\
+        let want_ct = hex("d31a8d34648e60db7b86afbc53ef7ec2\
              a4aded51296e08fea9e2b5a736ee62d6\
              3dbea45e8ca9671282fafb69da92728b\
              1a71de0a9e060b2905d6a5b67ecd3b36\
              92ddbd7f2d778b8c9803aee328091b58\
              fab324e4fad675945585808b4831d7bc\
              3ff4def08e4b7a9de576d26586cec64b\
-             6116",
-        );
+             6116");
         let want_tag = hex("1ae10b594f09e26a7e902ecbd0600691");
         let a = ChaCha20Poly1305::new(&key);
         let (ct, tag) = a.seal(&nonce, &aad, pt);

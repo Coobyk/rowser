@@ -11,13 +11,14 @@
 //! and minimal auto table layout (table/tr/td/th with per-cell borders).
 
 use rowser_css as css;
+mod bgimg;
 mod borderfx;
 pub mod colorfx;
 mod stacking;
 pub mod svg;
-mod bgimg;
 
 use borderfx::{Borders, BoxShadow, Outline, RadiusSpec};
+pub mod xform;
 
 use rowser_dom::{Document, NodeId, NodeKind};
 use rowser_text::FontCache;
@@ -187,7 +188,19 @@ pub enum DisplayItem {
         ry: u8,
         src: String,
     },
+    /// Begin a 2D affine transform (xform::Mat) over the items up to the
+    /// matching PopTransform. Nests; matrices compose in paint order.
+    /// Coords stay in pre-transform space — transforms are visual-only.
+    PushTransform { m: xform::Mat },
+    /// Close the innermost PushTransform.
+    PopTransform,
 }
+
+/// Hit-test record: rect in PRE-transform (laid-out) coordinates plus the
+/// accumulated transform mapping those coords to painted position
+/// (identity for untransformed elements). Hit-testing inverse-maps the
+/// click point through the matrix, so rotated elements stay exact.
+pub type Hit = (f32, f32, f32, f32, NodeId, xform::Mat);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Align {
@@ -535,7 +548,12 @@ fn falpha(s: &str) -> f32 {
 /// `<hue>`: bare degrees or deg/rad/grad/turn suffixes; `none` → 0.
 fn fhue(s: &str) -> f32 {
     let s = s.trim();
-    for (suf, k) in [("grad", 0.9f32), ("turn", 360.0), ("deg", 1.0), ("rad", 57.295779513)] {
+    for (suf, k) in [
+        ("grad", 0.9f32),
+        ("turn", 360.0),
+        ("deg", 1.0),
+        ("rad", 57.295779513),
+    ] {
         if let Some(n) = s.strip_suffix(suf) {
             return fnum(n) * k;
         }
@@ -706,7 +724,11 @@ pub fn parse_color_ctx(v: &str, cur: Option<Color>) -> Option<Color> {
         if sum <= 0.0 {
             return Some(bgra_a(0, 0, 0, 0));
         }
-        let (na, nb) = if sum > 1.0 { (wa / sum, wb / sum) } else { (wa, wb) };
+        let (na, nb) = if sum > 1.0 {
+            (wa / sum, wb / sum)
+        } else {
+            (wa, wb)
+        };
         if !matches!(space, "" | "srgb") {
             return colorfx::color_mix(space, ca, cb, na, nb);
         }
@@ -733,15 +755,19 @@ pub fn parse_color_ctx(v: &str, cur: Option<Color>) -> Option<Color> {
                 bgra((r * 17) as u8, (g * 17) as u8, (b * 17) as u8)
             }
             4 => {
-                let (r, g, b, a) = (
-                    (d >> 12) & 0xf,
-                    (d >> 8) & 0xf,
-                    (d >> 4) & 0xf,
-                    d & 0xf,
-                );
-                bgra_a((r * 17) as u8, (g * 17) as u8, (b * 17) as u8, (a * 17) as u8)
+                let (r, g, b, a) = ((d >> 12) & 0xf, (d >> 8) & 0xf, (d >> 4) & 0xf, d & 0xf);
+                bgra_a(
+                    (r * 17) as u8,
+                    (g * 17) as u8,
+                    (b * 17) as u8,
+                    (a * 17) as u8,
+                )
             }
-            6 => bgra(((d >> 16) & 0xff) as u8, ((d >> 8) & 0xff) as u8, (d & 0xff) as u8),
+            6 => bgra(
+                ((d >> 16) & 0xff) as u8,
+                ((d >> 8) & 0xff) as u8,
+                (d & 0xff) as u8,
+            ),
             8 => {
                 let (r, g, b, a) = (
                     (d >> 24) & 0xff,
@@ -762,11 +788,7 @@ pub fn parse_color_ctx(v: &str, cur: Option<Color>) -> Option<Color> {
         let args = fn_args(inner);
         let arg = |i: usize| args.get(i).map(String::as_str).unwrap_or("");
         // alpha defaults to 1 when the arg is absent (`/a` or 4th arg)
-        let fa = |i: usize| {
-            args.get(i)
-                .map(|s| falpha(s))
-                .unwrap_or(1.0)
-        };
+        let fa = |i: usize| args.get(i).map(|s| falpha(s)).unwrap_or(1.0);
         let a8 = |i: usize| (fa(i).clamp(0.0, 1.0) * 255.0).round() as u8;
         match &v[..open] {
             "rgb" | "rgba" => {
@@ -882,8 +904,11 @@ impl Layouter<'_> {
     /// `background-color`/`background` or the legacy `bgcolor` attribute.
     /// `cur` = element's own color (for `currentcolor`).
     fn bg_of(&self, node: NodeId, c: &Props, cur: Option<Color>) -> Option<Color> {
-        bg_color(c, cur)
-            .or_else(|| self.doc.attr(node, "bgcolor").and_then(|v| parse_color_ctx(v, cur)))
+        bg_color(c, cur).or_else(|| {
+            self.doc
+                .attr(node, "bgcolor")
+                .and_then(|v| parse_color_ctx(v, cur))
+        })
     }
 }
 
@@ -935,86 +960,6 @@ fn bg_color(c: &Props, cur: Option<Color>) -> Option<Color> {
     None
 }
 
-/// `box-shadow: [inset]? x y [blur] [spread] [color], ...` → first visible
-/// shadow as (dx, dy, spread, color). Blur is ignored (solid-offset-blob
-/// approximation); a zero-offset positive-spread shadow is a ring and
-/// callers draw edges instead of a filled rect. The color is composited
-/// over `bd`; `def` stands in for `currentcolor` when none is given.
-fn parse_shadow(c: &Props, size: f32, bd: Color, def: Color) -> Option<(f32, f32, f32, Color)> {
-    let v = c.get("box-shadow")?;
-    if v.trim() == "none" {
-        return None;
-    }
-    let mut depth = 0i32;
-    for sh in v.split(|ch| {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        ch == ',' && depth <= 0
-    }) {
-        // tokens: lengths first, then a (possibly space-containing) color
-        let mut nums = Vec::new();
-        let mut col_s = "";
-        let b = sh.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            while i < b.len() && (b[i] as char).is_whitespace() {
-                i += 1;
-            }
-            let st = i;
-            let mut d = 0i32;
-            while i < b.len() && (d > 0 || !(b[i] as char).is_whitespace()) {
-                match b[i] {
-                    b'(' => d += 1,
-                    b')' => d -= 1,
-                    _ => {}
-                }
-                i += 1;
-            }
-            let tok = &sh[st..i];
-            if tok.is_empty() {
-                break;
-            }
-            if tok == "inset" {
-                continue;
-            }
-            if let Some(n) = parse_len(tok, size, size) {
-                nums.push(n);
-            } else {
-                col_s = sh[st..].trim();
-                break;
-            }
-        }
-        if nums.len() < 2 {
-            continue;
-        }
-        let col = if col_s.is_empty() {
-            def
-        } else {
-            parse_color_ctx(col_s, Some(def)).unwrap_or(def)
-        };
-        if alpha(col) == 0 {
-            continue; // fully transparent shadow (e.g. `0 0 #0000`)
-        }
-        let spread = nums.get(3).copied().unwrap_or(0.0).max(0.0);
-        return Some((nums[0], nums[1], spread, over(col, bd)));
-    }
-    None
-}
-
-/// `border-radius` → uniform max radius (px).
-fn parse_radius(c: &Props, size: f32) -> f32 {
-    c.get("border-radius")
-        .and_then(|v| {
-            v.split_whitespace()
-                .filter_map(|t| parse_len(t, size, size))
-                .reduce(f32::max)
-        })
-        .unwrap_or(0.0)
-}
-
 /// CSS length → px. `em`/`%` resolve against `rel` (usually parent font size).
 /// Tiny `calc()` evaluator: numbers with units, + - * / and parens.
 /// `%` resolves against `rel`; unitless numbers pass through.
@@ -1049,7 +994,10 @@ fn calc_len(expr: &str, rel: f32, em: f32) -> Option<f32> {
             let c = b[i] as char;
             if c.is_whitespace() {
                 i += 1;
-            } else if c.is_ascii_digit() || c == '.' || (c == '-' && i + 1 < b.len() && b[i + 1].is_ascii_digit()) {
+            } else if c.is_ascii_digit()
+                || c == '.'
+                || (c == '-' && i + 1 < b.len() && b[i + 1].is_ascii_digit())
+            {
                 let st = i;
                 if c == '-' {
                     i += 1;
@@ -1144,7 +1092,13 @@ fn calc_len(expr: &str, rel: f32, em: f32) -> Option<f32> {
         }
     }
     let t = toks(&expr.to_lowercase())?;
-    let mut p = P { t, i: 0, rel, em, _m: std::marker::PhantomData };
+    let mut p = P {
+        t,
+        i: 0,
+        rel,
+        em,
+        _m: std::marker::PhantomData,
+    };
     p.expr()
 }
 
@@ -1206,9 +1160,7 @@ fn math_eval(s: &str, rel: f32, em: f32, vh: f32, vw: f32) -> Option<f32> {
             b')' | b']' => depth += 1,
             b'(' | b'[' => depth -= 1,
             b'+' | b'-' if depth == 0 => {
-                if s[..i].trim().is_empty()
-                    || s[..i].trim_end().ends_with(['+', '-', '*', '/'])
-                {
+                if s[..i].trim().is_empty() || s[..i].trim_end().ends_with(['+', '-', '*', '/']) {
                     continue; // unary sign
                 }
                 let a = math_eval(&s[..i], rel, em, vh, vw)?;
@@ -1338,7 +1290,10 @@ fn font_weight_value(v: &str, parent: u16) -> u16 {
             550..=749 => 400,
             _ => 700,
         },
-        other => other.parse::<u16>().map(|n| n.clamp(1, 1000)).unwrap_or(400),
+        other => other
+            .parse::<u16>()
+            .map(|n| n.clamp(1, 1000))
+            .unwrap_or(400),
     }
 }
 
@@ -1414,7 +1369,8 @@ fn dim_intrinsic(c: &Props, name: &str, rel: f32, em: f32) -> Option<f32> {
 /// Tailwind sets `box-sizing:border-box` globally — `width`/`height` then
 /// include padding+border rather than sizing the content box.
 fn border_box(c: &Props) -> bool {
-    c.get("box-sizing").is_some_and(|v| v.trim() == "border-box")
+    c.get("box-sizing")
+        .is_some_and(|v| v.trim() == "border-box")
 }
 
 /// `translate` property + `transform: translate*(...)` → (dx, dy) px.
@@ -1485,7 +1441,11 @@ fn flex_grow_basis(c: &Props, rel: f32, em: f32) -> (f32, Option<f32>) {
         }
         let _shrink = it.next();
         if let Some(t) = it.next() {
-            b = if t == "auto" { None } else { parse_len(t, rel, em).or(Some(0.0)) };
+            b = if t == "auto" {
+                None
+            } else {
+                parse_len(t, rel, em).or(Some(0.0))
+            };
         }
     }
     if let Some(v) = c.get("flex-grow") {
@@ -1493,7 +1453,11 @@ fn flex_grow_basis(c: &Props, rel: f32, em: f32) -> (f32, Option<f32>) {
     }
     if let Some(v) = c.get("flex-basis") {
         let v = v.trim();
-        b = if v == "auto" { None } else { parse_len(v, rel, em).or(Some(0.0)) };
+        b = if v == "auto" {
+            None
+        } else {
+            parse_len(v, rel, em).or(Some(0.0))
+        };
     }
     (g, b)
 }
@@ -1523,7 +1487,10 @@ fn has_auto_ml(c: &Props) -> bool {
     if c.get("margin-left").map(&auto).unwrap_or(false) {
         return true;
     }
-    if let Some(v) = c.get("margin-inline").or_else(|| c.get("margin-inline-start")) {
+    if let Some(v) = c
+        .get("margin-inline")
+        .or_else(|| c.get("margin-inline-start"))
+    {
         if auto(v) {
             return true;
         }
@@ -1558,10 +1525,18 @@ fn box_sides(c: &Props, name: &str, rel: f32, em: f32) -> [f32; 4] {
         ),
         _ => {
             return [
-                side(c, &format!("{name}-top"), rel, em).or(sh[0]).unwrap_or(0.0),
-                side(c, &format!("{name}-right"), rel, em).or(sh[1]).unwrap_or(0.0),
-                side(c, &format!("{name}-bottom"), rel, em).or(sh[2]).unwrap_or(0.0),
-                side(c, &format!("{name}-left"), rel, em).or(sh[3]).unwrap_or(0.0),
+                side(c, &format!("{name}-top"), rel, em)
+                    .or(sh[0])
+                    .unwrap_or(0.0),
+                side(c, &format!("{name}-right"), rel, em)
+                    .or(sh[1])
+                    .unwrap_or(0.0),
+                side(c, &format!("{name}-bottom"), rel, em)
+                    .or(sh[2])
+                    .unwrap_or(0.0),
+                side(c, &format!("{name}-left"), rel, em)
+                    .or(sh[3])
+                    .unwrap_or(0.0),
             ];
         }
     };
@@ -1576,7 +1551,9 @@ fn box_sides(c: &Props, name: &str, rel: f32, em: f32) -> [f32; 4] {
 /// Is margin-left/right `auto` (longhand or shorthand position)?
 fn margin_auto(c: &Props, left: bool) -> bool {
     let long = if left { "margin-left" } else { "margin-right" };
-    if c.get(long).is_some_and(|v| v.trim().eq_ignore_ascii_case("auto")) {
+    if c.get(long)
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("auto"))
+    {
         return true;
     }
     if let Some(v) = c.get("margin") {
@@ -1596,95 +1573,6 @@ fn margin_auto(c: &Props, left: bool) -> bool {
         return t.get(idx).is_some_and(|s| s.eq_ignore_ascii_case("auto"));
     }
     false
-}
-
-/// `border: 2px solid red` → (width px, color). The color may contain
-/// spaces (`rgb(...)`/`color-mix(...)`) — the rest of the value is tried
-/// as one color before the bare token.
-fn parse_border(v: &str, em: f32, cur: Color) -> Option<(f32, Color)> {
-    let mut width = None;
-    let mut color = None;
-    let mut rest = v.trim();
-    while !rest.is_empty() {
-        let part = rest.split_whitespace().next().unwrap();
-        if part == "none" || part == "hidden" {
-            return None;
-        }
-        if parse_len(part, 16.0, em).is_some() || matches!(part, "thin" | "medium" | "thick") {
-            width = Some(match part {
-                "thin" => 1.0,
-                "thick" => 6.0,
-                "medium" => 3.0,
-                p => parse_len(p, 16.0, em).unwrap_or(1.0),
-            });
-        } else if matches!(
-            part,
-            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"
-        ) {
-            // style keyword — all styles paint solid edges
-        } else {
-            color = parse_color_ctx(rest, Some(cur))
-                .or_else(|| parse_color_ctx(part, Some(cur)))
-                .or(color);
-            break;
-        }
-        rest = rest[part.len()..].trim_start();
-    }
-    width.zip(color.or(Some(BLACK)))
-}
-
-/// Per-side border widths + color, merged: `border` shorthand →
-/// `border-width`/`border-<side>-width` → `border-(<side>-)?style` →
-/// `border-color`. Sides are [top, right, bottom, left]. Longhands apply
-/// over the shorthand (preflight `border:0 solid` + `border-t` pattern).
-fn border_sides(c: &Props, size: f32, cur: Color) -> Option<([f32; 4], Color)> {
-    let mut w = [0.0f32; 4];
-    let mut col = None;
-    if let Some(v) = c.get("border") {
-        // `border:none` or an unparseable shorthand contributes nothing;
-        // longhands can still re-enable individual sides
-        if let Some((bw, sc)) = parse_border(v, size, cur) {
-            w = [bw; 4];
-            col = Some(sc);
-        }
-    }
-    let sh = sides(c, "border-width", size, size);
-    for (i, s) in sh.iter().copied().enumerate() {
-        if let Some(v) = s {
-            w[i] = v;
-        }
-    }
-    const SIDES: [(&str, &str, &str); 4] = [
-        ("border-top-width", "border-top-style", "border-top-color"),
-        ("border-right-width", "border-right-style", "border-right-color"),
-        ("border-bottom-width", "border-bottom-style", "border-bottom-color"),
-        ("border-left-width", "border-left-style", "border-left-color"),
-    ];
-    if c.get("border-style")
-        .is_some_and(|v| matches!(v.trim(), "none" | "hidden"))
-    {
-        w = [0.0; 4];
-    }
-    let mut any = false;
-    if let Some(bc) = c.get("border-color").and_then(|v| parse_color_ctx(v, Some(cur))) {
-        col = Some(bc);
-    }
-    for (i, (wn, sn, cn)) in SIDES.iter().copied().enumerate() {
-        if let Some(v) = c.get(wn).and_then(|v| parse_len(v, size, size)) {
-            w[i] = v;
-        }
-        if c.get(sn).is_some_and(|v| matches!(v.trim(), "none" | "hidden")) {
-            w[i] = 0.0;
-        }
-        if let Some(sc) = c.get(cn).and_then(|v| parse_color_ctx(v, Some(cur))) {
-            col = Some(sc);
-        }
-        any |= w[i] > 0.0;
-    }
-    if !any {
-        return None;
-    }
-    Some((w, col.unwrap_or(BLACK)))
 }
 
 // ---------- CSS Grid (autoplacement-capable subset) ----------
@@ -1771,10 +1659,7 @@ fn track_spec(t: &str, rel: f32, em: f32, vh: f32, vw: f32) -> GTrack {
     if t == "auto" || t == "min-content" || t == "max-content" {
         return GTrack::Auto(0.0, f32::MAX);
     }
-    if let Some(inner) = t
-        .strip_prefix("minmax(")
-        .and_then(|x| x.strip_suffix(')'))
-    {
+    if let Some(inner) = t.strip_prefix("minmax(").and_then(|x| x.strip_suffix(')')) {
         let (a, b) = top_comma(inner).unwrap_or((inner, "auto"));
         let min = if a.trim() == "auto" {
             0.0
@@ -1794,7 +1679,10 @@ fn track_spec(t: &str, rel: f32, em: f32, vh: f32, vw: f32) -> GTrack {
         .strip_prefix("fit-content(")
         .and_then(|x| x.strip_suffix(')'))
     {
-        return GTrack::Auto(0.0, parse_len_vp(inner.trim(), rel, em, vh, vw).unwrap_or(f32::MAX));
+        return GTrack::Auto(
+            0.0,
+            parse_len_vp(inner.trim(), rel, em, vh, vw).unwrap_or(f32::MAX),
+        );
     }
     GTrack::Fixed(parse_len_vp(&t, rel, em, vh, vw).unwrap_or(0.0))
 }
@@ -1812,7 +1700,9 @@ fn grid_track_list(
     avail: f32,
     gap: f32,
 ) -> (Vec<GTrack>, Vec<Vec<String>>) {
-    let Some(v) = v else { return (Vec::new(), Vec::new()) };
+    let Some(v) = v else {
+        return (Vec::new(), Vec::new());
+    };
     let v = v.trim();
     if v.is_empty() || v == "none" {
         return (Vec::new(), Vec::new());
@@ -1827,10 +1717,7 @@ fn grid_track_list(
             names[out.len()].extend(inner.split_whitespace().map(String::from));
             continue;
         }
-        if let Some(inner) = t
-            .strip_prefix("repeat(")
-            .and_then(|x| x.strip_suffix(')'))
-        {
+        if let Some(inner) = t.strip_prefix("repeat(").and_then(|x| x.strip_suffix(')')) {
             let (cnt, rest) = top_comma(inner).unwrap_or((inner, ""));
             let sub: Vec<GTrack> = track_tokens(rest)
                 .iter()
@@ -2029,13 +1916,16 @@ struct Word {
     /// inline-block payload: display items in box-local coords (origin top-left)
     items: Option<Vec<DisplayItem>>,
     /// element boxes inside the payload — same coord space as `items`
-    hits: Vec<(f32, f32, f32, f32, NodeId)>,
+    hits: Vec<Hit>,
     /// inline-block height (baseline alignment: box bottom sits on baseline)
     box_h: f32,
     /// painted-position shift from enclosing `position:relative` inlines —
     /// applied at emit; doesn't affect line geometry
     dx: f32,
     dy: f32,
+    /// transform spec of the enclosing transformed inline-level element —
+    /// a consecutive run of words sharing it wraps at flush_line
+    xf: Option<Rc<xform::Spec>>,
 }
 
 /// A floated box: horizontal margin-box extent [x0,x1] (emission coords)
@@ -2082,7 +1972,14 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             h,
             pixels,
         },
-        DisplayItem::RoundedRect { x, y, w, h, radius, color } => DisplayItem::RoundedRect {
+        DisplayItem::RoundedRect {
+            x,
+            y,
+            w,
+            h,
+            radius,
+            color,
+        } => DisplayItem::RoundedRect {
             x: x + dx,
             y: y + dy,
             w,
@@ -2125,7 +2022,15 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             h,
             src,
         },
-        DisplayItem::BorderSide { x, y, w, h, side, style, color } => DisplayItem::BorderSide {
+        DisplayItem::BorderSide {
+            x,
+            y,
+            w,
+            h,
+            side,
+            style,
+            color,
+        } => DisplayItem::BorderSide {
             x: x + dx,
             y: y + dy,
             w,
@@ -2134,7 +2039,14 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             style,
             color,
         },
-        DisplayItem::RoundedRect2 { x, y, w, h, radii, color } => DisplayItem::RoundedRect2 {
+        DisplayItem::RoundedRect2 {
+            x,
+            y,
+            w,
+            h,
+            radii,
+            color,
+        } => DisplayItem::RoundedRect2 {
             x: x + dx,
             y: y + dy,
             w,
@@ -2176,7 +2088,24 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
         },
         DisplayItem::PopClip => DisplayItem::PopClip,
         DisplayItem::BgImage {
-            x, y, w, h, px, py, pw, ph, mode, sw, sh, fx, ax, fy, ay, rx, ry, src,
+            x,
+            y,
+            w,
+            h,
+            px,
+            py,
+            pw,
+            ph,
+            mode,
+            sw,
+            sh,
+            fx,
+            ax,
+            fy,
+            ay,
+            rx,
+            ry,
+            src,
         } => DisplayItem::BgImage {
             x: x + dx,
             y: y + dy,
@@ -2196,26 +2125,24 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             rx,
             ry,
             src,
-        },        DisplayItem::PushEffect(e) => DisplayItem::PushEffect(e.offset(dx, dy)),
-        DisplayItem::PopEffect => DisplayItem::PopEffect,
+        },
+        DisplayItem::PushEffect(e) => DisplayItem::PushEffect(e.offset(dx, dy)),
+        DisplayItem::PopEffect => DisplayItem::PopEffect, // moving stored points by (dx,dy) conjugates the authored matrix
+        DisplayItem::PushTransform { m } => DisplayItem::PushTransform {
+            m: m.conjugated(dx, dy),
+        },
+        DisplayItem::PopTransform => DisplayItem::PopTransform,
     }
 }
 
 /// Drop descendant hit rects poking outside a clip rect, intersecting the
 /// rest — `hits[start..]` are the subtree's boxes in the same coords.
-fn clip_hits(
-    hits: &mut Vec<(f32, f32, f32, f32, NodeId)>,
-    start: usize,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-) {
+fn clip_hits(hits: &mut Vec<Hit>, start: usize, x: f32, y: f32, w: f32, h: f32) {
     let tail: Vec<_> = hits.drain(start..).collect();
-    hits.extend(tail.into_iter().filter_map(|(hx, hy, hw, hh, n)| {
+    hits.extend(tail.into_iter().filter_map(|(hx, hy, hw, hh, n, m)| {
         let (x0, y0) = (hx.max(x), hy.max(y));
         let (x1, y1) = ((hx + hw).min(x + w), (hy + hh).min(y + h));
-        (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0, n))
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0, n, m))
     }));
 }
 
@@ -2286,7 +2213,7 @@ pub struct Layouter<'a> {
     inset_h: Option<f32>,
     /// element border boxes (x, y, w, h, node) in paint order — hit-testing
     /// for click dispatch; later entries paint above earlier ones
-    hits: Vec<(f32, f32, f32, f32, NodeId)>,
+    hits: Vec<Hit>,
     /// color translucent paints composite over — the nearest ancestor
     /// background (body's dark page bg makes `bg-white/5` a dim veil)
     backdrop: Color,
@@ -2307,6 +2234,10 @@ pub struct Layouter<'a> {
     cb_stack: Vec<CbRect>,
     /// sticky boxes awaiting the enclosing block's bottom to clamp against
     stickies: Vec<StickyFix>,
+    /// transform spec of the innermost transformed inline-level element —
+    /// words queued on `line` pick it up (see flush_line). Reset inside
+    /// nested boxes (nest/flex/grid) whose content isn't part of the run.
+    cur_xf: Option<Rc<xform::Spec>>,
 }
 
 impl<'a> Layouter<'a> {
@@ -2318,7 +2249,7 @@ impl<'a> Layouter<'a> {
         width: f32,
         scroll: f32,
         external: &[css::StyleSheet],
-    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<(f32, f32, f32, f32, NodeId)>) {
+    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<Hit>) {
         Self::layout_vh(doc, fonts, width, scroll, 768.0, external)
     }
 
@@ -2330,7 +2261,7 @@ impl<'a> Layouter<'a> {
         scroll: f32,
         viewport_h: f32,
         external: &[css::StyleSheet],
-    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<(f32, f32, f32, f32, NodeId)>) {
+    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<Hit>) {
         let author = css::document_sheets_vw(doc, width);
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
         sheets.extend(external.iter());
@@ -2364,6 +2295,7 @@ impl<'a> Layouter<'a> {
             canvas_bg_node: None,
             cb_stack: Vec::new(),
             stickies: Vec::new(),
+            cur_xf: None,
         };
         l.preresolve_styles();
         // css-backgrounds §2.11: the canvas takes the root element's
@@ -2404,10 +2336,7 @@ impl<'a> Layouter<'a> {
                         .get("font-size")
                         .map(|v| parse_font_size(v, BASE_SIZE))
                         .unwrap_or(BASE_SIZE);
-                    let cur = p
-                        .get("color")
-                        .and_then(|v| parse_color(v))
-                        .unwrap_or(BLACK);
+                    let cur = p.get("color").and_then(|v| parse_color(v)).unwrap_or(BLACK);
                     if let Some(bgl) =
                         bgimg::parse_box(&p, [0.0; 4], [0.0; 4], em, viewport_h, width, cur)
                     {
@@ -2672,8 +2601,17 @@ impl<'a> Layouter<'a> {
                 // `display:block` — that must not swallow the image)
                 let replaced = matches!(
                     tag.as_str(),
-                    "img" | "svg" | "input" | "select" | "textarea" | "video" | "canvas"
-                        | "iframe" | "object" | "embed" | "br"
+                    "img"
+                        | "svg"
+                        | "input"
+                        | "select"
+                        | "textarea"
+                        | "video"
+                        | "canvas"
+                        | "iframe"
+                        | "object"
+                        | "embed"
+                        | "br"
                 );
                 // `opacity` folds into every emitted item: the painter
                 // stores flattened opaque colors, so each item emitted for
@@ -2683,7 +2621,6 @@ impl<'a> Layouter<'a> {
                     .and_then(|v| v.trim().parse::<f32>().ok())
                     .unwrap_or(1.0)
                     .clamp(0.0, 1.0);
-                let (i0, h0, bd) = (self.items.len(), self.hits.len(), self.backdrop);
                 // filter/clip-path/mix-blend-mode/backdrop-filter context —
                 // st moves into the dispatch below
                 let (fx_size, fx_cur) = (st.size, st.color);
@@ -2694,7 +2631,44 @@ impl<'a> Layouter<'a> {
                     c.get("visibility").map(String::as_str),
                     Some("hidden") | Some("collapse")
                 );
-                match c.get("display").map(String::as_str) {
+                let disp = c.get("display").map(String::as_str);
+                // Elements whose dispatch flushes the pending line and
+                // writes straight into self.items — block-ish boxes,
+                // positioned boxes (routed through `block`) and the
+                // direct-emit replaced tags (img/svg flush internally).
+                // Only those can wrap items[i0..] in a transform;
+                // inline-level elements tag their queued words instead
+                // (flush_line resolves the run's matrix).
+                let direct = visually_hidden
+                    || disp == Some("none")
+                    || matches!(
+                        disp,
+                        Some("block") | Some("list-item") | Some("flex") | Some("grid")
+                    )
+                    || matches!(
+                        c.get("position").map(String::as_str),
+                        Some("absolute") | Some("fixed")
+                    )
+                    || matches!(tag.as_str(), "svg" | "img");
+                if direct {
+                    // the dispatch flushes anyway — flushing first keeps
+                    // items[i0..] to THIS element's emission so a transform
+                    // wrap (or the opacity fade below) can't sweep in
+                    // earlier siblings' queued words
+                    self.flush_line();
+                }
+                let (i0, h0, bd) = (self.items.len(), self.hits.len(), self.backdrop);
+                // CSS 2D transform spec (xform.rs) — visual-only, applied
+                // around the element's border box after its subtree emits
+                let xf = xform::spec(&c, st.size);
+                // transformed inline-level elements: stash the spec while
+                // dispatching so push_word/push_box tag the queued words
+                let saved_xf = if !direct && xf.is_some() {
+                    Some(std::mem::replace(&mut self.cur_xf, xf.clone()))
+                } else {
+                    None
+                };
+                match disp {
                     _ if visually_hidden => return,
                     Some("none") => return,
                     // CSS 2.1 §9.7: absolute/fixed blockify AND leave normal
@@ -2725,6 +2699,9 @@ impl<'a> Layouter<'a> {
                     }
                     _ => self.inline(node, tag, &c, st),
                 }
+                if let Some(prev) = saved_xf {
+                    self.cur_xf = prev;
+                }
                 if op <= 0.0 || hidden {
                     // fully transparent/hidden: nothing painted, nothing clickable
                     self.items.truncate(i0);
@@ -2753,8 +2730,17 @@ impl<'a> Layouter<'a> {
                             | DisplayItem::PushClip { .. }
                             | DisplayItem::PopClip
                             | DisplayItem::PushEffect(_)
-                            | DisplayItem::PopEffect => {}
+                            | DisplayItem::PopEffect
+                            | DisplayItem::PushTransform { .. }
+                            | DisplayItem::PopTransform => {}
                         }
+                    }
+                }
+                // transform: wrap the element's emitted span; hit rects map
+                // through the same matrix so clicks still land on it
+                if direct {
+                    if let Some(sp) = &xf {
+                        self.wrap_span(sp, node, i0, h0);
                     }
                 }
                 // filter/clip-path/mix-blend-mode/backdrop-filter wrap this
@@ -2853,8 +2839,13 @@ impl<'a> Layouter<'a> {
 
     fn block(&mut self, node: NodeId, tag: &str, c: &Props, mut st: Style) {
         self.flush_line();
+        // a fresh block box isn't part of an enclosing inline's transformed
+        // run — its own transform (if any) wraps via walk's wrap_span
+        let saved_xf = self.cur_xf.take();
         if tag == "table" {
-            return self.table(node, c, st);
+            self.table(node, c, st);
+            self.cur_xf = saved_xf;
+            return;
         }
         // positioning: `absolute`/`fixed` leave flow (space restored at the
         // end); `sticky` stays in flow and clamps its painted y at the inset
@@ -2933,16 +2924,19 @@ impl<'a> Layouter<'a> {
         st.inline_bg = None;
         // this element's text sits on its own bg — re-composite the color
         if let Some(b) = bg {
-            if let Some(col) = c.get("color").and_then(|v| parse_color_ctx(v, Some(st.color))) {
+            if let Some(col) = c
+                .get("color")
+                .and_then(|v| parse_color_ctx(v, Some(st.color)))
+            {
                 st.color = over(col, b);
             }
         }
         let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let bw_h = bw_l + bw_r; // horizontal border total
         let bw_v = bw_t + bw_b; // vertical border total
-        // `background-image` layers resolve to display items at finish_patch
-        // (the final box height isn't known yet). Skip a node whose
-        // background already propagated to the canvas.
+                                // `background-image` layers resolve to display items at finish_patch
+                                // (the final box height isn't known yet). Skip a node whose
+                                // background already propagated to the canvas.
         let bgl = if self.canvas_bg_node == Some(node) {
             None
         } else {
@@ -2958,8 +2952,15 @@ impl<'a> Layouter<'a> {
         };
 
         // floats blockify but out-of-flow boxes ignore `float` entirely
-        if !oof && matches!(c.get("float").map(String::as_str), Some("left") | Some("right")) {
-            return self.float_block(node, tag, c, st, mt, mb);
+        if !oof
+            && matches!(
+                c.get("float").map(String::as_str),
+                Some("left") | Some("right")
+            )
+        {
+            self.float_block(node, tag, c, st, mt, mb);
+            self.cur_xf = saved_xf;
+            return;
         }
 
         // `width` caps the content box; `margin-?:auto` splits leftover space
@@ -2968,10 +2969,16 @@ impl<'a> Layouter<'a> {
         // inset-stretched boxes are sized by left+right, a border-box length
         let w_explicit = dim(c, "width", self.avail_w, size);
         let mut w_prop = w_explicit.or(inset_w);
-        if let Some(mxw) = c.get("max-width").and_then(|v| parse_len_vp(v, self.avail_w, size, self.viewport_h, self.avail_w)) {
+        if let Some(mxw) = c
+            .get("max-width")
+            .and_then(|v| parse_len_vp(v, self.avail_w, size, self.viewport_h, self.avail_w))
+        {
             w_prop = Some(w_prop.unwrap_or(self.avail_w).min(mxw));
         }
-        if let Some(mnw) = c.get("min-width").and_then(|v| parse_len_vp(v, self.avail_w, size, self.viewport_h, self.avail_w)) {
+        if let Some(mnw) = c
+            .get("min-width")
+            .and_then(|v| parse_len_vp(v, self.avail_w, size, self.viewport_h, self.avail_w))
+        {
             // min-width constrains the box — it must not *create* a width:
             // `min-width:0` on a width:auto block must stay full-width
             if mnw > 0.0 {
@@ -3023,7 +3030,11 @@ impl<'a> Layouter<'a> {
             if hide {
                 None
             } else {
-                Some(if ordered { format!("{num}. ") } else { "•  ".to_string() })
+                Some(if ordered {
+                    format!("{num}. ")
+                } else {
+                    "•  ".to_string()
+                })
             }
         } else {
             None
@@ -3033,12 +3044,8 @@ impl<'a> Layouter<'a> {
         // `clear`: the border edge drops below same-side floats (not oof)
         if !oof {
             match c.get("clear").map(String::as_str) {
-                Some("left") | Some("inline-start") => {
-                    self.y = self.y.max(self.clear_below(false))
-                }
-                Some("right") | Some("inline-end") => {
-                    self.y = self.y.max(self.clear_below(true))
-                }
+                Some("left") | Some("inline-start") => self.y = self.y.max(self.clear_below(false)),
+                Some("right") | Some("inline-end") => self.y = self.y.max(self.clear_below(true)),
                 Some("both") => {
                     self.y = self
                         .y
@@ -3063,8 +3070,8 @@ impl<'a> Layouter<'a> {
         // or with margin-inline:auto gets centered
         if w_prop.is_some() {
             let outer = inner_w + pl + pr + bw_h;
-            let centered = saved_align == Align::Center
-                || (margin_auto(c, true) && margin_auto(c, false));
+            let centered =
+                saved_align == Align::Center || (margin_auto(c, true) && margin_auto(c, false));
             if centered && outer < self.avail_w {
                 self.margin_x += ((self.avail_w - outer) / 2.0).max(0.0);
             }
@@ -3228,8 +3235,7 @@ impl<'a> Layouter<'a> {
                 if extra > 0.0 {
                     // flex row `items-center` / any `justify-content:center`:
                     // children shift down by half the surplus
-                    let is_col =
-                        c.get("flex-direction").map(String::as_str) == Some("column");
+                    let is_col = c.get("flex-direction").map(String::as_str) == Some("column");
                     let centered = c.get("display").map(String::as_str) == Some("flex")
                         && (matches!(
                             c.get("justify-content").map(String::as_str),
@@ -3242,12 +3248,19 @@ impl<'a> Layouter<'a> {
                         for i in children_items_start..self.items.len() {
                             let it = std::mem::replace(
                                 &mut self.items[i],
-                                DisplayItem::FillRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0, color: 0 },
+                                DisplayItem::FillRect {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    w: 0.0,
+                                    h: 0.0,
+                                    color: 0,
+                                },
                             );
                             self.items[i] = offset_item(it, 0.0, dy);
                         }
                         for h in self.hits.iter_mut().skip(children_hits_start) {
                             h.1 += dy;
+                            h.5 = h.5.conjugated(0.0, dy);
                         }
                     }
                     self.y += extra;
@@ -3285,15 +3298,22 @@ impl<'a> Layouter<'a> {
             inner_w + pl + pr + bw_h,
             self.y - content_top + pt + bw_t,
             node,
+            xform::Mat::IDENTITY,
         ));
         // `translate`/`transform:translate*()` + `position:relative` offsets —
-        // post-layout visual offset; flow position is unaffected.
-        let (mut tx, mut ty) = translate_xy(
-            c,
-            inner_w + pl + pr + bw_h,
-            self.y - (content_top - pt - bw_t),
-            size,
-        );
+        // post-layout visual offset; flow position is unaffected. Elements
+        // with a non-translate transform compose it into a matrix instead —
+        // wrap_span emits PushTransform around their whole span.
+        let (mut tx, mut ty) = if xform::has_matrix(c) {
+            (0.0, 0.0)
+        } else {
+            translate_xy(
+                c,
+                inner_w + pl + pr + bw_h,
+                self.y - (content_top - pt - bw_t),
+                size,
+            )
+        };
         if pos_kind == Some("relative") {
             tx += ins_l.unwrap_or(0.0) - ins_r.unwrap_or(0.0);
             ty += ins_t.unwrap_or(0.0) - ins_b.unwrap_or(0.0);
@@ -3316,7 +3336,13 @@ impl<'a> Layouter<'a> {
             for i in children_items_start..self.items.len() {
                 let it = std::mem::replace(
                     &mut self.items[i],
-                    DisplayItem::FillRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0, color: 0 },
+                    DisplayItem::FillRect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 0.0,
+                        h: 0.0,
+                        color: 0,
+                    },
                 );
                 self.items[i] = offset_item(it, tx, ty);
             }
@@ -3324,7 +3350,13 @@ impl<'a> Layouter<'a> {
                 for i in p.idx..p.idx + p.nslots.min(self.items.len() - p.idx) {
                     let it = std::mem::replace(
                         &mut self.items[i],
-                        DisplayItem::FillRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0, color: 0 },
+                        DisplayItem::FillRect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: 0.0,
+                            h: 0.0,
+                            color: 0,
+                        },
                     );
                     self.items[i] = offset_item(it, tx, ty);
                 }
@@ -3332,6 +3364,7 @@ impl<'a> Layouter<'a> {
             for h in self.hits.iter_mut().skip(children_hits_start) {
                 h.0 += tx;
                 h.1 += ty;
+                h.5 = h.5.conjugated(tx, ty);
             }
         }
         if sticky {
@@ -3339,7 +3372,10 @@ impl<'a> Layouter<'a> {
             // parent is on screen — applied by drain_stickies when the
             // enclosing block finishes
             self.stickies.push(StickyFix {
-                i0: patch.as_ref().map(|p| p.idx).unwrap_or(children_items_start),
+                i0: patch
+                    .as_ref()
+                    .map(|p| p.idx)
+                    .unwrap_or(children_items_start),
                 i1: self.items.len(),
                 h0: children_hits_start,
                 h1: self.hits.len(),
@@ -3362,21 +3398,14 @@ impl<'a> Layouter<'a> {
         if tag == "ul" || tag == "ol" || tag == "menu" || tag == "dir" {
             self.list_stack.pop();
         }
+        self.cur_xf = saved_xf;
     }
 
     /// `float:left|right` block: shrink-to-fit (or `width`-sized), placed at
     /// the margin edge; a float that doesn't fit beside earlier floats drops
     /// below them. Following lines inset via `self.floats` until `bottom`.
     /// The float is a BFC — it contains floats of its own.
-    fn float_block(
-        &mut self,
-        node: NodeId,
-        tag: &str,
-        c: &Props,
-        mut st: Style,
-        mt: f32,
-        mb: f32,
-    ) {
+    fn float_block(&mut self, node: NodeId, tag: &str, c: &Props, mut st: Style, mt: f32, mb: f32) {
         let size = st.size;
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, size);
@@ -3423,12 +3452,8 @@ impl<'a> Layouter<'a> {
         self.y += mt.max(0.0);
         // `clear`: drop below same-side floats first
         match c.get("clear").map(String::as_str) {
-            Some("left") | Some("inline-start") => {
-                self.y = self.y.max(self.clear_below(false))
-            }
-            Some("right") | Some("inline-end") => {
-                self.y = self.y.max(self.clear_below(true))
-            }
+            Some("left") | Some("inline-start") => self.y = self.y.max(self.clear_below(false)),
+            Some("right") | Some("inline-end") => self.y = self.y.max(self.clear_below(true)),
             Some("both") => {
                 self.y = self
                     .y
@@ -3555,8 +3580,13 @@ impl<'a> Layouter<'a> {
             Some("relative") | Some("absolute") | Some("fixed") | Some("sticky")
         );
         if is_cb {
-            let ph = dim(c, "height", self.pct_h.unwrap_or(self.viewport_h), size)
-                .map(|h| if border_box(c) { h - bw_v } else { h + pt + pb });
+            let ph = dim(c, "height", self.pct_h.unwrap_or(self.viewport_h), size).map(|h| {
+                if border_box(c) {
+                    h - bw_v
+                } else {
+                    h + pt + pb
+                }
+            });
             self.cb_stack.push(CbRect {
                 x: self.margin_x - pl,
                 y: content_top - pt,
@@ -3577,16 +3607,11 @@ impl<'a> Layouter<'a> {
             }
             for h in hits {
                 self.hits
-                    .push((h.0 + self.margin_x + tx, h.1 + self.y + ty, h.2, h.3, h.4));
+                    .push(xform::off_hit(h, self.margin_x + tx, self.y + ty));
             }
             self.y += ph;
         } else {
-            self.walk_children(
-                node,
-                &st,
-                content_top,
-                content_top + mh_prop.unwrap_or(0.0),
-            );
+            self.walk_children(node, &st, content_top, content_top + mh_prop.unwrap_or(0.0));
         }
         if is_cb {
             self.cb_stack.pop();
@@ -3654,7 +3679,10 @@ impl<'a> Layouter<'a> {
         });
         st.inline_bg = None; // the box paints its own bg
         if let Some(b) = bg {
-            if let Some(col) = c.get("color").and_then(|v| parse_color_ctx(v, Some(st.color))) {
+            if let Some(col) = c
+                .get("color")
+                .and_then(|v| parse_color_ctx(v, Some(st.color)))
+            {
                 st.color = over(col, b);
             }
         }
@@ -3667,12 +3695,7 @@ impl<'a> Layouter<'a> {
             // resolved flex main size — an outer (border-box) target
             (w - pl - pr - bw_h).max(1.0)
         } else if let Some(w) = dim(c, "width", self.avail_w, size) {
-            if bb {
-                w - pl - pr - bw_h
-            } else {
-                w
-            }
-            .max(1.0)
+            if bb { w - pl - pr - bw_h } else { w }.max(1.0)
         } else if matches!(
             c.get("display").map(String::as_str),
             Some("flex") | Some("inline-flex") | Some("inline-grid")
@@ -3714,8 +3737,7 @@ impl<'a> Layouter<'a> {
         self.pct_h = h_prop
             .map(|h| if bb { h - pt - pb - bw_v } else { h })
             .or(saved_ph);
-        let (items, y_end, nhits) =
-            self.nest(node, &st, pl + bw_l, pt + bw_t, inner, c);
+        let (items, y_end, nhits) = self.nest(node, &st, pl + bw_l, pt + bw_t, inner, c);
         self.backdrop = saved_bd;
         self.pct_h = saved_ph;
         // explicit height/aspect-ratio/max-height may pin the painted box;
@@ -3746,7 +3768,14 @@ impl<'a> Layouter<'a> {
                 st.color,
             )
             .map(|bgl| {
-                bgimg::items_for(&bgl, 0.0, 0.0, box_w, box_h, (self.viewport_w, self.viewport_h))
+                bgimg::items_for(
+                    &bgl,
+                    0.0,
+                    0.0,
+                    box_w,
+                    box_h,
+                    (self.viewport_w, self.viewport_h),
+                )
             })
             .unwrap_or_default()
         } else {
@@ -3781,11 +3810,22 @@ impl<'a> Layouter<'a> {
         if !fx.is_empty() && !out.is_empty() {
             colorfx::wrap_vec(&mut out, 0, fx);
         }
-        // translate/transform: visual offset of the whole box
-        let (tx, ty) = translate_xy(c, box_w, box_h, size);
+        // translate/transform: visual-only — the box's line word carries
+        // the spec and wraps at flush_line (translate-only too: applying
+        // translate_xy here AND a translate marker would double-shift).
+        let ib_xf = xform::spec(c, size);
+        let (tx, ty) = if ib_xf.is_some() {
+            (0.0, 0.0)
+        } else {
+            translate_xy(c, box_w, box_h, size)
+        };
+
         let nhits: Vec<_> = if tx != 0.0 || ty != 0.0 {
             out = out.into_iter().map(|it| offset_item(it, tx, ty)).collect();
-            nhits.into_iter().map(|h| (h.0 + tx, h.1 + ty, h.2, h.3, h.4)).collect()
+            nhits
+                .into_iter()
+                .map(|h| xform::off_hit(h, tx, ty))
+                .collect()
         } else {
             nhits
         };
@@ -3796,8 +3836,7 @@ impl<'a> Layouter<'a> {
                 .resolve_font(&st)
                 .and_then(|f| {
                     self.fonts.font(f).map(|f| {
-                        f.advance_units(f.glyph_id(' ')) as f32 * st.size
-                            / f.units_per_em() as f32
+                        f.advance_units(f.glyph_id(' ')) as f32 * st.size / f.units_per_em() as f32
                     })
                 })
                 .unwrap_or(st.size * 0.3);
@@ -3810,7 +3849,25 @@ impl<'a> Layouter<'a> {
         if ml > 0.0 {
             self.spacer(ml);
         }
-        self.push_box(box_w, box_h, out, nhits, mb.max(0.0), self.rel_offset(c, size));
+        // the box's own transform spec tags its line word — the word run's
+        // marker applies it (translate or full matrix alike)
+        let saved_xf = if ib_xf.is_some() {
+            Some(std::mem::replace(&mut self.cur_xf, ib_xf.clone()))
+        } else {
+            None
+        };
+        self.push_box(
+            box_w,
+            box_h,
+            out,
+            nhits,
+            mb.max(0.0),
+            self.rel_offset(c, size),
+        );
+        if let Some(s) = saved_xf {
+            self.cur_xf = s;
+        }
+
         if mr > 0.0 {
             self.spacer(mr);
         }
@@ -3834,7 +3891,10 @@ impl<'a> Layouter<'a> {
         });
         st.inline_bg = None;
         if let Some(b) = bg {
-            if let Some(col) = c.get("color").and_then(|v| parse_color_ctx(v, Some(st.color))) {
+            if let Some(col) = c
+                .get("color")
+                .and_then(|v| parse_color_ctx(v, Some(st.color)))
+            {
                 st.color = over(col, b);
             }
         }
@@ -3914,7 +3974,8 @@ impl<'a> Layouter<'a> {
                 let cs = self.style(cell);
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
-                let [_t, pr, _b, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
+                let [_t, pr, _b, pl] =
+                    box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
                 let [_, cbw_r, _, cbw_l] = borderfx::borders(&cs, cst.size, cst.color)
                     .or(attr_border)
                     .map(|b| b.w)
@@ -3923,7 +3984,11 @@ impl<'a> Layouter<'a> {
                 let mut w = self.shrink_width(cell, &cst) + pl + pr + cbw_h;
                 let mut pw = self.max_content_width(cell, &cst) + pl + pr + cbw_h;
                 if let Some(wp) = dim(&cs, "width", self.avail_w, cst.size) {
-                    let wp = if border_box(&cs) { wp } else { wp + pl + pr + cbw_h };
+                    let wp = if border_box(&cs) {
+                        wp
+                    } else {
+                        wp + pl + pr + cbw_h
+                    };
                     w = w.max(wp);
                     pw = pw.max(wp);
                 }
@@ -4060,7 +4125,7 @@ impl<'a> Layouter<'a> {
                 Option<Borders>,
                 bool,
                 Vec<DisplayItem>,
-                Vec<(f32, f32, f32, f32, NodeId)>,
+                Vec<Hit>,
                 Vec<colorfx::Effect>,
                 (f32, f32),
             )> = Vec::new();
@@ -4081,7 +4146,8 @@ impl<'a> Layouter<'a> {
                     Some("center") => cst.align = Align::Center,
                     _ => {}
                 }
-                let [pt, pr, pb, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
+                let [pt, pr, pb, pl] =
+                    box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
                 let cborder = borderfx::borders(&cs, cst.size, cst.color)
                     .or(attr_border)
                     .map(|mut b| {
@@ -4090,8 +4156,7 @@ impl<'a> Layouter<'a> {
                         }
                         b
                     });
-                let [bw_t, bw_r, bw_b, bw_l] =
-                    cborder.map(|b| b.w).unwrap_or([0.0; 4]);
+                let [bw_t, bw_r, bw_b, bw_l] = cborder.map(|b| b.w).unwrap_or([0.0; 4]);
                 let cbg = cs
                     .get("background-color")
                     .and_then(|v| parse_color_ctx(v, Some(cst.color)))
@@ -4115,8 +4180,7 @@ impl<'a> Layouter<'a> {
                         cst.color,
                     )
                 });
-                let (items, y_end, nhits) =
-                    self.nest(cell, &cst, pl + bw_l, pt + bw_t, inner, &cs);
+                let (items, y_end, nhits) = self.nest(cell, &cst, pl + bw_l, pt + bw_t, inner, &cs);
                 let min_h = self.eff_line_h(&cst);
                 let cell_h = (y_end + pb + bw_b).max(min_h);
                 let cell_clip = borderfx::clips_overflow(&cs);
@@ -4186,8 +4250,7 @@ impl<'a> Layouter<'a> {
                     self.items.push(DisplayItem::PopClip);
                 }
                 for h in nhits {
-                    self.hits
-                        .push((h.0 + cx + rx, h.1 + self.y + ry, h.2, h.3, h.4));
+                    self.hits.push(xform::off_hit(h, cx + rx, self.y + ry));
                 }
                 if !cfx.is_empty() {
                     colorfx::wrap_vec(&mut self.items, i0, cfx);
@@ -4220,6 +4283,9 @@ impl<'a> Layouter<'a> {
     /// `display:flex` — element children laid as inline-block items on a
     /// row with `gap` spacing.
     fn flex_children(&mut self, node: NodeId, c: &Props, st: Style) {
+        // flex items are atomic boxes, not part of an enclosing inline's
+        // transform run — their own specs tag their line words
+        let saved_xf = self.cur_xf.take();
         // `gap` shorthand then axis longhands (Tailwind emits gap-x/gap-y)
         let base_gap = c
             .get("gap")
@@ -4250,7 +4316,10 @@ impl<'a> Layouter<'a> {
             let mut segs: Vec<(usize, usize, usize, usize, f32)> = Vec::new();
             let mut first = true;
             for &ch in self.doc.children(node) {
-                if !matches!(self.doc.kind(ch), NodeKind::Element { .. } | NodeKind::Text(_)) {
+                if !matches!(
+                    self.doc.kind(ch),
+                    NodeKind::Element { .. } | NodeKind::Text(_)
+                ) {
                     continue;
                 }
                 if !first && gap > 0.0 {
@@ -4261,9 +4330,7 @@ impl<'a> Layouter<'a> {
                     let cc = self.style(ch);
                     cc.get("flex")
                         .and_then(|v| v.split_whitespace().next().and_then(|t| t.parse().ok()))
-                        .or_else(|| {
-                            cc.get("flex-grow").and_then(|v| v.trim().parse().ok())
-                        })
+                        .or_else(|| cc.get("flex-grow").and_then(|v| v.trim().parse().ok()))
                         .unwrap_or(0.0f32)
                 } else {
                     0.0
@@ -4293,19 +4360,25 @@ impl<'a> Layouter<'a> {
                                 let it = std::mem::replace(
                                     &mut self.items[i],
                                     DisplayItem::FillRect {
-                                        x: 0.0, y: 0.0, w: 0.0, h: 0.0, color: 0,
+                                        x: 0.0,
+                                        y: 0.0,
+                                        w: 0.0,
+                                        h: 0.0,
+                                        color: 0,
                                     },
                                 );
                                 self.items[i] = offset_item(it, 0.0, shift);
                             }
                             for h in self.hits.iter_mut().skip(h0).take(h1 - h0) {
                                 h.1 += shift;
+                                h.5 = h.5.conjugated(0.0, shift);
                             }
                         }
                     }
                 }
                 self.y = start_y + t.max(self.y - start_y);
             }
+            self.cur_xf = saved_xf;
             return;
         }
         // justify-content on the main axis: pre-measure total child width.
@@ -4365,13 +4438,7 @@ impl<'a> Layouter<'a> {
                         basis.unwrap_or(0.0)
                     } else {
                         dim(&cc, "width", self.avail_w, cst.size)
-                            .map(|w| {
-                                if border_box(&cc) {
-                                    w - pl - pr
-                                } else {
-                                    w
-                                }
-                            })
+                            .map(|w| if border_box(&cc) { w - pl - pr } else { w })
                             .unwrap_or_else(|| self.max_content_width(ch, &cst))
                     };
                     base_w.insert(ch, w + pl + pr);
@@ -4479,7 +4546,14 @@ impl<'a> Layouter<'a> {
                                 if !fx.is_empty() && !items.is_empty() {
                                     colorfx::wrap_vec(&mut items, 0, fx);
                                 }
-                                let (tx, ty) = translate_xy(&cc, w, h, cst.size);
+                                let xf = xform::spec(&cc, cst.size);
+                                let wrapping = xf.as_ref().is_some_and(|s| s.wrap);
+                                let (tx, ty) = if wrapping {
+                                    (0.0, 0.0)
+                                } else {
+                                    translate_xy(&cc, w, h, cst.size)
+                                };
+
                                 let items = if tx != 0.0 || ty != 0.0 {
                                     items
                                         .into_iter()
@@ -4490,13 +4564,18 @@ impl<'a> Layouter<'a> {
                                 };
                                 let hits = if tx != 0.0 || ty != 0.0 {
                                     hits.into_iter()
-                                        .map(|h| (h.0 + tx, h.1 + ty, h.2, h.3, h.4))
+                                        .map(|h| xform::off_hit(h, tx, ty))
                                         .collect()
                                 } else {
                                     hits
                                 };
                                 let mb =
                                     box_sides(&cc, "margin", self.avail_w, cst.size)[2].max(0.0);
+                                let saved = if wrapping {
+                                    Some(std::mem::replace(&mut self.cur_xf, xf.clone()))
+                                } else {
+                                    None
+                                };
                                 self.push_box(
                                     w,
                                     h,
@@ -4505,10 +4584,25 @@ impl<'a> Layouter<'a> {
                                     mb,
                                     self.rel_offset(&cc, cst.size),
                                 );
+                                if let Some(s) = saved {
+                                    self.cur_xf = s;
+                                }
                             }
                         }
-                        Some(t @ ("input" | "select" | "textarea" | "video" | "canvas" | "iframe" | "object" | "embed" | "br" | "hr")) => {
-                            self.inline(ch, t, &cc, cst)
+                        Some(
+                            t @ ("input" | "select" | "textarea" | "video" | "canvas" | "iframe"
+                            | "object" | "embed" | "br" | "hr"),
+                        ) => {
+                            let fx = xform::spec(&cc, cst.size);
+                            let saved = if fx.is_some() {
+                                Some(std::mem::replace(&mut self.cur_xf, fx.clone()))
+                            } else {
+                                None
+                            };
+                            self.inline(ch, t, &cc, cst);
+                            if let Some(s) = saved {
+                                self.cur_xf = s;
+                            }
                         }
                         _ => {
                             // flex item main size: grow → basis + share of the
@@ -4555,9 +4649,15 @@ impl<'a> Layouter<'a> {
                 let cc = self.style(ch);
                 let mut cst = st.clone();
                 self.apply_computed(&cc, &mut cst);
+                let (i0, h0) = (self.items.len(), self.hits.len());
+                let sp = xform::spec(&cc, cst.size);
                 self.block(ch, self.doc.tag(ch).unwrap_or("div"), &cc, cst);
+                if let Some(sp) = sp {
+                    self.wrap_span(&sp, ch, i0, h0);
+                }
             }
         }
+        self.cur_xf = saved_xf;
     }
 
     /// `display:grid|inline-grid` children. Resolve the track templates,
@@ -4567,6 +4667,9 @@ impl<'a> Layouter<'a> {
     /// emit its box at the aligned offset.
     /// Subset: no named lines/areas/subgrid; non-element children skipped.
     fn grid_children(&mut self, node: NodeId, c: &Props, st: &Style) {
+        // grid items are atomic boxes — not part of an enclosing inline's
+        // transform run (their own spec wraps their emitted span below)
+        let saved_xf = self.cur_xf.take();
         struct GItem {
             id: NodeId,
             r: usize,
@@ -4598,7 +4701,7 @@ impl<'a> Layouter<'a> {
             laid: Vec<DisplayItem>,
             /// child element boxes laid relative to the item's content box —
             /// offset to (ix, iy+dy) at emit for click hit-testing
-            hits: Vec<(f32, f32, f32, f32, NodeId)>,
+            hits: Vec<Hit>,
             /// border-box height of the laid content (pre-stretch)
             box_h_intr: f32,
         }
@@ -4618,7 +4721,9 @@ impl<'a> Layouter<'a> {
             let mut it = v.split_whitespace();
             row_gap = it
                 .next()
-                .and_then(|t| parse_len_vp(t, cont_h.unwrap_or(avail), st.size, self.viewport_h, avail))
+                .and_then(|t| {
+                    parse_len_vp(t, cont_h.unwrap_or(avail), st.size, self.viewport_h, avail)
+                })
                 .unwrap_or(0.0);
             col_gap = it
                 .next()
@@ -4675,10 +4780,24 @@ impl<'a> Layouter<'a> {
             .map(String::as_str)
             .or(t_rows.as_deref())
             .map(String::from);
-        let (col_specs, col_names) =
-            grid_track_list(col_src.as_ref(), avail, st.size, self.viewport_h, avail, avail, col_gap);
-        let (row_specs, row_names) =
-            grid_track_list(row_src.as_ref(), row_rel, st.size, self.viewport_h, avail, row_rel, row_gap);
+        let (col_specs, col_names) = grid_track_list(
+            col_src.as_ref(),
+            avail,
+            st.size,
+            self.viewport_h,
+            avail,
+            avail,
+            col_gap,
+        );
+        let (row_specs, row_names) = grid_track_list(
+            row_src.as_ref(),
+            row_rel,
+            st.size,
+            self.viewport_h,
+            avail,
+            row_rel,
+            row_gap,
+        );
         // `grid-template-areas: 'a b' 'c b'` → name → (row, col, row+1, col+1)
         // bounding box; `grid-area: name` items resolve to those cells.
         let mut areas: FxHashMap<String, (usize, usize, usize, usize)> = FxHashMap::default();
@@ -4781,12 +4900,7 @@ impl<'a> Layouter<'a> {
                 .filter(|v| !v.is_empty() && !v.contains('/'))
                 .and_then(|v| areas.get(v));
             let (ecol, cs, erow, rs) = if let Some(&(r0, c0, r1, c1)) = named {
-                (
-                    Some(c0),
-                    c1 - c0 + 1,
-                    Some(r0),
-                    r1 - r0 + 1,
-                )
+                (Some(c0), c1 - c0 + 1, Some(r0), r1 - r0 + 1)
             } else {
                 let (ecol, cs) = resolve_axis(grid_lines(&ic, "column"), exp_cols, &col_names);
                 let (erow, rs) = resolve_axis(grid_lines(&ic, "row"), exp_rows, &row_names);
@@ -4876,7 +4990,9 @@ impl<'a> Layouter<'a> {
         let nrows = occ.len().max(exp_rows).max(1);
 
         // ---- column track sizes ----
-        let col_spec: Vec<GTrack> = (0..ncols).map(|i| spec_at(&col_specs, &auto_cols, i)).collect();
+        let col_spec: Vec<GTrack> = (0..ncols)
+            .map(|i| spec_at(&col_specs, &auto_cols, i))
+            .collect();
         let mut cw: Vec<f32> = col_spec.iter().map(track_floor).collect();
         // pre-measure each item's box metrics + intrinsic width
         let mut items: Vec<GItem> = Vec::with_capacity(placed.len());
@@ -4889,7 +5005,9 @@ impl<'a> Layouter<'a> {
             let p = box_sides(&cc, "padding", avail, cst.size).map(|v| v.max(0.0));
             let bd = self.backdrop;
             let bb = border_box(&cc);
-            let bg = self.bg_of(ch, &cc, Some(cst.color)).map(|col| over(col, bd));
+            let bg = self
+                .bg_of(ch, &cc, Some(cst.color))
+                .map(|col| over(col, bd));
             let border = borderfx::borders(&cc, cst.size, cst.color).map(|mut b| {
                 for col in b.color.iter_mut() {
                     *col = over(*col, bg.unwrap_or(bd));
@@ -4903,14 +5021,24 @@ impl<'a> Layouter<'a> {
             let clip = borderfx::clips_overflow(&cc);
             let w_prop = dim(&cc, "width", avail, cst.size).map(|w| {
                 let mut w = w;
-                if let Some(mx) = cc.get("max-width").and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail)) {
+                if let Some(mx) = cc
+                    .get("max-width")
+                    .and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail))
+                {
                     w = w.min(mx);
                 }
-                if let Some(mn) = cc.get("min-width").and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail)) {
+                if let Some(mn) = cc
+                    .get("min-width")
+                    .and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail))
+                {
                     w = w.max(mn);
                 }
                 // border-box `width` → strip padding+border for content size
-                if bb { w - p[1] - p[3] - bw[1] - bw[3] } else { w }
+                if bb {
+                    w - p[1] - p[3] - bw[1] - bw[3]
+                } else {
+                    w
+                }
             });
             // auto tracks size to the item's max-content contribution
             // (minmax(0,X) clamps at X) — min-content would wrap every word
@@ -4930,8 +5058,13 @@ impl<'a> Layouter<'a> {
                 .or_else(|| ps.as_ref().and_then(|(_, j)| galign(Some(j))))
                 .unwrap_or(def_just);
             // heights stored content-relative: border-box subtracts pad+border
-            let hconv =
-                |v: f32| if bb { v - p[0] - p[2] - bw[0] - bw[2] } else { v };
+            let hconv = |v: f32| {
+                if bb {
+                    v - p[0] - p[2] - bw[0] - bw[2]
+                } else {
+                    v
+                }
+            };
             let ihrel = cont_h.or(self.pct_h).unwrap_or(avail);
             let h_prop = dim(&cc, "height", ihrel, cst.size).map(hconv);
             let min_h = cc
@@ -4991,8 +5124,7 @@ impl<'a> Layouter<'a> {
 
         // auto columns take the widest single-span item's margin-box width
         for it in &items {
-            let need =
-                it.intrinsic_w + it.p[1] + it.p[3] + it.bw[1] + it.bw[3] + it.m[1] + it.m[3];
+            let need = it.intrinsic_w + it.p[1] + it.p[3] + it.bw[1] + it.bw[3] + it.m[1] + it.m[3];
             if it.cs == 1 {
                 if let GTrack::Auto(_, mx) = col_spec[it.c] {
                     cw[it.c] = cw[it.c].max(need.min(mx));
@@ -5001,15 +5133,10 @@ impl<'a> Layouter<'a> {
         }
         for it in &items {
             if it.cs > 1 {
-                let need = it.intrinsic_w
-                    + it.p[1]
-                    + it.p[3]
-                    + it.bw[1]
-                    + it.bw[3]
-                    + it.m[1]
-                    + it.m[3];
-                let have: f32 = cw[it.c..it.c + it.cs].iter().sum::<f32>()
-                    + col_gap * (it.cs - 1) as f32;
+                let need =
+                    it.intrinsic_w + it.p[1] + it.p[3] + it.bw[1] + it.bw[3] + it.m[1] + it.m[3];
+                let have: f32 =
+                    cw[it.c..it.c + it.cs].iter().sum::<f32>() + col_gap * (it.cs - 1) as f32;
                 if need > have {
                     let add = (need - have) / it.cs as f32;
                     for w in cw.iter_mut().skip(it.c).take(it.cs) {
@@ -5040,14 +5167,8 @@ impl<'a> Layouter<'a> {
         for it in items.iter_mut() {
             let cell_w: f32 =
                 cw[it.c..it.c + it.cs].iter().sum::<f32>() + col_gap * (it.cs - 1) as f32;
-            let inner_w = (cell_w
-                - it.m[1]
-                - it.m[3]
-                - it.p[1]
-                - it.p[3]
-                - it.bw[1]
-                - it.bw[3])
-                .max(1.0);
+            let inner_w =
+                (cell_w - it.m[1] - it.m[3] - it.p[1] - it.p[3] - it.bw[1] - it.bw[3]).max(1.0);
             let content_w = it
                 .w_prop
                 .map(|w| w.min(inner_w))
@@ -5112,7 +5233,9 @@ impl<'a> Layouter<'a> {
         }
 
         // ---- row track sizes ----
-        let row_spec: Vec<GTrack> = (0..nrows).map(|i| spec_at(&row_specs, &auto_rows, i)).collect();
+        let row_spec: Vec<GTrack> = (0..nrows)
+            .map(|i| spec_at(&row_specs, &auto_rows, i))
+            .collect();
         // fr rows with an indefinite container height behave as auto
         let mut rh: Vec<f32> = row_spec
             .iter()
@@ -5141,8 +5264,8 @@ impl<'a> Layouter<'a> {
         for it in &items {
             if it.rs > 1 {
                 let need = it.box_h_intr + it.m[0] + it.m[2];
-                let have: f32 = rh[it.r..it.r + it.rs].iter().sum::<f32>()
-                    + row_gap * (it.rs - 1) as f32;
+                let have: f32 =
+                    rh[it.r..it.r + it.rs].iter().sum::<f32>() + row_gap * (it.rs - 1) as f32;
                 if need > have {
                     let add = (need - have) / it.rs as f32;
                     for h in rh.iter_mut().skip(it.r).take(it.rs) {
@@ -5162,8 +5285,7 @@ impl<'a> Layouter<'a> {
                     .zip(&row_spec)
                     .map(|(h, t)| if matches!(t, GTrack::Fr(..)) { 0.0 } else { *h })
                     .sum();
-                let leftover =
-                    (ch - row_gap * nrows.saturating_sub(1) as f32 - non_fr).max(0.0);
+                let leftover = (ch - row_gap * nrows.saturating_sub(1) as f32 - non_fr).max(0.0);
                 for (i, t) in row_spec.iter().enumerate() {
                     if let GTrack::Fr(f, m) = t {
                         rh[i] = (*m).max(leftover * *f / total_fr);
@@ -5184,14 +5306,15 @@ impl<'a> Layouter<'a> {
                 (a, j)
             })
             .unwrap_or_default();
-        let jc = c.get("justify-content").or(if pc_j.is_empty() { None } else { Some(&pc_j) });
-        let ac = c.get("align-content").or(if pc_a.is_empty() { None } else { Some(&pc_a) });
+        let jc = c
+            .get("justify-content")
+            .or(if pc_j.is_empty() { None } else { Some(&pc_j) });
+        let ac = c
+            .get("align-content")
+            .or(if pc_a.is_empty() { None } else { Some(&pc_a) });
         let (egap_x, off_x) = content_offset(jc, (avail - tracks_w).max(0.0), ncols);
-        let (egap_y, off_y) = content_offset(
-            ac,
-            (cont_h.unwrap_or(tracks_h) - tracks_h).max(0.0),
-            nrows,
-        );
+        let (egap_y, off_y) =
+            content_offset(ac, (cont_h.unwrap_or(tracks_h) - tracks_h).max(0.0), nrows);
         let egx = col_gap + egap_x;
         let egy = row_gap + egap_y;
         let mut col_x = vec![0.0f32; ncols + 1];
@@ -5215,14 +5338,8 @@ impl<'a> Layouter<'a> {
             let cell_w = cw[it.c..it.c + it.cs].iter().sum::<f32>() + egx * (it.cs - 1) as f32;
             let cell_y = y0 + off_y + row_y[it.r];
             let cell_h = rh[it.r..it.r + it.rs].iter().sum::<f32>() + egy * (it.rs - 1) as f32;
-            let inner_w = (cell_w
-                - it.m[1]
-                - it.m[3]
-                - it.p[1]
-                - it.p[3]
-                - it.bw[1]
-                - it.bw[3])
-                .max(1.0);
+            let inner_w =
+                (cell_w - it.m[1] - it.m[3] - it.p[1] - it.p[3] - it.bw[1] - it.bw[3]).max(1.0);
             let content_w = it
                 .w_prop
                 .map(|w| w.min(inner_w).max(1.0))
@@ -5267,24 +5384,41 @@ impl<'a> Layouter<'a> {
                     _ => 0.0,
                 };
             // translate/transform + position:relative shift the painted
-            // box + its hit rects
-            let (tx, ty) = translate_xy(&it.cc, box_w, box_h, it.st.size);
+            // box + its hit rects; a matrix transform wraps the emitted span
+            let gspec = xform::spec(&it.cc, it.st.size);
+            let wrapping = gspec.as_ref().is_some_and(|s| s.wrap);
+            let gi0 = self.items.len();
+            let (i0, h0) = (gi0, self.hits.len());
+            let (tx, ty) = if wrapping {
+                (0.0, 0.0)
+            } else {
+                translate_xy(&it.cc, box_w, box_h, it.st.size)
+            };
             let (rx, ry) = self.rel_offset(&it.cc, it.st.size);
             let (ix, iy) = (ix + tx + rx, iy + ty + ry);
-            let gi0 = self.items.len();
             let radii = it.radius.resolve(box_w, box_h, it.st.size);
             let layers = it
                 .bgl
                 .as_ref()
                 .map(|bgl| {
-                    bgimg::items_for(bgl, ix, iy, box_w, box_h, (self.viewport_w, self.viewport_h))
+                    bgimg::items_for(
+                        bgl,
+                        ix,
+                        iy,
+                        box_w,
+                        box_h,
+                        (self.viewport_w, self.viewport_h),
+                    )
                 })
                 .unwrap_or_default();
 
             // `align-items:center` on the item centers its content inside the
             // (possibly stretched) box
             let dy = if matches!(
-                it.cc.get("align-items").or_else(|| it.cc.get("place-items")).map(String::as_str),
+                it.cc
+                    .get("align-items")
+                    .or_else(|| it.cc.get("place-items"))
+                    .map(String::as_str),
                 Some("center")
             ) {
                 ((box_h - it.box_h_intr) / 2.0).max(0.0)
@@ -5311,16 +5445,22 @@ impl<'a> Layouter<'a> {
                 layers,
                 laid,
             );
-            self.hits.push((ix, iy, box_w, box_h, it.id));
+            self.hits
+                .push((ix, iy, box_w, box_h, it.id, xform::Mat::IDENTITY));
             let mut hv: Vec<_> = it
                 .hits
                 .drain(..)
-                .map(|h| (h.0 + ix, h.1 + iy + dy, h.2, h.3, h.4))
+                .map(|h| xform::off_hit(h, ix, iy + dy))
                 .collect();
             if it.clip {
                 let bw = it.border.map(|b| b.w).unwrap_or([0.0; 4]);
                 let (cx, cy, cw, chh) = borderfx::padding_box(ix, iy, box_w, box_h, bw);
                 clip_hits(&mut hv, 0, cx, cy, cw, chh);
+            }
+            // hits join the list before wrap_span tags this span's [h0..]
+            self.hits.extend(hv.drain(..));
+            if let Some(sp) = gspec {
+                self.wrap_span(&sp, it.id, i0, h0);
             }
             let fx = colorfx::element_fx(
                 &it.cc,
@@ -5337,6 +5477,7 @@ impl<'a> Layouter<'a> {
 
         // the container consumes max(content, declared height) in flow
         self.y = y0 + tracks_h.max(cont_h.unwrap_or(0.0));
+        self.cur_xf = saved_xf;
     }
 
     fn nest(
@@ -5347,11 +5488,13 @@ impl<'a> Layouter<'a> {
         y0: f32,
         avail: f32,
         c: &Props,
-    ) -> (Vec<DisplayItem>, f32, Vec<(f32, f32, f32, f32, NodeId)>) {
+    ) -> (Vec<DisplayItem>, f32, Vec<Hit>) {
         let saved_items = std::mem::take(&mut self.items);
         let saved_hits = std::mem::take(&mut self.hits);
         let saved_line = std::mem::take(&mut self.line);
         let saved_floats = std::mem::take(&mut self.floats);
+        // box interiors aren't part of an enclosing inline's transform run
+        let saved_xf = self.cur_xf.take();
         let saved = (self.y, self.margin_x, self.avail_w, self.align);
         let saved_lx = self.line_x;
         let saved_ps = self.pending_space;
@@ -5375,8 +5518,7 @@ impl<'a> Layouter<'a> {
             }
             // positioned descendants resolve insets against the padding box
             // (x0/y0 are the content origin in box-local coords)
-            let [cpt, cpr, _cpb, cpl] =
-                box_sides(c, "padding", avail, st.size).map(|v| v.max(0.0));
+            let [cpt, cpr, _cpb, cpl] = box_sides(c, "padding", avail, st.size).map(|v| v.max(0.0));
             self.cb_stack.push(CbRect {
                 x: x0 - cpl,
                 y: y0 - cpt,
@@ -5404,9 +5546,9 @@ impl<'a> Layouter<'a> {
         }
         // sticky children clamp against this box's bottom — project the
         // explicit-height target since `self.y` only saw the content
-        let nest_bot = self.y.max(
-            y0 + dim(c, "height", self.viewport_h, st.size).unwrap_or(0.0),
-        );
+        let nest_bot = self
+            .y
+            .max(y0 + dim(c, "height", self.viewport_h, st.size).unwrap_or(0.0));
         self.drain_stickies(st0, y0, nest_bot);
         self.flush_line();
         // a nested box is a BFC: it contains its own floats (they're dropped
@@ -5425,7 +5567,83 @@ impl<'a> Layouter<'a> {
         self.line_x = saved_lx;
         self.pending_space = saved_ps;
         self.floats = saved_floats;
+        self.cur_xf = saved_xf;
         (items, bottom, hits)
+    }
+
+    /// Wrap the emitted span items[i0..] in PushTransform/PopTransform when
+    /// `sp` carries a non-translate transform, and tag hits[h0..] with the
+    /// matrix (composed after any already-recorded inner transform) so
+    /// hit-testing can inverse-map clicks exactly. `node`'s own hit rect
+    /// (pushed during its layout) is the transform-origin border box;
+    /// elements without one (table, floats) fall back to the items' bbox.
+    fn wrap_span(&mut self, sp: &xform::Spec, node: NodeId, i0: usize, h0: usize) {
+        if !sp.wrap || (self.items.len() <= i0 && self.hits.len() <= h0) {
+            return;
+        }
+        let bbox = self.hits[h0..]
+            .iter()
+            .rev()
+            .find(|h| h.4 == node)
+            .map(|h| (h.0, h.1, h.2, h.3))
+            .or_else(|| xform::items_bbox(&self.items[i0..]))
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let m = sp.matrix(bbox);
+        if m.is_identity() {
+            return;
+        }
+        // an element emitting no items (childless, unstyled) still needs
+        // its hits tagged — its painted shape just happens to be empty
+        if self.items.len() > i0 {
+            self.items.insert(i0, DisplayItem::PushTransform { m });
+            self.items.push(DisplayItem::PopTransform);
+        }
+        for h in &mut self.hits[h0..] {
+            h.5 = m.mul(&h.5);
+        }
+    }
+
+    /// Emit one line word's items (and hit rects) at pen position `x`.
+    /// `m` is the transform wrapping the run it belongs to — hit rects
+    /// compose it after their own (inner) transforms.
+    fn emit_word(&mut self, w: Word, x: f32, baseline: f32, m: Option<&xform::Mat>) {
+        if let Some(items) = w.items {
+            // inline-block: box bottom sits on the baseline
+            let dy = baseline - w.box_h;
+            for it in items {
+                self.items.push(offset_item(it, x, dy));
+            }
+            for h in w.hits {
+                let mut h = xform::off_hit(h, x, dy);
+                if let Some(m) = m {
+                    h.5 = m.mul(&h.5);
+                }
+                self.hits.push(h);
+            }
+        } else if !w.text.is_empty() {
+            if let Some(bg) = w.bg {
+                // inline background: rect behind the word's extent
+                self.items.push(DisplayItem::FillRect {
+                    x,
+                    y: baseline - w.ascent,
+                    w: w.width,
+                    h: w.ascent + w.size * 0.3,
+                    color: bg,
+                });
+            }
+            self.items.push(DisplayItem::Text {
+                x,
+                baseline: baseline - w.shift * w.size,
+                text: w.text,
+                font: w.font,
+                size: w.size,
+                color: w.color,
+                underline: w.underline,
+                strike: w.strike,
+                href: w.href,
+            });
+        }
+        // empty words (inline-margin spacers) just advance x
     }
 
     /// Invoke `f` on each descendant text node's raw text (node boundaries
@@ -5467,7 +5685,8 @@ impl<'a> Layouter<'a> {
         if let Some(ew) = dim_intrinsic(&c, "width", self.avail_w, st.size) {
             // border-box `width` already includes the box's own padding
             let ew = if border_box(&c) {
-                let [_t, pr, _b, pl] = box_sides(&c, "padding", self.avail_w, st.size).map(|v| v.max(0.0));
+                let [_t, pr, _b, pl] =
+                    box_sides(&c, "padding", self.avail_w, st.size).map(|v| v.max(0.0));
                 ew - pl - pr
             } else {
                 ew
@@ -5560,7 +5779,10 @@ impl<'a> Layouter<'a> {
         let gap = c
             .get("column-gap")
             .and_then(|v| parse_len(v, self.avail_w, st.size))
-            .or_else(|| c.get("gap").and_then(|v| parse_len(v, self.avail_w, st.size)))
+            .or_else(|| {
+                c.get("gap")
+                    .and_then(|v| parse_len(v, self.avail_w, st.size))
+            })
             .unwrap_or(0.0);
         let mut w = 0.0;
         let mut n = 0usize;
@@ -5568,10 +5790,8 @@ impl<'a> Layouter<'a> {
             if let NodeKind::Text(t) = self.doc.kind(ch) {
                 if let Some(fi) = self.resolve_font(st) {
                     if let Some(f) = self.fonts.font(fi) {
-                        w += f.measure(
-                            &t.split_whitespace().collect::<Vec<_>>().join(" "),
-                            st.size,
-                        );
+                        w +=
+                            f.measure(&t.split_whitespace().collect::<Vec<_>>().join(" "), st.size);
                     }
                 }
                 continue;
@@ -5643,8 +5863,16 @@ impl<'a> Layouter<'a> {
                     let tag = self.doc.tag(ch).unwrap_or("");
                     let atomic = matches!(
                         tag,
-                        "img" | "svg" | "input" | "select" | "textarea" | "video"
-                            | "canvas" | "iframe" | "object" | "embed"
+                        "img"
+                            | "svg"
+                            | "input"
+                            | "select"
+                            | "textarea"
+                            | "video"
+                            | "canvas"
+                            | "iframe"
+                            | "object"
+                            | "embed"
                     ) || matches!(
                         disp,
                         Some("inline-block") | Some("inline-flex") | Some("inline-grid")
@@ -5652,11 +5880,17 @@ impl<'a> Layouter<'a> {
                     if atomic {
                         *line += dim_intrinsic(&cc, "width", self.avail_w, cst.size)
                             .unwrap_or_else(|| self.max_content_width(ch, &cst));
-                    } else if tag == "br" || matches!(
-                        disp,
-                        Some("block") | Some("list-item") | Some("flex") | Some("grid")
-                            | Some("table") | Some("flow-root")
-                    ) {
+                    } else if tag == "br"
+                        || matches!(
+                            disp,
+                            Some("block")
+                                | Some("list-item")
+                                | Some("flex")
+                                | Some("grid")
+                                | Some("table")
+                                | Some("flow-root")
+                        )
+                    {
                         *best = (*best).max(*line);
                         *line = 0.0;
                         if tag != "br" {
@@ -5680,7 +5914,10 @@ impl<'a> Layouter<'a> {
         let gap = c
             .get("column-gap")
             .and_then(|v| parse_len(v, self.avail_w, st.size))
-            .or_else(|| c.get("gap").and_then(|v| parse_len(v, self.avail_w, st.size)))
+            .or_else(|| {
+                c.get("gap")
+                    .and_then(|v| parse_len(v, self.avail_w, st.size))
+            })
             .unwrap_or(0.0);
         // flex-wrap:wrap rows can break between items — the min-content
         // contribution is the widest single item, not the whole line
@@ -5694,10 +5931,8 @@ impl<'a> Layouter<'a> {
             if let NodeKind::Text(t) = self.doc.kind(ch) {
                 if let Some(fi) = self.resolve_font(st) {
                     if let Some(f) = self.fonts.font(fi) {
-                        let tw = f.measure(
-                            &t.split_whitespace().collect::<Vec<_>>().join(" "),
-                            st.size,
-                        );
+                        let tw =
+                            f.measure(&t.split_whitespace().collect::<Vec<_>>().join(" "), st.size);
                         if wrap {
                             w = w.max(tw);
                         } else {
@@ -5744,7 +5979,11 @@ impl<'a> Layouter<'a> {
             }
             n += 1;
         }
-        let gaps = if wrap { 0.0 } else { gap * n.saturating_sub(1) as f32 };
+        let gaps = if wrap {
+            0.0
+        } else {
+            gap * n.saturating_sub(1) as f32
+        };
         (w + gaps).max(st.size)
     }
 
@@ -5783,6 +6022,7 @@ impl<'a> Layouter<'a> {
             box_h: 0.0,
             dx: 0.0,
             dy: 0.0,
+            xf: self.cur_xf.clone(),
         });
         self.line_x += w;
     }
@@ -5793,7 +6033,7 @@ impl<'a> Layouter<'a> {
         w: f32,
         h: f32,
         items: Vec<DisplayItem>,
-        hits: Vec<(f32, f32, f32, f32, NodeId)>,
+        hits: Vec<Hit>,
         mb: f32,
         rel: (f32, f32),
     ) {
@@ -5818,6 +6058,7 @@ impl<'a> Layouter<'a> {
             box_h: h,
             dx: rel.0,
             dy: rel.1,
+            xf: self.cur_xf.clone(),
         });
         self.line_x += w;
     }
@@ -5892,7 +6133,7 @@ impl<'a> Layouter<'a> {
         tag: &str,
         c: &Props,
         st: &Style,
-    ) -> Option<(f32, f32, Vec<DisplayItem>, Vec<(f32, f32, f32, f32, NodeId)>)> {
+    ) -> Option<(f32, f32, Vec<DisplayItem>, Vec<Hit>)> {
         // % heights resolve against the definite containing height
         let hrel = self.pct_h.unwrap_or(self.avail_w);
         match tag {
@@ -5900,12 +6141,18 @@ impl<'a> Layouter<'a> {
                 // <video> lays out at its box size; its `poster` bitmap is
                 // the painted payload (object-fit applies like <img>)
                 let w = dim(c, "width", self.avail_w, st.size)
-                    .or_else(|| self.doc.attr(node, "width")
-                        .and_then(|v| v.trim_end_matches("px").parse().ok()))
+                    .or_else(|| {
+                        self.doc
+                            .attr(node, "width")
+                            .and_then(|v| v.trim_end_matches("px").parse().ok())
+                    })
                     .unwrap_or(300.0f32);
                 let h = dim(c, "height", hrel, st.size)
-                    .or_else(|| self.doc.attr(node, "height")
-                        .and_then(|v| v.trim_end_matches("px").parse().ok()))
+                    .or_else(|| {
+                        self.doc
+                            .attr(node, "height")
+                            .and_then(|v| v.trim_end_matches("px").parse().ok())
+                    })
                     .or_else(|| aspect_ratio(c).map(|r| w / r))
                     .unwrap_or(150.0f32);
                 let items = self
@@ -5913,7 +6160,12 @@ impl<'a> Layouter<'a> {
                     .attr(node, "poster")
                     .map(|src| vec![self.fit_image_item(c, st.size, w, h, src)])
                     .unwrap_or_default();
-                Some((w, h, items, vec![(0.0, 0.0, w, h, node)]))
+                Some((
+                    w,
+                    h,
+                    items,
+                    vec![(0.0, 0.0, w, h, node, xform::Mat::IDENTITY)],
+                ))
             }
             "svg" => {
                 let w = dim(c, "width", self.avail_w, st.size)
@@ -5926,25 +6178,38 @@ impl<'a> Layouter<'a> {
                 Some((
                     w,
                     h,
-                    vec![DisplayItem::Raster { x: 0.0, y: 0.0, w, h, pixels }],
-                    vec![(0.0, 0.0, w, h, node)],
+                    vec![DisplayItem::Raster {
+                        x: 0.0,
+                        y: 0.0,
+                        w,
+                        h,
+                        pixels,
+                    }],
+                    vec![(0.0, 0.0, w, h, node, xform::Mat::IDENTITY)],
                 ))
             }
             "img" => {
                 // CSS width/height beat the attributes (inline style and
                 // utility classes size almost every modern <img>)
                 let w = dim(c, "width", self.avail_w, st.size)
-                    .or_else(|| self.doc.attr(node, "width")
-                        .and_then(|v| v.trim_end_matches("px").parse().ok()))
+                    .or_else(|| {
+                        self.doc
+                            .attr(node, "width")
+                            .and_then(|v| v.trim_end_matches("px").parse().ok())
+                    })
                     .or_else(|| {
                         // only height given + aspect-ratio/intrinsic guess
-                        dim(c, "height", hrel, st.size).filter(|_| aspect_ratio(c).is_some())
+                        dim(c, "height", hrel, st.size)
+                            .filter(|_| aspect_ratio(c).is_some())
                             .map(|h| h * aspect_ratio(c).unwrap())
                     })
                     .unwrap_or(64.0f32);
                 let h = dim(c, "height", hrel, st.size)
-                    .or_else(|| self.doc.attr(node, "height")
-                        .and_then(|v| v.trim_end_matches("px").parse().ok()))
+                    .or_else(|| {
+                        self.doc
+                            .attr(node, "height")
+                            .and_then(|v| v.trim_end_matches("px").parse().ok())
+                    })
                     .or_else(|| aspect_ratio(c).map(|r| w / r))
                     .unwrap_or(w.min(48.0).max(16.0));
                 let items = self
@@ -5952,7 +6217,12 @@ impl<'a> Layouter<'a> {
                     .attr(node, "src")
                     .map(|src| vec![self.fit_image_item(c, st.size, w, h, src)])
                     .unwrap_or_default();
-                Some((w, h, items, vec![(0.0, 0.0, w, h, node)]))
+                Some((
+                    w,
+                    h,
+                    items,
+                    vec![(0.0, 0.0, w, h, node, xform::Mat::IDENTITY)],
+                ))
             }
             _ => None,
         }
@@ -6012,15 +6282,22 @@ impl<'a> Layouter<'a> {
             "svg" | "img" | "video" => {
                 self.flush_line();
                 if let Some((w, h, items, hits)) = self.replaced_payload(node, tag, c, &st) {
-                    let (tx, ty) = translate_xy(c, w, h, st.size);
+                    // svg|img are always `direct` in walk — a wrapping
+                    // transform wraps the span there; here just gate the
+                    // translate fast path
+                    let sp = xform::spec(c, st.size);
+                    let (tx, ty) = if sp.as_ref().is_some_and(|s| s.wrap) {
+                        (0.0, 0.0)
+                    } else {
+                        translate_xy(c, w, h, st.size)
+                    };
                     let x = self.line_origin();
                     let y = self.y;
                     for it in items {
                         self.items.push(offset_item(it, x + tx, y + ty));
                     }
                     for hd in hits {
-                        self.hits
-                            .push((hd.0 + x + tx, hd.1 + y + ty, hd.2, hd.3, hd.4));
+                        self.hits.push(xform::off_hit(hd, x + tx, y + ty));
                     }
                     let lh = self.eff_line_h(&st);
                     self.y += h.max(lh);
@@ -6096,7 +6373,11 @@ impl<'a> Layouter<'a> {
             ch.map_or(0, |c| c as u32),
         );
         if let Some(&v) = self.font_memo.get(&key) {
-            return if v == u32::MAX { None } else { Some(v as usize) };
+            return if v == u32::MAX {
+                None
+            } else {
+                Some(v as usize)
+            };
         }
         let r = self
             .fonts
@@ -6120,8 +6401,12 @@ impl<'a> Layouter<'a> {
             return Some(primary);
         }
         const ALT: &[&str] = &[
-            "noto sans symbols2", "noto sans symbols", "noto sans math",
-            "symbola", "dejavu sans", "noto sans",
+            "noto sans symbols2",
+            "noto sans symbols",
+            "noto sans math",
+            "symbola",
+            "dejavu sans",
+            "noto sans",
         ];
         for fam in ALT {
             if let Some(idx) = self.fonts.resolve(fam, st.bold, st.italic) {
@@ -6134,7 +6419,9 @@ impl<'a> Layouter<'a> {
     }
 
     fn word_with_space(&mut self, word: &str, st: &Style) {
-        let Some(font) = self.resolve_font_covering(word, st) else { return };
+        let Some(font) = self.resolve_font_covering(word, st) else {
+            return;
+        };
         let space_w = self
             .fonts
             .font(font)
@@ -6159,13 +6446,34 @@ impl<'a> Layouter<'a> {
     fn push_word(&mut self, word: &str, st: &Style, font: usize) {
         let owned: String;
         let word = match st.transform {
-            1 => { owned = word.to_uppercase(); &owned }
-            2 => { owned = word.to_lowercase(); &owned }
-            3 => { owned = word.chars().enumerate().map(|(i, c)| if i == 0 { c.to_uppercase().next().unwrap_or(c) } else { c }).collect(); &owned }
+            1 => {
+                owned = word.to_uppercase();
+                &owned
+            }
+            2 => {
+                owned = word.to_lowercase();
+                &owned
+            }
+            3 => {
+                owned = word
+                    .chars()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        if i == 0 {
+                            c.to_uppercase().next().unwrap_or(c)
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                &owned
+            }
             _ => word,
         };
         let (w, ascent, line_h) = {
-            let Some(f) = self.fonts.font(font) else { return };
+            let Some(f) = self.fonts.font(font) else {
+                return;
+            };
             let upem = f.units_per_em() as f32;
             (
                 f.measure(word, st.size),
@@ -6177,17 +6485,10 @@ impl<'a> Layouter<'a> {
                 },
             )
         };
-        if !st.nowrap
-            && self.line_x + w > self.content_width() + 0.5
-            && !self.line.is_empty()
-        {
+        if !st.nowrap && self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line();
         }
-        if st.break_word
-            && !st.nowrap
-            && w > self.content_width() + 0.5
-            && self.line.is_empty()
-        {
+        if st.break_word && !st.nowrap && w > self.content_width() + 0.5 && self.line.is_empty() {
             // word longer than the line — split mid-word (overflow-wrap etc.)
             let (mut chunk, mut cw) = (String::new(), 0.0f32);
             for c in word.chars() {
@@ -6217,6 +6518,7 @@ impl<'a> Layouter<'a> {
                         box_h: 0.0,
                         dx: st.rel_x,
                         dy: st.rel_y,
+                        xf: self.cur_xf.clone(),
                     });
                     self.flush_line();
                     chunk.clear();
@@ -6244,6 +6546,7 @@ impl<'a> Layouter<'a> {
                     box_h: 0.0,
                     dx: st.rel_x,
                     dy: st.rel_y,
+                    xf: self.cur_xf.clone(),
                 });
                 self.line_x += cw;
             }
@@ -6267,6 +6570,7 @@ impl<'a> Layouter<'a> {
             box_h: 0.0,
             dx: st.rel_x,
             dy: st.rel_y,
+            xf: self.cur_xf.clone(),
         });
         self.line_x += w;
     }
@@ -6281,11 +6585,12 @@ impl<'a> Layouter<'a> {
             .iter()
             .map(|w| w.line_h)
             .fold(0.0f32, f32::max)
-            .max(self
-                .line
-                .iter()
-                .map(|w| w.ascent + w.size * 0.25)
-                .fold(0.0, f32::max));
+            .max(
+                self.line
+                    .iter()
+                    .map(|w| w.ascent + w.size * 0.25)
+                    .fold(0.0, f32::max),
+            );
         let max_ascent = self.line.iter().map(|w| w.ascent).fold(0.0f32, f32::max);
         let baseline = self.y + max_ascent;
         let used = self.line.iter().map(|w| w.width).sum::<f32>();
@@ -6295,43 +6600,77 @@ impl<'a> Layouter<'a> {
                 Align::Center => ((self.content_width() - used) / 2.0).max(0.0),
                 Align::Right => (self.content_width() - used).max(0.0),
             };
-        for w in self.line.drain(..) {
-            if let Some(items) = w.items {
-                // inline-block: box bottom sits on the baseline; w.dx/dy are
-                // enclosing `position:relative` inline shifts (painted only)
-                let dy = baseline - w.box_h;
-                for it in items {
-                    self.items.push(offset_item(it, x + w.dx, dy + w.dy));
-                }
-                for h in w.hits {
-                    self.hits
-                        .push((h.0 + x + w.dx, h.1 + dy + w.dy, h.2, h.3, h.4));
-                }
-            } else if !w.text.is_empty() {
-                if let Some(bg) = w.bg {
-                    // inline background: rect behind the word's extent
-                    self.items.push(DisplayItem::FillRect {
-                        x: x + w.dx,
-                        y: baseline - w.ascent + w.dy,
-                        w: w.width,
-                        h: w.ascent + w.size * 0.3,
-                        color: bg,
-                    });
-                }
-                self.items.push(DisplayItem::Text {
-                    x: x + w.dx,
-                    baseline: baseline - w.shift * w.size + w.dy,
-                    text: w.text,
-                    font: w.font,
-                    size: w.size,
-                    color: w.color,
-                    underline: w.underline,
-                    strike: w.strike,
-                    href: w.href,
-                });
-            }
-            // empty words (inline-margin spacers) just advance x
+        // per-word x positions on this line
+        let n = self.line.len();
+        let mut xs = Vec::with_capacity(n);
+        for w in &self.line {
+            xs.push(x);
             x += w.width;
+        }
+        // a consecutive run of words sharing one transform spec wraps in
+        // PushTransform/PopTransform — the run's extent is the element's
+        // box (transform-origin anchors there)
+        let mut line: Vec<Option<Word>> = std::mem::take(&mut self.line)
+            .into_iter()
+            .map(Some)
+            .collect();
+        let mut i = 0;
+        while i < n {
+            let end = match &line[i].as_ref().unwrap().xf {
+                Some(sp) => {
+                    let mut j = i + 1;
+                    while j < n
+                        && line[j]
+                            .as_ref()
+                            .unwrap()
+                            .xf
+                            .as_ref()
+                            .is_some_and(|o| Rc::ptr_eq(o, sp))
+                    {
+                        j += 1;
+                    }
+                    j
+                }
+                None => i + 1,
+            };
+            let m = line[i]
+                .as_ref()
+                .unwrap()
+                .xf
+                .as_ref()
+                .map(|sp| {
+                    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    for k in i..end {
+                        let w = line[k].as_ref().unwrap();
+                        let (wx, wy, wh) = if w.items.is_some() {
+                            (xs[k] + w.dx, baseline + w.dy - w.box_h, w.box_h)
+                        } else {
+                            (
+                                xs[k] + w.dx,
+                                baseline + w.dy - w.ascent,
+                                w.ascent + w.size * 0.3,
+                            )
+                        };
+                        x0 = x0.min(wx);
+                        y0 = y0.min(wy);
+                        x1 = x1.max(wx + w.width);
+                        y1 = y1.max(wy + wh);
+                    }
+                    sp.matrix((x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)))
+                })
+                .filter(|m| !m.is_identity());
+            if let Some(m) = m {
+                self.items.push(DisplayItem::PushTransform { m });
+            }
+            for k in i..end {
+                let w = line[k].take().unwrap();
+                let (dx, dy) = (w.dx, w.dy);
+                self.emit_word(w, xs[k] + dx, baseline + dy, m.as_ref());
+            }
+            if m.is_some() {
+                self.items.push(DisplayItem::PopTransform);
+            }
+            i = end;
         }
         self.y += line_h;
         self.line_x = 0.0;
@@ -6372,9 +6711,8 @@ mod tests {
 
     #[test]
     fn class_selector_styles() {
-        let (items, _, _) = lay(
-            "<style>.big{font-size:40px}</style><p class=big>huge</p><p>small</p>",
-        );
+        let (items, _, _) =
+            lay("<style>.big{font-size:40px}</style><p class=big>huge</p><p>small</p>");
         let t = texts(&items);
         if let DisplayItem::Text { size, .. } = t[0] {
             assert!(*size > 30.0);
@@ -6386,7 +6724,8 @@ mod tests {
 
     #[test]
     fn display_none_hides() {
-        let (items, _, _) = lay("<style>.hide{display:none}</style><p class=hide>gone</p><p>here</p>");
+        let (items, _, _) =
+            lay("<style>.hide{display:none}</style><p class=hide>gone</p><p>here</p>");
         let all: String = texts(&items)
             .iter()
             .filter_map(|i| match i {
@@ -6408,8 +6747,7 @@ mod tests {
 
     #[test]
     fn text_align_center() {
-        let (items, _, _) =
-            lay("<style>p{text-align:center}</style><p>mid</p>");
+        let (items, _, _) = lay("<style>p{text-align:center}</style><p>mid</p>");
         let t = texts(&items);
         if let DisplayItem::Text { x, .. } = t[0] {
             assert!(*x > 200.0, "centered text should be right of center, x={x}");
@@ -6427,7 +6765,10 @@ mod tests {
 
     fn text_pos(items: &[DisplayItem], needle: &str) -> (f32, f32) {
         for i in items {
-            if let DisplayItem::Text { x, baseline, text, .. } = i {
+            if let DisplayItem::Text {
+                x, baseline, text, ..
+            } = i
+            {
                 if text.as_str() == needle {
                     return (*x, *baseline);
                 }
@@ -6444,16 +6785,17 @@ mod tests {
         );
         let (xa, _) = text_pos(&items, "a");
         let (xb, _) = text_pos(&items, "b");
-        assert!(xb - xa > 100.0, "b should sit past the 100px box: {xa} -> {xb}");
+        assert!(
+            xb - xa > 100.0,
+            "b should sit past the 100px box: {xa} -> {xb}"
+        );
     }
 
     #[test]
     fn inline_block_bg_and_border() {
-        let (items, _, _) = lay(
-            "<style>.ib{display:inline-block;width:50px;height:20px;\
+        let (items, _, _) = lay("<style>.ib{display:inline-block;width:50px;height:20px;\
              background-color:#ff0000;border:2px solid blue}</style>\
-             <p><span class=ib></span></p>",
-        );
+             <p><span class=ib></span></p>");
         assert!(items
             .iter()
             .any(|i| matches!(i, DisplayItem::FillRect { w, h, color, .. }
@@ -6466,10 +6808,8 @@ mod tests {
 
     #[test]
     fn table_places_cells_in_columns() {
-        let (items, _, _) = lay(
-            "<table><tr><td>a1</td><td>bbb1</td></tr>\
-             <tr><td>a2</td><td>b2</td></tr></table>",
-        );
+        let (items, _, _) = lay("<table><tr><td>a1</td><td>bbb1</td></tr>\
+             <tr><td>a2</td><td>b2</td></tr></table>");
         let (xa1, ya1) = text_pos(&items, "a1");
         let (xb1, yb1) = text_pos(&items, "bbb1");
         let (xa2, ya2) = text_pos(&items, "a2");
@@ -6484,27 +6824,28 @@ mod tests {
 
     #[test]
     fn td_border_draws() {
-        let (items, _, _) = lay(
-            "<style>td{border:2px solid #ff0000}</style>\
-             <table><tr><td>x</td></tr></table>",
-        );
+        let (items, _, _) = lay("<style>td{border:2px solid #ff0000}</style>\
+             <table><tr><td>x</td></tr></table>");
         let reds = items
             .iter()
-            .filter(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)))
+            .filter(
+                |i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)),
+            )
             .count();
         assert_eq!(reds, 4, "four border edges around the cell");
     }
 
     #[test]
     fn float_narrows_following_lines() {
-        let (items, _, _) = lay(
-            "<style>.fl{float:left;width:200px}</style>\
-             <div class=fl>nav</div><p>hello world</p>",
-        );
+        let (items, _, _) = lay("<style>.fl{float:left;width:200px}</style>\
+             <div class=fl>nav</div><p>hello world</p>");
         let (xnav, _) = text_pos(&items, "nav");
         let (xhello, _) = text_pos(&items, "hello");
         assert!(xnav < 30.0, "float content at left edge, x={xnav}");
-        assert!(xhello >= xnav + 190.0, "text flows beside the float: {xhello}");
+        assert!(
+            xhello >= xnav + 190.0,
+            "text flows beside the float: {xhello}"
+        );
     }
 
     #[test]
@@ -6521,7 +6862,12 @@ mod tests {
             })
             .collect();
         assert_eq!(hs.len(), 2);
-        assert!(hs[1] - hs[0] >= 30.0, "padding grows bg: {:?} vs {:?}", hs[0], hs[1]);
+        assert!(
+            hs[1] - hs[0] >= 30.0,
+            "padding grows bg: {:?} vs {:?}",
+            hs[0],
+            hs[1]
+        );
     }
 
     #[test]
@@ -6543,11 +6889,13 @@ mod tests {
 
     #[test]
     fn line_height_grows_line_box() {
-        let (items, _, _) =
-            lay("<style>.lh{line-height:3}</style><p class=lh>a</p><p>b</p>");
+        let (items, _, _) = lay("<style>.lh{line-height:3}</style><p class=lh>a</p><p>b</p>");
         let (_, ya) = text_pos(&items, "a");
         let (_, yb) = text_pos(&items, "b");
-        assert!(yb - ya > 40.0, "line-height 3x16 separates baselines: {yb} - {ya}");
+        assert!(
+            yb - ya > 40.0,
+            "line-height 3x16 separates baselines: {yb} - {ya}"
+        );
     }
 
     // ---------- grid ----------
@@ -6562,7 +6910,10 @@ mod tests {
         let (xb1, _) = text_pos(&items, "b1");
         let (xa2, ya2) = text_pos(&items, "a2");
         let (xb2, _) = text_pos(&items, "b2");
-        assert!((xb1 - xa1 - 100.0).abs() < 1.0, "col step 100: {xa1} -> {xb1}");
+        assert!(
+            (xb1 - xa1 - 100.0).abs() < 1.0,
+            "col step 100: {xa1} -> {xb1}"
+        );
         assert!(ya2 > ya1, "second row below first");
         assert!((xa2 - xa1).abs() < 1.0, "col 0 aligned across rows");
         assert!((xb2 - xb1).abs() < 1.0, "col 1 aligned across rows");
@@ -6578,7 +6929,10 @@ mod tests {
         let (xa, _) = text_pos(&items, "a");
         let (xb, _) = text_pos(&items, "b");
         let fr = (784.0 - 20.0) / 2.0;
-        assert!((xb - xa - fr - 20.0).abs() < 2.0, "fr column step: {xa} -> {xb}");
+        assert!(
+            (xb - xa - fr - 20.0).abs() < 2.0,
+            "fr column step: {xa} -> {xb}"
+        );
     }
 
     #[test]
@@ -6605,7 +6959,10 @@ mod tests {
         let (xc, yc) = text_pos(&items, "c");
         // wide spans row0; b and c land on row1 in cols 0 and 1
         assert!((xb - xa).abs() < 1.0, "b under a's start");
-        assert!((xc - xb - 110.0).abs() < 1.0, "col step incl gap: {xb} -> {xc}");
+        assert!(
+            (xc - xb - 110.0).abs() < 1.0,
+            "col step incl gap: {xb} -> {xc}"
+        );
         assert!((yb - ya).abs() > 10.0, "row below");
         assert!((yc - yb).abs() < 1.0, "same row");
     }
@@ -6642,7 +6999,10 @@ mod tests {
             .collect();
         assert_eq!(sqs.len(), 2);
         for (_, _, w, h) in &sqs {
-            assert!((w - 64.0).abs() < 1.0 && (h - 64.0).abs() < 1.0, "square cell {w}x{h}");
+            assert!(
+                (w - 64.0).abs() < 1.0 && (h - 64.0).abs() < 1.0,
+                "square cell {w}x{h}"
+            );
         }
     }
 
@@ -6654,9 +7014,9 @@ mod tests {
              place-items:center}.i{width:50px;height:20px;background:#ff0000}</style>\
              <div class=g><div class=i></div></div>",
         );
-        let r = items
-            .iter()
-            .find(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)));
+        let r = items.iter().find(
+            |i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)),
+        );
         let Some(DisplayItem::FillRect { x, y, w, h, .. }) = r else {
             panic!("cell bg not found")
         };
@@ -6667,15 +7027,16 @@ mod tests {
 
     #[test]
     fn grid_explicit_placement() {
-        let (items, _, _) = lay(
-            "<style>.g{display:grid;grid-template-columns:100px 100px}\
+        let (items, _, _) = lay("<style>.g{display:grid;grid-template-columns:100px 100px}\
              .x{grid-column:2;grid-row:1}</style>\
-             <div class=g><div>a</div><div class=x>b</div><div>c</div></div>",
-        );
+             <div class=g><div>a</div><div class=x>b</div><div>c</div></div>");
         let (xa, ya) = text_pos(&items, "a");
         let (xb, yb) = text_pos(&items, "b");
         let (_xc, yc) = text_pos(&items, "c");
-        assert!((xb - xa - 100.0).abs() < 1.0, "b pinned to col 2: {xa} -> {xb}");
+        assert!(
+            (xb - xa - 100.0).abs() < 1.0,
+            "b pinned to col 2: {xa} -> {xb}"
+        );
         assert!((yb - ya).abs() < 1.0, "b on row 1");
         assert!(yc > ya, "c auto-places on the next row");
     }
@@ -6689,7 +7050,10 @@ mod tests {
         );
         let (xa, _) = text_pos(&items, "a");
         let (xb, _) = text_pos(&items, "b");
-        assert!((xb - xa - 50.0).abs() < 1.0, "nested grid columns: {xa} -> {xb}");
+        assert!(
+            (xb - xa - 50.0).abs() < 1.0,
+            "nested grid columns: {xa} -> {xb}"
+        );
     }
 
     #[test]
@@ -6723,16 +7087,17 @@ mod tests {
                 r.0,
                 r.1
             );
-            assert!((r.2 - 64.0).abs() < 1.0 && (r.3 - 64.0).abs() < 1.0, "square cell");
+            assert!(
+                (r.2 - 64.0).abs() < 1.0 && (r.3 - 64.0).abs() < 1.0,
+                "square cell"
+            );
         }
     }
 
     #[test]
     fn width_caps_block_content() {
-        let (items, _, _) = lay(
-            "<style>.w{width:150px}</style>\
-             <div class=w>aa bb cc dd ee ff gg hh ii jj kk ll</div>",
-        );
+        let (items, _, _) = lay("<style>.w{width:150px}</style>\
+             <div class=w>aa bb cc dd ee ff gg hh ii jj kk ll</div>");
         let t = texts(&items);
         assert!(t.len() >= 4, "words wrap inside the narrow block");
         let mut baselines: Vec<f32> = t
@@ -6747,7 +7112,10 @@ mod tests {
         assert!(baselines.len() >= 2, "capped width forces multiple lines");
         for i in &t {
             if let DisplayItem::Text { x, .. } = i {
-                assert!(*x < 8.0 + 150.0 + 1.0, "word starts inside 150px box, x={x}");
+                assert!(
+                    *x < 8.0 + 150.0 + 1.0,
+                    "word starts inside 150px box, x={x}"
+                );
             }
         }
     }
@@ -6837,8 +7205,7 @@ mod tests {
 
     #[test]
     fn dashed_border_emits_border_side() {
-        let (items, _, _) =
-            lay("<style>.b{border:4px dashed #ff0000}</style><div class=b>x</div>");
+        let (items, _, _) = lay("<style>.b{border:4px dashed #ff0000}</style><div class=b>x</div>");
         assert!(items.iter().any(|i| matches!(
             i,
             DisplayItem::BorderSide { style, .. } if *style == BorderStyle::Dashed
@@ -6847,10 +7214,8 @@ mod tests {
 
     #[test]
     fn per_side_border_styles() {
-        let (items, _, _) = lay(
-            "<style>.b{border-width:2px;border-style:solid double;\
-             border-color:#ff0000}</style><div class=b>x</div>",
-        );
+        let (items, _, _) = lay("<style>.b{border-width:2px;border-style:solid double;\
+             border-color:#ff0000}</style><div class=b>x</div>");
         // solid sides stay FillRects; double sides become BorderSide items
         assert!(items.iter().any(|i| matches!(
             i,
@@ -6864,10 +7229,8 @@ mod tests {
 
     #[test]
     fn corner_radius_emits_rounded2() {
-        let (items, _, _) = lay(
-            "<style>.r{border-top-left-radius:20px;background:#ff0000;\
-             width:100px;height:100px}</style><div class=r></div>",
-        );
+        let (items, _, _) = lay("<style>.r{border-top-left-radius:20px;background:#ff0000;\
+             width:100px;height:100px}</style><div class=r></div>");
         assert!(items.iter().any(|i| matches!(
             i,
             DisplayItem::RoundedRect2 { radii, .. } if radii[0][0] > 10.0
@@ -6876,10 +7239,8 @@ mod tests {
 
     #[test]
     fn slash_radius_resolves_per_corner() {
-        let (items, _, _) = lay(
-            "<style>.r{border-radius:10px 20px/5px;background:#ff0000;\
-             width:100px;height:100px}</style><div class=r></div>",
-        );
+        let (items, _, _) = lay("<style>.r{border-radius:10px 20px/5px;background:#ff0000;\
+             width:100px;height:100px}</style><div class=r></div>");
         let r = items.iter().find_map(|i| match i {
             DisplayItem::RoundedRect2 { radii, .. } => Some(*radii),
             _ => None,
@@ -6893,28 +7254,26 @@ mod tests {
 
     #[test]
     fn box_shadow_multiple_and_inset() {
-        let (items, _, _) = lay(
-            "<style>.s{box-shadow:2px 3px red,inset 0 0 4px blue;\
-             width:10px;height:10px}</style><div class=s>x</div>",
-        );
+        let (items, _, _) = lay("<style>.s{box-shadow:2px 3px red,inset 0 0 4px blue;\
+             width:10px;height:10px}</style><div class=s>x</div>");
         let sh: Vec<_> = items
             .iter()
             .filter(|i| matches!(i, DisplayItem::Shadow { .. }))
             .collect();
         assert_eq!(sh.len(), 2);
-        let ins = sh.iter().any(|i| matches!(
-            i,
-            DisplayItem::Shadow { inset: true, blur, .. } if *blur > 0.0
-        ));
+        let ins = sh.iter().any(|i| {
+            matches!(
+                i,
+                DisplayItem::Shadow { inset: true, blur, .. } if *blur > 0.0
+            )
+        });
         assert!(ins, "one inset shadow with blur");
     }
 
     #[test]
     fn overflow_hidden_clips_children() {
-        let (items, _, _) = lay(
-            "<style>.o{overflow:hidden;width:100px;height:10px}</style>\
-             <div class=o><div>inner text</div></div>",
-        );
+        let (items, _, _) = lay("<style>.o{overflow:hidden;width:100px;height:10px}</style>\
+             <div class=o><div>inner text</div></div>");
         let pos = |pred: &dyn Fn(&DisplayItem) -> bool| items.iter().position(pred);
         let push = pos(&|i| matches!(i, DisplayItem::PushClip { .. })).expect("PushClip");
         let pop = pos(&|i| matches!(i, DisplayItem::PopClip)).expect("PopClip");
@@ -6930,10 +7289,12 @@ mod tests {
         );
         let reds = items
             .iter()
-            .filter(|i| matches!(
-                i,
-                DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)
-            ))
+            .filter(|i| {
+                matches!(
+                    i,
+                    DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)
+                )
+            })
             .count();
         assert!(reds >= 4, "four outline edges");
     }
@@ -6954,9 +7315,17 @@ mod tests {
         assert_eq!(r.2, 784.0); // body-margin edge to edge
         assert_eq!(r.3, 40.0);
         let px = r.4;
-        assert!(px[2] > 240 && px[0] < 20, "left pixel ~red: {:?}", &px[0..4]);
+        assert!(
+            px[2] > 240 && px[0] < 20,
+            "left pixel ~red: {:?}",
+            &px[0..4]
+        );
         let ri = 783 * 4;
-        assert!(px[ri] > 240 && px[ri + 2] < 20, "right pixel ~blue: {:?}", &px[ri..ri + 4]);
+        assert!(
+            px[ri] > 240 && px[ri + 2] < 20,
+            "right pixel ~blue: {:?}",
+            &px[ri..ri + 4]
+        );
     }
 
     #[test]
@@ -6964,8 +7333,20 @@ mod tests {
         let (items, _, _) = lay(
             "<style>div{height:50px;background-image:url(a.png);background-repeat:no-repeat}</style><div></div>",
         );
-        match items.iter().find(|it| matches!(it, DisplayItem::BgImage { .. })) {
-            Some(DisplayItem::BgImage { x, y, w, h, rx, ry, src, .. }) => {
+        match items
+            .iter()
+            .find(|it| matches!(it, DisplayItem::BgImage { .. }))
+        {
+            Some(DisplayItem::BgImage {
+                x,
+                y,
+                w,
+                h,
+                rx,
+                ry,
+                src,
+                ..
+            }) => {
                 assert_eq!((*x, *y, *w, *h), (8.0, 8.0, 784.0, 50.0));
                 assert_eq!((*rx, *ry), (0, 0));
                 assert_eq!(src, "a.png");
@@ -6980,14 +7361,18 @@ mod tests {
             "<style>div{height:50px;background:url(a) center/cover no-repeat}</style><div></div>",
         );
         assert!(
-            items.iter().any(|it| matches!(it, DisplayItem::BgImage { mode: 1, .. })),
+            items
+                .iter()
+                .any(|it| matches!(it, DisplayItem::BgImage { mode: 1, .. })),
             "cover BgImage missing"
         );
         let (items, _, _) = lay(
             "<style>div{height:50px;background-image:url(a);background-size:contain}</style><div></div>",
         );
         assert!(
-            items.iter().any(|it| matches!(it, DisplayItem::BgImage { mode: 2, .. })),
+            items
+                .iter()
+                .any(|it| matches!(it, DisplayItem::BgImage { mode: 2, .. })),
             "contain BgImage missing"
         );
     }
@@ -7008,10 +7393,14 @@ mod tests {
 
     #[test]
     fn object_fit_cover_uses_bgimage() {
-        let (items, _, _) =
-            lay("<img src=p.png width=100 height=50 style='object-fit:cover'>");
-        match items.iter().find(|it| matches!(it, DisplayItem::BgImage { .. })) {
-            Some(DisplayItem::BgImage { mode, w, h, src, .. }) => {
+        let (items, _, _) = lay("<img src=p.png width=100 height=50 style='object-fit:cover'>");
+        match items
+            .iter()
+            .find(|it| matches!(it, DisplayItem::BgImage { .. }))
+        {
+            Some(DisplayItem::BgImage {
+                mode, w, h, src, ..
+            }) => {
                 assert_eq!(*mode, 1);
                 assert_eq!((*w, *h), (100.0, 50.0));
                 assert_eq!(src, "p.png");
@@ -7023,7 +7412,10 @@ mod tests {
     #[test]
     fn body_background_image_paints_canvas() {
         let (items, _, _) = lay("<style>body{background:url(bg.png) no-repeat}</style>");
-        match items.iter().find(|it| matches!(it, DisplayItem::BgImage { .. })) {
+        match items
+            .iter()
+            .find(|it| matches!(it, DisplayItem::BgImage { .. }))
+        {
             Some(DisplayItem::BgImage { x, y, w, .. }) => {
                 assert_eq!((*x, *y, *w), (0.0, 0.0, 800.0)); // viewport-wide canvas rect
             }
@@ -7039,8 +7431,9 @@ mod tests {
 
     fn rect_index(items: &[DisplayItem], color: u32) -> Option<usize> {
         items.iter().position(|i| match i {
-            DisplayItem::FillRect { color: c, .. }
-            | DisplayItem::RoundedRect { color: c, .. } => *c == color,
+            DisplayItem::FillRect { color: c, .. } | DisplayItem::RoundedRect { color: c, .. } => {
+                *c == color
+            }
             _ => false,
         })
     }
@@ -7048,12 +7441,10 @@ mod tests {
     #[test]
     fn float_wraps_inline_text() {
         // a left float indents the lines it overlaps but not lines below it
-        let (items, _, _) = lay(
-            "<style>.fl{float:left;width:200px;height:30px}</style>\
+        let (items, _, _) = lay("<style>.fl{float:left;width:200px;height:30px}</style>\
              <div class=fl></div>\
              <p>aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz \
-                aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz</p>",
-        );
+                aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz</p>");
         let t = texts(&items);
         let mut by_x: Vec<(f32, f32)> = t
             .iter()
@@ -7064,7 +7455,11 @@ mod tests {
             .collect();
         by_x.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         // first line starts right of the float (body margin 8 + float 200)
-        assert!(by_x[0].0 > 200.0, "line 0 insets past the float, x={}", by_x[0].0);
+        assert!(
+            by_x[0].0 > 200.0,
+            "line 0 insets past the float, x={}",
+            by_x[0].0
+        );
         // the deepest line is back at the left margin once past the float's
         // bottom — check the leftmost word on that line
         let deep_y = by_x.last().unwrap().1;
@@ -7073,7 +7468,10 @@ mod tests {
             .filter(|w| (w.1 - deep_y).abs() < 1.0)
             .map(|w| w.0)
             .fold(f32::INFINITY, f32::min);
-        assert!(deep_x < 20.0, "line below the float returns to the left edge");
+        assert!(
+            deep_x < 20.0,
+            "line below the float returns to the left edge"
+        );
     }
 
     #[test]
@@ -7083,16 +7481,17 @@ mod tests {
              <div class=fl></div><div class=cl>below</div>",
         );
         let (_, by) = text_pos(&items, "below");
-        assert!(by >= 60.0, "cleared block below the 80px float, baseline={by}");
+        assert!(
+            by >= 60.0,
+            "cleared block below the 80px float, baseline={by}"
+        );
     }
 
     #[test]
     fn float_drops_when_no_room() {
-        let (items, _, _) = lay(
-            "<style>.f{float:left;width:60%;height:50px}</style>\
+        let (items, _, _) = lay("<style>.f{float:left;width:60%;height:50px}</style>\
              <div class=f style=background:#111></div>\
-             <div class=f style=background:#222></div>",
-        );
+             <div class=f style=background:#222></div>");
         let a = rect_index(&items, bgra(17, 17, 17)).expect("first float bg");
         let b = rect_index(&items, bgra(34, 34, 34)).expect("second float bg");
         let (xa, ya, xb, yb) = match (&items[a], &items[b]) {
@@ -7102,16 +7501,17 @@ mod tests {
             ) => (*xa, *ya, *xb, *yb),
             _ => panic!("float bgs are fill rects"),
         };
-        assert!((xb - xa).abs() < 1.0, "second float returns to the left edge");
+        assert!(
+            (xb - xa).abs() < 1.0,
+            "second float returns to the left edge"
+        );
         assert!(yb > ya + 40.0, "second float drops below the first");
     }
 
     #[test]
     fn float_shrink_to_fit() {
         // auto-width float hugs its max-content, not the longest word
-        let (items, _, _) = lay(
-            "<div style=\"float:left;background:#112233\">aa bbbbbbbb</div>",
-        );
+        let (items, _, _) = lay("<div style=\"float:left;background:#112233\">aa bbbbbbbb</div>");
         let i = rect_index(&items, bgra(0x11, 0x22, 0x33)).expect("float bg");
         let w = match items[i] {
             DisplayItem::FillRect { w, .. } | DisplayItem::RoundedRect { w, .. } => w,
@@ -7149,13 +7549,11 @@ mod tests {
 
     #[test]
     fn z_index_reorders_paint() {
-        let (items, _, _) = lay(
-            "<style>\
+        let (items, _, _) = lay("<style>\
              .a{position:absolute;top:0;left:0;width:100px;height:100px;background:#111111}\
              .b{position:absolute;top:0;left:0;width:50px;height:50px;background:#222222;z-index:2}\
              </style>\
-             <div class=a></div><div class=b></div><p>text here</p>",
-        );
+             <div class=a></div><div class=b></div><p>text here</p>");
         let a = rect_index(&items, bgra(0x11, 0x11, 0x11)).expect("a rect");
         let b = rect_index(&items, bgra(0x22, 0x22, 0x22)).expect("b rect");
         assert!(b > a, "z-index:2 paints after z-auto even though DOM-later");
@@ -7163,7 +7561,10 @@ mod tests {
             .iter()
             .position(|i| matches!(i, DisplayItem::Text { .. }))
             .expect("text");
-        assert!(a > ti && b > ti, "positioned boxes paint above in-flow text");
+        assert!(
+            a > ti && b > ti,
+            "positioned boxes paint above in-flow text"
+        );
     }
 
     #[test]
@@ -7181,21 +7582,172 @@ mod tests {
 
     #[test]
     fn absolute_resolves_against_positioned_ancestor() {
-        let (items, _, _) = lay(
-            "<style>\
+        let (items, _, _) = lay("<style>\
              .rel{position:relative;margin:100px 0 0 50px;width:300px;height:200px}\
              .ab{position:absolute;top:10px;left:20px;width:30px;height:30px;background:#123456}\
              </style>\
-             <div class=rel><div class=ab></div></div>",
-        );
+             <div class=rel><div class=ab></div></div>");
         let i = rect_index(&items, bgra(0x12, 0x34, 0x56)).expect("abspos bg");
         let (x, y) = match items[i] {
             DisplayItem::FillRect { x, y, .. } | DisplayItem::RoundedRect { x, y, .. } => (x, y),
             _ => panic!(),
         };
         // body margin 8 + rel margin-left 50 + left 20 = 78
-        assert!((x - 78.0).abs() < 2.0, "abspos x in the ancestor's cb, x={x}");
+        assert!(
+            (x - 78.0).abs() < 2.0,
+            "abspos x in the ancestor's cb, x={x}"
+        );
         // body margin 8 + rel margin-top 100 + top 10 = 118
-        assert!((y - 118.0).abs() < 2.0, "abspos y in the ancestor's cb, y={y}");
+        assert!(
+            (y - 118.0).abs() < 2.0,
+            "abspos y in the ancestor's cb, y={y}"
+        );
+    }
+
+    // ---------- CSS 2D transforms ----------
+
+    /// The same inverse-mapped containment the renderer's click path uses.
+    fn hit_at(hits: &[Hit], x: f32, y: f32) -> Option<NodeId> {
+        hits.iter()
+            .filter(|(hx, hy, hw, hh, _, m)| {
+                let Some(inv) = m.inverse() else { return false };
+                let (px, py) = inv.apply(x, y);
+                px >= *hx && px <= hx + hw && py >= *hy && py <= hy + hh
+            })
+            .min_by(|a, b| {
+                (a.2 * a.3)
+                    .partial_cmp(&(b.2 * b.3))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|h| h.4)
+    }
+
+    fn lay_hits(html: &str) -> (Vec<DisplayItem>, Vec<Hit>) {
+        let d = doc(html);
+        let mut fonts = FontCache::new();
+        let (items, _, _, hits) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[]);
+        (items, hits)
+    }
+
+    #[test]
+    fn translate_stays_on_direct_offset_path() {
+        // pure translate() → no transform markers; items + hits just shift
+        let (items, hits) = lay_hits(
+            "<div style=\"transform:translate(10px,20px);width:50px;height:50px;\
+             background:#ff0000\"></div>",
+        );
+        assert!(
+            !items.iter().any(|i| matches!(
+                i,
+                DisplayItem::PushTransform { .. } | DisplayItem::PopTransform
+            )),
+            "translate-only transform must not emit matrix markers"
+        );
+        let r = items.iter().find(
+            |i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)),
+        );
+        let Some(DisplayItem::FillRect { x, y, w, h, .. }) = r else {
+            panic!("missing bg rect")
+        };
+        assert!(
+            (*x - 18.0).abs() < 1.0 && (*y - 28.0).abs() < 1.0,
+            "shifted bg at ({x},{y})"
+        );
+        assert!((*w - 50.0).abs() < 1.0 && (*h - 50.0).abs() < 1.0);
+        // the element's hit moved with it and stays identity-mapped
+        let h50 = hits
+            .iter()
+            .find(|h| (h.2 - 50.0).abs() < 1.0 && (h.3 - 50.0).abs() < 1.0)
+            .expect("50x50 hit");
+        assert!((h50.0 - 18.0).abs() < 1.0 && (h50.1 - 28.0).abs() < 1.0);
+        assert!(h50.5.is_identity());
+        // a click on the shifted spot finds the moved element
+        assert!(hit_at(&hits, 30.0, 40.0).is_some());
+    }
+
+    #[test]
+    fn rotate_emits_transform_wrapper() {
+        let (items, hits) = lay_hits(
+            "<div id=r style=\"transform:rotate(90deg);width:200px;height:20px\
+             ;background:#ff0000\"></div>",
+        );
+        let pi = items
+            .iter()
+            .position(|i| matches!(i, DisplayItem::PushTransform { .. }))
+            .expect("rotation must emit PushTransform");
+        assert!(
+            items[pi + 1..]
+                .iter()
+                .any(|i| matches!(i, DisplayItem::PopTransform)),
+            "PushTransform needs a matching PopTransform"
+        );
+        let DisplayItem::PushTransform { m } = items[pi] else {
+            unreachable!()
+        };
+        assert!(!m.is_identity());
+        // wrapped items keep pre-transform coords: the bg still sits at the
+        // laid-out spot (8,8)-ish, NOT rotated
+        let r = items.iter().find(
+            |i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)),
+        );
+        let Some(DisplayItem::FillRect { x, y, w, h, .. }) = r else {
+            panic!("missing bg rect")
+        };
+        assert!((*w - 200.0).abs() < 1.0 && (*h - 20.0).abs() < 1.0);
+        assert!(
+            *x < 20.0 && *y < 20.0,
+            "pre-transform coords kept ({x},{y})"
+        );
+        // the element's hit carries the same matrix
+        let hrot = hits
+            .iter()
+            .find(|h| (h.2 - 200.0).abs() < 1.0 && (h.3 - 20.0).abs() < 1.0)
+            .expect("200x20 hit");
+        assert!(!hrot.5.is_identity(), "transformed hit keeps its matrix");
+    }
+
+    #[test]
+    fn rotated_hit_inverse_maps_clicks() {
+        // 200x20 bar rotated 90° paints as a vertical strip; the click map
+        // must follow the real shape, not the laid-out rect
+        let (_, hits) =
+            lay_hits("<div id=r style=\"transform:rotate(90deg);width:200px;height:20px\"></div>");
+        let hrot = hits
+            .iter()
+            .find(|h| !h.5.is_identity() && (h.2 - 200.0).abs() < 1.0)
+            .copied()
+            .expect("rotated hit");
+        let node = hrot.4;
+        // painted position inside the rect's top-left corner → click hits
+        // (a point 1px in avoids the boundary's float jitter)
+        let (cx, cy) = hrot.5.apply(hrot.0 + 1.0, hrot.1 + 1.0);
+        assert_eq!(hit_at(&hits, cx, cy), Some(node), "painted corner");
+        let (cx, cy) = hrot.5.apply(hrot.0 + hrot.2 / 2.0, hrot.1 + hrot.3 / 2.0);
+        assert_eq!(hit_at(&hits, cx, cy), Some(node), "painted center");
+        // a click inside the laid-out rect but outside the rotated shape
+        // must NOT reach the element (no mere-AABB approximation)
+        let (bx, by) = (hrot.0 + 2.0, hrot.1 + 2.0);
+        let (ix, iy) = hrot.5.inverse().unwrap().apply(bx, by);
+        let inside = ix >= hrot.0 && ix <= hrot.0 + hrot.2 && iy >= hrot.1 && iy <= hrot.1 + hrot.3;
+        assert!(!inside, "un-rotated spot must inverse-map outside");
+        assert_ne!(hit_at(&hits, bx, by), Some(node));
+    }
+
+    #[test]
+    fn nested_transform_composes_on_hits() {
+        // outer translate + inner rotate: the inner element's hit matrix is
+        // the composition — inverse-mapping still lands exactly
+        let (_, hits) = lay_hits(
+            "<div style=\"transform:translate(50px,0px) rotate(90deg)\
+             ;width:200px;height:100px\">             <div style=\"transform:rotate(90deg);width:40px;height:10px\"></div>             </div>",
+        );
+        let h_in = hits
+            .iter()
+            .find(|h| !h.5.is_identity() && (h.2 - 40.0).abs() < 1.0)
+            .copied()
+            .expect("inner hit");
+        // outer list is translate·rotate → wraps too (rotate present)
+        let (cx, cy) = h_in.5.apply(h_in.0 + 1.0, h_in.1 + 1.0);
+        assert_eq!(hit_at(&hits, cx, cy), Some(h_in.4));
     }
 }

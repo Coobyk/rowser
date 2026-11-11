@@ -71,7 +71,6 @@ pub(crate) fn clamp_index(n: f64, len: usize) -> usize {
     }
 }
 
-
 // ===========================================================================
 // install
 // ===========================================================================
@@ -298,7 +297,9 @@ fn install_protos(i: &mut Interp) {
             (SYM_SPLIT, "[Symbol.split]", re_sym_split),
         ] {
             let v = native(i, name, f);
-            p.borrow_mut().props.insert(PropKey::Sym(sym), Prop::builtin(v));
+            p.borrow_mut()
+                .props
+                .insert(PropKey::Sym(sym), Prop::builtin(v));
         }
         i.set_builtin(&p, "lastIndex", Value::Num(0.0));
     }
@@ -410,8 +411,16 @@ fn install_globals(i: &mut Interp) {
     {
         let ctor = make_ctor(i, "String", string_ctor, i.p.string.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
-        i.set_builtin(o, "fromCharCode", native(i, "fromCharCode", string_from_char_code));
-        i.set_builtin(o, "fromCodePoint", native(i, "fromCodePoint", string_from_char_code));
+        i.set_builtin(
+            o,
+            "fromCharCode",
+            native(i, "fromCharCode", string_from_char_code),
+        );
+        i.set_builtin(
+            o,
+            "fromCodePoint",
+            native(i, "fromCodePoint", string_from_char_code),
+        );
         i.set_builtin(o, "raw", native(i, "raw", string_raw));
         define_global(i, "String", ctor);
     }
@@ -472,11 +481,27 @@ fn install_globals(i: &mut Interp) {
         );
         i.set_builtin(o, "for", native(i, "for", symbol_for));
         i.set_builtin(o, "keyFor", native(i, "keyFor", symbol_key_for));
-        i.set_builtin(o, "hasInstance", Value::Sym(SYM_HASINSTANCE, Rc::from("Symbol.hasInstance")));
+        i.set_builtin(
+            o,
+            "hasInstance",
+            Value::Sym(SYM_HASINSTANCE, Rc::from("Symbol.hasInstance")),
+        );
         i.set_builtin(o, "match", Value::Sym(SYM_MATCH, Rc::from("Symbol.match")));
-        i.set_builtin(o, "matchAll", Value::Sym(SYM_MATCHALL, Rc::from("Symbol.matchAll")));
-        i.set_builtin(o, "replace", Value::Sym(SYM_REPLACE, Rc::from("Symbol.replace")));
-        i.set_builtin(o, "search", Value::Sym(SYM_SEARCH, Rc::from("Symbol.search")));
+        i.set_builtin(
+            o,
+            "matchAll",
+            Value::Sym(SYM_MATCHALL, Rc::from("Symbol.matchAll")),
+        );
+        i.set_builtin(
+            o,
+            "replace",
+            Value::Sym(SYM_REPLACE, Rc::from("Symbol.replace")),
+        );
+        i.set_builtin(
+            o,
+            "search",
+            Value::Sym(SYM_SEARCH, Rc::from("Symbol.search")),
+        );
         i.set_builtin(o, "split", Value::Sym(SYM_SPLIT, Rc::from("Symbol.split")));
         define_global(i, "Symbol", ctor);
     }
@@ -552,7 +577,12 @@ fn install_globals(i: &mut Interp) {
         define_global(i, "TypeError", te);
         let re = make_ctor(i, "RangeError", range_error_ctor, i.p.range_error.clone());
         define_global(i, "RangeError", re);
-        let se = make_ctor(i, "SyntaxError", syntax_error_ctor, i.p.syntax_error.clone());
+        let se = make_ctor(
+            i,
+            "SyntaxError",
+            syntax_error_ctor,
+            i.p.syntax_error.clone(),
+        );
         define_global(i, "SyntaxError", se);
         let fe = make_ctor(i, "ReferenceError", ref_error_ctor, i.p.ref_error.clone());
         define_global(i, "ReferenceError", fe);
@@ -589,22 +619,54 @@ fn install_globals(i: &mut Interp) {
         method(i, &dp, "toLocaleString", date_to_utc);
         method(i, &dp, "toLocaleDateString", date_to_datestr);
         method(i, &dp, "toLocaleTimeString", date_to_timestr);
-        method(i, &dp, "getFullYear", |i, t, _| date_getter(i, t, |d| d.0 as f64));
-        method(i, &dp, "getMonth", |i, t, _| date_getter(i, t, |d| (d.1 - 1) as f64));
-        method(i, &dp, "getDate", |i, t, _| date_getter(i, t, |d| d.2 as f64));
-        method(i, &dp, "getDay", |i, t, _| date_getter(i, t, |d| d.3 as f64));
-        method(i, &dp, "getHours", |i, t, _| date_getter(i, t, |d| d.4 as f64));
-        method(i, &dp, "getMinutes", |i, t, _| date_getter(i, t, |d| d.5 as f64));
-        method(i, &dp, "getSeconds", |i, t, _| date_getter(i, t, |d| d.6 as f64));
-        method(i, &dp, "getMilliseconds", |i, t, _| date_getter(i, t, |d| d.7 as f64));
-        method(i, &dp, "getUTCFullYear", |i, t, _| date_getter(i, t, |d| d.0 as f64));
-        method(i, &dp, "getUTCMonth", |i, t, _| date_getter(i, t, |d| (d.1 - 1) as f64));
-        method(i, &dp, "getUTCDate", |i, t, _| date_getter(i, t, |d| d.2 as f64));
-        method(i, &dp, "getUTCDay", |i, t, _| date_getter(i, t, |d| d.3 as f64));
-        method(i, &dp, "getUTCHours", |i, t, _| date_getter(i, t, |d| d.4 as f64));
-        method(i, &dp, "getUTCMinutes", |i, t, _| date_getter(i, t, |d| d.5 as f64));
-        method(i, &dp, "getUTCSeconds", |i, t, _| date_getter(i, t, |d| d.6 as f64));
-        method(i, &dp, "getUTCMilliseconds", |i, t, _| date_getter(i, t, |d| d.7 as f64));
+        method(i, &dp, "getFullYear", |i, t, _| {
+            date_getter(i, t, |d| d.0 as f64)
+        });
+        method(i, &dp, "getMonth", |i, t, _| {
+            date_getter(i, t, |d| (d.1 - 1) as f64)
+        });
+        method(i, &dp, "getDate", |i, t, _| {
+            date_getter(i, t, |d| d.2 as f64)
+        });
+        method(i, &dp, "getDay", |i, t, _| {
+            date_getter(i, t, |d| d.3 as f64)
+        });
+        method(i, &dp, "getHours", |i, t, _| {
+            date_getter(i, t, |d| d.4 as f64)
+        });
+        method(i, &dp, "getMinutes", |i, t, _| {
+            date_getter(i, t, |d| d.5 as f64)
+        });
+        method(i, &dp, "getSeconds", |i, t, _| {
+            date_getter(i, t, |d| d.6 as f64)
+        });
+        method(i, &dp, "getMilliseconds", |i, t, _| {
+            date_getter(i, t, |d| d.7 as f64)
+        });
+        method(i, &dp, "getUTCFullYear", |i, t, _| {
+            date_getter(i, t, |d| d.0 as f64)
+        });
+        method(i, &dp, "getUTCMonth", |i, t, _| {
+            date_getter(i, t, |d| (d.1 - 1) as f64)
+        });
+        method(i, &dp, "getUTCDate", |i, t, _| {
+            date_getter(i, t, |d| d.2 as f64)
+        });
+        method(i, &dp, "getUTCDay", |i, t, _| {
+            date_getter(i, t, |d| d.3 as f64)
+        });
+        method(i, &dp, "getUTCHours", |i, t, _| {
+            date_getter(i, t, |d| d.4 as f64)
+        });
+        method(i, &dp, "getUTCMinutes", |i, t, _| {
+            date_getter(i, t, |d| d.5 as f64)
+        });
+        method(i, &dp, "getUTCSeconds", |i, t, _| {
+            date_getter(i, t, |d| d.6 as f64)
+        });
+        method(i, &dp, "getUTCMilliseconds", |i, t, _| {
+            date_getter(i, t, |d| d.7 as f64)
+        });
         method(i, &dp, "getTimezoneOffset", |_i, _t, _| Ok(Value::Num(0.0)));
         let ctor = make_ctor(i, "Date", date_ctor, dp.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
@@ -627,11 +689,14 @@ fn install_globals(i: &mut Interp) {
         method(i, &mp, "values", map_values);
         method(i, &mp, "entries", map_entries);
         let ent = i.obj_get_raw(&mp, &PropKey::from_str("entries")).unwrap();
-        mp.borrow_mut().props.insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(ent));
-        let size_g = native(i, "get size", map_size);
         mp.borrow_mut()
             .props
-            .insert(PropKey::from_str("size"), Prop::accessor(Some(size_g), None));
+            .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(ent));
+        let size_g = native(i, "get size", map_size);
+        mp.borrow_mut().props.insert(
+            PropKey::from_str("size"),
+            Prop::accessor(Some(size_g), None),
+        );
         let ctor = make_ctor(i, "Map", map_ctor, mp);
         define_global(i, "Map", ctor);
 
@@ -645,7 +710,9 @@ fn install_globals(i: &mut Interp) {
         method(i, &sp, "values", set_values);
         method(i, &sp, "entries", set_entries);
         let sv = i.obj_get_raw(&sp, &PropKey::from_str("values")).unwrap();
-        sp.borrow_mut().props.insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(sv));
+        sp.borrow_mut()
+            .props
+            .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(sv));
         let ssize = native(i, "get size", set_size);
         sp.borrow_mut()
             .props
@@ -846,9 +913,13 @@ fn obj_set_proto(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn obj_keys(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let keys = i.own_keys(&arg(args, 0));
-    Ok(Value::Obj(i.new_arr(
-        keys.into_iter().map(|k| Value::Str(Rc::from(k.as_str()))).collect(),
-    )))
+    Ok(Value::Obj(
+        i.new_arr(
+            keys.into_iter()
+                .map(|k| Value::Str(Rc::from(k.as_str())))
+                .collect(),
+        ),
+    ))
 }
 
 fn obj_values(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -865,7 +936,9 @@ fn obj_entries(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let mut out = Vec::new();
     for k in i.own_keys(&v) {
         let val = i.get_prop(&v, &PropKey::from_str(&k))?;
-        out.push(Value::Obj(i.new_arr(vec![Value::Str(Rc::from(k.as_str())), val])));
+        out.push(Value::Obj(
+            i.new_arr(vec![Value::Str(Rc::from(k.as_str())), val]),
+        ));
     }
     Ok(Value::Obj(i.new_arr(out)))
 }
@@ -922,7 +995,12 @@ fn obj_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     Ok(target)
 }
 
-fn define_prop_from_desc(i: &mut Interp, o: &ObjRef, key: PropKey, desc: &Value) -> Result<(), Value> {
+fn define_prop_from_desc(
+    i: &mut Interp,
+    o: &ObjRef,
+    key: PropKey,
+    desc: &Value,
+) -> Result<(), Value> {
     let mut prop = {
         let b = o.borrow();
         b.props.get(&key).cloned().unwrap_or(Prop {
@@ -1082,8 +1160,10 @@ fn obj_freeze(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             p.writable = false;
             p.configurable = false;
         }
-        b.props
-            .insert(PropKey::from_str("$frozen"), Prop::builtin(Value::Bool(true)));
+        b.props.insert(
+            PropKey::from_str("$frozen"),
+            Prop::builtin(Value::Bool(true)),
+        );
     }
     Ok(v)
 }
@@ -1220,9 +1300,7 @@ fn fn_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let _ = i;
     let name = if let Value::Obj(o) = this {
         match &o.borrow().kind {
-            ObjKind::Func(Func::User { def, .. }) => {
-                def.name.clone().unwrap_or_default()
-            }
+            ObjKind::Func(Func::User { def, .. }) => def.name.clone().unwrap_or_default(),
             ObjKind::Func(Func::Native { name, .. }) => name.to_string(),
             _ => String::new(),
         }
@@ -1332,7 +1410,11 @@ fn arr_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         Value::Und => len,
         v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
     };
-    let out = if start < end { items[start..end].to_vec() } else { Vec::new() };
+    let out = if start < end {
+        items[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
     Ok(Value::Obj(i.new_arr(out)))
 }
 
@@ -1452,7 +1534,11 @@ fn arr_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let this_arg = arg(args, 1);
     let items = arr_clone(this);
     for (k, v) in items.iter().enumerate() {
-        let r = i.call(&cb, this_arg.clone(), vec![v.clone(), Value::Num(k as f64), this.clone()])?;
+        let r = i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v.clone(), Value::Num(k as f64), this.clone()],
+        )?;
         if i.to_bool(&r) {
             return Ok(v.clone());
         }
@@ -1465,7 +1551,11 @@ fn arr_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let this_arg = arg(args, 1);
     let items = arr_clone(this);
     for (k, v) in items.iter().enumerate() {
-        let r = i.call(&cb, this_arg.clone(), vec![v.clone(), Value::Num(k as f64), this.clone()])?;
+        let r = i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v.clone(), Value::Num(k as f64), this.clone()],
+        )?;
         if i.to_bool(&r) {
             return Ok(Value::Num(k as f64));
         }
@@ -1478,7 +1568,11 @@ fn arr_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let this_arg = arg(args, 1);
     let items = arr_clone(this);
     for k in (0..items.len()).rev() {
-        let r = i.call(&cb, this_arg.clone(), vec![items[k].clone(), Value::Num(k as f64), this.clone()])?;
+        let r = i.call(
+            &cb,
+            this_arg.clone(),
+            vec![items[k].clone(), Value::Num(k as f64), this.clone()],
+        )?;
         if i.to_bool(&r) {
             return Ok(items[k].clone());
         }
@@ -1491,7 +1585,11 @@ fn arr_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult 
     let this_arg = arg(args, 1);
     let items = arr_clone(this);
     for k in (0..items.len()).rev() {
-        let r = i.call(&cb, this_arg.clone(), vec![items[k].clone(), Value::Num(k as f64), this.clone()])?;
+        let r = i.call(
+            &cb,
+            this_arg.clone(),
+            vec![items[k].clone(), Value::Num(k as f64), this.clone()],
+        )?;
         if i.to_bool(&r) {
             return Ok(Value::Num(k as f64));
         }
@@ -1505,7 +1603,11 @@ fn arr_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let items = arr_clone(this);
     let mut out = Vec::new();
     for (k, v) in items.iter().enumerate() {
-        let r = i.call(&cb, this_arg.clone(), vec![v.clone(), Value::Num(k as f64), this.clone()])?;
+        let r = i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v.clone(), Value::Num(k as f64), this.clone()],
+        )?;
         if i.to_bool(&r) {
             out.push(v.clone());
         }
@@ -1519,7 +1621,11 @@ fn arr_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let items = arr_clone(this);
     let mut out = Vec::with_capacity(items.len());
     for (k, v) in items.iter().enumerate() {
-        out.push(i.call(&cb, this_arg.clone(), vec![v.clone(), Value::Num(k as f64), this.clone()])?);
+        out.push(i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v.clone(), Value::Num(k as f64), this.clone()],
+        )?);
     }
     Ok(Value::Obj(i.new_arr(out)))
 }
@@ -1529,7 +1635,11 @@ fn arr_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let this_arg = arg(args, 1);
     let items = arr_clone(this);
     for (k, v) in items.iter().enumerate() {
-        i.call(&cb, this_arg.clone(), vec![v.clone(), Value::Num(k as f64), this.clone()])?;
+        i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v.clone(), Value::Num(k as f64), this.clone()],
+        )?;
     }
     Ok(Value::Und)
 }
@@ -1583,7 +1693,11 @@ fn arr_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let this_arg = arg(args, 1);
     let items = arr_clone(this);
     for (k, v) in items.iter().enumerate() {
-        let r = i.call(&cb, this_arg.clone(), vec![v.clone(), Value::Num(k as f64), this.clone()])?;
+        let r = i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v.clone(), Value::Num(k as f64), this.clone()],
+        )?;
         if i.to_bool(&r) {
             return Ok(Value::Bool(true));
         }
@@ -1596,7 +1710,11 @@ fn arr_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let this_arg = arg(args, 1);
     let items = arr_clone(this);
     for (k, v) in items.iter().enumerate() {
-        let r = i.call(&cb, this_arg.clone(), vec![v.clone(), Value::Num(k as f64), this.clone()])?;
+        let r = i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v.clone(), Value::Num(k as f64), this.clone()],
+        )?;
         if !i.to_bool(&r) {
             return Ok(Value::Bool(false));
         }
@@ -1709,7 +1827,11 @@ fn arr_sort(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(this.clone())
 }
 
-pub(crate) fn merge_sort(items: &mut [Value], work: &mut Vec<Value>, cmp: &mut dyn FnMut(&Value, &Value) -> std::cmp::Ordering) {
+pub(crate) fn merge_sort(
+    items: &mut [Value],
+    work: &mut Vec<Value>,
+    cmp: &mut dyn FnMut(&Value, &Value) -> std::cmp::Ordering,
+) {
     let n = items.len();
     if n <= 1 {
         return;
@@ -1736,7 +1858,11 @@ pub(crate) fn merge_sort(items: &mut [Value], work: &mut Vec<Value>, cmp: &mut d
 fn arr_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let items = arr_clone(this);
     let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let idx = if n < 0.0 { items.len() as i64 + n as i64 } else { n as i64 };
+    let idx = if n < 0.0 {
+        items.len() as i64 + n as i64
+    } else {
+        n as i64
+    };
     if idx < 0 || idx >= items.len() as i64 {
         return Ok(Value::Und);
     }
@@ -1785,7 +1911,11 @@ fn str_char_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let idx = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
     Ok(Value::Str(Rc::from(
-        s.chars().nth(idx).map(|c| c.to_string()).unwrap_or_default().as_str(),
+        s.chars()
+            .nth(idx)
+            .map(|c| c.to_string())
+            .unwrap_or_default()
+            .as_str(),
     )))
 }
 
@@ -1803,18 +1933,28 @@ fn str_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let chars: Vec<char> = s.chars().collect();
     let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let idx = if n < 0.0 { chars.len() as i64 + n as i64 } else { n as i64 };
+    let idx = if n < 0.0 {
+        chars.len() as i64 + n as i64
+    } else {
+        n as i64
+    };
     if idx < 0 || idx >= chars.len() as i64 {
         return Ok(Value::Und);
     }
-    Ok(Value::Str(Rc::from(chars[idx as usize].to_string().as_str())))
+    Ok(Value::Str(Rc::from(
+        chars[idx as usize].to_string().as_str(),
+    )))
 }
 
 fn str_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let needle = i.to_str(&arg(args, 0))?;
     let from = i.to_num(&arg(args, 1)).unwrap_or(0.0).max(0.0) as usize;
-    let byte_from = s.char_indices().nth(from).map(|(b, _)| b).unwrap_or(s.len());
+    let byte_from = s
+        .char_indices()
+        .nth(from)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
     match s[byte_from..].find(&needle) {
         Some(b) => Ok(Value::Num(s[..byte_from + b].chars().count() as f64)),
         None => Ok(Value::Num(-1.0)),
@@ -1878,15 +2018,21 @@ fn str_substr(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn str_to_lower(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(unbox_str(i, this)?.to_lowercase().as_str())))
+    Ok(Value::Str(Rc::from(
+        unbox_str(i, this)?.to_lowercase().as_str(),
+    )))
 }
 
 fn str_to_upper(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(unbox_str(i, this)?.to_uppercase().as_str())))
+    Ok(Value::Str(Rc::from(
+        unbox_str(i, this)?.to_uppercase().as_str(),
+    )))
 }
 
 fn str_trim(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(unbox_str(i, this)?.trim().to_string().as_str())))
+    Ok(Value::Str(Rc::from(
+        unbox_str(i, this)?.trim().to_string().as_str(),
+    )))
 }
 
 fn str_trim_start(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -1927,13 +2073,15 @@ fn str_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             }
         }
     };
-    Ok(Value::Obj(i.new_arr(
-        parts
-            .into_iter()
-            .take(limit)
-            .map(|p| Value::Str(Rc::from(p.as_str())))
-            .collect(),
-    )))
+    Ok(Value::Obj(
+        i.new_arr(
+            parts
+                .into_iter()
+                .take(limit)
+                .map(|p| Value::Str(Rc::from(p.as_str())))
+                .collect(),
+        ),
+    ))
 }
 
 fn str_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -2019,7 +2167,8 @@ fn str_replace_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     }
     let rep = i.to_str(&repl_fn)?;
     Ok(Value::Str(Rc::from(
-        s.replace(&needle as &str, &expand_replacement(&rep, &needle, 0, &s)).as_str(),
+        s.replace(&needle as &str, &expand_replacement(&rep, &needle, 0, &s))
+            .as_str(),
     )))
 }
 
@@ -2055,7 +2204,10 @@ fn str_match_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let chars: Vec<char> = s.chars().collect();
     let matches = all_matches(&re, &chars);
-    let items: Vec<Value> = matches.iter().map(|m| match_obj(i, &chars, &re, m)).collect();
+    let items: Vec<Value> = matches
+        .iter()
+        .map(|m| match_obj(i, &chars, &re, m))
+        .collect();
     Ok(make_iter(i, items))
 }
 
@@ -2305,7 +2457,10 @@ fn num_to_exponential(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     }
     let s = format!("{n:.d$e}");
     // rust gives "1.5e2" — JS wants "1.5e+2"
-    let s = s.replace("e-", "e-").replacen('e', "e+", 1).replace("e+-", "e-");
+    let s = s
+        .replace("e-", "e-")
+        .replacen('e', "e+", 1)
+        .replace("e+-", "e-");
     Ok(Value::Str(Rc::from(s.as_str())))
 }
 
@@ -2378,17 +2533,23 @@ fn number_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn number_is_nan(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let _ = i;
-    Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.is_nan())))
+    Ok(Value::Bool(
+        matches!(arg(args, 0), Value::Num(n) if n.is_nan()),
+    ))
 }
 
 fn number_is_finite(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let _ = i;
-    Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.is_finite())))
+    Ok(Value::Bool(
+        matches!(arg(args, 0), Value::Num(n) if n.is_finite()),
+    ))
 }
 
 fn number_is_integer(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let _ = i;
-    Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.is_finite() && n == n.trunc())))
+    Ok(Value::Bool(
+        matches!(arg(args, 0), Value::Num(n) if n.is_finite() && n == n.trunc()),
+    ))
 }
 
 fn unbox_bool(i: &mut Interp, this: &Value) -> Result<bool, Value> {
@@ -2405,7 +2566,9 @@ fn unbox_bool(i: &mut Interp, this: &Value) -> Result<bool, Value> {
 }
 
 fn bool_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(unbox_bool(i, this)?.to_string().as_str())))
+    Ok(Value::Str(Rc::from(
+        unbox_bool(i, this)?.to_string().as_str(),
+    )))
 }
 
 fn bool_value_of(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -2497,7 +2660,11 @@ fn error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         o.borrow_mut().kind = ObjKind::Err;
         i.set_data(o, "message", Value::Str(Rc::from(msg.as_str())));
         i.set_data(o, "name", Value::Str(Rc::from("Error")));
-        i.set_data(o, "stack", Value::Str(Rc::from(format!("Error: {msg}").as_str())));
+        i.set_data(
+            o,
+            "stack",
+            Value::Str(Rc::from(format!("Error: {msg}").as_str())),
+        );
         return Ok(this.clone());
     }
     let p = i.p.error.clone();
@@ -2515,7 +2682,11 @@ macro_rules! sub_err_ctor {
                 o.borrow_mut().kind = ObjKind::Err;
                 i.set_data(o, "message", Value::Str(Rc::from(msg.as_str())));
                 i.set_data(o, "name", Value::Str(Rc::from($jname)));
-                i.set_data(o, "stack", Value::Str(Rc::from(format!("{}: {}", $jname, msg).as_str())));
+                i.set_data(
+                    o,
+                    "stack",
+                    Value::Str(Rc::from(format!("{}: {}", $jname, msg).as_str())),
+                );
                 return Ok(this.clone());
             }
             let p = i.p.$field.clone();
@@ -2567,7 +2738,11 @@ math1!(math_round, |n: f64| {
 });
 math1!(math_trunc, f64::trunc);
 math1!(math_abs, f64::abs);
-math1!(math_sign, |n: f64| if n.is_nan() { f64::NAN } else { n.signum() });
+math1!(math_sign, |n: f64| if n.is_nan() {
+    f64::NAN
+} else {
+    n.signum()
+});
 math1!(math_sqrt, f64::sqrt);
 math1!(math_cbrt, f64::cbrt);
 math1!(math_log, f64::ln);
@@ -2637,7 +2812,9 @@ fn math_imul(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 }
 
 fn math_clz32(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    Ok(Value::Num(to_u32(i.to_num(&arg(args, 0))?).leading_zeros() as f64))
+    Ok(Value::Num(
+        to_u32(i.to_num(&arg(args, 0))?).leading_zeros() as f64
+    ))
 }
 
 fn math_fround(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -2749,9 +2926,10 @@ impl JsonParser {
             Some('n') => self.lit("null", Value::Null),
             Some(c) if c == '-' || c.is_ascii_digit() => {
                 let start = self.pos;
-                while self.peek().is_some_and(|c| {
-                    c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-')
-                }) {
+                while self
+                    .peek()
+                    .is_some_and(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
+                {
                     self.pos += 1;
                 }
                 let s: String = self.chars[start..self.pos].iter().collect();
@@ -2833,9 +3011,16 @@ fn json_stringify(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     }
 }
 
-fn json_ser(i: &mut Interp, v: &Value, indent: &str, level: usize) -> Result<Option<String>, Value> {
+fn json_ser(
+    i: &mut Interp,
+    v: &Value,
+    indent: &str,
+    level: usize,
+) -> Result<Option<String>, Value> {
     // replacer via toJSON
-    let tj = i.get_prop(v, &PropKey::from_str("toJSON")).unwrap_or(Value::Und);
+    let tj = i
+        .get_prop(v, &PropKey::from_str("toJSON"))
+        .unwrap_or(Value::Und);
     let v2 = if i.is_callable(&tj) {
         i.call(&tj, v.clone(), vec![Value::Str(Rc::from(""))])?
     } else {
@@ -2853,40 +3038,53 @@ fn json_ser(i: &mut Interp, v: &Value, indent: &str, level: usize) -> Result<Opt
             }
         }
         Value::Str(s) => Some(json_escape(s)),
-        Value::Obj(o) => {
-            match &o.borrow().kind {
-                ObjKind::Arr(items) => {
-                    let items = items.clone();
-                    let mut parts = Vec::new();
-                    for it in &items {
-                        parts.push(json_ser(i, it, indent, level + 1)?.unwrap_or_else(|| "null".into()));
-                    }
-                    Some(if indent.is_empty() {
-                        format!("[{}]", parts.join(","))
-                    } else {
-                        let pad = indent.repeat(level + 1);
-                        format!("[\n{}{}\n{}]", pad, parts.join(&format!(",\n{pad}")), indent.repeat(level))
-                    })
+        Value::Obj(o) => match &o.borrow().kind {
+            ObjKind::Arr(items) => {
+                let items = items.clone();
+                let mut parts = Vec::new();
+                for it in &items {
+                    parts
+                        .push(json_ser(i, it, indent, level + 1)?.unwrap_or_else(|| "null".into()));
                 }
-                ObjKind::Func(_) | ObjKind::Bound { .. } => None,
-                _ => {
-                    let mut parts = Vec::new();
-                    for k in i.own_keys(&v2) {
-                        let val = i.get_prop(&v2, &PropKey::from_str(&k))?;
-                        if let Some(s) = json_ser(i, &val, indent, level + 1)? {
-                            let kv = format!("{}:{}", json_escape(&k), if indent.is_empty() { "" } else { " " });
-                            parts.push(format!("{kv}{s}"));
-                        }
-                    }
-                    Some(if indent.is_empty() {
-                        format!("{{{}}}", parts.join(","))
-                    } else {
-                        let pad = indent.repeat(level + 1);
-                        format!("{{\n{}{}\n{}}}", pad, parts.join(&format!(",\n{pad}")), indent.repeat(level))
-                    })
-                }
+                Some(if indent.is_empty() {
+                    format!("[{}]", parts.join(","))
+                } else {
+                    let pad = indent.repeat(level + 1);
+                    format!(
+                        "[\n{}{}\n{}]",
+                        pad,
+                        parts.join(&format!(",\n{pad}")),
+                        indent.repeat(level)
+                    )
+                })
             }
-        }
+            ObjKind::Func(_) | ObjKind::Bound { .. } => None,
+            _ => {
+                let mut parts = Vec::new();
+                for k in i.own_keys(&v2) {
+                    let val = i.get_prop(&v2, &PropKey::from_str(&k))?;
+                    if let Some(s) = json_ser(i, &val, indent, level + 1)? {
+                        let kv = format!(
+                            "{}:{}",
+                            json_escape(&k),
+                            if indent.is_empty() { "" } else { " " }
+                        );
+                        parts.push(format!("{kv}{s}"));
+                    }
+                }
+                Some(if indent.is_empty() {
+                    format!("{{{}}}", parts.join(","))
+                } else {
+                    let pad = indent.repeat(level + 1);
+                    format!(
+                        "{{\n{}{}\n{}}}",
+                        pad,
+                        parts.join(&format!(",\n{pad}")),
+                        indent.repeat(level)
+                    )
+                })
+            }
+        },
     })
 }
 
@@ -2998,11 +3196,19 @@ fn promise_resolve_inner(i: &mut Interp, this: &Value, args: &[Value]) -> NResul
                         let rej_fn = i.native("reject", promise_reject_inner);
                         let res = Rc::new(RefCell::new(Obj::new(
                             Some(i.p.func.clone()),
-                            ObjKind::Bound { target: res_fn, thisv: pv.clone(), extra: vec![] },
+                            ObjKind::Bound {
+                                target: res_fn,
+                                thisv: pv.clone(),
+                                extra: vec![],
+                            },
                         )));
                         let rej = Rc::new(RefCell::new(Obj::new(
                             Some(i.p.func.clone()),
-                            ObjKind::Bound { target: rej_fn, thisv: pv, extra: vec![] },
+                            ObjKind::Bound {
+                                target: rej_fn,
+                                thisv: pv,
+                                extra: vec![],
+                            },
                         )));
                         return i.call(&then, arg(args, 0), vec![Value::Obj(res), Value::Obj(rej)]);
                     }
@@ -3045,7 +3251,12 @@ fn settle(i: &mut Interp, p: &ObjRef, ok: bool, v: Value) -> NResult {
 
 fn handlers_of(i: &mut Interp, p: &ObjRef) -> Vec<Value> {
     let _ = i;
-    if let Some(Value::Obj(h)) = p.borrow().props.get(&PropKey::from_str("$handlers")).map(|pr| pr.val.clone()) {
+    if let Some(Value::Obj(h)) = p
+        .borrow()
+        .props
+        .get(&PropKey::from_str("$handlers"))
+        .map(|pr| pr.val.clone())
+    {
         if let ObjKind::Arr(items) = &h.borrow().kind {
             return items.clone();
         }
@@ -3134,11 +3345,19 @@ fn promise_then(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let rej_fn = i.native("reject", promise_reject_inner);
     let res = Rc::new(RefCell::new(Obj::new(
         Some(i.p.func.clone()),
-        ObjKind::Bound { target: res_fn, thisv: pv.clone(), extra: vec![] },
+        ObjKind::Bound {
+            target: res_fn,
+            thisv: pv.clone(),
+            extra: vec![],
+        },
     )));
     let rej = Rc::new(RefCell::new(Obj::new(
         Some(i.p.func.clone()),
-        ObjKind::Bound { target: rej_fn, thisv: pv, extra: vec![] },
+        ObjKind::Bound {
+            target: rej_fn,
+            thisv: pv,
+            extra: vec![],
+        },
     )));
     i.set_builtin(&rec, "resolve", Value::Obj(res));
     i.set_builtin(&rec, "reject", Value::Obj(rej));
@@ -3196,11 +3415,19 @@ fn promise_finally(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             let rej_fn = i.native("reject", promise_reject_inner);
             let res = Rc::new(RefCell::new(Obj::new(
                 Some(i.p.func.clone()),
-                ObjKind::Bound { target: res_fn, thisv: pv.clone(), extra: vec![] },
+                ObjKind::Bound {
+                    target: res_fn,
+                    thisv: pv.clone(),
+                    extra: vec![],
+                },
             )));
             let rej = Rc::new(RefCell::new(Obj::new(
                 Some(i.p.func.clone()),
-                ObjKind::Bound { target: rej_fn, thisv: pv, extra: vec![] },
+                ObjKind::Bound {
+                    target: rej_fn,
+                    thisv: pv,
+                    extra: vec![],
+                },
             )));
             i.set_builtin(&rec, "resolve", Value::Obj(res));
             i.set_builtin(&rec, "reject", Value::Obj(rej));
@@ -3412,17 +3639,19 @@ fn date_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     const MO: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    Ok(Value::Str(Rc::from(format!(
-        "{} {} {:02} {} {:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
-        WD[wd as usize],
-        MO[(m - 1) as usize],
-        d,
-        y,
-        h,
-        mi,
-        s
-    )
-    .as_str())))
+    Ok(Value::Str(Rc::from(
+        format!(
+            "{} {} {:02} {} {:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+            WD[wd as usize],
+            MO[(m - 1) as usize],
+            d,
+            y,
+            h,
+            mi,
+            s
+        )
+        .as_str(),
+    )))
 }
 
 fn date_to_utc(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -3435,17 +3664,19 @@ fn date_to_utc(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     const MO: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    Ok(Value::Str(Rc::from(format!(
-        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
-        WD[wd as usize],
-        d,
-        MO[(m - 1) as usize],
-        y,
-        h,
-        mi,
-        s
-    )
-    .as_str())))
+    Ok(Value::Str(Rc::from(
+        format!(
+            "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+            WD[wd as usize],
+            d,
+            MO[(m - 1) as usize],
+            y,
+            h,
+            mi,
+            s
+        )
+        .as_str(),
+    )))
 }
 
 fn date_to_iso(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -3454,11 +3685,13 @@ fn date_to_iso(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         return Ok(Value::Str(Rc::from("Invalid Date")));
     }
     let (y, m, d, _, h, mi, s, msec) = date_parts(ms);
-    Ok(Value::Str(Rc::from(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y, m, d, h, mi, s, msec
-    )
-    .as_str())))
+    Ok(Value::Str(Rc::from(
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            y, m, d, h, mi, s, msec
+        )
+        .as_str(),
+    )))
 }
 
 fn date_to_datestr(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -3471,14 +3704,16 @@ fn date_to_datestr(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     const MO: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    Ok(Value::Str(Rc::from(format!(
-        "{} {} {:02} {}",
-        WD[wd as usize],
-        MO[(m - 1) as usize],
-        d,
-        y
-    )
-    .as_str())))
+    Ok(Value::Str(Rc::from(
+        format!(
+            "{} {} {:02} {}",
+            WD[wd as usize],
+            MO[(m - 1) as usize],
+            d,
+            y
+        )
+        .as_str(),
+    )))
 }
 
 fn date_to_timestr(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -3487,7 +3722,9 @@ fn date_to_timestr(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         return Ok(Value::Str(Rc::from("Invalid Date")));
     }
     let (_, _, _, _, h, mi, s, _) = date_parts(ms);
-    Ok(Value::Str(Rc::from(format!("{:02}:{:02}:{:02}", h, mi, s).as_str())))
+    Ok(Value::Str(Rc::from(
+        format!("{:02}:{:02}:{:02}", h, mi, s).as_str(),
+    )))
 }
 
 fn date_utc(_i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
@@ -3513,7 +3750,10 @@ fn date_parse(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
     };
     // ISO-ish: YYYY-MM-DD[THH:MM[:SS[.mmm]]][Z]
     let s = s.trim();
-    let (dpart, tpart) = s.split_once(['T', ' ']).map(|(d, t)| (d, Some(t))).unwrap_or((s, None));
+    let (dpart, tpart) = s
+        .split_once(['T', ' '])
+        .map(|(d, t)| (d, Some(t)))
+        .unwrap_or((s, None));
     let dsegs: Vec<i64> = dpart.split('-').filter_map(|x| x.parse().ok()).collect();
     if dsegs.len() < 3 {
         return Ok(Value::Num(f64::NAN));
@@ -3521,10 +3761,7 @@ fn date_parse(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
     let mut ms = days_from_civil(dsegs[0], dsegs[1] as u32, dsegs[2] as u32) as f64 * 86_400_000.0;
     if let Some(t) = tpart {
         let t = t.trim_end_matches('Z');
-        let tsegs: Vec<f64> = t
-            .split(':')
-            .map(|x| x.parse().unwrap_or(0.0))
-            .collect();
+        let tsegs: Vec<f64> = t.split(':').map(|x| x.parse().unwrap_or(0.0)).collect();
         if !tsegs.is_empty() {
             ms += tsegs[0] * 3_600_000.0;
         }
@@ -3548,7 +3785,10 @@ fn map_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         o.borrow_mut().kind = ObjKind::Map(Vec::new());
         o.clone()
     } else {
-        Rc::new(RefCell::new(Obj::new(Some(i.p.obj.clone()), ObjKind::Map(Vec::new()))))
+        Rc::new(RefCell::new(Obj::new(
+            Some(i.p.obj.clone()),
+            ObjKind::Map(Vec::new()),
+        )))
     };
     match arg(args, 0) {
         Value::Und | Value::Null => {}
@@ -3605,7 +3845,9 @@ fn map_has(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
         if let ObjKind::Map(items) = &o.borrow().kind {
             let k = arg(args, 0);
-            return Ok(Value::Bool(items.iter().any(|(k2, _)| same_value_zero(k2, &k))));
+            return Ok(Value::Bool(
+                items.iter().any(|(k2, _)| same_value_zero(k2, &k)),
+            ));
         }
     }
     Ok(Value::Bool(false))
@@ -3697,7 +3939,10 @@ fn set_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         o.borrow_mut().kind = ObjKind::Set(Vec::new());
         o.clone()
     } else {
-        Rc::new(RefCell::new(Obj::new(Some(i.p.obj.clone()), ObjKind::Set(Vec::new()))))
+        Rc::new(RefCell::new(Obj::new(
+            Some(i.p.obj.clone()),
+            ObjKind::Set(Vec::new()),
+        )))
     };
     match arg(args, 0) {
         Value::Und | Value::Null => {}
@@ -3866,7 +4111,8 @@ fn g_parse_float(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     for (k, &c) in bytes.iter().enumerate() {
         match c {
             '+' | '-' if k == 0 => {}
-            '+' | '-' if seen_e && matches!(bytes.get(k.wrapping_sub(1)), Some('e') | Some('E')) => {}
+            '+' | '-'
+                if seen_e && matches!(bytes.get(k.wrapping_sub(1)), Some('e') | Some('E')) => {}
             '.' if !seen_dot && !seen_e => seen_dot = true,
             'e' | 'E' if seen_digit && !seen_e => seen_e = true,
             '0'..='9' => seen_digit = true,
@@ -3904,7 +4150,12 @@ fn g_encode_uri_component(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult
     let s = i.to_str(&arg(args, 0))?;
     let mut out = String::new();
     for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')') {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
+        {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -3941,9 +4192,7 @@ fn g_escape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let mut out = String::new();
     for ch in s.chars() {
         let cp = ch as u32;
-        if ch.is_ascii_alphanumeric()
-            || matches!(ch, '@' | '*' | '_' | '+' | '-' | '.' | '/')
-        {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '@' | '*' | '_' | '+' | '-' | '.' | '/') {
             out.push(ch);
         } else if cp < 256 {
             out.push_str(&format!("%{cp:02X}"));
@@ -4024,8 +4273,16 @@ fn g_btoa(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         let n = (a << 16) | (b1 << 8) | c;
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     Ok(Value::Str(Rc::from(out.as_str())))
 }
@@ -4147,7 +4404,11 @@ fn match_obj(i: &mut Interp, chars: &[char], re: &Regex, m: &RxMatch) -> Value {
     }
     let arr = i.new_arr(items);
     i.set_data(&arr, "index", Value::Num(m.start as f64));
-    i.set_data(&arr, "input", Value::Str(Rc::from(chars_string(chars).as_str())));
+    i.set_data(
+        &arr,
+        "input",
+        Value::Str(Rc::from(chars_string(chars).as_str())),
+    );
     if re.names.is_empty() {
         i.set_data(&arr, "groups", Value::Und);
     } else {
@@ -4401,9 +4662,9 @@ fn re_sym_match_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(i.type_err("Symbol.matchAll called on non-RegExp"));
     };
     if !re.global {
-        return Err(i.type_err(
-            "String.prototype.matchAll called with a non-global RegExp argument",
-        ));
+        return Err(
+            i.type_err("String.prototype.matchAll called with a non-global RegExp argument")
+        );
     }
     let s = i.to_str(&arg(args, 0))?;
     let chars: Vec<char> = s.chars().collect();
@@ -4430,12 +4691,7 @@ fn re_sym_search(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 /// Substitution expansion for regex replaces: `$$` `$&` `` $` `` `$'` `$n`
 /// `$nn` `$<name>`.
-fn expand_replacement_rx(
-    rep: &str,
-    m: &RxMatch,
-    chars: &[char],
-    re: &Regex,
-) -> String {
+fn expand_replacement_rx(rep: &str, m: &RxMatch, chars: &[char], re: &Regex) -> String {
     let mut out = String::new();
     let cs: Vec<char> = rep.chars().collect();
     let mut j = 0;

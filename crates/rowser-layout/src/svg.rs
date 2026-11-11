@@ -54,7 +54,14 @@ struct Mat {
 }
 
 impl Mat {
-    const ID: Mat = Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 };
+    const ID: Mat = Mat {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
 
     /// self ∘ o (o applied to the point first).
     fn mul(self, o: Mat) -> Mat {
@@ -68,17 +75,41 @@ impl Mat {
         }
     }
     fn tr(x: f32, y: f32) -> Mat {
-        Mat { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y }
+        Mat {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: x,
+            f: y,
+        }
     }
     fn sc(x: f32, y: f32) -> Mat {
-        Mat { a: x, b: 0.0, c: 0.0, d: y, e: 0.0, f: 0.0 }
+        Mat {
+            a: x,
+            b: 0.0,
+            c: 0.0,
+            d: y,
+            e: 0.0,
+            f: 0.0,
+        }
     }
     fn rot(deg: f32) -> Mat {
         let (s, c) = deg.to_radians().sin_cos();
-        Mat { a: c, b: s, c: -s, d: c, e: 0.0, f: 0.0 }
+        Mat {
+            a: c,
+            b: s,
+            c: -s,
+            d: c,
+            e: 0.0,
+            f: 0.0,
+        }
     }
     fn map(self, p: Pt) -> Pt {
-        Pt { x: self.a * p.x + self.c * p.y + self.e, y: self.b * p.x + self.d * p.y + self.f }
+        Pt {
+            x: self.a * p.x + self.c * p.y + self.e,
+            y: self.b * p.x + self.d * p.y + self.f,
+        }
     }
     /// √|det| — rough local→parent length scale, used for stroke width/tol.
     fn wscale(self) -> f32 {
@@ -214,8 +245,22 @@ fn parse_transform(s: &str) -> Mat {
                 .mul(Mat::rot(g(0, 0.0)))
                 .mul(Mat::tr(-g(1, 0.0), -g(2, 0.0))),
             "rotate" => Mat::rot(g(0, 0.0)),
-            "skewX" => Mat { a: 1.0, b: 0.0, c: g(0, 0.0).to_radians().tan(), d: 1.0, e: 0.0, f: 0.0 },
-            "skewY" => Mat { a: 1.0, b: g(0, 0.0).to_radians().tan(), c: 0.0, d: 1.0, e: 0.0, f: 0.0 },
+            "skewX" => Mat {
+                a: 1.0,
+                b: 0.0,
+                c: g(0, 0.0).to_radians().tan(),
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            },
+            "skewY" => Mat {
+                a: 1.0,
+                b: g(0, 0.0).to_radians().tan(),
+                c: 0.0,
+                d: 1.0,
+                e: 0.0,
+                f: 0.0,
+            },
             _ => Mat::ID,
         };
         m = m.mul(t);
@@ -251,7 +296,17 @@ fn quad(pts: &mut Poly, p0: Pt, c1: Pt, e: Pt) {
 /// Elliptical arc, endpoint→center parameterization (SVG spec F.6.5),
 /// flattened with chord error ≤ `tol` local units.
 #[allow(clippy::too_many_arguments)]
-fn arc(out: &mut Poly, p0: Pt, rx0: f32, ry0: f32, rot: f32, large: bool, sweep: bool, p1: Pt, tol: f32) {
+fn arc(
+    out: &mut Poly,
+    p0: Pt,
+    rx0: f32,
+    ry0: f32,
+    rot: f32,
+    large: bool,
+    sweep: bool,
+    p1: Pt,
+    tol: f32,
+) {
     if (p0.x - p1.x).abs() + (p0.y - p1.y).abs() < 1e-9 {
         return; // spec: coincident endpoints skip the arc
     }
@@ -281,7 +336,8 @@ fn arc(out: &mut Poly, p0: Pt, rx0: f32, ry0: f32, rot: f32, large: bool, sweep:
     let cx = cp * cxp - sp * cyp + (p0.x + p1.x) * 0.5;
     let cy = sp * cxp + cp * cyp + (p0.y + p1.y) * 0.5;
     let ang = |ux: f32, uy: f32, vx: f32, vy: f32| -> f32 {
-        let d = ((ux * vx + uy * vy) / ((ux * ux + uy * uy) * (vx * vx + vy * vy)).sqrt()).clamp(-1.0, 1.0);
+        let d = ((ux * vx + uy * vy) / ((ux * ux + uy * uy) * (vx * vx + vy * vy)).sqrt())
+            .clamp(-1.0, 1.0);
         let mut a = d.acos();
         if ux * vy - uy * vx < 0.0 {
             a = -a;
@@ -298,7 +354,11 @@ fn arc(out: &mut Poly, p0: Pt, rx0: f32, ry0: f32, rot: f32, large: bool, sweep:
         dth -= std::f32::consts::TAU;
     }
     let r = rx.max(ry);
-    let step = if tol < r { 2.0 * (1.0 - tol / r).clamp(-1.0, 1.0).acos() } else { std::f32::consts::FRAC_PI_2 };
+    let step = if tol < r {
+        2.0 * (1.0 - tol / r).clamp(-1.0, 1.0).acos()
+    } else {
+        std::f32::consts::FRAC_PI_2
+    };
     let n = ((dth.abs() / step).ceil() as usize).clamp(1, 512);
     for k in 1..=n {
         let t = th0 + dth * (k as f32 / n as f32);
@@ -385,7 +445,10 @@ fn parse_d(d: &str, tol: f32) -> Vec<Sub> {
             rel = c.is_ascii_lowercase();
             i += 1;
             if cmd == b'Z' || cmd == b'z' {
-                subs.push(Sub { pts: std::mem::take(&mut pts), closed: true });
+                subs.push(Sub {
+                    pts: std::mem::take(&mut pts),
+                    closed: true,
+                });
                 cur = start;
                 last_c = None;
                 last_q = None;
@@ -406,7 +469,10 @@ fn parse_d(d: &str, tol: f32) -> Vec<Sub> {
         match up {
             b'M' => {
                 if !pts.is_empty() {
-                    subs.push(Sub { pts: std::mem::take(&mut pts), closed: false });
+                    subs.push(Sub {
+                        pts: std::mem::take(&mut pts),
+                        closed: false,
+                    });
                 }
                 cur = p(&mut i, rel, cur);
                 start = cur;
@@ -443,7 +509,10 @@ fn parse_d(d: &str, tol: f32) -> Vec<Sub> {
             }
             b'S' => {
                 let c1 = last_c
-                    .map(|l| Pt { x: 2.0 * cur.x - l.x, y: 2.0 * cur.y - l.y })
+                    .map(|l| Pt {
+                        x: 2.0 * cur.x - l.x,
+                        y: 2.0 * cur.y - l.y,
+                    })
                     .unwrap_or(cur);
                 let c2 = p(&mut i, rel, cur);
                 let e = p(&mut i, rel, cur);
@@ -460,7 +529,10 @@ fn parse_d(d: &str, tol: f32) -> Vec<Sub> {
             }
             b'T' => {
                 let c1 = last_q
-                    .map(|l| Pt { x: 2.0 * cur.x - l.x, y: 2.0 * cur.y - l.y })
+                    .map(|l| Pt {
+                        x: 2.0 * cur.x - l.x,
+                        y: 2.0 * cur.y - l.y,
+                    })
                     .unwrap_or(cur);
                 let e = p(&mut i, rel, cur);
                 quad(&mut pts, cur, c1, e);
@@ -561,8 +633,14 @@ fn svg_color(v: &str, fallback: u32) -> Option<Option<u32>> {
     }
     // rgb()/rgba() functional notation
     let l = v.to_ascii_lowercase();
-    if let Some(inner) = l.strip_prefix("rgb").and_then(|s| s.strip_prefix('(')).and_then(|s| s.strip_suffix(')')) {
-        let mut it = inner.split(|c: char| c == ',' || c == '/' || c.is_whitespace()).filter(|t| !t.is_empty());
+    if let Some(inner) = l
+        .strip_prefix("rgb")
+        .and_then(|s| s.strip_prefix('('))
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        let mut it = inner
+            .split(|c: char| c == ',' || c == '/' || c.is_whitespace())
+            .filter(|t| !t.is_empty());
         let chan = |t: Option<&str>| -> Option<u32> {
             let t = t?.trim();
             if let Some(p) = t.strip_suffix('%') {
@@ -579,11 +657,15 @@ fn svg_color(v: &str, fallback: u32) -> Option<Option<u32>> {
                     if let Some(p) = t.strip_suffix('%') {
                         p.parse::<f32>().ok().map(|v| v * 2.55)
                     } else {
-                        t.parse::<f32>().ok().map(|v| if v <= 1.0 { v * 255.0 } else { v })
+                        t.parse::<f32>()
+                            .ok()
+                            .map(|v| if v <= 1.0 { v * 255.0 } else { v })
                     }
                 })
                 .unwrap_or(255.0);
-            return Some(Some((a as u32).min(255) << 24 | r.min(255) << 16 | g.min(255) << 8 | b.min(255)));
+            return Some(Some(
+                (a as u32).min(255) << 24 | r.min(255) << 16 | g.min(255) << 8 | b.min(255),
+            ));
         }
     }
     named(&l).map(Some)
@@ -612,7 +694,9 @@ fn elem_paint(props: &HashMap<String, String>, parent: Paint) -> Paint {
         .unwrap_or(parent.cc);
     let stroke = {
         let c = paint_of(at("stroke"), parent.stroke.map(|s| s.0), cc);
-        let w = at("stroke-width").and_then(fnum).or(parent.stroke.map(|s| s.1));
+        let w = at("stroke-width")
+            .and_then(fnum)
+            .or(parent.stroke.map(|s| s.1));
         // spec default stroke-width is 1 — a bare stroke= still paints
         c.map(|c| (c, w.unwrap_or(1.0)))
     };
@@ -638,9 +722,13 @@ fn elem_paint(props: &HashMap<String, String>, parent: Paint) -> Paint {
             Some("miter") | Some("miter-clip") => Join::Miter,
             _ => parent.join,
         },
-        miter: at("stroke-miterlimit").and_then(fnum).unwrap_or(parent.miter),
+        miter: at("stroke-miterlimit")
+            .and_then(fnum)
+            .unwrap_or(parent.miter),
         cc,
-        xf: parent.xf.mul(parse_transform(at("transform").unwrap_or(""))),
+        xf: parent
+            .xf
+            .mul(parse_transform(at("transform").unwrap_or(""))),
     }
 }
 
@@ -679,7 +767,9 @@ fn push_shape(out: &mut Vec<Shape>, mut subs: Vec<Sub>, paint: &Paint) {
     out.push(Shape {
         subs,
         fill: paint.fill.map(|c| with_alpha(c, paint.falpha)),
-        stroke: paint.stroke.map(|(c, w)| (with_alpha(c, paint.salpha), w * det)),
+        stroke: paint
+            .stroke
+            .map(|(c, w)| (with_alpha(c, paint.salpha), w * det)),
         rule: paint.rule,
         cap: paint.cap,
         join: paint.join,
@@ -693,10 +783,15 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
     if depth > 16 {
         return;
     }
-    let NodeKind::Element { tag, .. } = ctx.doc.kind(ch) else { return };
+    let NodeKind::Element { tag, .. } = ctx.doc.kind(ch) else {
+        return;
+    };
     let props = elem_props(ctx.doc, ch);
     if matches!(props.get("display").map(|v| v.trim()), Some("none"))
-        || matches!(props.get("visibility").map(|v| v.trim()), Some("hidden") | Some("collapse"))
+        || matches!(
+            props.get("visibility").map(|v| v.trim()),
+            Some("hidden") | Some("collapse")
+        )
     {
         return;
     }
@@ -722,7 +817,10 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
                 let mut pts = Vec::with_capacity(33);
                 for k in 0..32 {
                     let a = k as f32 / 32.0 * std::f32::consts::TAU;
-                    pts.push(Pt { x: cx + rx * a.cos(), y: cy + ry * a.sin() });
+                    pts.push(Pt {
+                        x: cx + rx * a.cos(),
+                        y: cy + ry * a.sin(),
+                    });
                 }
                 push_shape(out, vec![Sub { pts, closed: true }], &mine);
             }
@@ -735,8 +833,16 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
             if w <= 0.0 || h <= 0.0 {
                 return;
             }
-            let mut rx = at("rx").or_else(|| at("ry")).and_then(fnum).unwrap_or(0.0).min(w * 0.5);
-            let mut ry = at("ry").or_else(|| at("rx")).and_then(fnum).unwrap_or(0.0).min(h * 0.5);
+            let mut rx = at("rx")
+                .or_else(|| at("ry"))
+                .and_then(fnum)
+                .unwrap_or(0.0)
+                .min(w * 0.5);
+            let mut ry = at("ry")
+                .or_else(|| at("rx"))
+                .and_then(fnum)
+                .unwrap_or(0.0)
+                .min(h * 0.5);
             if rx <= 0.0 {
                 rx = ry;
             }
@@ -761,7 +867,10 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
                 ] {
                     for k in 0..=6 {
                         let a = (a0 + k as f32 * 15.0).to_radians();
-                        pts.push(Pt { x: ccx + rx * a.cos(), y: ccy + ry * a.sin() });
+                        pts.push(Pt {
+                            x: ccx + rx * a.cos(),
+                            y: ccy + ry * a.sin(),
+                        });
                     }
                 }
                 pts
@@ -775,14 +884,33 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
                     .chunks(2)
                     .filter_map(|c| c.get(0).zip(c.get(1)).map(|(&x, &y)| Pt { x, y }))
                     .collect();
-                push_shape(out, vec![Sub { pts, closed: tag.as_str() == "polygon" }], &mine);
+                push_shape(
+                    out,
+                    vec![Sub {
+                        pts,
+                        closed: tag.as_str() == "polygon",
+                    }],
+                    &mine,
+                );
             }
         }
         "line" => {
             let g = |n: &str| at(n).and_then(fnum).unwrap_or(0.0);
             push_shape(
                 out,
-                vec![Sub { pts: vec![Pt { x: g("x1"), y: g("y1") }, Pt { x: g("x2"), y: g("y2") }], closed: false }],
+                vec![Sub {
+                    pts: vec![
+                        Pt {
+                            x: g("x1"),
+                            y: g("y1"),
+                        },
+                        Pt {
+                            x: g("x2"),
+                            y: g("y2"),
+                        },
+                    ],
+                    closed: false,
+                }],
                 &mine,
             );
         }
@@ -815,7 +943,10 @@ fn disc(v: Pt, r: f32, out: &mut Vec<Poly>) {
     let mut p = Vec::with_capacity(9);
     for k in 0..8 {
         let a = k as f32 / 8.0 * std::f32::consts::TAU;
-        p.push(Pt { x: v.x + r * a.cos(), y: v.y + r * a.sin() });
+        p.push(Pt {
+            x: v.x + r * a.cos(),
+            y: v.y + r * a.sin(),
+        });
     }
     out.push(p);
 }
@@ -823,27 +954,45 @@ fn disc(v: Pt, r: f32, out: &mut Vec<Poly>) {
 /// Arc-fan polygon centred at `v`, radius `r`, from offset `o0` sweeping
 /// `sweep` radians (signed).
 fn fan(v: Pt, o0: Pt, r: f32, sweep: f32, tol: f32) -> Poly {
-    let step = if tol < r { 2.0 * (1.0 - tol / r).clamp(-1.0, 1.0).acos() } else { std::f32::consts::FRAC_PI_2 };
+    let step = if tol < r {
+        2.0 * (1.0 - tol / r).clamp(-1.0, 1.0).acos()
+    } else {
+        std::f32::consts::FRAC_PI_2
+    };
     let n = ((sweep.abs() / step).ceil() as usize).clamp(1, 64);
     let a0 = o0.y.atan2(o0.x);
     let mut poly = Vec::with_capacity(n + 2);
     poly.push(v);
     for k in 0..=n {
         let a = a0 + sweep * (k as f32 / n as f32);
-        poly.push(Pt { x: v.x + r * a.cos(), y: v.y + r * a.sin() });
+        poly.push(Pt {
+            x: v.x + r * a.cos(),
+            y: v.y + r * a.sin(),
+        });
     }
     poly
 }
 
 /// Stroke `subs` into filled polygon patches of width `w` (viewBox units),
 /// honoring `cap`/`join`/`miter` (miter limit in multiples of width).
-fn stroke_shape(subs: &[Sub], w: f32, cap: Cap, join: Join, mlim: f32, tol: f32, out: &mut Vec<Poly>) {
+fn stroke_shape(
+    subs: &[Sub],
+    w: f32,
+    cap: Cap,
+    join: Join,
+    mlim: f32,
+    tol: f32,
+    out: &mut Vec<Poly>,
+) {
     let hw = w * 0.5;
     for sub in subs {
         // drop consecutive duplicates; unwrap the repeated closure point
         let mut pts: Vec<Pt> = Vec::with_capacity(sub.pts.len());
         for &p in &sub.pts {
-            if pts.last().map_or(true, |l: &Pt| (l.x - p.x).abs() + (l.y - p.y).abs() > 1e-6) {
+            if pts
+                .last()
+                .map_or(true, |l: &Pt| (l.x - p.x).abs() + (l.y - p.y).abs() > 1e-6)
+            {
                 pts.push(p);
             }
         }
@@ -862,10 +1011,22 @@ fn stroke_shape(subs: &[Sub], w: f32, cap: Cap, join: Join, mlim: f32, tol: f32,
                 } else {
                     let v = pts[0];
                     out.push(vec![
-                        Pt { x: v.x - hw, y: v.y - hw },
-                        Pt { x: v.x + hw, y: v.y - hw },
-                        Pt { x: v.x + hw, y: v.y + hw },
-                        Pt { x: v.x - hw, y: v.y + hw },
+                        Pt {
+                            x: v.x - hw,
+                            y: v.y - hw,
+                        },
+                        Pt {
+                            x: v.x + hw,
+                            y: v.y - hw,
+                        },
+                        Pt {
+                            x: v.x + hw,
+                            y: v.y + hw,
+                        },
+                        Pt {
+                            x: v.x - hw,
+                            y: v.y + hw,
+                        },
                     ]);
                 }
             }
@@ -877,16 +1038,31 @@ fn stroke_shape(subs: &[Sub], w: f32, cap: Cap, join: Join, mlim: f32, tol: f32,
             let (a, b) = (pts[i], pts[(i + 1) % n]);
             let (dx, dy) = (b.x - a.x, b.y - a.y);
             let l = (dx * dx + dy * dy).sqrt().max(1e-9);
-            dirs.push(Pt { x: dx / l, y: dy / l });
+            dirs.push(Pt {
+                x: dx / l,
+                y: dy / l,
+            });
         }
         for i in 0..segs {
             let (a, b, d) = (pts[i], pts[(i + 1) % n], dirs[i]);
             let (nx, ny) = (-d.y * hw, d.x * hw);
             out.push(vec![
-                Pt { x: a.x + nx, y: a.y + ny },
-                Pt { x: b.x + nx, y: b.y + ny },
-                Pt { x: b.x - nx, y: b.y - ny },
-                Pt { x: a.x - nx, y: a.y - ny },
+                Pt {
+                    x: a.x + nx,
+                    y: a.y + ny,
+                },
+                Pt {
+                    x: b.x + nx,
+                    y: b.y + ny,
+                },
+                Pt {
+                    x: b.x - nx,
+                    y: b.y - ny,
+                },
+                Pt {
+                    x: a.x - nx,
+                    y: a.y - ny,
+                },
             ]);
         }
         // joins at every vertex (all of them for closed paths)
@@ -903,8 +1079,14 @@ fn stroke_shape(subs: &[Sub], w: f32, cap: Cap, join: Join, mlim: f32, tol: f32,
             let v = pts[j];
             // outer side is -sign(cross) for the (-dy,dx) normal convention
             let os = if cross < 0.0 { 1.0 } else { -1.0 };
-            let o0 = Pt { x: -d0.y * hw * os, y: d0.x * hw * os };
-            let o1 = Pt { x: -d1.y * hw * os, y: d1.x * hw * os };
+            let o0 = Pt {
+                x: -d0.y * hw * os,
+                y: d0.x * hw * os,
+            };
+            let o1 = Pt {
+                x: -d1.y * hw * os,
+                y: d1.x * hw * os,
+            };
             let th = cross.atan2(dot); // signed turn angle, |th| ≤ π
             match join {
                 Join::Round => out.push(fan(v, o0, hw, th, tol)),
@@ -913,15 +1095,46 @@ fn stroke_shape(subs: &[Sub], w: f32, cap: Cap, join: Join, mlim: f32, tol: f32,
                     let half = (th * 0.5).cos();
                     if half.abs() > 1e-3 && 1.0 / half.abs() <= mlim {
                         let k = 1.0 / (1.0 + dot);
-                        let m = Pt { x: v.x + (o0.x + o1.x) * k, y: v.y + (o0.y + o1.y) * k };
-                        out.push(vec![Pt { x: v.x + o0.x, y: v.y + o0.y }, m, Pt { x: v.x + o1.x, y: v.y + o1.y }]);
+                        let m = Pt {
+                            x: v.x + (o0.x + o1.x) * k,
+                            y: v.y + (o0.y + o1.y) * k,
+                        };
+                        out.push(vec![
+                            Pt {
+                                x: v.x + o0.x,
+                                y: v.y + o0.y,
+                            },
+                            m,
+                            Pt {
+                                x: v.x + o1.x,
+                                y: v.y + o1.y,
+                            },
+                        ]);
                     } else {
-                        out.push(vec![v, Pt { x: v.x + o0.x, y: v.y + o0.y }, Pt { x: v.x + o1.x, y: v.y + o1.y }]);
+                        out.push(vec![
+                            v,
+                            Pt {
+                                x: v.x + o0.x,
+                                y: v.y + o0.y,
+                            },
+                            Pt {
+                                x: v.x + o1.x,
+                                y: v.y + o1.y,
+                            },
+                        ]);
                     }
                 }
-                Join::Bevel => {
-                    out.push(vec![v, Pt { x: v.x + o0.x, y: v.y + o0.y }, Pt { x: v.x + o1.x, y: v.y + o1.y }])
-                }
+                Join::Bevel => out.push(vec![
+                    v,
+                    Pt {
+                        x: v.x + o0.x,
+                        y: v.y + o0.y,
+                    },
+                    Pt {
+                        x: v.x + o1.x,
+                        y: v.y + o1.y,
+                    },
+                ]),
             }
         }
         // caps on open ends
@@ -935,16 +1148,31 @@ fn stroke_shape(subs: &[Sub], w: f32, cap: Cap, join: Join, mlim: f32, tol: f32,
                     Cap::Square => {
                         let (ex, ey) = (d.x * hw * sgn, d.y * hw * sgn);
                         out.push(vec![
-                            Pt { x: v.x + nx, y: v.y + ny },
-                            Pt { x: v.x + nx + ex, y: v.y + ny + ey },
-                            Pt { x: v.x - nx + ex, y: v.y - ny + ey },
-                            Pt { x: v.x - nx, y: v.y - ny },
+                            Pt {
+                                x: v.x + nx,
+                                y: v.y + ny,
+                            },
+                            Pt {
+                                x: v.x + nx + ex,
+                                y: v.y + ny + ey,
+                            },
+                            Pt {
+                                x: v.x - nx + ex,
+                                y: v.y - ny + ey,
+                            },
+                            Pt {
+                                x: v.x - nx,
+                                y: v.y - ny,
+                            },
                         ]);
                     }
                     Cap::Round => {
                         // semicircle starting at the clockwise-normal of the
                         // outward dir so the +π sweep passes through it
-                        let o0 = Pt { x: sgn * d.y * hw, y: -sgn * d.x * hw };
+                        let o0 = Pt {
+                            x: sgn * d.y * hw,
+                            y: -sgn * d.x * hw,
+                        };
                         out.push(fan(v, o0, hw, std::f32::consts::PI, tol));
                     }
                 }
@@ -957,7 +1185,15 @@ fn stroke_shape(subs: &[Sub], w: f32, cap: Cap, join: Join, mlim: f32, tol: f32,
 
 /// Scanline fill of closed rings `polys` under `rule`, compositing `color`
 /// (ARGB) source-over into `out` (BGRA).
-fn fill_polys(polys: &[&Poly], rule: Rule, color: u32, out: &mut [u8], w: usize, h: usize, m: &VMap) {
+fn fill_polys(
+    polys: &[&Poly],
+    rule: Rule,
+    color: u32,
+    out: &mut [u8],
+    w: usize,
+    h: usize,
+    m: &VMap,
+) {
     if color >> 24 == 0 || m.sy.abs() < 1e-9 || m.sx.abs() < 1e-9 {
         return;
     }
@@ -982,7 +1218,12 @@ fn fill_polys(polys: &[&Poly], rule: Rule, color: u32, out: &mut [u8], w: usize,
             continue;
         }
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let (r, g, b, sa) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff, color >> 24);
+        let (r, g, b, sa) = (
+            (color >> 16) & 0xff,
+            (color >> 8) & 0xff,
+            color & 0xff,
+            color >> 24,
+        );
         let mut wind = 0i32;
         let mut parity = false;
         let mut from: Option<f32> = None;
@@ -1075,7 +1316,12 @@ pub fn render(doc: &Document, node: NodeId, w: u32, h: u32, fallback_color: u32)
     let align = it.next().unwrap_or("xMidYMid");
     let mos = it.next().unwrap_or("meet");
     let map = if align.eq_ignore_ascii_case("none") {
-        VMap { sx: w as f32 / vbw, sy: h as f32 / vbh, ox: -vbx * w as f32 / vbw, oy: -vby * h as f32 / vbh }
+        VMap {
+            sx: w as f32 / vbw,
+            sy: h as f32 / vbh,
+            ox: -vbx * w as f32 / vbw,
+            oy: -vby * h as f32 / vbh,
+        }
     } else {
         let s = if mos.eq_ignore_ascii_case("slice") {
             (w as f32 / vbw).max(h as f32 / vbh)
@@ -1096,20 +1342,40 @@ pub fn render(doc: &Document, node: NodeId, w: u32, h: u32, fallback_color: u32)
         } else {
             (h as f32 - vbh * s) * 0.5
         };
-        VMap { sx: s, sy: s, ox: ax - vbx * s, oy: ay - vby * s }
+        VMap {
+            sx: s,
+            sy: s,
+            ox: ax - vbx * s,
+            oy: ay - vby * s,
+        }
     };
 
     // supersample small outputs for antialiasing
-    let ss = if w.max(h) < 64 { 4 } else if w.max(h) <= 256 { 2 } else { 1 };
+    let ss = if w.max(h) < 64 {
+        4
+    } else if w.max(h) <= 256 {
+        2
+    } else {
+        1
+    };
     let (bw, bh) = (w * ss, h * ss);
     let f = ss as f32;
-    let smap = VMap { sx: map.sx * f, sy: map.sy * f, ox: map.ox * f, oy: map.oy * f };
+    let smap = VMap {
+        sx: map.sx * f,
+        sy: map.sy * f,
+        ox: map.ox * f,
+        oy: map.oy * f,
+    };
     let tol0 = 0.3 / smap.sx.abs().max(0.01); // ~0.3 output px in viewBox units
 
     // paint tree → flattened shapes
     let mut ids = HashMap::new();
     collect_ids(doc, node, &mut ids);
-    let ctx = Ctx { doc, ids: &ids, tol0 };
+    let ctx = Ctx {
+        doc,
+        ids: &ids,
+        tol0,
+    };
     let base = Paint {
         fill: Some(0xff000000), // SVG default fill is black
         falpha: 1.0,
@@ -1170,11 +1436,16 @@ mod tests {
     #[test]
     fn arcs_make_circles() {
         // full circle from two 180° arcs
-        let (d, s) = doc(r##"<svg viewBox="0 0 24 24"><path d="M4 12 A8 8 0 1 0 20 12 A8 8 0 1 0 4 12" fill="#fff"/></svg>"##);
+        let (d, s) = doc(
+            r##"<svg viewBox="0 0 24 24"><path d="M4 12 A8 8 0 1 0 20 12 A8 8 0 1 0 4 12" fill="#fff"/></svg>"##,
+        );
         let px = render(&d, s, 48, 48, 0xff000000);
         let cov = covered(&px);
         let expect = std::f64::consts::PI * 16.0 * 16.0; // r=16px circle
-        assert!(cov > (expect * 0.8) as usize && cov < (expect * 1.2) as usize, "cov={cov} expect~{expect}");
+        assert!(
+            cov > (expect * 0.8) as usize && cov < (expect * 1.2) as usize,
+            "cov={cov} expect~{expect}"
+        );
         // arc endpoint must land on (20,12) in vb coords
         let subs = parse_d("M4 12 A8 8 0 1 0 20 12", 0.01);
         let last = subs[0].pts.last().unwrap();
@@ -1183,8 +1454,10 @@ mod tests {
 
     #[test]
     fn multi_subpath_evenodd_hole() {
-        let (d, s) = doc(r##"<svg viewBox="0 0 10 10"><path fill-rule="evenodd" fill="#fff"
-            d="M0 0h10v10h-10z M2 2h6v6h-6z"/></svg>"##);
+        let (d, s) = doc(
+            r##"<svg viewBox="0 0 10 10"><path fill-rule="evenodd" fill="#fff"
+            d="M0 0h10v10h-10z M2 2h6v6h-6z"/></svg>"##,
+        );
         let px = render(&d, s, 20, 20, 0);
         assert_eq!(pix(&px, 20, 10, 10)[3], 0, "hole must be transparent");
         assert!(pix(&px, 20, 1, 1)[3] > 200, "ring must be filled");
@@ -1206,26 +1479,38 @@ mod tests {
 
     #[test]
     fn transform_translate_group() {
-        let (d, s) = doc(r#"<svg viewBox="0 0 20 20"><g transform="translate(10 0)" style="fill:#ff0000">
-            <rect width="5" height="5"/></g></svg>"#);
+        let (d, s) = doc(
+            r#"<svg viewBox="0 0 20 20"><g transform="translate(10 0)" style="fill:#ff0000">
+            <rect width="5" height="5"/></g></svg>"#,
+        );
         let px = render(&d, s, 20, 20, 0);
         let p = pix(&px, 20, 11, 2);
-        assert!(p[3] > 200 && p[2] > 200 && p[1] < 40, "translated red rect: {p:?}");
+        assert!(
+            p[3] > 200 && p[2] > 200 && p[1] < 40,
+            "translated red rect: {p:?}"
+        );
         assert_eq!(pix(&px, 20, 2, 2)[3], 0);
     }
 
     #[test]
     fn lucide_line_icon_not_a_box() {
-        let (d, s) = doc(r#"<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="24" height="24">
-            <path d="M5 12h14"/></svg>"#);
+        let (d, s) = doc(
+            r#"<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="24" height="24">
+            <path d="M5 12h14"/></svg>"#,
+        );
         let px = render(&d, s, 24, 24, 0xffffffff);
         let cov = covered(&px);
         assert!(cov > 8, "line should paint some pixels, got {cov}");
-        assert!(cov < 24 * 24 / 3, "line icon must not fill the box, cov={cov}");
+        assert!(
+            cov < 24 * 24 / 3,
+            "line icon must not fill the box, cov={cov}"
+        );
         assert_eq!(pix(&px, 24, 0, 0)[3], 0, "corner stays transparent");
         // and via style= instead of attributes
-        let (d2, s2) = doc(r#"<svg style="fill:none;stroke:currentColor" viewBox="0 0 24 24">
-            <path d="M5 12h14"/></svg>"#);
+        let (d2, s2) = doc(
+            r#"<svg style="fill:none;stroke:currentColor" viewBox="0 0 24 24">
+            <path d="M5 12h14"/></svg>"#,
+        );
         let px2 = render(&d2, s2, 24, 24, 0xffffffff);
         assert!(covered(&px2) > 8 && covered(&px2) < 24 * 24 / 3);
     }
@@ -1237,7 +1522,10 @@ mod tests {
             <use href="#r" x="3" y="3" fill="#00ff00" opacity="0.5"/></svg>"##);
         let px = render(&d, s, 10, 10, 0);
         let p = pix(&px, 10, 4, 4);
-        assert!(p[3] > 100 && p[3] < 160 && p[1] > 200, "half-alpha green via use: {p:?}");
+        assert!(
+            p[3] > 100 && p[3] < 160 && p[1] > 200,
+            "half-alpha green via use: {p:?}"
+        );
     }
 
     #[test]
@@ -1255,12 +1543,16 @@ mod tests {
     #[test]
     fn stroke_only_no_fill_box() {
         // the reported lucide bug: bare stroke + fill none must not paint a box
-        let (d, s) = doc(r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-            stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>"#);
+        let (d, s) = doc(
+            r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="2"><circle cx="12" cy="12" r="9"/></svg>"#,
+        );
         let px = render(&d, s, 48, 48, 0xffffffff);
         let cov = covered(&px);
-        assert!(cov > 24 && cov < 48 * 48 / 3, "ring outline only, cov={cov}");
+        assert!(
+            cov > 24 && cov < 48 * 48 / 3,
+            "ring outline only, cov={cov}"
+        );
         assert_eq!(pix(&px, 48, 24, 24)[3], 0, "centre stays empty");
     }
 }
-

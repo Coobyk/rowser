@@ -5,9 +5,10 @@
 //! color. Underline/strikethrough are plain rects under/over the baseline.
 
 use rowser_image::Image;
-use rowser_layout::{Color, DisplayItem};
-use std::collections::HashMap;
+use rowser_layout::xform::{items_bbox, Mat};
+use rowser_layout::{offset_item, Color, DisplayItem};
 use rowser_text::FontCache;
+use std::collections::HashMap;
 
 pub mod fx;
 use fx::Clip;
@@ -58,7 +59,12 @@ impl Canvas {
         self.fill_rect(x + ri, y, w.saturating_sub(2 * ri as u32), h, color);
         self.fill_rect(x, y + ri, w, h.saturating_sub(2 * ri as u32), color);
         // four corner quarter-discs
-        for (cx, cy) in [(x + ri, y + ri), (x + w as i32 - ri, y + ri), (x + ri, y + h as i32 - ri), (x + w as i32 - ri, y + h as i32 - ri)] {
+        for (cx, cy) in [
+            (x + ri, y + ri),
+            (x + w as i32 - ri, y + ri),
+            (x + ri, y + h as i32 - ri),
+            (x + w as i32 - ri, y + h as i32 - ri),
+        ] {
             let mut dy = -ri;
             while dy <= ri {
                 let mut dx = -ri;
@@ -172,10 +178,8 @@ impl Canvas {
                 let i = ((dy * cw + dx) * 4) as usize;
                 let inv = 255 - a;
                 self.pixels[i] = ((b as u32 * a + self.pixels[i] as u32 * inv) / 255) as u8;
-                self.pixels[i + 1] =
-                    ((g as u32 * a + self.pixels[i + 1] as u32 * inv) / 255) as u8;
-                self.pixels[i + 2] =
-                    ((r as u32 * a + self.pixels[i + 2] as u32 * inv) / 255) as u8;
+                self.pixels[i + 1] = ((g as u32 * a + self.pixels[i + 1] as u32 * inv) / 255) as u8;
+                self.pixels[i + 2] = ((r as u32 * a + self.pixels[i + 2] as u32 * inv) / 255) as u8;
                 self.pixels[i + 3] = 255;
             }
         }
@@ -203,7 +207,11 @@ fn fill(
     let clipped = !clips.is_empty();
     for yy in y0..y1 {
         for xx in x0..x1 {
-            if clipped && !clips.iter().all(|c| c.contains(xx as f32 + 0.5, yy as f32 + 0.5)) {
+            if clipped
+                && !clips
+                    .iter()
+                    .all(|c| c.contains(xx as f32 + 0.5, yy as f32 + 0.5))
+            {
                 continue;
             }
             let i = ((yy * w + xx) * 4) as usize;
@@ -235,10 +243,46 @@ pub fn paint_into(
     fonts: &mut FontCache,
     images: &HashMap<String, Image>,
 ) {
+    paint_span(canvas, items, fonts, images, &Mat::IDENTITY);
+}
+
+/// Paint one display-item span. `m` maps the span's coordinates onto the
+/// canvas — identity at the top level and inside each offscreen tile.
+/// PushTransform consumes its whole sub-span: it renders through an
+/// offscreen tile + affine blit, so nested transforms compose by
+/// matrix-multiplying onto `m`.
+fn paint_span(
+    canvas: &mut Canvas,
+    items: &[DisplayItem],
+    fonts: &mut FontCache,
+    images: &HashMap<String, Image>,
+    m: &Mat,
+) {
     let ch = canvas.height as f32;
     let mut i = 0;
     while i < items.len() {
         let item = &items[i];
+        if let DisplayItem::PushTransform { m: inner } = item {
+            let total = m.mul(inner);
+            // the matching PopTransform (nesting counts)
+            let mut depth = 1i32;
+            let mut j = i + 1;
+            while j < items.len() && depth > 0 {
+                match items[j] {
+                    DisplayItem::PushTransform { .. } => depth += 1,
+                    DisplayItem::PopTransform => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            paint_transformed(canvas, &items[i + 1..j - 1], &total, fonts, images);
+            i = j;
+            continue;
+        }
+        if matches!(item, DisplayItem::PopTransform) {
+            i += 1;
+            continue;
+        }
         // Vertical cull: items fully off-canvas can't write visible pixels.
         // Text gets a ±4em band — glyph ink can overshoot the em box, but
         // never by multiples of it. Effect markers never cull.
@@ -261,7 +305,9 @@ pub fn paint_into(
             | DisplayItem::PopClip
             | DisplayItem::Shadow { .. }
             | DisplayItem::PushEffect(_)
-            | DisplayItem::PopEffect => (f32::MIN, f32::MAX),
+            | DisplayItem::PopEffect
+            | DisplayItem::PushTransform { .. }
+            | DisplayItem::PopTransform => (f32::MIN, f32::MAX),
         };
         if bot < 0.0 || top > ch {
             i += 1;
@@ -276,7 +322,14 @@ pub fn paint_into(
                 i += 1;
                 continue;
             }
-            DisplayItem::RoundedRect { x, y, w, h, radius, color } => {
+            DisplayItem::RoundedRect {
+                x,
+                y,
+                w,
+                h,
+                radius,
+                color,
+            } => {
                 canvas.fill_rounded(*x as i32, *y as i32, *w as u32, *h as u32, *radius, *color);
             }
             DisplayItem::Raster { x, y, w, h, pixels } => {
@@ -296,12 +349,29 @@ pub fn paint_into(
                 }
             }
             DisplayItem::BgImage {
-                x, y, w, h, px, py, pw, ph, mode, sw, sh, fx, ax, fy, ay, rx, ry, src,
+                x,
+                y,
+                w,
+                h,
+                px,
+                py,
+                pw,
+                ph,
+                mode,
+                sw,
+                sh,
+                fx,
+                ax,
+                fy,
+                ay,
+                rx,
+                ry,
+                src,
             } => {
                 if let Some(img) = images.get(src) {
                     canvas.blit_tiled(
-                        img, *x, *y, *w, *h, *px, *py, *pw, *ph, *mode, *sw, *sh,
-                        *fx, *ax, *fy, *ay, *rx, *ry,
+                        img, *x, *y, *w, *h, *px, *py, *pw, *ph, *mode, *sw, *sh, *fx, *ax, *fy,
+                        *ay, *rx, *ry,
                     );
                 }
                 // undecoded/failed image: paint nothing — the element's
@@ -310,13 +380,27 @@ pub fn paint_into(
             DisplayItem::FillRect { x, y, w, h, color } => {
                 canvas.fill_rect(*x as i32, *y as i32, *w as u32, *h as u32, *color);
             }
-            DisplayItem::BorderSide { x, y, w, h, side, style, color } => {
+            DisplayItem::BorderSide {
+                x,
+                y,
+                w,
+                h,
+                side,
+                style,
+                color,
+            } => {
                 fx::border_side(canvas, *x, *y, *w, *h, *side, *style, *color);
             }
-            DisplayItem::RoundedRect2 { x, y, w, h, radii, color } => {
-                canvas.fill_rounded_radii(
-                    *x as i32, *y as i32, *w as u32, *h as u32, *radii, *color,
-                );
+            DisplayItem::RoundedRect2 {
+                x,
+                y,
+                w,
+                h,
+                radii,
+                color,
+            } => {
+                canvas
+                    .fill_rounded_radii(*x as i32, *y as i32, *w as u32, *h as u32, *radii, *color);
             }
             DisplayItem::Shadow {
                 x,
@@ -385,17 +469,80 @@ pub fn paint_into(
                 if *underline {
                     let uy = *baseline + 0.1 * size;
                     let thick = (size / 14.0).max(1.0);
-                    canvas.fill_rect(*x as i32, uy as i32, (end - *x) as u32, thick as u32, *color);
+                    canvas.fill_rect(
+                        *x as i32,
+                        uy as i32,
+                        (end - *x) as u32,
+                        thick as u32,
+                        *color,
+                    );
                 }
                 if *strike {
                     let sy = *baseline - 0.28 * size;
                     let thick = (size / 16.0).max(1.0);
-                    canvas.fill_rect(*x as i32, sy as i32, (end - *x) as u32, thick as u32, *color);
+                    canvas.fill_rect(
+                        *x as i32,
+                        sy as i32,
+                        (end - *x) as u32,
+                        thick as u32,
+                        *color,
+                    );
                 }
             }
+            DisplayItem::PushTransform { .. } | DisplayItem::PopTransform => {}
         }
         i += 1;
     }
+}
+
+/// Paint `span` (pre-transform coordinates) through matrix `m`: render it
+/// into a transparent BGRA tile sized to its laid-out bounding box, then
+/// blit the tile onto the canvas through `m`. Singular matrices paint
+/// nothing; nested PushTransform inside the tile composes recursively.
+fn paint_transformed(
+    canvas: &mut Canvas,
+    span: &[DisplayItem],
+    m: &Mat,
+    fonts: &mut FontCache,
+    images: &HashMap<String, Image>,
+) {
+    if m.is_identity() {
+        return paint_span(canvas, span, fonts, images, &Mat::IDENTITY);
+    }
+    if m.inverse().is_none() {
+        return; // singular transform — the element has no painted area
+    }
+    // leaf-item bbox in pre-transform space (+ bleed for glyph ink/shadows)
+    let Some((bx, by, bw, bh)) = items_bbox(span) else {
+        return;
+    };
+    const PAD: f32 = 8.0;
+    let (bx, by) = (bx - PAD, by - PAD);
+    let (tw, th) = (
+        (bw + 2.0 * PAD).ceil() as u32,
+        (bh + 2.0 * PAD).ceil() as u32,
+    );
+    const MAX_TILE_PX: u64 = 64 * 1024 * 1024;
+    if tw == 0 || th == 0 || tw as u64 * th as u64 > MAX_TILE_PX {
+        return;
+    }
+    // tile pixel (x,y) ↔ pre-transform point (x+bx, y+by): shift the
+    // span's items into tile space and paint them there
+    let mut tile = Canvas {
+        width: tw,
+        height: th,
+        pixels: vec![0; tw as usize * th as usize * 4],
+        clips: Vec::new(),
+    };
+    let shifted: Vec<DisplayItem> = span
+        .iter()
+        .cloned()
+        .map(|it| offset_item(it, -bx, -by))
+        .collect();
+    paint_span(&mut tile, &shifted, fonts, images, &Mat::IDENTITY);
+    // canvas_pt = m(pre_pt) = m(tile_pt + (bx,by)) → m ∘ T(bx,by)
+    let bm = m.mul(&Mat::translate(bx, by));
+    canvas.blit_affine(&tile.pixels, tw, th, &bm);
 }
 
 #[cfg(test)]
@@ -434,7 +581,14 @@ mod tests {
                 color: bgra(255, 0, 0),
             },
         ];
-        let px = paint(&items, &mut fonts, 200, 100, rowser_layout::WHITE, &HashMap::new());
+        let px = paint(
+            &items,
+            &mut fonts,
+            200,
+            100,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         // some dark pixels must exist (the text)
         let dark = px.chunks(4).filter(|p| p[2] < 100).count();
         assert!(dark > 50);
@@ -462,7 +616,14 @@ mod tests {
             },
             DisplayItem::PopClip,
         ];
-        let px = paint(&items, &mut fonts, 100, 100, rowser_layout::WHITE, &HashMap::new());
+        let px = paint(
+            &items,
+            &mut fonts,
+            100,
+            100,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         let at = |x: usize, y: usize| &px[(y * 100 + x) * 4..(y * 100 + x) * 4 + 3];
         // red pixel has blue channel 0; white bg has 255
         assert_eq!(at(5, 5)[0], 0, "inside clip painted red");
@@ -483,7 +644,14 @@ mod tests {
             style: rowser_layout::BorderStyle::Dashed,
             color: bgra(0, 0, 0),
         }];
-        let px = paint(&items, &mut fonts, 40, 10, rowser_layout::WHITE, &HashMap::new());
+        let px = paint(
+            &items,
+            &mut fonts,
+            40,
+            10,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         // pixel dark when all channels < 128 (black dash vs white bg)
         let dark = |x: usize| (0..3).all(|ch| px[(2 * 40 + x) * 4 + ch] < 128);
         let (mut painted, mut empty) = (0, 0);
@@ -509,7 +677,14 @@ mod tests {
             style: rowser_layout::BorderStyle::Double,
             color: bgra(0, 0, 0),
         }];
-        let px = paint(&items, &mut fonts, 40, 10, rowser_layout::WHITE, &HashMap::new());
+        let px = paint(
+            &items,
+            &mut fonts,
+            40,
+            10,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         let dark = |y: usize| (0..3).all(|ch| px[(y * 40 + 15) * 4 + ch] < 128);
         let light = |y: usize| (0..3).all(|ch| px[(y * 40 + 15) * 4 + ch] > 200);
         assert!(dark(0) && dark(5), "two lines painted");
@@ -532,7 +707,14 @@ mod tests {
             color: bgra(0, 0, 0),
             inset: false,
         }];
-        let px = paint(&items, &mut fonts, 80, 80, rowser_layout::WHITE, &HashMap::new());
+        let px = paint(
+            &items,
+            &mut fonts,
+            80,
+            80,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         let edge = px[(30 * 80 + 14) * 4 + 2]; // 6px left of the box — halo
         assert!(edge < 250 && edge > 100, "soft shadow halo present: {edge}");
         let far = px[(30 * 80 + 5) * 4 + 2]; // beyond blur reach — stays white
@@ -550,21 +732,122 @@ mod tests {
             radii: [[20.0, 20.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
             color: bgra(255, 0, 0),
         }];
-        let px = paint(&items, &mut fonts, 50, 50, rowser_layout::WHITE, &HashMap::new());
+        let px = paint(
+            &items,
+            &mut fonts,
+            50,
+            50,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         // blue channel: white bg 255, red fill 0
         assert_eq!(px[0], 255, "top-left corner cut to bg");
         let center = px[(20 * 50 + 20) * 4];
         assert_eq!(center, 0, "interior painted red");
     }
+
+    fn px_at(px: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [px[i], px[i + 1], px[i + 2], px[i + 3]]
+    }
+
+    #[test]
+    fn rotated_span_paints_shifted_pixels() {
+        let mut fonts = FontCache::new();
+        let red = bgra(255, 0, 0);
+        let items = vec![DisplayItem::FillRect {
+            x: 10.0,
+            y: 10.0,
+            w: 20.0,
+            h: 20.0,
+            color: red,
+        }];
+        let (w, h) = (60u32, 60u32);
+        let flat = paint(
+            &items,
+            &mut fonts,
+            w,
+            h,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
+        // 45° about the square's center: a diamond — tips reach outside the
+        // original square, its corners empty out
+        let m = Mat::translate(20.0, 20.0)
+            .mul(&Mat::rotate(45.0))
+            .mul(&Mat::translate(-20.0, -20.0));
+        let items = vec![
+            DisplayItem::PushTransform { m },
+            DisplayItem::FillRect {
+                x: 10.0,
+                y: 10.0,
+                w: 20.0,
+                h: 20.0,
+                color: red,
+            },
+            DisplayItem::PopTransform,
+        ];
+        let rot = paint(
+            &items,
+            &mut fonts,
+            w,
+            h,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
+        assert_ne!(flat, rot, "transformed output must differ");
+        // non-empty + shifted: the diamond's top tip paints above where the
+        // square ended (pixel-center 20.5,8.5 sits ~2px inside the tip)
+        let tip = px_at(&rot, w, 20, 8);
+        assert!(tip[2] > 128 && tip[0] < 128, "diamond tip is red: {tip:?}");
+        let ctr = px_at(&rot, w, 20, 20);
+        assert_eq!(ctr, [0, 0, 255, 255], "center stays solid red");
+        // the original square's corner is outside the diamond → stays white
+        assert_eq!(px_at(&rot, w, 11, 11), [255, 255, 255, 255], "corner bg");
+    }
+
+    #[test]
+    fn translated_span_via_matrix_offsets() {
+        // a pure-translate PushTransform paints the same rect, moved —
+        // sanity for the offscreen+blit path (not only direct offsets)
+        let mut fonts = FontCache::new();
+        let red = bgra(255, 0, 0);
+        let m = Mat::translate(15.0, 10.0);
+        let items = vec![
+            DisplayItem::PushTransform { m },
+            DisplayItem::FillRect {
+                x: 4.0,
+                y: 4.0,
+                w: 10.0,
+                h: 10.0,
+                color: red,
+            },
+            DisplayItem::PopTransform,
+        ];
+        let (w, h) = (60u32, 60u32);
+        let px = paint(
+            &items,
+            &mut fonts,
+            w,
+            h,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
+        // rect (4,4,10,10) → painted at (19,14)-(29,24)
+        assert_eq!(px_at(&px, w, 24, 19), [0, 0, 255, 255], "shifted rect");
+        assert_eq!(px_at(&px, w, 5, 5), [255, 255, 255, 255], "original spot");
+    }
 }
-
-
 
 impl Canvas {
     /// Nearest-neighbor blit of a decoded BGRA image into a rect.
     /// Blit a raw BGRA buffer of `dw`×`dh` pixels (no scaling).
     pub fn blit_pixels(&mut self, pixels: &[u8], dx: i32, dy: i32, dw: i32, dh: i32) {
-        let img = Image { width: dw.max(0) as u32, height: dh.max(0) as u32, pixels: pixels.to_vec() };
+        let img = Image {
+            width: dw.max(0) as u32,
+            height: dh.max(0) as u32,
+            pixels: pixels.to_vec(),
+        };
         self.blit(&img, dx, dy, dw, dh);
     }
 
@@ -690,8 +973,16 @@ impl Canvas {
         let (cx0, cy0) = (x as i32, y as i32);
         let (cx1, cy1) = ((x + w).ceil() as i32, (y + h).ceil() as i32);
         // first tile index that can intersect the clip rect
-        let kx0 = if rx != 0 { ((x - ox) / tw).floor() as i32 } else { 0 };
-        let ky0 = if ry != 0 { ((y - oy) / th).floor() as i32 } else { 0 };
+        let kx0 = if rx != 0 {
+            ((x - ox) / tw).floor() as i32
+        } else {
+            0
+        };
+        let ky0 = if ry != 0 {
+            ((y - oy) / th).floor() as i32
+        } else {
+            0
+        };
         let mut ti = ky0;
         loop {
             let ty = oy + ti as f32 * th;
@@ -754,11 +1045,9 @@ impl Canvas {
         let y_lo = dy.max(cy0).max(0);
         let y_hi = (dy + dh).min(cy1).min(ch);
         for yy in y_lo..y_hi {
-            let sy =
-                ((yy - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
+            let sy = ((yy - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
             for xx in x_lo..x_hi {
-                let sx =
-                    ((xx - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
+                let sx = ((xx - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
                 let si = ((sy * img.width + sx) * 4) as usize;
                 let di = ((yy * cw + xx) * 4) as usize;
                 let (b, g, r, a) = (
@@ -774,8 +1063,7 @@ impl Canvas {
                     self.pixels[di + 3] = 255;
                 } else if a > 0 {
                     let inv = 255 - a;
-                    self.pixels[di] =
-                        ((b as u32 * a + self.pixels[di] as u32 * inv) / 255) as u8;
+                    self.pixels[di] = ((b as u32 * a + self.pixels[di] as u32 * inv) / 255) as u8;
                     self.pixels[di + 1] =
                         ((g as u32 * a + self.pixels[di + 1] as u32 * inv) / 255) as u8;
                     self.pixels[di + 2] =
@@ -785,4 +1073,70 @@ impl Canvas {
             }
         }
     }
+    /// Blit a BGRA tile through affine matrix `m` (tile coords → canvas
+    /// coords): each destination pixel inside the transformed tile bbox is
+    /// inverse-mapped back into the tile and bilinear-sampled, then
+    /// source-over composited (transparent tile pixels keep the backdrop).
+    pub fn blit_affine(&mut self, src: &[u8], sw: u32, sh: u32, m: &Mat) {
+        let Some(inv) = m.inverse() else { return };
+        // destination bbox = m applied to the tile's corners
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for (cx, cy) in [
+            (0.0, 0.0),
+            (sw as f32, 0.0),
+            (0.0, sh as f32),
+            (sw as f32, sh as f32),
+        ] {
+            let (px, py) = m.apply(cx, cy);
+            x0 = x0.min(px);
+            y0 = y0.min(py);
+            x1 = x1.max(px);
+            y1 = y1.max(py);
+        }
+        let (cw, ch) = (self.width as i32, self.height as i32);
+        let (x0, y0) = ((x0.floor() as i32).max(0), (y0.floor() as i32).max(0));
+        let (x1, y1) = ((x1.ceil() as i32).min(cw), (y1.ceil() as i32).min(ch));
+        for y in y0..y1 {
+            for x in x0..x1 {
+                // pixel-center sampling back into the tile
+                let (sx, sy) = inv.apply(x as f32 + 0.5, y as f32 + 0.5);
+                if sx < 0.0 || sy < 0.0 || sx >= sw as f32 || sy >= sh as f32 {
+                    continue;
+                }
+                let (b, g, r, a) = bilinear(src, sw, sh, sx, sy);
+                if a == 0 {
+                    continue;
+                }
+                let i = ((y * cw + x) * 4) as usize;
+                let ia = 255 - a;
+                self.pixels[i] = ((b * a + self.pixels[i] as u32 * ia) / 255) as u8;
+                self.pixels[i + 1] = ((g * a + self.pixels[i + 1] as u32 * ia) / 255) as u8;
+                self.pixels[i + 2] = ((r * a + self.pixels[i + 2] as u32 * ia) / 255) as u8;
+                self.pixels[i + 3] = 255;
+            }
+        }
+    }
+}
+
+/// Bilinear sample of a straight-alpha BGRA buffer at fractional (x, y);
+/// out-of-range neighbors contribute zero.
+fn bilinear(px: &[u8], w: u32, h: u32, x: f32, y: f32) -> (u32, u32, u32, u32) {
+    let (x, y) = (x - 0.5, y - 0.5);
+    let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+    let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+    let mut acc = [0f32; 4];
+    for oy in 0..2 {
+        for ox in 0..2 {
+            let wgt = (if ox == 0 { 1.0 - fx } else { fx }) * (if oy == 0 { 1.0 - fy } else { fy });
+            let (sx, sy) = (x0 + ox, y0 + oy);
+            if wgt == 0.0 || sx < 0 || sy < 0 || sx >= w as i32 || sy >= h as i32 {
+                continue;
+            }
+            let i = ((sy * w as i32 + sx) * 4) as usize;
+            for c in 0..4 {
+                acc[c] += px[i + c] as f32 * wgt;
+            }
+        }
+    }
+    (acc[0] as u32, acc[1] as u32, acc[2] as u32, acc[3] as u32)
 }

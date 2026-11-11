@@ -35,13 +35,7 @@ fn rsaep(n: &Big, e: &Big, sig: &[u8]) -> Vec<u8> {
 
 /// PKCS#1 v1.5: verify that `sig` decrypts to `EM = 00 01 FF.. 00 T`
 /// where `T = DigestInfo || H`.
-pub fn pkcs1v15_verify(
-    n: &Big,
-    e: &Big,
-    alg: HashAlg,
-    digest: &[u8],
-    sig: &[u8],
-) -> Result<()> {
+pub fn pkcs1v15_verify(n: &Big, e: &Big, alg: HashAlg, digest: &[u8], sig: &[u8]) -> Result<()> {
     let em = rsaep(n, e, sig);
     let mut t = Vec::with_capacity(digest.len() + 19);
     t.extend_from_slice(digest_info_prefix(alg));
@@ -172,8 +166,10 @@ mod tests {
     #[test]
     fn pkcs1v15_negative() {
         // A valid-size signature with wrong content must fail.
-        let n = hex("00d5eeaa4f7a4d9a8b2e3e06f7e6f5e8c0a3b1d2e4f5060708090a0b0c0d0e0f\
-                    00112233445566778899aabbccddee11");
+        let n = hex(
+            "00d5eeaa4f7a4d9a8b2e3e06f7e6f5e8c0a3b1d2e4f5060708090a0b0c0d0e0f\
+                    00112233445566778899aabbccddee11",
+        );
         let n = Big::from_be_bytes(&n);
         let e = Big::from_u64(65537);
         let sig = vec![1u8; n.nbits().div_ceil(8)];

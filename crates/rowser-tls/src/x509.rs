@@ -41,7 +41,10 @@ const OID_BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
 /// A parsed public key from a SubjectPublicKeyInfo.
 #[derive(Clone, Debug)]
 pub enum PublicKey {
-    Rsa { n: Big, e: Big },
+    Rsa {
+        n: Big,
+        e: Big,
+    },
     /// Uncompressed SEC1 point `04 || x || y`, on the named curve.
     EcP256(Vec<u8>),
     EcP384(Vec<u8>),
@@ -122,7 +125,8 @@ fn parse_time(tlv: &Tlv<'_>) -> Result<i64> {
         return Err(Error::Decode("non-ascii time"));
     }
     let digits = |r: &str| -> Result<i64> {
-        r.parse::<i64>().map_err(|_| Error::Decode("bad time digits"))
+        r.parse::<i64>()
+            .map_err(|_| Error::Decode("bad time digits"))
     };
     let (year, rest) = match tlv.tag {
         der::TAG_UTC_TIME => {
@@ -535,10 +539,7 @@ impl TrustStore {
     }
 
     fn find_root_candidates(&self, issuer_raw: &[u8]) -> Vec<usize> {
-        self.by_subject
-            .get(issuer_raw)
-            .cloned()
-            .unwrap_or_default()
+        self.by_subject.get(issuer_raw).cloned().unwrap_or_default()
     }
 }
 
@@ -657,7 +658,10 @@ mod tests {
     fn base64_roundtrip() {
         assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
         assert_eq!(base64_decode("aGVsbG8gd29ybGQ=").unwrap(), b"hello world");
-        assert_eq!(base64_decode("AAECAwQFBgc=").unwrap(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            base64_decode("AAECAwQFBgc=").unwrap(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
         // unpadded
         assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello");
     }
@@ -727,7 +731,10 @@ mod tests {
         let alg_sha256rsa = enc(
             0x30,
             &[
-                enc(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b]),
+                enc(
+                    0x06,
+                    &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b],
+                ),
                 enc(0x05, &[]),
             ]
             .concat(),
@@ -735,17 +742,17 @@ mod tests {
         let issuer = name_with_cn("Test Root");
         let validity = enc(
             0x30,
-            &[
-                enc(0x17, b"240101000000Z"),
-                enc(0x17, b"490101000000Z"),
-            ]
-            .concat(),
+            &[enc(0x17, b"240101000000Z"), enc(0x17, b"490101000000Z")].concat(),
         );
         let subject = name_with_cn("leaf.example.com");
         // SPKI: RSA with n = 0x00a1..., e = 65537
         let rsa_seq = enc(
             0x30,
-            &[enc(0x02, &[0x00, 0xa1, 0x02]), enc(0x02, &[0x01, 0x00, 0x01])].concat(),
+            &[
+                enc(0x02, &[0x00, 0xa1, 0x02]),
+                enc(0x02, &[0x01, 0x00, 0x01]),
+            ]
+            .concat(),
         );
         let spki = enc(
             0x30,
@@ -753,7 +760,10 @@ mod tests {
                 enc(
                     0x30,
                     &[
-                        enc(0x06, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]),
+                        enc(
+                            0x06,
+                            &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01],
+                        ),
                         enc(0x05, &[]),
                     ]
                     .concat(),
@@ -767,26 +777,27 @@ mod tests {
         let san_seq = enc(0x30, &san_gn);
         let san_ext = enc(
             0x30,
-            &[
-                enc(0x06, &[0x55, 0x1d, 0x11]),
-                enc(0x04, &san_seq),
-            ]
-            .concat(),
+            &[enc(0x06, &[0x55, 0x1d, 0x11]), enc(0x04, &san_seq)].concat(),
         );
         let bc_inner = enc(0x30, &enc(0x01, &[0xff]));
         let bc_ext = enc(
             0x30,
-            &[
-                enc(0x06, &[0x55, 0x1d, 0x13]),
-                enc(0x04, &bc_inner),
-            ]
-            .concat(),
+            &[enc(0x06, &[0x55, 0x1d, 0x13]), enc(0x04, &bc_inner)].concat(),
         );
         let exts = enc(0xa3, &enc(0x30, &[san_ext, bc_ext].concat()));
         let tbs = enc(
             0x30,
-            &[version, serial, alg_sha256rsa.clone(), issuer, validity, subject, spki, exts]
-                .concat(),
+            &[
+                version,
+                serial,
+                alg_sha256rsa.clone(),
+                issuer,
+                validity,
+                subject,
+                spki,
+                exts,
+            ]
+            .concat(),
         );
         let sig = enc(0x03, &[0x00, 0xaa, 0xbb]);
         enc(0x30, &[tbs, alg_sha256rsa, sig].concat())

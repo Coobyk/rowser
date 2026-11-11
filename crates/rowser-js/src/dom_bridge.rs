@@ -140,7 +140,11 @@ fn proto_for(ds: &mut DomState, did: u32, nid: NodeId) -> ObjRef {
         return ds.p_frag.clone();
     }
     let svg = tag == "svg" || ds.svg_nodes.contains(&(did, nid));
-    let base = if svg { ds.p_svg.clone() } else { ds.p_html.clone() };
+    let base = if svg {
+        ds.p_svg.clone()
+    } else {
+        ds.p_html.clone()
+    };
     if let Some(p) = ds.tag_protos.get(&tag) {
         return p.clone();
     }
@@ -280,9 +284,7 @@ fn clone_subtree_inplace(doc: &mut Document, id: NodeId) -> NodeId {
     let kind = doc.nodes[id].kind.clone();
     let n = match kind {
         NodeKind::Document => return doc.root,
-        NodeKind::Element { tag, attrs } => {
-            doc.create_element(&tag, attrs.into_iter().collect())
-        }
+        NodeKind::Element { tag, attrs } => doc.create_element(&tag, attrs.into_iter().collect()),
         NodeKind::Text(t) => doc.create_text(&t),
         NodeKind::Comment(c) => doc.create_comment(&c),
     };
@@ -378,9 +380,7 @@ fn escape_attr(t: &str, out: &mut String) {
 /// `innerHTML` set — parse markup and graft its body's children under `id`.
 fn set_inner_html(ds: &mut DomState, did: u32, id: NodeId, html: &str) {
     let parsed = rowser_html::parse(html);
-    let src = parsed
-        .find_deep(parsed.root, "body")
-        .unwrap_or(parsed.root);
+    let src = parsed.find_deep(parsed.root, "body").unwrap_or(parsed.root);
     let doc = &mut ds.docs[did as usize];
     remove_children(doc, id);
     graft_children(doc, &parsed, src, id);
@@ -431,8 +431,14 @@ fn listeners(i: &mut Interp, o: &ObjRef, create: bool) -> Option<ObjRef> {
 }
 
 fn listener_fns(i: &mut Interp, o: &ObjRef, ty: &str, capture: bool) -> Vec<Value> {
-    let Some(m) = listeners(i, o, false) else { return Vec::new() };
-    let key = if capture { format!("\u{1}{ty}") } else { ty.to_string() };
+    let Some(m) = listeners(i, o, false) else {
+        return Vec::new();
+    };
+    let key = if capture {
+        format!("\u{1}{ty}")
+    } else {
+        ty.to_string()
+    };
     if let Some(Value::Obj(a)) = i.obj_get_raw(&m, &pk(&key)) {
         if let ObjKind::Arr(items) = &a.borrow().kind {
             return items.clone();
@@ -442,7 +448,9 @@ fn listener_fns(i: &mut Interp, o: &ObjRef, ty: &str, capture: bool) -> Vec<Valu
 }
 
 fn el_add_event_listener(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let Value::Obj(o) = this else { return Ok(Value::Und) };
+    let Value::Obj(o) = this else {
+        return Ok(Value::Und);
+    };
     let ty = i.to_str(&arg(args, 0))?;
     let f = arg(args, 1);
     if !i.is_callable(&f) {
@@ -452,7 +460,11 @@ fn el_add_event_listener(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some(m) = listeners(i, o, true) else {
         return Ok(Value::Und);
     };
-    let key = if capture { format!("\u{1}{ty}") } else { ty.to_string() };
+    let key = if capture {
+        format!("\u{1}{ty}")
+    } else {
+        ty.to_string()
+    };
     let arr = match i.obj_get_raw(&m, &pk(&key)) {
         Some(Value::Obj(a)) => a,
         _ => {
@@ -468,14 +480,20 @@ fn el_add_event_listener(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn el_remove_event_listener(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let Value::Obj(o) = this else { return Ok(Value::Und) };
+    let Value::Obj(o) = this else {
+        return Ok(Value::Und);
+    };
     let ty = i.to_str(&arg(args, 0))?;
     let f = arg(args, 1);
     let capture = i.to_bool(&arg(args, 2));
     let Some(m) = listeners(i, o, false) else {
         return Ok(Value::Und);
     };
-    let key = if capture { format!("\u{1}{ty}") } else { ty.to_string() };
+    let key = if capture {
+        format!("\u{1}{ty}")
+    } else {
+        ty.to_string()
+    };
     if let Some(Value::Obj(a)) = i.obj_get_raw(&m, &pk(&key)) {
         if let ObjKind::Arr(items) = &mut a.borrow_mut().kind {
             // find first equal fn
@@ -608,7 +626,12 @@ fn ev_flag(ev: &Value, key: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// descendants of `from` that are elements satisfying `pred`
-fn collect_elems(ds: &DomState, did: u32, from: NodeId, pred: impl Fn(&Document, NodeId) -> bool) -> Vec<NodeId> {
+fn collect_elems(
+    ds: &DomState,
+    did: u32,
+    from: NodeId,
+    pred: impl Fn(&Document, NodeId) -> bool,
+) -> Vec<NodeId> {
     let doc = &ds.docs[did as usize];
     doc.descendants(from)
         .filter(|&c| doc.tag(c).is_some() && pred(doc, c))
@@ -643,7 +666,9 @@ fn get_by_tag(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     let want = i.to_str(&arg(args, 0))?.to_lowercase();
     let ids = with_ds(i, |ds| {
-        collect_elems(ds, did, nid, |d, n| want == "*" || d.tag(n) == Some(want.as_str()))
+        collect_elems(ds, did, nid, |d, n| {
+            want == "*" || d.tag(n) == Some(want.as_str())
+        })
     });
     Ok(wrap_list(i, did, ids))
 }
@@ -655,8 +680,10 @@ fn get_by_class(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let want = i.to_str(&arg(args, 0))?;
     let ids = with_ds(i, |ds| {
         collect_elems(ds, did, nid, |d, n| {
-            d.attr(n, "class")
-                .is_some_and(|v| want.split_whitespace().all(|c| v.split_whitespace().any(|x| x == c)))
+            d.attr(n, "class").is_some_and(|v| {
+                want.split_whitespace()
+                    .all(|c| v.split_whitespace().any(|x| x == c))
+            })
         })
     });
     Ok(wrap_list(i, did, ids))
@@ -668,7 +695,9 @@ fn get_by_name(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     let want = i.to_str(&arg(args, 0))?;
     let ids = with_ds(i, |ds| {
-        collect_elems(ds, did, nid, |d, n| d.attr(n, "name") == Some(want.as_str()))
+        collect_elems(ds, did, nid, |d, n| {
+            d.attr(n, "name") == Some(want.as_str())
+        })
     });
     Ok(wrap_list(i, did, ids))
 }
@@ -812,7 +841,9 @@ fn doc_create_fragment(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, _)) = node_ref(i, this) else {
         return Err(i.type_err("createDocumentFragment called on non-document"));
     };
-    let nid = with_ds(i, |ds| ds.docs[did as usize].create_element(FRAG_TAG, vec![]));
+    let nid = with_ds(i, |ds| {
+        ds.docs[did as usize].create_element(FRAG_TAG, vec![])
+    });
     Ok(wrap_node(i, did, nid))
 }
 
@@ -918,11 +949,14 @@ fn doc_active_element(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
         return Ok(Value::Null);
     };
     let n = with_ds(i, |ds| {
-        ds.focused.filter(|&(d, _)| d == did).map(|(_, n)| n).or_else(|| {
-            let d = &ds.docs[did as usize];
-            d.find_deep(d.root, "body")
-                .or_else(|| d.find_deep(d.root, "html"))
-        })
+        ds.focused
+            .filter(|&(d, _)| d == did)
+            .map(|(_, n)| n)
+            .or_else(|| {
+                let d = &ds.docs[did as usize];
+                d.find_deep(d.root, "body")
+                    .or_else(|| d.find_deep(d.root, "html"))
+            })
     });
     Ok(match n {
         Some(n) => wrap_node(i, did, n),
@@ -974,9 +1008,17 @@ fn doc_create_event(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
 fn doc_create_range(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
     let o = i.new_obj();
     for m in [
-        "setStart", "setEnd", "collapse", "selectNodeContents", "selectNode",
-        "setStartBefore", "setStartAfter", "setEndBefore", "setEndAfter",
-        "deleteContents", "detach",
+        "setStart",
+        "setEnd",
+        "collapse",
+        "selectNodeContents",
+        "selectNode",
+        "setStartBefore",
+        "setStartAfter",
+        "setEndBefore",
+        "setEndAfter",
+        "deleteContents",
+        "detach",
     ] {
         i.set_builtin(&o, m, i.native(m, noop));
     }
@@ -1062,13 +1104,12 @@ fn node_insert_before(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     with_ds(i, |ds| {
         let doc = &mut ds.docs[pdid as usize];
         let pos = match refr {
-            Some((rdid, rnid)) if rdid == pdid && doc.nodes[rnid].parent == Some(pnid) => {
-                doc.nodes[pnid]
-                    .children
-                    .iter()
-                    .position(|&c| c == rnid)
-                    .unwrap_or_else(|| doc.nodes[pnid].children.len())
-            }
+            Some((rdid, rnid)) if rdid == pdid && doc.nodes[rnid].parent == Some(pnid) => doc.nodes
+                [pnid]
+                .children
+                .iter()
+                .position(|&c| c == rnid)
+                .unwrap_or_else(|| doc.nodes[pnid].children.len()),
             _ => doc.nodes[pnid].children.len(),
         };
         insert_maybe_frag(doc, pnid, cnid2, pos);
@@ -1146,10 +1187,9 @@ fn node_clone(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             let d = &mut ds.docs[did as usize];
             let kind = d.nodes[nid].kind.clone();
             match kind {
-                NodeKind::Element { tag, attrs } => d.create_element(
-                    &tag,
-                    attrs.into_iter().collect(),
-                ),
+                NodeKind::Element { tag, attrs } => {
+                    d.create_element(&tag, attrs.into_iter().collect())
+                }
                 NodeKind::Text(t) => d.create_text(&t),
                 NodeKind::Comment(c) => d.create_comment(&c),
                 NodeKind::Document => d.create_element(FRAG_TAG, vec![]),
@@ -1217,9 +1257,7 @@ fn js_to_node(i: &mut Interp, did: u32, v: &Value) -> Result<Option<NodeId>, Val
         Value::Und | Value::Null => Ok(None),
         _ => {
             let s = i.to_str(v)?;
-            Ok(Some(with_ds(i, |ds| {
-                ds.docs[did as usize].create_text(&s)
-            })))
+            Ok(Some(with_ds(i, |ds| ds.docs[did as usize].create_text(&s))))
         }
     }
 }
@@ -1362,12 +1400,16 @@ fn rel_node(i: &mut Interp, this: &Value, pick: usize) -> NR {
     let found = with_ds(i, |ds| {
         let d = &ds.docs[did as usize];
         match pick {
-            0 | 6 => d.nodes[nid].children.first().copied().filter(|&c| {
-                pick == 0 || d.tag(c).is_some()
-            }),
-            1 | 7 => d.nodes[nid].children.last().copied().filter(|&c| {
-                pick == 1 || d.tag(c).is_some()
-            }),
+            0 | 6 => d.nodes[nid]
+                .children
+                .first()
+                .copied()
+                .filter(|&c| pick == 0 || d.tag(c).is_some()),
+            1 | 7 => d.nodes[nid]
+                .children
+                .last()
+                .copied()
+                .filter(|&c| pick == 1 || d.tag(c).is_some()),
             2 | 3 | 8 | 9 => {
                 let (p, pos) = pos_in_parent(d, nid)?;
                 let kids = &d.nodes[p].children;
@@ -1378,12 +1420,16 @@ fn rel_node(i: &mut Interp, this: &Value, pick: usize) -> NR {
                         .iter()
                         .copied()
                         .find(|&c| d.tag(c).is_some()),
-                    _ => kids[..pos].iter().rev().copied().find(|&c| d.tag(c).is_some()),
+                    _ => kids[..pos]
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|&c| d.tag(c).is_some()),
                 }
             }
-            4 | 5 => d.nodes[nid].parent.filter(|&p| {
-                pick == 4 || d.tag(p).is_some()
-            }),
+            4 | 5 => d.nodes[nid]
+                .parent
+                .filter(|&p| pick == 4 || d.tag(p).is_some()),
             _ => None,
         }
     });
@@ -1477,11 +1523,9 @@ fn node_tag_name(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Und);
     };
-    Ok(with_ds(i, |ds| {
-        match ds.docs[did as usize].tag(nid) {
-            Some(t) if t != FRAG_TAG => Value::Str(Rc::from(t.to_uppercase().as_str())),
-            _ => Value::Und,
-        }
+    Ok(with_ds(i, |ds| match ds.docs[did as usize].tag(nid) {
+        Some(t) if t != FRAG_TAG => Value::Str(Rc::from(t.to_uppercase().as_str())),
+        _ => Value::Und,
     }))
 }
 
@@ -1489,13 +1533,9 @@ fn node_node_value_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Null);
     };
-    Ok(with_ds(i, |ds| {
-        match ds.docs[did as usize].kind(nid) {
-            NodeKind::Text(t) | NodeKind::Comment(t) => {
-                Value::Str(Rc::from(t.as_str()))
-            }
-            _ => Value::Null,
-        }
+    Ok(with_ds(i, |ds| match ds.docs[did as usize].kind(nid) {
+        NodeKind::Text(t) | NodeKind::Comment(t) => Value::Str(Rc::from(t.as_str())),
+        _ => Value::Null,
     }))
 }
 
@@ -1517,16 +1557,10 @@ fn node_text_content_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Null);
     };
-    Ok(with_ds(i, |ds| {
-        match ds.docs[did as usize].kind(nid) {
-            NodeKind::Document => Value::Null,
-            NodeKind::Text(t) | NodeKind::Comment(t) => {
-                Value::Str(Rc::from(t.as_str()))
-            }
-            _ => Value::Str(Rc::from(
-                ds.docs[did as usize].text_content(nid).as_str(),
-            )),
-        }
+    Ok(with_ds(i, |ds| match ds.docs[did as usize].kind(nid) {
+        NodeKind::Document => Value::Null,
+        NodeKind::Text(t) | NodeKind::Comment(t) => Value::Str(Rc::from(t.as_str())),
+        _ => Value::Str(Rc::from(ds.docs[did as usize].text_content(nid).as_str())),
     }))
 }
 
@@ -1537,9 +1571,7 @@ fn node_text_content_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             let doc = &mut ds.docs[did as usize];
             match &doc.nodes[nid].kind {
                 NodeKind::Text(_) | NodeKind::Comment(_) => {
-                    if let NodeKind::Text(t) | NodeKind::Comment(t) =
-                        &mut doc.nodes[nid].kind
-                    {
+                    if let NodeKind::Text(t) | NodeKind::Comment(t) = &mut doc.nodes[nid].kind {
                         *t = v;
                     }
                 }
@@ -1608,16 +1640,13 @@ fn el_namespace_uri(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
         _ => None,
     };
     let is_svg = with_ds(i, |ds| {
-        ds.svg_nodes.contains(&(did, nid))
-            || ds.docs[did as usize].tag(nid) == Some("svg")
+        ds.svg_nodes.contains(&(did, nid)) || ds.docs[did as usize].tag(nid) == Some("svg")
     }) || matches!(ns_prop, Some(Value::Str(s)) if s.contains("svg"));
-    Ok(Value::Str(Rc::from(
-        if is_svg {
-            "http://www.w3.org/2000/svg"
-        } else {
-            "http://www.w3.org/1999/xhtml"
-        },
-    )))
+    Ok(Value::Str(Rc::from(if is_svg {
+        "http://www.w3.org/2000/svg"
+    } else {
+        "http://www.w3.org/1999/xhtml"
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,12 +1750,14 @@ fn el_attribute_names(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
         NodeKind::Element { attrs, .. } => attrs.keys().cloned().collect::<Vec<_>>(),
         _ => vec![],
     });
-    Ok(Value::Obj(i.new_arr(
-        names
-            .into_iter()
-            .map(|n| Value::Str(Rc::from(n.as_str())))
-            .collect(),
-    )))
+    Ok(Value::Obj(
+        i.new_arr(
+            names
+                .into_iter()
+                .map(|n| Value::Str(Rc::from(n.as_str())))
+                .collect(),
+        ),
+    ))
 }
 
 fn el_attributes(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
@@ -1808,7 +1839,9 @@ fn el_classname_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 fn el_classname_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let v = i.to_str(&arg(args, 0))?;
     if let Some((did, nid)) = node_ref(i, this) {
-        with_ds(i, |ds| attr_set(&mut ds.docs[did as usize], nid, "class", &v));
+        with_ds(i, |ds| {
+            attr_set(&mut ds.docs[did as usize], nid, "class", &v)
+        });
     }
     Ok(Value::Und)
 }
@@ -2020,7 +2053,9 @@ fn el_click(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 
 fn el_get_rect(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
     let o = i.new_obj();
-    for k in ["x", "y", "top", "left", "right", "bottom", "width", "height"] {
+    for k in [
+        "x", "y", "top", "left", "right", "bottom", "width", "height",
+    ] {
         i.set_data(&o, k, Value::Num(0.0));
     }
     Ok(Value::Obj(o))
@@ -2165,23 +2200,97 @@ fn kebab(s: &str) -> String {
 }
 
 const STYLE_PROPS: &[&str] = &[
-    "cssText", "display", "position", "top", "left", "right", "bottom", "width",
-    "height", "minWidth", "minHeight", "maxWidth", "maxHeight", "margin",
-    "marginTop", "marginRight", "marginBottom", "marginLeft", "padding",
-    "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "color",
-    "background", "backgroundColor", "backgroundImage", "border", "borderRadius",
-    "borderColor", "borderWidth", "borderStyle", "borderTop", "borderBottom",
-    "font", "fontSize", "fontFamily", "fontWeight", "fontStyle", "lineHeight",
-    "textAlign", "textDecoration", "textTransform", "verticalAlign",
-    "visibility", "opacity", "overflow", "overflowX", "overflowY", "zIndex",
-    "transform", "transformOrigin", "transition", "animation", "animationName",
-    "animationDuration", "boxShadow", "boxSizing", "content", "cursor", "flex",
-    "flexDirection", "flexWrap", "flexGrow", "flexShrink", "flexBasis",
-    "justifyContent", "alignItems", "alignContent", "alignSelf", "gap", "order",
-    "gridTemplateColumns", "gridTemplateRows", "whiteSpace", "wordBreak",
-    "pointerEvents", "userSelect", "float", "clear", "listStyle",
-    "listStyleType", "objectFit", "outline", "clipPath", "filter", "willChange",
-    "letterSpacing", "wordSpacing", "scrollBehavior", "aspectRatio",
+    "cssText",
+    "display",
+    "position",
+    "top",
+    "left",
+    "right",
+    "bottom",
+    "width",
+    "height",
+    "minWidth",
+    "minHeight",
+    "maxWidth",
+    "maxHeight",
+    "margin",
+    "marginTop",
+    "marginRight",
+    "marginBottom",
+    "marginLeft",
+    "padding",
+    "paddingTop",
+    "paddingRight",
+    "paddingBottom",
+    "paddingLeft",
+    "color",
+    "background",
+    "backgroundColor",
+    "backgroundImage",
+    "border",
+    "borderRadius",
+    "borderColor",
+    "borderWidth",
+    "borderStyle",
+    "borderTop",
+    "borderBottom",
+    "font",
+    "fontSize",
+    "fontFamily",
+    "fontWeight",
+    "fontStyle",
+    "lineHeight",
+    "textAlign",
+    "textDecoration",
+    "textTransform",
+    "verticalAlign",
+    "visibility",
+    "opacity",
+    "overflow",
+    "overflowX",
+    "overflowY",
+    "zIndex",
+    "transform",
+    "transformOrigin",
+    "transition",
+    "animation",
+    "animationName",
+    "animationDuration",
+    "boxShadow",
+    "boxSizing",
+    "content",
+    "cursor",
+    "flex",
+    "flexDirection",
+    "flexWrap",
+    "flexGrow",
+    "flexShrink",
+    "flexBasis",
+    "justifyContent",
+    "alignItems",
+    "alignContent",
+    "alignSelf",
+    "gap",
+    "order",
+    "gridTemplateColumns",
+    "gridTemplateRows",
+    "whiteSpace",
+    "wordBreak",
+    "pointerEvents",
+    "userSelect",
+    "float",
+    "clear",
+    "listStyle",
+    "listStyleType",
+    "objectFit",
+    "outline",
+    "clipPath",
+    "filter",
+    "willChange",
+    "letterSpacing",
+    "wordSpacing",
+    "scrollBehavior",
+    "aspectRatio",
 ];
 
 /// fresh CSS-style declaration object for `el` (`el` must be a wrapped node).
@@ -2271,7 +2380,9 @@ fn sync_style_attr(i: &Interp, style: &ObjRef) -> Option<(u32, NodeId, String)> 
 }
 
 fn style_set_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let Value::Obj(o) = this else { return Ok(Value::Und) };
+    let Value::Obj(o) = this else {
+        return Ok(Value::Und);
+    };
     let k = i.to_str(&arg(args, 0))?;
     let v = i.to_str(&arg(args, 1))?;
     if let Some(d) = decls_of(i, o) {
@@ -2279,7 +2390,9 @@ fn style_set_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     }
     // reflect immediately to the attr
     if let Some((did, nid, css)) = sync_style_attr(i, o) {
-        with_ds(i, |ds| attr_set(&mut ds.docs[did as usize], nid, "style", &css));
+        with_ds(i, |ds| {
+            attr_set(&mut ds.docs[did as usize], nid, "style", &css)
+        });
     }
     Ok(Value::Und)
 }
@@ -2330,7 +2443,9 @@ fn style_remove_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         d.borrow_mut().props.remove(&pk(&k));
     }
     if let Some((did, nid, css)) = sync_style_attr(i, o) {
-        with_ds(i, |ds| attr_set(&mut ds.docs[did as usize], nid, "style", &css));
+        with_ds(i, |ds| {
+            attr_set(&mut ds.docs[did as usize], nid, "style", &css)
+        });
     }
     Ok(Value::Str(Rc::from("")))
 }
@@ -2349,9 +2464,7 @@ fn dataset_obj(i: &mut Interp, el: &Value, el_o: &ObjRef) -> Value {
         let attrs = with_ds(i, |ds| match ds.docs[did as usize].kind(nid) {
             NodeKind::Element { attrs, .. } => attrs
                 .iter()
-                .filter_map(|(k, v)| {
-                    k.strip_prefix("data-").map(|r| (r.to_string(), v.clone()))
-                })
+                .filter_map(|(k, v)| k.strip_prefix("data-").map(|r| (r.to_string(), v.clone())))
                 .collect::<Vec<_>>(),
             _ => vec![],
         });
@@ -2468,11 +2581,7 @@ fn text_split(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             NodeKind::Text(t) => t.clone(),
             _ => return None,
         };
-        let byte_off = t
-            .char_indices()
-            .nth(off)
-            .map(|(b, _)| b)
-            .unwrap_or(t.len());
+        let byte_off = t.char_indices().nth(off).map(|(b, _)| b).unwrap_or(t.len());
         let tail = t[byte_off..].to_string();
         if let NodeKind::Text(tt) = &mut doc.nodes[nid].kind {
             *tt = t[..byte_off].to_string();
@@ -2558,7 +2667,10 @@ fn custom_event_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn event_prevent_default(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     if let Value::Obj(o) = this {
-        if i.to_bool(&i.obj_get_raw(o, &pk("cancelable")).unwrap_or(Value::Bool(true))) {
+        if i.to_bool(
+            &i.obj_get_raw(o, &pk("cancelable"))
+                .unwrap_or(Value::Bool(true)),
+        ) {
             i.set_builtin(o, "defaultPrevented", Value::Bool(true));
         }
     }
@@ -2617,10 +2729,7 @@ fn event_composed_path(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 // storage
 // ---------------------------------------------------------------------------
 
-fn store_map<'m>(
-    ds: &'m mut DomState,
-    which: &str,
-) -> &'m mut Vec<(String, String)> {
+fn store_map<'m>(ds: &'m mut DomState, which: &str) -> &'m mut Vec<(String, String)> {
     if which == "session" {
         &mut ds.storage_session
     } else {
@@ -2679,11 +2788,9 @@ fn st_clear(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 fn st_key(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let n = i.to_num(&arg(args, 0))? as usize;
     let w = store_which(i, this);
-    Ok(with_ds(i, |ds| {
-        match store_map(ds, &w).get(n) {
-            Some((k, _)) => Value::Str(Rc::from(k.as_str())),
-            None => Value::Null,
-        }
+    Ok(with_ds(i, |ds| match store_map(ds, &w).get(n) {
+        Some((k, _)) => Value::Str(Rc::from(k.as_str())),
+        None => Value::Null,
     }))
 }
 
@@ -2702,8 +2809,13 @@ fn location_obj(i: &mut Interp) -> Value {
     }
     let (proto, url) = (Some(i.p.obj.clone()), with_ds(i, |ds| ds.url.clone()));
     let o = obj(proto);
-    let (mut protocol, mut host, mut path, mut search, mut hash) =
-        (String::new(), String::new(), "/".to_string(), String::new(), String::new());
+    let (mut protocol, mut host, mut path, mut search, mut hash) = (
+        String::new(),
+        String::new(),
+        "/".to_string(),
+        String::new(),
+        String::new(),
+    );
     // split scheme://authority/path?search#hash
     let mut rest = url.as_str();
     if let Some((scheme, r)) = rest.split_once("://") {
@@ -2826,7 +2938,11 @@ fn g_idle_cb(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
     let cb = arg(args, 0);
     let deadline = i.new_obj();
     i.set_data(&deadline, "didTimeout", Value::Bool(false));
-    i.set_builtin(&deadline, "timeRemaining", i.native("timeRemaining", idle_time));
+    i.set_builtin(
+        &deadline,
+        "timeRemaining",
+        i.native("timeRemaining", idle_time),
+    );
     Ok(Value::Num(with_ds(i, |ds| {
         ds.next_timer += 1;
         let id = ds.next_timer;
@@ -2850,7 +2966,13 @@ fn g_match_media(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
     i.set_data(&o, "matches", Value::Bool(false));
     i.set_data(&o, "media", Value::Str(Rc::from(q.as_str())));
     i.set_data(&o, "onchange", Value::Null);
-    for m in ["addEventListener", "removeEventListener", "addListener", "removeListener", "dispatchEvent"] {
+    for m in [
+        "addEventListener",
+        "removeEventListener",
+        "addListener",
+        "removeListener",
+        "dispatchEvent",
+    ] {
         i.set_builtin(&o, m, i.native(m, noop));
     }
     Ok(Value::Obj(o))
@@ -2932,8 +3054,7 @@ fn mo_observe(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     if i.is_callable(&cb) {
         let records = Value::Obj(i.new_arr(vec![]));
         with_ds(i, |ds| {
-            ds.microtasks
-                .push_back((cb, vec![records, this.clone()]))
+            ds.microtasks.push_back((cb, vec![records, this.clone()]))
         });
     }
     Ok(Value::Und)
@@ -2970,8 +3091,16 @@ fn mc_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         i.set_builtin(&p, "postMessage", i.native("postMessage", mc_post));
         i.set_builtin(&p, "start", i.native("start", noop));
         i.set_builtin(&p, "close", i.native("close", noop));
-        i.set_builtin(&p, "addEventListener", i.native("addEventListener", el_add_event_listener));
-        i.set_builtin(&p, "removeEventListener", i.native("removeEventListener", el_remove_event_listener));
+        i.set_builtin(
+            &p,
+            "addEventListener",
+            i.native("addEventListener", el_add_event_listener),
+        );
+        i.set_builtin(
+            &p,
+            "removeEventListener",
+            i.native("removeEventListener", el_remove_event_listener),
+        );
         i.set_builtin(&p, "onmessage", Value::Null);
         i.set_builtin(&p, "onmessageerror", Value::Null);
         p
@@ -3007,10 +3136,26 @@ fn ac_ctor(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let sig = i.new_obj();
     i.set_builtin(&sig, "aborted", Value::Bool(false));
     i.set_builtin(&sig, "reason", Value::Und);
-    i.set_builtin(&sig, "addEventListener", i.native("addEventListener", el_add_event_listener));
-    i.set_builtin(&sig, "removeEventListener", i.native("removeEventListener", el_remove_event_listener));
-    i.set_builtin(&sig, "dispatchEvent", i.native("dispatchEvent", el_dispatch_event));
-    i.set_builtin(&sig, "throwIfAborted", i.native("throwIfAborted", sig_throw));
+    i.set_builtin(
+        &sig,
+        "addEventListener",
+        i.native("addEventListener", el_add_event_listener),
+    );
+    i.set_builtin(
+        &sig,
+        "removeEventListener",
+        i.native("removeEventListener", el_remove_event_listener),
+    );
+    i.set_builtin(
+        &sig,
+        "dispatchEvent",
+        i.native("dispatchEvent", el_dispatch_event),
+    );
+    i.set_builtin(
+        &sig,
+        "throwIfAborted",
+        i.native("throwIfAborted", sig_throw),
+    );
     i.set_builtin(&sig, "onabort", Value::Null);
     i.set_builtin(o, "signal", Value::Obj(sig));
     Ok(Value::Und)
@@ -3018,7 +3163,10 @@ fn ac_ctor(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 
 fn sig_throw(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     if let Value::Obj(o) = this {
-        if i.to_bool(&i.obj_get_raw(o, &pk("aborted")).unwrap_or(Value::Bool(false))) {
+        if i.to_bool(
+            &i.obj_get_raw(o, &pk("aborted"))
+                .unwrap_or(Value::Bool(false)),
+        ) {
             let r = i
                 .obj_get_raw(o, &pk("reason"))
                 .unwrap_or_else(|| i.plain_err("AbortError"));
@@ -3064,9 +3212,7 @@ fn met(i: &Interp, o: &ObjRef, name: &str, f: NativeFn) {
 fn acc(i: &Interp, o: &ObjRef, name: &str, get: Option<NativeFn>, set: Option<NativeFn>) {
     let g = get.map(|f| i.native(&format!("get {name}"), f));
     let s = set.map(|f| i.native(&format!("set {name}"), f));
-    o.borrow_mut()
-        .props
-        .insert(pk(name), Prop::accessor(g, s));
+    o.borrow_mut().props.insert(pk(name), Prop::accessor(g, s));
 }
 
 fn gdef(i: &mut Interp, name: &str, v: Value) {
@@ -3169,8 +3315,20 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     acc(i, &p_node, "parentElement", Some(node_parent_elem), None);
     acc(i, &p_node, "nodeType", Some(node_node_type), None);
     acc(i, &p_node, "nodeName", Some(node_node_name), None);
-    acc(i, &p_node, "nodeValue", Some(node_node_value_get), Some(node_node_value_set));
-    acc(i, &p_node, "textContent", Some(node_text_content_get), Some(node_text_content_set));
+    acc(
+        i,
+        &p_node,
+        "nodeValue",
+        Some(node_node_value_get),
+        Some(node_node_value_set),
+    );
+    acc(
+        i,
+        &p_node,
+        "textContent",
+        Some(node_text_content_get),
+        Some(node_text_content_set),
+    );
     acc(i, &p_node, "ownerDocument", Some(node_owner_document), None);
     acc(i, &p_node, "isConnected", Some(node_is_connected), None);
     acc(i, &p_node, "baseURI", Some(node_base_uri), None);
@@ -3211,7 +3369,13 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         met(i, &p_elem, n, f);
     }
     acc(i, &p_elem, "id", Some(el_id_get), Some(el_id_set));
-    acc(i, &p_elem, "className", Some(el_classname_get), Some(el_classname_set));
+    acc(
+        i,
+        &p_elem,
+        "className",
+        Some(el_classname_get),
+        Some(el_classname_set),
+    );
     acc(i, &p_elem, "tagName", Some(node_tag_name), None);
     acc(i, &p_elem, "localName", Some(el_local_name), None);
     acc(i, &p_elem, "namespaceURI", Some(el_namespace_uri), None);
@@ -3223,10 +3387,34 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     acc(i, &p_elem, "firstElementChild", Some(node_first_elem), None);
     acc(i, &p_elem, "lastElementChild", Some(node_last_elem), None);
     acc(i, &p_elem, "nextElementSibling", Some(node_next_elem), None);
-    acc(i, &p_elem, "previousElementSibling", Some(node_prev_elem), None);
-    acc(i, &p_elem, "innerHTML", Some(el_inner_html_get), Some(el_inner_html_set));
-    acc(i, &p_elem, "outerHTML", Some(el_outer_html_get), Some(el_outer_html_set));
-    acc(i, &p_elem, "innerText", Some(node_text_content_get), Some(node_text_content_set));
+    acc(
+        i,
+        &p_elem,
+        "previousElementSibling",
+        Some(node_prev_elem),
+        None,
+    );
+    acc(
+        i,
+        &p_elem,
+        "innerHTML",
+        Some(el_inner_html_get),
+        Some(el_inner_html_set),
+    );
+    acc(
+        i,
+        &p_elem,
+        "outerHTML",
+        Some(el_outer_html_get),
+        Some(el_outer_html_set),
+    );
+    acc(
+        i,
+        &p_elem,
+        "innerText",
+        Some(node_text_content_get),
+        Some(node_text_content_set),
+    );
     // reflected attrs
     acc(i, &p_elem, "value", Some(val_get), Some(val_set));
     acc(i, &p_elem, "href", Some(href_get), Some(href_set));
@@ -3241,19 +3429,68 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     acc(i, &p_elem, "htmlFor", Some(for_get), Some(for_set));
     acc(i, &p_elem, "action", Some(action_get), Some(action_set));
     acc(i, &p_elem, "method", Some(method_get), Some(method_set));
-    acc(i, &p_elem, "title", Some(title_attr_get), Some(title_attr_set));
+    acc(
+        i,
+        &p_elem,
+        "title",
+        Some(title_attr_get),
+        Some(title_attr_set),
+    );
     acc(i, &p_elem, "checked", Some(checked_get), Some(checked_set));
-    acc(i, &p_elem, "disabled", Some(disabled_get), Some(disabled_set));
-    acc(i, &p_elem, "selected", Some(selected_get), Some(selected_set));
-    acc(i, &p_elem, "readOnly", Some(readonly_get), Some(readonly_set));
-    acc(i, &p_elem, "multiple", Some(multiple_get), Some(multiple_set));
-    acc(i, &p_elem, "required", Some(required_get), Some(required_set));
-    acc(i, &p_elem, "tabIndex", Some(tab_index_get), Some(tab_index_set));
+    acc(
+        i,
+        &p_elem,
+        "disabled",
+        Some(disabled_get),
+        Some(disabled_set),
+    );
+    acc(
+        i,
+        &p_elem,
+        "selected",
+        Some(selected_get),
+        Some(selected_set),
+    );
+    acc(
+        i,
+        &p_elem,
+        "readOnly",
+        Some(readonly_get),
+        Some(readonly_set),
+    );
+    acc(
+        i,
+        &p_elem,
+        "multiple",
+        Some(multiple_get),
+        Some(multiple_set),
+    );
+    acc(
+        i,
+        &p_elem,
+        "required",
+        Some(required_get),
+        Some(required_set),
+    );
+    acc(
+        i,
+        &p_elem,
+        "tabIndex",
+        Some(tab_index_get),
+        Some(tab_index_set),
+    );
     // geometry — no layout here, all zeros
     for k in [
-        "offsetWidth", "offsetHeight", "offsetTop", "offsetLeft",
-        "clientWidth", "clientHeight", "clientTop", "clientLeft",
-        "scrollWidth", "scrollHeight",
+        "offsetWidth",
+        "offsetHeight",
+        "offsetTop",
+        "offsetLeft",
+        "clientWidth",
+        "clientHeight",
+        "clientTop",
+        "clientLeft",
+        "scrollWidth",
+        "scrollHeight",
     ] {
         acc(i, &p_elem, k, Some(zero), None);
     }
@@ -3363,10 +3600,15 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     let node_ctor = dom_ctor(i, "Node", elem_ctor_throw, &p_node);
     // Node statics
     for (k, v) in [
-        ("ELEMENT_NODE", 1.0), ("ATTRIBUTE_NODE", 2.0), ("TEXT_NODE", 3.0),
-        ("CDATA_SECTION_NODE", 4.0), ("PROCESSING_INSTRUCTION_NODE", 7.0),
-        ("COMMENT_NODE", 8.0), ("DOCUMENT_NODE", 9.0),
-        ("DOCUMENT_TYPE_NODE", 10.0), ("DOCUMENT_FRAGMENT_NODE", 11.0),
+        ("ELEMENT_NODE", 1.0),
+        ("ATTRIBUTE_NODE", 2.0),
+        ("TEXT_NODE", 3.0),
+        ("CDATA_SECTION_NODE", 4.0),
+        ("PROCESSING_INSTRUCTION_NODE", 7.0),
+        ("COMMENT_NODE", 8.0),
+        ("DOCUMENT_NODE", 9.0),
+        ("DOCUMENT_TYPE_NODE", 10.0),
+        ("DOCUMENT_FRAGMENT_NODE", 11.0),
     ] {
         if let Value::Obj(o) = &node_ctor {
             i.set_builtin(o, k, Value::Num(v));
@@ -3431,23 +3673,40 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     // Per-tag-family HTML element ctors — all "loose" (each has its own
     // prototype object chaining HTMLElement.prototype).
     for (tag, name) in [
-        ("div", "HTMLDivElement"), ("span", "HTMLSpanElement"),
-        ("a", "HTMLAnchorElement"), ("p", "HTMLParagraphElement"),
-        ("input", "HTMLInputElement"), ("button", "HTMLButtonElement"),
-        ("img", "HTMLImageElement"), ("canvas", "HTMLCanvasElement"),
-        ("form", "HTMLFormElement"), ("label", "HTMLLabelElement"),
-        ("select", "HTMLSelectElement"), ("option", "HTMLOptionElement"),
-        ("textarea", "HTMLTextAreaElement"), ("ul", "HTMLUListElement"),
-        ("ol", "HTMLOListElement"), ("li", "HTMLLIElement"),
-        ("table", "HTMLTableElement"), ("tr", "HTMLTableRowElement"),
-        ("td", "HTMLTableCellElement"), ("script", "HTMLScriptElement"),
-        ("style", "HTMLStyleElement"), ("template", "HTMLTemplateElement"),
-        ("iframe", "HTMLIFrameElement"), ("body", "HTMLBodyElement"),
-        ("html", "HTMLHtmlElement"), ("head", "HTMLHeadElement"),
-        ("title", "HTMLTitleElement"), ("br", "HTMLBRElement"),
-        ("hr", "HTMLHRElement"), ("pre", "HTMLPreElement"),
-        ("video", "HTMLVideoElement"), ("audio", "HTMLAudioElement"),
-        ("meta", "HTMLMetaElement"), ("link", "HTMLLinkElement"),
+        ("div", "HTMLDivElement"),
+        ("span", "HTMLSpanElement"),
+        ("a", "HTMLAnchorElement"),
+        ("p", "HTMLParagraphElement"),
+        ("input", "HTMLInputElement"),
+        ("button", "HTMLButtonElement"),
+        ("img", "HTMLImageElement"),
+        ("canvas", "HTMLCanvasElement"),
+        ("form", "HTMLFormElement"),
+        ("label", "HTMLLabelElement"),
+        ("select", "HTMLSelectElement"),
+        ("option", "HTMLOptionElement"),
+        ("textarea", "HTMLTextAreaElement"),
+        ("ul", "HTMLUListElement"),
+        ("ol", "HTMLOListElement"),
+        ("li", "HTMLLIElement"),
+        ("table", "HTMLTableElement"),
+        ("tr", "HTMLTableRowElement"),
+        ("td", "HTMLTableCellElement"),
+        ("script", "HTMLScriptElement"),
+        ("style", "HTMLStyleElement"),
+        ("template", "HTMLTemplateElement"),
+        ("iframe", "HTMLIFrameElement"),
+        ("body", "HTMLBodyElement"),
+        ("html", "HTMLHtmlElement"),
+        ("head", "HTMLHeadElement"),
+        ("title", "HTMLTitleElement"),
+        ("br", "HTMLBRElement"),
+        ("hr", "HTMLHRElement"),
+        ("pre", "HTMLPreElement"),
+        ("video", "HTMLVideoElement"),
+        ("audio", "HTMLAudioElement"),
+        ("meta", "HTMLMetaElement"),
+        ("link", "HTMLLinkElement"),
         ("h", "HTMLHeadingElement"),
     ] {
         let proto = obj(Some(p_html.clone()));
@@ -3500,22 +3759,49 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         i.set_builtin(&go, "screenY", Value::Num(0.0));
         i.set_builtin(&go, "screenLeft", Value::Num(0.0));
         i.set_builtin(&go, "screenTop", Value::Num(0.0));
-        i.set_builtin(&go, "addEventListener", i.native("addEventListener", el_add_event_listener));
-        i.set_builtin(&go, "removeEventListener", i.native("removeEventListener", el_remove_event_listener));
-        i.set_builtin(&go, "dispatchEvent", i.native("dispatchEvent", el_dispatch_event));
-        for m in ["scroll", "scrollTo", "scrollBy", "alert", "confirm", "prompt", "print", "blur", "focus", "close", "stop", "open"] {
+        i.set_builtin(
+            &go,
+            "addEventListener",
+            i.native("addEventListener", el_add_event_listener),
+        );
+        i.set_builtin(
+            &go,
+            "removeEventListener",
+            i.native("removeEventListener", el_remove_event_listener),
+        );
+        i.set_builtin(
+            &go,
+            "dispatchEvent",
+            i.native("dispatchEvent", el_dispatch_event),
+        );
+        for m in [
+            "scroll", "scrollTo", "scrollBy", "alert", "confirm", "prompt", "print", "blur",
+            "focus", "close", "stop", "open",
+        ] {
             i.set_builtin(&go, m, i.native(m, noop));
         }
-        i.set_builtin(&go, "getComputedStyle", i.native("getComputedStyle", g_get_computed_style));
+        i.set_builtin(
+            &go,
+            "getComputedStyle",
+            i.native("getComputedStyle", g_get_computed_style),
+        );
         i.set_builtin(&go, "matchMedia", i.native("matchMedia", g_match_media));
         i.set_builtin(&go, "fetch", i.native("fetch", g_fetch));
-        i.set_builtin(&go, "getSelection", i.native("getSelection", g_get_selection));
+        i.set_builtin(
+            &go,
+            "getSelection",
+            i.native("getSelection", g_get_selection),
+        );
         i.set_builtin(&go, "hasFocus", i.native("hasFocus", doc_has_focus));
     }
 
     // navigator / screen / history / performance / storage
     let nav = i.new_obj();
-    i.set_builtin(&nav, "userAgent", Value::Str(Rc::from("Mozilla/5.0 (rowser) rowser-js")));
+    i.set_builtin(
+        &nav,
+        "userAgent",
+        Value::Str(Rc::from("Mozilla/5.0 (rowser) rowser-js")),
+    );
     i.set_builtin(&nav, "appName", Value::Str(Rc::from("Netscape")));
     i.set_builtin(&nav, "appVersion", Value::Str(Rc::from("5.0 (rowser)")));
     i.set_builtin(&nav, "platform", Value::Str(Rc::from("Linux x86_64")));
@@ -3527,13 +3813,21 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     i.set_builtin(&nav, "cookieEnabled", Value::Bool(true));
     i.set_builtin(&nav, "hardwareConcurrency", Value::Num(4.0));
     i.set_builtin(&nav, "maxTouchPoints", Value::Num(0.0));
-    i.set_builtin(&nav, "languages", Value::Obj(i.new_arr(vec![Value::Str(Rc::from("en-US"))])));
+    i.set_builtin(
+        &nav,
+        "languages",
+        Value::Obj(i.new_arr(vec![Value::Str(Rc::from("en-US"))])),
+    );
     gdef(i, "navigator", Value::Obj(nav));
 
     let screen = i.new_obj();
     for (k, v) in [
-        ("width", vw), ("height", vh), ("availWidth", vw),
-        ("availHeight", vh), ("colorDepth", 24.0), ("pixelDepth", 24.0),
+        ("width", vw),
+        ("height", vh),
+        ("availWidth", vw),
+        ("availHeight", vh),
+        ("colorDepth", 24.0),
+        ("pixelDepth", 24.0),
     ] {
         i.set_builtin(&screen, k, Value::Num(v));
     }
@@ -3554,8 +3848,16 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     i.set_builtin(&perf, "mark", i.native("mark", noop));
     i.set_builtin(&perf, "measure", i.native("measure", noop));
     i.set_builtin(&perf, "getEntries", i.native("getEntries", mo_take_records));
-    i.set_builtin(&perf, "getEntriesByType", i.native("getEntriesByType", mo_take_records));
-    i.set_builtin(&perf, "getEntriesByName", i.native("getEntriesByName", mo_take_records));
+    i.set_builtin(
+        &perf,
+        "getEntriesByType",
+        i.native("getEntriesByType", mo_take_records),
+    );
+    i.set_builtin(
+        &perf,
+        "getEntriesByName",
+        i.native("getEntriesByName", mo_take_records),
+    );
     gdef(i, "performance", Value::Obj(perf));
 
     // storage objects
@@ -3576,11 +3878,31 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     gdef(i, "setInterval", i.native("setInterval", g_set_interval));
     gdef(i, "clearTimeout", i.native("clearTimeout", g_clear_timer));
     gdef(i, "clearInterval", i.native("clearInterval", g_clear_timer));
-    gdef(i, "requestAnimationFrame", i.native("requestAnimationFrame", g_raf));
-    gdef(i, "cancelAnimationFrame", i.native("cancelAnimationFrame", g_cancel_raf));
-    gdef(i, "queueMicrotask", i.native("queueMicrotask", g_queue_microtask));
-    gdef(i, "requestIdleCallback", i.native("requestIdleCallback", g_idle_cb));
-    gdef(i, "cancelIdleCallback", i.native("cancelIdleCallback", g_clear_timer));
+    gdef(
+        i,
+        "requestAnimationFrame",
+        i.native("requestAnimationFrame", g_raf),
+    );
+    gdef(
+        i,
+        "cancelAnimationFrame",
+        i.native("cancelAnimationFrame", g_cancel_raf),
+    );
+    gdef(
+        i,
+        "queueMicrotask",
+        i.native("queueMicrotask", g_queue_microtask),
+    );
+    gdef(
+        i,
+        "requestIdleCallback",
+        i.native("requestIdleCallback", g_idle_cb),
+    );
+    gdef(
+        i,
+        "cancelIdleCallback",
+        i.native("cancelIdleCallback", g_clear_timer),
+    );
 }
 
 fn observer_proto(i: &mut Interp) -> ObjRef {
@@ -3705,7 +4027,8 @@ impl DomContext {
                     i.set_builtin(&ev, "target", pv.clone());
                     if let Err(e) = i.call(&onm, pv.clone(), vec![Value::Obj(ev)]) {
                         let m = i.inspect(&e, 0);
-                        self.errors.push(format!("Uncaught (in port onmessage) {m}"));
+                        self.errors
+                            .push(format!("Uncaught (in port onmessage) {m}"));
                     }
                 }
             }
@@ -3831,15 +4154,15 @@ mod tests {
     #[test]
     fn inner_html_roundtrip() {
         let mut dc = ctx("<html><body><div id='root'></div></body></html>");
-        run(&mut dc, "document.getElementById('root').innerHTML = '<p>hi</p>'");
+        run(
+            &mut dc,
+            "document.getElementById('root').innerHTML = '<p>hi</p>'",
+        );
         assert_eq!(
             s(&mut dc, "document.getElementById('root').innerHTML"),
             "<p>hi</p>"
         );
-        assert_eq!(
-            s(&mut dc, "document.querySelector('p').textContent"),
-            "hi"
-        );
+        assert_eq!(s(&mut dc, "document.querySelector('p').textContent"), "hi");
         // and the real Document was mutated
         let doc = dc.take_document();
         let root = doc
@@ -3859,28 +4182,22 @@ mod tests {
             s(&mut dc, "document.querySelector('#a .x').textContent"),
             "1"
         );
+        assert_eq!(s(&mut dc, "document.querySelectorAll('p').length"), "2");
+        assert_eq!(s(&mut dc, "document.querySelectorAll('.x').length"), "2");
+        assert_eq!(s(&mut dc, "document.querySelectorAll('.x.y').length"), "1");
+        assert_eq!(s(&mut dc, "document.getElementsByTagName('p').length"), "2");
         assert_eq!(
-            s(&mut dc, "document.querySelectorAll('p').length"),
-            "2"
-        );
-        assert_eq!(
-            s(&mut dc, "document.querySelectorAll('.x').length"),
-            "2"
-        );
-        assert_eq!(
-            s(&mut dc, "document.querySelectorAll('.x.y').length"),
-            "1"
-        );
-        assert_eq!(
-            s(&mut dc, "document.getElementsByTagName('p').length"),
-            "2"
-        );
-        assert_eq!(
-            s(&mut dc, "document.getElementById('a').querySelector('span').className"),
+            s(
+                &mut dc,
+                "document.getElementById('a').querySelector('span').className"
+            ),
             "x y"
         );
         assert_eq!(
-            s(&mut dc, "document.querySelector('div p:first-child').tagName"),
+            s(
+                &mut dc,
+                "document.querySelector('div p:first-child').tagName"
+            ),
             "P"
         );
     }
@@ -3889,10 +4206,16 @@ mod tests {
     fn text_content_and_attrs() {
         let mut dc = ctx("<html><body><div id='r'><b>a</b>c</div></body></html>");
         assert_eq!(s(&mut dc, "document.getElementById('r').textContent"), "ac");
-        run(&mut dc, "var r = document.getElementById('r'); r.textContent = 'zz'");
+        run(
+            &mut dc,
+            "var r = document.getElementById('r'); r.textContent = 'zz'",
+        );
         assert_eq!(s(&mut dc, "r.childNodes.length"), "1");
         assert_eq!(s(&mut dc, "r.firstChild.nodeValue"), "zz");
-        run(&mut dc, "r.setAttribute('data-x', '42'); r.setAttribute('title', 't')");
+        run(
+            &mut dc,
+            "r.setAttribute('data-x', '42'); r.setAttribute('title', 't')",
+        );
         assert_eq!(s(&mut dc, "r.getAttribute('data-x')"), "42");
         assert_eq!(s(&mut dc, "r.hasAttribute('title')"), "true");
         run(&mut dc, "r.removeAttribute('title')");
@@ -3925,7 +4248,13 @@ mod tests {
         assert_eq!(s(&mut dc, "l.children.length"), "4");
         assert_eq!(s(&mut dc, "l.children[0].textContent"), "zero");
         assert_eq!(s(&mut dc, "l.children[3].tagName"), "LI");
-        assert_eq!(s(&mut dc, "l.firstElementChild.nextElementSibling.textContent"), "one");
+        assert_eq!(
+            s(
+                &mut dc,
+                "l.firstElementChild.nextElementSibling.textContent"
+            ),
+            "one"
+        );
         run(&mut dc, "l.removeChild(a)");
         assert_eq!(s(&mut dc, "l.children.length"), "3");
         run(&mut dc, "l.replaceChild(document.createElement('em'), b)");
@@ -3947,7 +4276,13 @@ mod tests {
     #[test]
     fn classlist_and_dataset() {
         let mut dc = ctx("<html><body><div id='r' class='a b' data-user='x'></div></body></html>");
-        assert_eq!(s(&mut dc, "var r = document.getElementById('r'); r.classList.contains('a')"), "true");
+        assert_eq!(
+            s(
+                &mut dc,
+                "var r = document.getElementById('r'); r.classList.contains('a')"
+            ),
+            "true"
+        );
         run(&mut dc, "r.classList.add('c'); r.classList.remove('a')");
         assert_eq!(s(&mut dc, "r.className"), "b c");
         assert_eq!(s(&mut dc, "r.classList.toggle('b')"), "false");
@@ -3968,7 +4303,10 @@ mod tests {
     fn style_syncs_to_attr() {
         let mut dc = ctx("<html><body><div id='r'></div></body></html>");
         run(&mut dc, "var r = document.getElementById('r'); r.style.display = 'none'; r.style.setProperty('color', 'red');");
-        assert_eq!(s(&mut dc, "r.getAttribute('style')"), "display: none; color: red");
+        assert_eq!(
+            s(&mut dc, "r.getAttribute('style')"),
+            "display: none; color: red"
+        );
         let doc = dc.take_document();
         let r = doc
             .descendants(doc.root)
@@ -4064,8 +4402,14 @@ mod tests {
             &mut dc,
             "document.getElementById('r').innerHTML = '<section><h2 class=\"t\">T</h2><p>x<b>y</b>z</p></section>'",
         );
-        assert_eq!(s(&mut dc, "document.querySelector('h2.t').textContent"), "T");
-        assert_eq!(s(&mut dc, "document.querySelector('section p').textContent"), "xyz");
+        assert_eq!(
+            s(&mut dc, "document.querySelector('h2.t').textContent"),
+            "T"
+        );
+        assert_eq!(
+            s(&mut dc, "document.querySelector('section p').textContent"),
+            "xyz"
+        );
         assert_eq!(
             s(&mut dc, "document.querySelector('#r').innerHTML"),
             "<section><h2 class=\"t\">T</h2><p>x<b>y</b>z</p></section>"
@@ -4076,9 +4420,8 @@ mod tests {
     fn mini_spa_mount_flow() {
         // React-shape smoke: delegated root listener, fragment mount,
         // timer-scheduled state update, attr serialization.
-        let mut dc = ctx(
-            "<html><head><title>t</title></head><body><div id='root'></div></body></html>",
-        );
+        let mut dc =
+            ctx("<html><head><title>t</title></head><body><div id='root'></div></body></html>");
         run(
             &mut dc,
             r#"
@@ -4111,7 +4454,10 @@ mod tests {
             "My App"
         );
         dc.run_timers();
-        run(&mut dc, "btn.dispatchEvent(new Event('click', {bubbles: true}))");
+        run(
+            &mut dc,
+            "btn.dispatchEvent(new Event('click', {bubbles: true}))",
+        );
         assert_eq!(s(&mut dc, "clicks"), "1");
         assert_eq!(
             s(&mut dc, "root.innerHTML"),

@@ -10,8 +10,7 @@
 //! compound), and the extra media features evaluated at parse time.
 
 use crate::{
-    StrMap, StyleCtx, decl_wins, each_decl, inline_decls, matches, rightmost_ok,
-    specificity,
+    decl_wins, each_decl, inline_decls, matches, rightmost_ok, specificity, StrMap, StyleCtx,
 };
 use rowser_dom::NodeId;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -155,7 +154,9 @@ pub(crate) fn shorthand_sides(prop: &str) -> Option<&'static [&'static str]> {
 /// Distribute 1–4 (TRBL) or 1–2 (start,end) resolved tokens over `prop`'s
 /// longhands — the same cycling `each_decl` uses for static values.
 fn assign_sides<'v>(prop: &str, toks: &[&'v str], mut f: impl FnMut(&'static str, &'v str)) {
-    let Some(sides) = shorthand_sides(prop) else { return };
+    let Some(sides) = shorthand_sides(prop) else {
+        return;
+    };
     if sides.len() == 4 {
         let t = toks.first().copied().unwrap_or("0");
         let r = toks.get(1).copied().unwrap_or(t);
@@ -343,22 +344,62 @@ pub(crate) fn is_inherited(prop: &str) -> bool {
     matches!(
         prop,
         "color"
-            | "caret-color" | "font" | "font-family" | "font-size" | "font-style"
-            | "font-variant" | "font-variant-caps" | "font-variant-ligatures"
-            | "font-variant-numeric" | "font-weight" | "font-stretch"
-            | "font-kerning" | "font-feature-settings" | "line-height"
-            | "text-align" | "text-align-last" | "text-indent" | "text-transform"
-            | "text-decoration" | "text-decoration-line" | "text-decoration-color"
-            | "text-decoration-style" | "text-decoration-thickness"
-            | "text-emphasis-color" | "text-emphasis-style" | "text-emphasis-position"
-            | "text-shadow" | "text-justify" | "text-size-adjust"
-            | "-webkit-text-size-adjust" | "-moz-tab-size" | "tab-size"
-            | "letter-spacing" | "word-spacing" | "white-space" | "word-break"
-            | "overflow-wrap" | "word-wrap" | "line-break" | "direction"
-            | "visibility" | "cursor" | "list-style" | "list-style-type"
-            | "list-style-position" | "list-style-image" | "border-collapse"
-            | "caption-side" | "empty-cells" | "quotes" | "orphans" | "widows"
-            | "pointer-events" | "speak" | "writing-mode" | "text-orientation"
+            | "caret-color"
+            | "font"
+            | "font-family"
+            | "font-size"
+            | "font-style"
+            | "font-variant"
+            | "font-variant-caps"
+            | "font-variant-ligatures"
+            | "font-variant-numeric"
+            | "font-weight"
+            | "font-stretch"
+            | "font-kerning"
+            | "font-feature-settings"
+            | "line-height"
+            | "text-align"
+            | "text-align-last"
+            | "text-indent"
+            | "text-transform"
+            | "text-decoration"
+            | "text-decoration-line"
+            | "text-decoration-color"
+            | "text-decoration-style"
+            | "text-decoration-thickness"
+            | "text-emphasis-color"
+            | "text-emphasis-style"
+            | "text-emphasis-position"
+            | "text-shadow"
+            | "text-justify"
+            | "text-size-adjust"
+            | "-webkit-text-size-adjust"
+            | "-moz-tab-size"
+            | "tab-size"
+            | "letter-spacing"
+            | "word-spacing"
+            | "white-space"
+            | "word-break"
+            | "overflow-wrap"
+            | "word-wrap"
+            | "line-break"
+            | "direction"
+            | "visibility"
+            | "cursor"
+            | "list-style"
+            | "list-style-type"
+            | "list-style-position"
+            | "list-style-image"
+            | "border-collapse"
+            | "caption-side"
+            | "empty-cells"
+            | "quotes"
+            | "orphans"
+            | "widows"
+            | "pointer-events"
+            | "speak"
+            | "writing-mode"
+            | "text-orientation"
     )
 }
 
@@ -373,10 +414,9 @@ fn is_pct(s: &str) -> bool {
 }
 
 const LEN_UNITS: &[&str] = &[
-    "px", "em", "rem", "ex", "ch", "cap", "ic", "lh", "rlh", "vw", "vh", "vi", "vb",
-    "vmin", "vmax", "svw", "svh", "svi", "svb", "svmin", "svmax", "lvw", "lvh", "lvi",
-    "lvb", "lvmin", "lvmax", "dvw", "dvh", "dvi", "dvb", "dvmin", "dvmax", "cm", "mm",
-    "q", "in", "pc", "pt",
+    "px", "em", "rem", "ex", "ch", "cap", "ic", "lh", "rlh", "vw", "vh", "vi", "vb", "vmin",
+    "vmax", "svw", "svh", "svi", "svb", "svmin", "svmax", "lvw", "lvh", "lvi", "lvb", "lvmin",
+    "lvmax", "dvw", "dvh", "dvi", "dvb", "dvmin", "dvmax", "cm", "mm", "q", "in", "pc", "pt",
 ];
 
 fn is_len(s: &str) -> bool {
@@ -405,8 +445,19 @@ fn is_color(s: &str) -> bool {
     let l = s.to_lowercase();
     if l.contains('(') {
         return [
-            "rgb", "hsl", "hwb(", "lab(", "lch(", "oklab(", "oklch(", "color(",
-            "color-mix(", "light-dark(", "device-cmyk(", "hsla(", "rgba(",
+            "rgb",
+            "hsl",
+            "hwb(",
+            "lab(",
+            "lch(",
+            "oklab(",
+            "oklch(",
+            "color(",
+            "color-mix(",
+            "light-dark(",
+            "device-cmyk(",
+            "hsla(",
+            "rgba(",
         ]
         .iter()
         .any(|f| l.starts_with(f));
@@ -559,7 +610,11 @@ pub(crate) fn parse_ratio(s: &str) -> Option<f32> {
     if let Some((a, b)) = s.split_once('/') {
         let a = a.trim().parse::<f32>().ok()?;
         let b = b.trim().parse::<f32>().ok()?;
-        if b == 0.0 { None } else { Some(a / b) }
+        if b == 0.0 {
+            None
+        } else {
+            Some(a / b)
+        }
     } else {
         s.parse::<f32>().ok()
     }
@@ -568,7 +623,12 @@ pub(crate) fn parse_ratio(s: &str) -> Option<f32> {
 /// resolution → dppx (1dppx = 96dpi; `x` and bare numbers = dppx).
 pub(crate) fn parse_dppx(s: &str) -> Option<f32> {
     let s = s.trim().to_lowercase();
-    for (suf, k) in [("dppx", 1.0f32), ("dpcm", 96.0 / 2.54), ("dpi", 1.0 / 96.0), ("x", 1.0)] {
+    for (suf, k) in [
+        ("dppx", 1.0f32),
+        ("dpcm", 96.0 / 2.54),
+        ("dpi", 1.0 / 96.0),
+        ("x", 1.0),
+    ] {
         if let Some(n) = s.strip_suffix(suf) {
             return n.trim().parse::<f32>().ok().map(|v| v * k);
         }
@@ -592,7 +652,10 @@ pub(crate) fn media_extra(name: &str, val: &str, vw: f32) -> bool {
         "resolution" => parse_dppx(val).is_some_and(|r| (r - 1.0).abs() < 0.01),
         "min-resolution" => parse_dppx(val).is_some_and(|r| r <= 1.01),
         "max-resolution" => parse_dppx(val).is_some_and(|r| r >= 1.0 - 0.01),
-        "color" => val.trim().parse::<f32>().is_ok_and(|n| (1.0..=8.0).contains(&n)),
+        "color" => val
+            .trim()
+            .parse::<f32>()
+            .is_ok_and(|n| (1.0..=8.0).contains(&n)),
         "min-color" => val.trim().parse::<f32>().is_ok_and(|n| n <= 8.0),
         "max-color" => val.trim().parse::<f32>().is_ok_and(|n| n >= 8.0),
         "color-index" | "min-color-index" | "max-color-index" => val.trim() == "0",
@@ -724,11 +787,7 @@ impl<'a> StyleCtx<'a> {
             sheet.candidates_into(doc, node, &mut self.buf);
             for &ri in &self.buf {
                 let rule = &sheet.rules[ri as usize];
-                let layer = sheet
-                    .layers
-                    .get(ri as usize)
-                    .copied()
-                    .unwrap_or(u32::MAX);
+                let layer = sheet.layers.get(ri as usize).copied().unwrap_or(u32::MAX);
                 // best specificity across matching selectors — and whether
                 // any matched at all — in one pass over the selector list
                 let mut spec = (0u32, 0u32, 0u32);
@@ -832,11 +891,7 @@ impl<'a> StyleCtx<'a> {
             .or_else(|| out.props.get("animation"))
             .cloned()
         {
-            if let Some(name) = v
-                .split([',', ' '])
-                .map(str::trim)
-                .find(|t| !t.is_empty())
-            {
+            if let Some(name) = v.split([',', ' ']).map(str::trim).find(|t| !t.is_empty()) {
                 for sheet in &self.sheets {
                     if let Some(decls) = sheet.keyframes.get(name) {
                         for d in decls {
@@ -1041,9 +1096,7 @@ impl<'a> StyleCtx<'a> {
         for (prop, wide, orig, layer) in wides {
             let mut resolved: Option<String> = match wide {
                 Wide::Initial => None,
-                Wide::Inherit => {
-                    parent.as_ref().and_then(|p| p.props.get(&prop).cloned())
-                }
+                Wide::Inherit => parent.as_ref().and_then(|p| p.props.get(&prop).cloned()),
                 Wide::Unset => unset_val(&prop),
                 Wide::Revert => {
                     // as if the decl came from an earlier origin (author → UA)
@@ -1057,9 +1110,7 @@ impl<'a> StyleCtx<'a> {
             // one more level if the cascaded value is itself a keyword
             if let Some(w2) = resolved.as_deref().and_then(css_wide) {
                 resolved = match w2 {
-                    Wide::Inherit => {
-                        parent.as_ref().and_then(|p| p.props.get(&prop).cloned())
-                    }
+                    Wide::Inherit => parent.as_ref().and_then(|p| p.props.get(&prop).cloned()),
                     Wide::Initial => None,
                     _ => unset_val(&prop),
                 };
@@ -1099,8 +1150,7 @@ impl<'a> StyleCtx<'a> {
         }
 
         // ---------- extract ----------
-        let mut props: StrMap<String> =
-            acc.out.into_iter().map(|(k, e)| (k, e.0)).collect();
+        let mut props: StrMap<String> = acc.out.into_iter().map(|(k, e)| (k, e.0)).collect();
 
         // ---------- inherited-property pass ----------
         // Only props with no surviving decl inherit (the cascade already
@@ -1237,7 +1287,7 @@ mod tests {
         );
         assert_eq!(c.get("color").unwrap(), "red"); // nested fallback
         assert_eq!(c.get("x-c").unwrap(), "rgb(1, 2, 3)"); // comma in fallback
-        // chained: --a unset → --b defined → green
+                                                           // chained: --a unset → --b defined → green
         let c = props(
             "<body><p></p></body>",
             ":root { --b: green } p { color: var(--a, var(--b, red)) }",
@@ -1411,10 +1461,19 @@ mod tests {
     #[test]
     fn media_misc() {
         let n = |css: &str| parse(css).rules.len();
-        assert_eq!(n("@media (prefers-reduced-motion: reduce) { p { a: 1 } }"), 0);
-        assert_eq!(n("@media (prefers-reduced-motion: no-preference) { p { a: 1 } }"), 1);
+        assert_eq!(
+            n("@media (prefers-reduced-motion: reduce) { p { a: 1 } }"),
+            0
+        );
+        assert_eq!(
+            n("@media (prefers-reduced-motion: no-preference) { p { a: 1 } }"),
+            1
+        );
         assert_eq!(n("@media (prefers-contrast: more) { p { a: 1 } }"), 0);
-        assert_eq!(n("@media (prefers-contrast: no-preference) { p { a: 1 } }"), 1);
+        assert_eq!(
+            n("@media (prefers-contrast: no-preference) { p { a: 1 } }"),
+            1
+        );
         assert_eq!(n("@media (forced-colors: active) { p { a: 1 } }"), 0);
         assert_eq!(n("@media (forced-colors: none) { p { a: 1 } }"), 1);
         assert_eq!(n("@media (hover: hover) { p { a: 1 } }"), 1);

@@ -48,7 +48,11 @@ fn sbox() -> &'static [u8; 256] {
         let mut s = [0u8; 256];
         for (i, v) in s.iter_mut().enumerate() {
             let x = gf8_inv(i as u8);
-            *v = x ^ x.rotate_left(1) ^ x.rotate_left(2) ^ x.rotate_left(3) ^ x.rotate_left(4)
+            *v = x
+                ^ x.rotate_left(1)
+                ^ x.rotate_left(2)
+                ^ x.rotate_left(3)
+                ^ x.rotate_left(4)
                 ^ 0x63;
         }
         s
@@ -192,9 +196,7 @@ mod tests {
     fn fips197_aes128() {
         // FIPS-197 Appendix B / C.1 example.
         let key: [u8; 16] = hex("000102030405060708090a0b0c0d0e0f").try_into().unwrap();
-        let mut block: [u8; 16] = hex("00112233445566778899aabbccddeeff")
-            .try_into()
-            .unwrap();
+        let mut block: [u8; 16] = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
         Aes::new128(&key).encrypt_block(&mut block);
         assert_eq!(hexify(&block), "69c4e0d86a7b0430d8cdb78070b4c55a");
     }
@@ -205,9 +207,7 @@ mod tests {
         let key: [u8; 32] = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
             .try_into()
             .unwrap();
-        let mut block: [u8; 16] = hex("00112233445566778899aabbccddeeff")
-            .try_into()
-            .unwrap();
+        let mut block: [u8; 16] = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
         Aes::new256(&key).encrypt_block(&mut block);
         assert_eq!(hexify(&block), "8ea2b7ca516745bfeafc49904b496089");
     }

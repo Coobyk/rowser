@@ -18,7 +18,17 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
     };
     for it in items {
         match it {
-            DisplayItem::Text { x, baseline, text, font, size, color, underline, strike, href } => {
+            DisplayItem::Text {
+                x,
+                baseline,
+                text,
+                font,
+                size,
+                color,
+                underline,
+                strike,
+                href,
+            } => {
                 mix(&[1]);
                 mix(&x.to_bits().to_le_bytes());
                 mix(&baseline.to_bits().to_le_bytes());
@@ -36,7 +46,14 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 }
                 mix(&color.to_le_bytes());
             }
-            DisplayItem::RoundedRect { x, y, w, h, radius, color } => {
+            DisplayItem::RoundedRect {
+                x,
+                y,
+                w,
+                h,
+                radius,
+                color,
+            } => {
                 mix(&[3]);
                 for v in [x, y, w, h, radius] {
                     mix(&v.to_bits().to_le_bytes());
@@ -58,7 +75,15 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 }
                 mix(src.as_bytes());
             }
-            DisplayItem::BorderSide { x, y, w, h, side, style, color } => {
+            DisplayItem::BorderSide {
+                x,
+                y,
+                w,
+                h,
+                side,
+                style,
+                color,
+            } => {
                 mix(&[6]);
                 for v in [x, y, w, h] {
                     mix(&v.to_bits().to_le_bytes());
@@ -66,14 +91,23 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 mix(&[*side as u8, *style as u8]);
                 mix(&color.to_le_bytes());
             }
-            DisplayItem::BgImage { x, y, w, h, src, .. } => {
+            DisplayItem::BgImage {
+                x, y, w, h, src, ..
+            } => {
                 mix(&[11]);
                 for v in [x, y, w, h] {
                     mix(&v.to_bits().to_le_bytes());
                 }
                 mix(src.as_bytes());
             }
-            DisplayItem::RoundedRect2 { x, y, w, h, radii, color } => {
+            DisplayItem::RoundedRect2 {
+                x,
+                y,
+                w,
+                h,
+                radii,
+                color,
+            } => {
                 mix(&[7]);
                 for v in [x, y, w, h] {
                     mix(&v.to_bits().to_le_bytes());
@@ -85,7 +119,19 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 }
                 mix(&color.to_le_bytes());
             }
-            DisplayItem::Shadow { x, y, w, h, dx, dy, blur, spread, radii, color, inset } => {
+            DisplayItem::Shadow {
+                x,
+                y,
+                w,
+                h,
+                dx,
+                dy,
+                blur,
+                spread,
+                radii,
+                color,
+                inset,
+            } => {
                 mix(&[8]);
                 for v in [x, y, w, h, dx, dy, blur, spread] {
                     mix(&v.to_bits().to_le_bytes());
@@ -110,6 +156,13 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 }
             }
             DisplayItem::PopClip => mix(&[10]),
+            DisplayItem::PushTransform { m } => {
+                mix(&[6]);
+                for v in m.0 {
+                    mix(&v.to_bits().to_le_bytes());
+                }
+            }
+            DisplayItem::PopTransform => mix(&[7]),
             _ => {
                 mix(&[9]);
             }
@@ -120,7 +173,9 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().unwrap_or_else(|| "/tmp/wiki_dec.html".to_string());
+    let path = args
+        .next()
+        .unwrap_or_else(|| "/tmp/wiki_dec.html".to_string());
     // remaining args: "N" = iteration count, otherwise external css file
     let mut iters = 3usize;
     let mut css_files = Vec::new();

@@ -175,18 +175,14 @@ mod tests {
         // Nonzero key, 64-byte plaintext, no AAD (spec Test Case 3).
         let key: [u8; 16] = hex("feffe9928665731c6d6a8f9467308308").try_into().unwrap();
         let iv: [u8; 12] = hex("cafebabefacedbaddecaf888").try_into().unwrap();
-        let pt = hex(
-            "d9313225f88406e5a55909c5aff5269a\
+        let pt = hex("d9313225f88406e5a55909c5aff5269a\
              86a7a9531534f7da2e4c303d8a318a72\
              1c3c0c95956809532fcf0e2449a6b525\
-             b16aedf5aa0de657ba637b391aafd255",
-        );
-        let want_ct = hex(
-            "42831ec2217774244b7221b784d0d49c\
+             b16aedf5aa0de657ba637b391aafd255");
+        let want_ct = hex("42831ec2217774244b7221b784d0d49c\
              e3aa212f2c02a4e035c17e2329aca12e\
              21d514b25466931c7d8f6a5aac84aa05\
-             1ba30b396a0aac973d58e091473f5985",
-        );
+             1ba30b396a0aac973d58e091473f5985");
         let want_tag = hex("4d5c2af327cd64a62cf35abd2ba6fab4");
         let g = AesGcm::new128(&key);
         let (ct, tag) = g.seal(&iv, &[], &pt);
@@ -200,19 +196,15 @@ mod tests {
         // Same plaintext, with 20 bytes of AAD.
         let key: [u8; 16] = hex("feffe9928665731c6d6a8f9467308308").try_into().unwrap();
         let iv: [u8; 12] = hex("cafebabefacedbaddecaf888").try_into().unwrap();
-        let pt = hex(
-            "d9313225f88406e5a55909c5aff5269a\
+        let pt = hex("d9313225f88406e5a55909c5aff5269a\
              86a7a9531534f7da2e4c303d8a318a72\
              1c3c0c95956809532fcf0e2449a6b525\
-             b16aedf5aa0de657ba637b39",
-        );
+             b16aedf5aa0de657ba637b39");
         let aad = hex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
-        let want_ct = hex(
-            "42831ec2217774244b7221b784d0d49c\
+        let want_ct = hex("42831ec2217774244b7221b784d0d49c\
              e3aa212f2c02a4e035c17e2329aca12e\
              21d514b25466931c7d8f6a5aac84aa05\
-             1ba30b396a0aac973d58e091",
-        );
+             1ba30b396a0aac973d58e091");
         let want_tag = hex("5bc94fbc3221a5db94fae95ae7121a47");
         let g = AesGcm::new128(&key);
         let (ct, tag) = g.seal(&iv, &aad, &pt);
@@ -225,26 +217,20 @@ mod tests {
     #[test]
     fn gcm_aes256() {
         // AES-256-GCM: 32-byte key, same plaintext + AAD.
-        let key: [u8; 32] = hex(
-            "feffe9928665731c6d6a8f9467308308\
-             feffe9928665731c6d6a8f9467308308",
-        )
+        let key: [u8; 32] = hex("feffe9928665731c6d6a8f9467308308\
+             feffe9928665731c6d6a8f9467308308")
         .try_into()
         .unwrap();
         let iv: [u8; 12] = hex("cafebabefacedbaddecaf888").try_into().unwrap();
-        let pt = hex(
-            "d9313225f88406e5a55909c5aff5269a\
+        let pt = hex("d9313225f88406e5a55909c5aff5269a\
              86a7a9531534f7da2e4c303d8a318a72\
              1c3c0c95956809532fcf0e2449a6b525\
-             b16aedf5aa0de657ba637b39",
-        );
+             b16aedf5aa0de657ba637b39");
         let aad = hex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
-        let want_ct = hex(
-            "522dc1f099567d07f47f37a32a84427d\
+        let want_ct = hex("522dc1f099567d07f47f37a32a84427d\
              643a8cdcbfe5c0c97598a2bd2555d1aa\
              8cb08e48590dbb3da7b08b1056828838\
-             c5f61e6393ba7a0abcc9f662",
-        );
+             c5f61e6393ba7a0abcc9f662");
         let want_tag = hex("76fc6ece0f4e1768cddf8853bb2d551b");
         let g = AesGcm::new256(&key);
         let (ct, tag) = g.seal(&iv, &aad, &pt);

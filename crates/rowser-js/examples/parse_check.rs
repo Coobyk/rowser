@@ -2,7 +2,9 @@
 //! Usage: cargo run -p rowser-js --example parse_check -- <file.js>
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: parse_check <file.js>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: parse_check <file.js>");
     let src = std::fs::read_to_string(&path).expect("read failed");
     let t = std::time::Instant::now();
     match rowser_js::parser::parse(&src) {

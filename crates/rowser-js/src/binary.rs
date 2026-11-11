@@ -207,7 +207,13 @@ fn install_typed_arrays(i: &mut Interp) {
 /// (buffer-obj, byte offset, element count, kind) for a TypedArray value.
 fn ta_parts(v: &Value) -> Option<(ObjRef, usize, usize, TAK)> {
     if let Value::Obj(o) = v {
-        if let ObjKind::Typed { buf, off, len, kind } = &o.borrow().kind {
+        if let ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+        } = &o.borrow().kind
+        {
             return Some((buf.clone(), *off, *len, *kind));
         }
     }
@@ -230,7 +236,12 @@ fn ta_f64s(v: &Value) -> Vec<f64> {
 fn mk_typed(proto: Option<ObjRef>, buf: ObjRef, off: usize, len: usize, kind: TAK) -> ObjRef {
     Rc::new(RefCell::new(Obj::new(
         proto,
-        ObjKind::Typed { buf, off, len, kind },
+        ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+        },
     )))
 }
 
@@ -277,16 +288,14 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
                         v => i.to_num(&v)?.max(0.0) as usize,
                     };
                     if off % sz != 0 || off > blen {
-                        return Err(i.range_err(
-                            "start offset of typed array is out of bounds",
-                        ));
+                        return Err(i.range_err("start offset of typed array is out of bounds"));
                     }
                     let len = match arg(args, 2) {
                         Value::Und => {
                             if (blen - off) % sz != 0 {
-                                return Err(i.range_err(
-                                    "byte length of typed array is not aligned",
-                                ));
+                                return Err(
+                                    i.range_err("byte length of typed array is not aligned")
+                                );
                             }
                             (blen - off) / sz
                         }
@@ -340,7 +349,12 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
         Value::Obj(o) => o.clone(),
         _ => plain(global_ctor_proto(i, kind.type_name())),
     };
-    o.borrow_mut().kind = ObjKind::Typed { buf, off, len, kind };
+    o.borrow_mut().kind = ObjKind::Typed {
+        buf,
+        off,
+        len,
+        kind,
+    };
     Ok(Value::Obj(o))
 }
 
@@ -410,9 +424,8 @@ fn this_proto(this: &Value) -> Option<ObjRef> {
 }
 
 fn need_ta(i: &mut Interp, this: &Value) -> Result<(ObjRef, usize, usize, TAK), Value> {
-    ta_parts(this).ok_or_else(|| {
-        i.type_err("Method called on incompatible receiver (expected TypedArray)")
-    })
+    ta_parts(this)
+        .ok_or_else(|| i.type_err("Method called on incompatible receiver (expected TypedArray)"))
 }
 
 fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -471,7 +484,13 @@ fn m_ta_subarray(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     let nlen = end.saturating_sub(begin);
     let noff = off + begin * kind.size();
-    Ok(Value::Obj(mk_typed(this_proto(this), buf, noff, nlen, kind)))
+    Ok(Value::Obj(mk_typed(
+        this_proto(this),
+        buf,
+        noff,
+        nlen,
+        kind,
+    )))
 }
 
 fn m_ta_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -482,7 +501,11 @@ fn m_ta_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Value::Und => len,
         v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
     };
-    let out = if begin < end { all[begin..end].to_vec() } else { Vec::new() };
+    let out = if begin < end {
+        all[begin..end].to_vec()
+    } else {
+        Vec::new()
+    };
     Ok(ta_from_f64s(i, this_proto(this), out, kind))
 }
 
@@ -662,7 +685,11 @@ fn m_ta_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 fn m_ta_at(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let (_, _, len, _) = need_ta(i, this)?;
     let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let idx = if n < 0.0 { len as i64 + n as i64 } else { n as i64 };
+    let idx = if n < 0.0 {
+        len as i64 + n as i64
+    } else {
+        n as i64
+    };
     if idx < 0 || idx >= len as i64 {
         return Ok(Value::Und);
     }
@@ -766,7 +793,12 @@ fn m_ta_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         acc = i.call(
             &cb,
             Value::Und,
-            vec![acc, Value::Num(elems[k]), Value::Num(k as f64), this.clone()],
+            vec![
+                acc,
+                Value::Num(elems[k]),
+                Value::Num(k as f64),
+                this.clone(),
+            ],
         )?;
     }
     Ok(acc)
@@ -815,11 +847,7 @@ fn m_ta_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![
-                Value::Num(elems[k]),
-                Value::Num(k as f64),
-                this.clone(),
-            ],
+            vec![Value::Num(elems[k]), Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
             return Ok(Value::Num(elems[k]));
@@ -837,11 +865,7 @@ fn m_ta_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![
-                Value::Num(elems[k]),
-                Value::Num(k as f64),
-                this.clone(),
-            ],
+            vec![Value::Num(elems[k]), Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
             return Ok(Value::Num(k as f64));
@@ -900,10 +924,9 @@ fn m_ta_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     need_ta(i, this)?;
     let mut out = Vec::new();
     for (k, v) in ta_f64s(this).iter().enumerate() {
-        out.push(Value::Obj(i.new_arr(vec![
-            Value::Num(k as f64),
-            Value::Num(*v),
-        ])));
+        out.push(Value::Obj(
+            i.new_arr(vec![Value::Num(k as f64), Value::Num(*v)]),
+        ));
     }
     Ok(make_iter(i, out))
 }
@@ -926,7 +949,11 @@ fn m_ta_to_sorted(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let (_, _, len, kind) = need_ta(i, this)?;
     let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let idx = if n < 0.0 { len as i64 + n as i64 } else { n as i64 };
+    let idx = if n < 0.0 {
+        len as i64 + n as i64
+    } else {
+        n as i64
+    };
     if idx < 0 || idx >= len as i64 {
         return Err(i.range_err("Invalid index"));
     }
@@ -993,7 +1020,11 @@ fn m_ab_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Value::Und => len,
         v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
     };
-    let out = if start < end { data[start..end].to_vec() } else { Vec::new() };
+    let out = if start < end {
+        data[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
     Ok(Value::Obj(mk_buffer(i, out)))
 }
 
@@ -1090,7 +1121,12 @@ fn dv_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Obj(o))
 }
 
-fn dv_bounds(i: &mut Interp, this: &Value, args: &[Value], sz: usize) -> Result<(Rc<RefCell<Vec<u8>>>, usize), Value> {
+fn dv_bounds(
+    i: &mut Interp,
+    this: &Value,
+    args: &[Value],
+    sz: usize,
+) -> Result<(Rc<RefCell<Vec<u8>>>, usize), Value> {
     let Some((b, off, len)) = dv_parts(this) else {
         return Err(i.type_err("Method called on incompatible receiver (expected DataView)"));
     };
@@ -1120,7 +1156,11 @@ fn dv_get_u16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let bb = b.borrow();
     let mut s = [0u8; 2];
     s.copy_from_slice(&bb[at..at + 2]);
-    let v = if dv_le(i, args, 1) { u16::from_le_bytes(s) } else { u16::from_be_bytes(s) };
+    let v = if dv_le(i, args, 1) {
+        u16::from_le_bytes(s)
+    } else {
+        u16::from_be_bytes(s)
+    };
     Ok(Value::Num(v as f64))
 }
 fn dv_get_i16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1128,7 +1168,11 @@ fn dv_get_i16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let bb = b.borrow();
     let mut s = [0u8; 2];
     s.copy_from_slice(&bb[at..at + 2]);
-    let v = if dv_le(i, args, 1) { i16::from_le_bytes(s) } else { i16::from_be_bytes(s) };
+    let v = if dv_le(i, args, 1) {
+        i16::from_le_bytes(s)
+    } else {
+        i16::from_be_bytes(s)
+    };
     Ok(Value::Num(v as f64))
 }
 fn dv_get_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1136,7 +1180,11 @@ fn dv_get_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let bb = b.borrow();
     let mut s = [0u8; 4];
     s.copy_from_slice(&bb[at..at + 4]);
-    let v = if dv_le(i, args, 1) { u32::from_le_bytes(s) } else { u32::from_be_bytes(s) };
+    let v = if dv_le(i, args, 1) {
+        u32::from_le_bytes(s)
+    } else {
+        u32::from_be_bytes(s)
+    };
     Ok(Value::Num(v as f64))
 }
 fn dv_get_i32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1144,7 +1192,11 @@ fn dv_get_i32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let bb = b.borrow();
     let mut s = [0u8; 4];
     s.copy_from_slice(&bb[at..at + 4]);
-    let v = if dv_le(i, args, 1) { i32::from_le_bytes(s) } else { i32::from_be_bytes(s) };
+    let v = if dv_le(i, args, 1) {
+        i32::from_le_bytes(s)
+    } else {
+        i32::from_be_bytes(s)
+    };
     Ok(Value::Num(v as f64))
 }
 fn dv_get_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1152,7 +1204,11 @@ fn dv_get_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let bb = b.borrow();
     let mut s = [0u8; 4];
     s.copy_from_slice(&bb[at..at + 4]);
-    let v = if dv_le(i, args, 1) { f32::from_le_bytes(s) } else { f32::from_be_bytes(s) };
+    let v = if dv_le(i, args, 1) {
+        f32::from_le_bytes(s)
+    } else {
+        f32::from_be_bytes(s)
+    };
     Ok(Value::Num(v as f64))
 }
 fn dv_get_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1160,7 +1216,11 @@ fn dv_get_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let bb = b.borrow();
     let mut s = [0u8; 8];
     s.copy_from_slice(&bb[at..at + 8]);
-    let v = if dv_le(i, args, 1) { f64::from_le_bytes(s) } else { f64::from_be_bytes(s) };
+    let v = if dv_le(i, args, 1) {
+        f64::from_le_bytes(s)
+    } else {
+        f64::from_be_bytes(s)
+    };
     Ok(Value::Num(v))
 }
 fn dv_set_u8(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1194,14 +1254,22 @@ fn dv_set_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 fn dv_set_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let (b, at) = dv_bounds(i, this, args, 4)?;
     let v = i.to_num(&arg(args, 1))? as f32;
-    let s = if dv_le(i, args, 2) { v.to_le_bytes() } else { v.to_be_bytes() };
+    let s = if dv_le(i, args, 2) {
+        v.to_le_bytes()
+    } else {
+        v.to_be_bytes()
+    };
     b.borrow_mut()[at..at + 4].copy_from_slice(&s);
     Ok(Value::Und)
 }
 fn dv_set_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let (b, at) = dv_bounds(i, this, args, 8)?;
     let v = i.to_num(&arg(args, 1))?;
-    let s = if dv_le(i, args, 2) { v.to_le_bytes() } else { v.to_be_bytes() };
+    let s = if dv_le(i, args, 2) {
+        v.to_le_bytes()
+    } else {
+        v.to_be_bytes()
+    };
     b.borrow_mut()[at..at + 8].copy_from_slice(&s);
     Ok(Value::Und)
 }
@@ -1280,8 +1348,14 @@ fn te_encode_into(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
 }
 
 fn td_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let label = i.to_str(&arg(args, 0)).unwrap_or_else(|_| "utf-8".to_string());
-    let enc = if label.is_empty() { "utf-8".to_string() } else { label };
+    let label = i
+        .to_str(&arg(args, 0))
+        .unwrap_or_else(|_| "utf-8".to_string());
+    let enc = if label.is_empty() {
+        "utf-8".to_string()
+    } else {
+        label
+    };
     let o = match this {
         Value::Obj(o) => o.clone(),
         _ => plain(global_ctor_proto(i, "TextDecoder")),
@@ -1297,7 +1371,12 @@ fn view_bytes(v: &Value) -> Option<Vec<u8>> {
     let Value::Obj(o) = v else { return None };
     match &o.borrow().kind {
         ObjKind::Bytes(b) => Some(b.borrow().clone()),
-        ObjKind::Typed { buf, off, len, kind } => {
+        ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+        } => {
             let b = buffer_bytes(buf)?;
             let bb = b.borrow();
             let start = (*off).min(bb.len());
@@ -1530,9 +1609,7 @@ fn url_parse(input: &str, base: Option<&Url>) -> Option<Url> {
             return Some(u);
         }
         // path part up to ? or #
-        let end = rest
-            .find(|c| matches!(c, '?' | '#'))
-            .unwrap_or(rest.len());
+        let end = rest.find(|c| matches!(c, '?' | '#')).unwrap_or(rest.len());
         let p = &rest[..end];
         let rest = &rest[end..];
         if p.starts_with('/') {
@@ -1738,21 +1815,59 @@ fn install_url(i: &mut Interp) {
     met(i, &up, "toString", url_href_get);
     met(i, &up, "toJSON", url_href_get);
     acc(i, &up, "href", Some(url_href_get), Some(url_href_set));
-    acc(i, &up, "protocol", Some(url_protocol_get), Some(url_protocol_set));
+    acc(
+        i,
+        &up,
+        "protocol",
+        Some(url_protocol_get),
+        Some(url_protocol_set),
+    );
     acc(i, &up, "host", Some(url_host_get), Some(url_host_set));
-    acc(i, &up, "hostname", Some(url_hostname_get), Some(url_hostname_set));
+    acc(
+        i,
+        &up,
+        "hostname",
+        Some(url_hostname_get),
+        Some(url_hostname_set),
+    );
     acc(i, &up, "port", Some(url_port_get), Some(url_port_set));
-    acc(i, &up, "pathname", Some(url_pathname_get), Some(url_pathname_set));
+    acc(
+        i,
+        &up,
+        "pathname",
+        Some(url_pathname_get),
+        Some(url_pathname_set),
+    );
     acc(i, &up, "search", Some(url_search_get), Some(url_search_set));
     acc(i, &up, "hash", Some(url_hash_get), Some(url_hash_set));
     acc(i, &up, "origin", Some(url_origin_get), None);
-    acc(i, &up, "username", Some(url_username_get), Some(url_username_set));
-    acc(i, &up, "password", Some(url_password_get), Some(url_password_set));
+    acc(
+        i,
+        &up,
+        "username",
+        Some(url_username_get),
+        Some(url_username_set),
+    );
+    acc(
+        i,
+        &up,
+        "password",
+        Some(url_password_get),
+        Some(url_password_set),
+    );
     acc(i, &up, "searchParams", Some(url_search_params_get), None);
     let uctor = mk_ctor(i, "URL", url_ctor, &up);
     if let Value::Obj(co) = &uctor {
-        i.set_builtin(co, "createObjectURL", i.native("createObjectURL", url_create_object_url));
-        i.set_builtin(co, "revokeObjectURL", i.native("revokeObjectURL", |_, _, _| Ok(Value::Und)));
+        i.set_builtin(
+            co,
+            "createObjectURL",
+            i.native("createObjectURL", url_create_object_url),
+        );
+        i.set_builtin(
+            co,
+            "revokeObjectURL",
+            i.native("revokeObjectURL", |_, _, _| Ok(Value::Und)),
+        );
         i.set_builtin(co, "canParse", i.native("canParse", url_can_parse));
         i.set_builtin(co, "parse", i.native("parse", url_parse_static));
     }
@@ -1885,7 +2000,11 @@ fn url_pathname_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         return Ok(Value::Und);
     }
     let s = i.to_str(&arg(args, 0))?;
-    let owned = if s.starts_with('/') { s } else { format!("/{s}") };
+    let owned = if s.starts_with('/') {
+        s
+    } else {
+        format!("/{s}")
+    };
     u.path = url_norm_path(&owned);
     url_store(i, &o, &u);
     Ok(Value::Und)
@@ -2434,7 +2553,9 @@ fn install_stubs(i: &mut Interp) {
         ] {
             met(i, &p, m, stub_noop);
         }
-        met(i, &p, "canPlayType", |_i, _t, _a| Ok(Value::Str(Rc::from(""))));
+        met(i, &p, "canPlayType", |_i, _t, _a| {
+            Ok(Value::Str(Rc::from("")))
+        });
         let ctor = mk_ctor(i, name, media_ctor, &p);
         gdef(i, name, ctor);
     }
@@ -2614,7 +2735,11 @@ fn blob_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Value::Und => len,
         v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
     };
-    let out = if start < end { data[start..end].to_vec() } else { Vec::new() };
+    let out = if start < end {
+        data[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
     let ty = i.to_str(&arg(args, 2)).unwrap_or_default().to_lowercase();
     let proto = this_proto(this);
     let o = plain(proto);
@@ -2720,7 +2845,9 @@ fn fd_get_all(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 fn fd_has(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let o = this_fd(i, this)?;
     let k = i.to_str(&arg(args, 0))?;
-    Ok(Value::Bool(fd_entries_of(i, &o).iter().any(|(k2, _)| k2 == &k)))
+    Ok(Value::Bool(
+        fd_entries_of(i, &o).iter().any(|(k2, _)| k2 == &k),
+    ))
 }
 
 fn fd_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -2751,7 +2878,9 @@ fn fd_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let o = this_fd(i, this)?;
     let mut out = Vec::new();
     for (k, v) in fd_entries_of(i, &o) {
-        out.push(Value::Obj(i.new_arr(vec![Value::Str(Rc::from(k.as_str())), v])));
+        out.push(Value::Obj(
+            i.new_arr(vec![Value::Str(Rc::from(k.as_str())), v]),
+        ));
     }
     Ok(make_iter(i, out))
 }

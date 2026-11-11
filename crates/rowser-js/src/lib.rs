@@ -273,16 +273,28 @@ mod tests {
     #[test]
     fn default_rest_params() {
         assert_eq!(num("function f(a, b = 10) { return a + b; } f(1)"), 11.0);
-        assert_eq!(num("function g(...rest) { return rest.length; } g(1,2,3)"), 3.0);
-        assert_eq!(num("function h(a, ...rest) { return rest.join(','); } h(1,2,3).length"), 3.0);
+        assert_eq!(
+            num("function g(...rest) { return rest.length; } g(1,2,3)"),
+            3.0
+        );
+        assert_eq!(
+            num("function h(a, ...rest) { return rest.join(','); } h(1,2,3).length"),
+            3.0
+        );
         assert_eq!(num("function k(a = 1, b = a + 1) { return b; } k()"), 2.0);
     }
 
     #[test]
     fn arguments_object() {
-        assert_eq!(num("function f() { return arguments.length; } f(1,2,3)"), 3.0);
+        assert_eq!(
+            num("function f() { return arguments.length; } f(1,2,3)"),
+            3.0
+        );
         assert_eq!(s("function f() { return arguments[1]; } f('a','b')"), "b");
-        assert_eq!(s("function f() { return arguments[0] + arguments[1]; } f('a','b')"), "ab");
+        assert_eq!(
+            s("function f() { return arguments[0] + arguments[1]; } f('a','b')"),
+            "ab"
+        );
     }
 
     #[test]
@@ -318,7 +330,10 @@ mod tests {
     // --- objects ---
     #[test]
     fn object_literals() {
-        assert_eq!(num("let o = {a: 1, 'b': 2, 3: 4}; o.a + o['b'] + o[3]"), 7.0);
+        assert_eq!(
+            num("let o = {a: 1, 'b': 2, 3: 4}; o.a + o['b'] + o[3]"),
+            7.0
+        );
         assert_eq!(num("let k = 'x'; let o = {[k + 'y']: 5}; o.xy"), 5.0);
         assert_eq!(num("let v = 9; let o = {v}; o.v"), 9.0);
         assert_eq!(num("let o = {m() { return 3; }}; o.m()"), 3.0);
@@ -328,7 +343,10 @@ mod tests {
     #[test]
     fn object_mutation_and_delete() {
         assert_eq!(num("let o = {}; o.x = 5; o.x += 2; o.x"), 7.0);
-        assert_eq!(num("let o = {a: 1, b: 2}; delete o.a; 'a' in o ? 1 : 0"), 0.0);
+        assert_eq!(
+            num("let o = {a: 1, b: 2}; delete o.a; 'a' in o ? 1 : 0"),
+            0.0
+        );
         assert!(b("'x' in {x: 1}"));
         assert!(b("let o = {a:{b:{c:4}}}; o.a.b.c === 4"));
         assert!(b("let o = {a:1}; o?.a === 1"));
@@ -365,7 +383,10 @@ mod tests {
         assert_eq!(num("Object.keys({a:1,b:2,c:3}).length"), 3.0);
         assert_eq!(num("Object.values({a:1,b:2}).reduce((s,v)=>s+v)"), 3.0);
         assert_eq!(num("Object.assign({a:1},{b:2},{c:3}).b"), 2.0);
-        assert_eq!(num("Object.entries({x:5})[0][0].length + Object.entries({x:5})[0][1]"), 6.0);
+        assert_eq!(
+            num("Object.entries({x:5})[0][0].length + Object.entries({x:5})[0][1]"),
+            6.0
+        );
         assert!(b("let p = {z:9}; let o = Object.create(p); o.z === 9"));
         assert_eq!(
             num("let o = {}; Object.defineProperty(o, 'x', {value: 42, writable: false}); o.x = 1; o.x"),
@@ -391,16 +412,25 @@ mod tests {
         assert_eq!(num("let [a = 5, b = 6] = [1]; a + b"), 7.0);
         assert_eq!(num("let {a = 1} = {}; a"), 1.0);
         assert_eq!(num("let [x, ...rest] = [1,2,3,4]; rest.length"), 3.0);
-        assert_eq!(num("let {a, ...o} = {a:1,b:2,c:3}; Object.keys(o).length"), 2.0);
+        assert_eq!(
+            num("let {a, ...o} = {a:1,b:2,c:3}; Object.keys(o).length"),
+            2.0
+        );
         assert_eq!(num("var a, b; [a, b] = [3, 4]; a * b"), 12.0);
         assert_eq!(num("let {n: {m}} = {n: {m: 8}}; m"), 8.0);
-        assert_eq!(num("function f({a, b}) { return a - b; } f({a: 10, b: 3})"), 7.0);
+        assert_eq!(
+            num("function f({a, b}) { return a - b; } f({a: 10, b: 3})"),
+            7.0
+        );
     }
 
     #[test]
     fn spread() {
         assert_eq!(num("let a = [1,2]; let b = [...a, 3]; b.length"), 3.0);
-        assert_eq!(num("function s(...n){ return n.reduce((a,b)=>a+b,0); } s(...[1,2,3])"), 6.0);
+        assert_eq!(
+            num("function s(...n){ return n.reduce((a,b)=>a+b,0); } s(...[1,2,3])"),
+            6.0
+        );
         assert_eq!(num("let o = {...{a:1}, b:2}; o.a + o.b"), 3.0);
         assert_eq!(num("Math.max(...[3, 9, 2])"), 9.0);
     }
@@ -408,14 +438,32 @@ mod tests {
     // --- control flow ---
     #[test]
     fn control_flow() {
-        assert_eq!(num("let x = 0; for (let i = 0; i < 10; i++) x += i; x"), 45.0);
-        assert_eq!(num("let x = 0; let i = 0; while (i < 5) { x += i; i++; } x"), 10.0);
+        assert_eq!(
+            num("let x = 0; for (let i = 0; i < 10; i++) x += i; x"),
+            45.0
+        );
+        assert_eq!(
+            num("let x = 0; let i = 0; while (i < 5) { x += i; i++; } x"),
+            10.0
+        );
         assert_eq!(num("let i = 0; do { i++; } while (i < 3); i"), 3.0);
-        assert_eq!(num("let s = ''; for (let k of [1,2,3]) s += k; s.length"), 3.0);
-        assert_eq!(s("let s = ''; for (let c of 'abc') s += c + '.'; s"), "a.b.c.");
+        assert_eq!(
+            num("let s = ''; for (let k of [1,2,3]) s += k; s.length"),
+            3.0
+        );
+        assert_eq!(
+            s("let s = ''; for (let c of 'abc') s += c + '.'; s"),
+            "a.b.c."
+        );
         assert_eq!(num("let n = 0; for (let k in {a:1,b:2,c:3}) n++; n"), 3.0);
-        assert_eq!(num("let x = 0; for (let i = 0; i < 10; i++) { if (i == 5) break; x++; } x"), 5.0);
-        assert_eq!(num("let x = 0; for (let i = 0; i < 10; i++) { if (i % 2) continue; x++; } x"), 5.0);
+        assert_eq!(
+            num("let x = 0; for (let i = 0; i < 10; i++) { if (i == 5) break; x++; } x"),
+            5.0
+        );
+        assert_eq!(
+            num("let x = 0; for (let i = 0; i < 10; i++) { if (i % 2) continue; x++; } x"),
+            5.0
+        );
     }
 
     #[test]
@@ -424,10 +472,7 @@ mod tests {
             num("let n = 0; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { if (j > i) continue outer; n++; } } n"),
             6.0
         );
-        assert_eq!(
-            num("let n = 0; lbl: { n = 5; break lbl; n = 9; } n"),
-            5.0
-        );
+        assert_eq!(num("let n = 0; lbl: { n = 5; break lbl; n = 9; } n"), 5.0);
     }
 
     #[test]
@@ -461,11 +506,10 @@ mod tests {
             s("try { throw new TypeError('bad'); } catch (e) { e.name + ':' + e.message }"),
             "TypeError:bad"
         );
-        assert!(b("let ok = false; try { null.x; } catch (e) { ok = e instanceof TypeError; } ok"));
-        assert_eq!(
-            num("try { JSON.parse('{bad'); } catch (e) { 42 }"),
-            42.0
-        );
+        assert!(b(
+            "let ok = false; try { null.x; } catch (e) { ok = e instanceof TypeError; } ok"
+        ));
+        assert_eq!(num("try { JSON.parse('{bad'); } catch (e) { 42 }"), 42.0);
     }
 
     // --- classes ---
@@ -476,14 +520,8 @@ mod tests {
             5.0
         );
         assert!(b("class A {} let a = new A(); a instanceof A"));
-        assert_eq!(
-            num("class A { static make() { return 3; } } A.make()"),
-            3.0
-        );
-        assert_eq!(
-            num("class A { get v() { return 7; } } new A().v"),
-            7.0
-        );
+        assert_eq!(num("class A { static make() { return 3; } } A.make()"), 3.0);
+        assert_eq!(num("class A { get v() { return 7; } } new A().v"), 7.0);
         assert_eq!(
             s("class A { set v(x) { this._v = 'set:' + x; } get v() { return this._v; } } let a = new A(); a.v = 'k'; a.v"),
             "set:k"
@@ -663,15 +701,24 @@ mod tests {
     // --- JSON ---
     #[test]
     fn json_round_trip() {
-        assert_eq!(s("JSON.stringify({a: 1, b: 'x', c: [1,2], d: null})"), r#"{"a":1,"b":"x","c":[1,2],"d":null}"#);
-        assert_eq!(s("JSON.stringify([1, 'a', true, null])"), r#"[1,"a",true,null]"#);
+        assert_eq!(
+            s("JSON.stringify({a: 1, b: 'x', c: [1,2], d: null})"),
+            r#"{"a":1,"b":"x","c":[1,2],"d":null}"#
+        );
+        assert_eq!(
+            s("JSON.stringify([1, 'a', true, null])"),
+            r#"[1,"a",true,null]"#
+        );
         assert_eq!(s("JSON.stringify('hi')"), r#""hi""#);
         assert_eq!(num("JSON.parse('{\"a\": 5}').a"), 5.0);
         assert_eq!(num("JSON.parse('[1,2,3]')[1]"), 2.0);
         assert!(b("JSON.parse('true') === true"));
         assert!(matches!(run("JSON.parse('null')"), Value::Null));
         assert_eq!(s("let o = {n: 'x', arr: [{k: 1}]}; JSON.parse(JSON.stringify(o)).arr[0].k === 1 ? 'ok' : 'bad'"), "ok");
-        assert_eq!(num("Object.keys(JSON.parse('{\"x\":1,\"y\":2}')).length"), 2.0);
+        assert_eq!(
+            num("Object.keys(JSON.parse('{\"x\":1,\"y\":2}')).length"),
+            2.0
+        );
     }
 
     // --- promises (synchronous stub) ---
@@ -710,10 +757,7 @@ mod tests {
             num("let m = new Map(); m.set('a', 1); m.set('b', 2); m.get('a') + m.size"),
             3.0
         );
-        assert_eq!(
-            num("let s = new Set([1,1,2]); s.size"),
-            2.0
-        );
+        assert_eq!(num("let s = new Set([1,1,2]); s.size"), 2.0);
         // conditional member on null
         assert!(matches!(run("let o = null; o?.x"), Value::Und));
         // in/instanceof/typeof combos
@@ -721,7 +765,10 @@ mod tests {
         // computed member + call chains
         assert_eq!(num("let o = {f: {g: () => 12}}; o.f['g']()"), 12.0);
         // recursion
-        assert_eq!(num("function fib(n) { return n < 2 ? n : fib(n-1) + fib(n-2); } fib(15)"), 610.0);
+        assert_eq!(
+            num("function fib(n) { return n < 2 ? n : fib(n-1) + fib(n-2); } fib(15)"),
+            610.0
+        );
         // eval of a whole bundled-style program
         let prog = r#"
             'use strict';
@@ -754,7 +801,8 @@ mod tests {
     #[test]
     fn console_output() {
         let mut ctx = Context::new();
-        ctx.eval("console.log('hello', 42, {a:1}, [1,2]); console.warn('w')").unwrap();
+        ctx.eval("console.log('hello', 42, {a:1}, [1,2]); console.warn('w')")
+            .unwrap();
         let out = ctx.output();
         assert_eq!(out.len(), 2);
         assert!(out[0].contains("hello"));
@@ -764,7 +812,8 @@ mod tests {
     #[test]
     fn persistent_context() {
         let mut ctx = Context::new();
-        ctx.eval("var g = 10; function f() { return g * 2; }").unwrap();
+        ctx.eval("var g = 10; function f() { return g * 2; }")
+            .unwrap();
         assert_eq!(num_ctx(&mut ctx, "f()"), 20.0);
         ctx.eval("g = 50").unwrap();
         assert_eq!(num_ctx(&mut ctx, "f()"), 100.0);
@@ -869,14 +918,20 @@ mod tests {
 
     #[test]
     fn regex_groups_and_backrefs() {
-        assert_eq!(s("var m = /(\\d+)-(\\d+)/.exec('12-34'); m[1] + '/' + m[2]"), "12/34");
+        assert_eq!(
+            s("var m = /(\\d+)-(\\d+)/.exec('12-34'); m[1] + '/' + m[2]"),
+            "12/34"
+        );
         assert_eq!(num("var m = /b(c)/.exec('abc'); m.index"), 1.0);
         assert_eq!(s("var m = /b(c)/.exec('abc'); m.input"), "abc");
         assert!(b("/(a|b)\\1/.test('aa')"));
         assert!(!b("/(a|b)\\1/.test('ab')"));
         assert!(b("/(\\w+)\\s+\\1/.test('hello hello')"));
         // non-capture group isn't counted
-        assert_eq!(s("var m = /(?:a)(b)/.exec('ab'); m.length + ':' + m[1]"), "2:b");
+        assert_eq!(
+            s("var m = /(?:a)(b)/.exec('ab'); m.length + ':' + m[1]"),
+            "2:b"
+        );
         // named groups
         assert_eq!(
             s("var m = /(?<yr>\\d{4})-(?<mo>\\d{2})/.exec('2024-05'); m.groups.yr + '/' + m.groups.mo"),
@@ -903,10 +958,7 @@ mod tests {
         assert_eq!(s("var m = /b/.exec('abc'); m[0]"), "b");
         assert_eq!(num("var m = /b/.exec('abc'); m.length"), 1.0);
         // global exec advances lastIndex
-        assert_eq!(
-            num("var re = /a/g; re.exec('aa'); re.lastIndex"),
-            1.0
-        );
+        assert_eq!(num("var re = /a/g; re.exec('aa'); re.lastIndex"), 1.0);
         assert_eq!(
             num("var re = /a/g; re.exec('aa'); re.exec('aa'); re.lastIndex"),
             2.0
@@ -927,7 +979,10 @@ mod tests {
             3.0
         );
         // non-global ignores lastIndex
-        assert_eq!(num("var re = /a/; re.lastIndex = 5; var m = re.exec('a'); m.index"), 0.0);
+        assert_eq!(
+            num("var re = /a/; re.lastIndex = 5; var m = re.exec('a'); m.index"),
+            0.0
+        );
     }
 
     #[test]
@@ -949,7 +1004,10 @@ mod tests {
     #[test]
     fn string_match_regex() {
         // non-global → exec result
-        assert_eq!(s("var m = 'a1b2'.match(/\\d/); m[0] + '@' + m.index"), "1@1");
+        assert_eq!(
+            s("var m = 'a1b2'.match(/\\d/); m[0] + '@' + m.index"),
+            "1@1"
+        );
         // global → all match strings
         assert_eq!(s("'a1b2c3'.match(/\\d/g).join(',')"), "1,2,3");
         assert_eq!(num("'hello'.match(/z/g) === null ? 1 : 0"), 1.0);
@@ -1003,10 +1061,7 @@ mod tests {
             "x(1@1)y(2@3)"
         );
         // named group $<name>
-        assert_eq!(
-            s("'a5'.replace(/(?<d>\\d)/, '#$<d>#')"),
-            "a#5#"
-        );
+        assert_eq!(s("'a5'.replace(/(?<d>\\d)/, '#$<d>#')"), "a#5#");
         // replaceAll with regex needs /g
         assert_eq!(s("'a1b2'.replaceAll(/\\d/g, '_')"), "a_b_");
         assert!(eval("'x'.replaceAll(/x/, 'y')").is_err());
@@ -1035,7 +1090,9 @@ mod tests {
     fn regex_sticky_and_more() {
         // sticky: anchored at lastIndex
         assert_eq!(num("var re = /b/y; re.lastIndex = 1; var m = re.exec('abc'); m === null ? -1 : m.index"), 1.0);
-        assert!(b("var re = /b/y; re.lastIndex = 0; re.exec('abc') === null"));
+        assert!(b(
+            "var re = /b/y; re.lastIndex = 0; re.exec('abc') === null"
+        ));
         // unicode + d flags tolerated
         assert!(b("/a/u.test('a')"));
         assert!(b("/a/d.test('a')"));
@@ -1070,9 +1127,14 @@ mod tests {
         assert_eq!(s("var x = typeof /a/; x"), "object");
         assert_eq!(s("typeof /a/"), "object");
         assert!(b("var x = void /a/; x === undefined"));
-        assert!(b("var o = {a:1}; delete /x/.test('x') && delete o.a; !('a' in o)"));
+        assert!(b(
+            "var o = {a:1}; delete /x/.test('x') && delete o.a; !('a' in o)"
+        ));
         // after `case`, `do`, `else`
-        assert_eq!(num("var r = 0; if (false) {} else /a/.test('a') ? r = 5 : 0; r"), 5.0);
+        assert_eq!(
+            num("var r = 0; if (false) {} else /a/.test('a') ? r = 5 : 0; r"),
+            5.0
+        );
         assert!(b("do { } while (false); /z/.test('z')"));
         // division vs regex after number/paren/bracket
         assert_eq!(num("var a = [10]; a[0] / 2"), 5.0);
@@ -1098,8 +1160,8 @@ mod tests {
     fn regex_char_classes_detail() {
         assert!(b("/[\\d]/.test('5')"));
         assert!(!b("/[\\D]/.test('5')"));
-        assert!(b("/[a-]/.test('-')"));      // trailing dash literal
-        assert!(b("/[-a]/.test('-')"));      // leading dash literal
+        assert!(b("/[a-]/.test('-')")); // trailing dash literal
+        assert!(b("/[-a]/.test('-')")); // leading dash literal
         assert!(b("/[\\]]/.test(']')"));
         assert!(b("/[a-cx-z]/.test('y')"));
         assert!(!b("/[a-cx-z]/.test('w')"));
@@ -1184,9 +1246,15 @@ mod tests {
         // toString on empty pattern → /(?:)/
         assert_eq!(s("new RegExp().toString()"), "/(?:)/");
         // regex from regex: new RegExp(re, flags)
-        assert_eq!(s("var r = new RegExp(/ab/, 'i'); r.flags + r.source"), "iab");
+        assert_eq!(
+            s("var r = new RegExp(/ab/, 'i'); r.flags + r.source"),
+            "iab"
+        );
         // lastIndex writable
-        assert_eq!(num("var re = /a/g; re.lastIndex = 99; re.exec('a'); re.lastIndex"), 0.0);
+        assert_eq!(
+            num("var re = /a/g; re.lastIndex = 99; re.exec('a'); re.lastIndex"),
+            0.0
+        );
         // replace $1 with unmatched group → empty
         assert_eq!(s("'ab'.replace(/(x)?b/, '[$1]')"), "a[]");
         // $n where n > groups → literal
@@ -1225,7 +1293,9 @@ mod tests {
         assert!(b("/a|/.test('zzz')"));
         // regex in template / call args / arrays / objects
         assert!(b("var f = (r) => r.test('a'); f(/a/)"));
-        assert!(b("var arr = [/a/, /b/]; arr[0].test('a') && arr[1].test('b')"));
+        assert!(b(
+            "var arr = [/a/, /b/]; arr[0].test('a') && arr[1].test('b')"
+        ));
         // regex literal inside class method body
         assert_eq!(
             num("class C { ok() { return /\\d/.test('5') ? 1 : 0; } } new C().ok()"),
@@ -1242,16 +1312,22 @@ mod tests {
     fn regex_from_bundle_patterns() {
         // patterns actually seen in minified bundles
         assert!(b("var j = /\\/+/g; j.test('a//b')"));
-        assert_eq!(s("'a=b:c'.replace(/[=:]/g, function(m) { return m === '=' ? '1' : '2'; })"), "a1b2c");
+        assert_eq!(
+            s("'a=b:c'.replace(/[=:]/g, function(m) { return m === '=' ? '1' : '2'; })"),
+            "a1b2c"
+        );
         assert!(b("/^https?:\\/\\//.test('https://x.com')"));
         assert!(b("/[\\w-]+/.test('some-thing_9')"));
-        assert_eq!(s("'fooBar'.replace(/([A-Z])/g, '-$1').toLowerCase()"), "foo-bar");
-        assert!(b("/function\\s*\\(/.test('function (x)')"));
-        assert_eq!(num("'color: rgb(1, 2, 3)'.match(/rgb\\((\\d+), (\\d+), (\\d+)\\)/).length"), 4.0);
         assert_eq!(
-            s("'a\\nb\\nc'.split(/\\n/).join(';')"),
-            "a;b;c"
+            s("'fooBar'.replace(/([A-Z])/g, '-$1').toLowerCase()"),
+            "foo-bar"
         );
+        assert!(b("/function\\s*\\(/.test('function (x)')"));
+        assert_eq!(
+            num("'color: rgb(1, 2, 3)'.match(/rgb\\((\\d+), (\\d+), (\\d+)\\)/).length"),
+            4.0
+        );
+        assert_eq!(s("'a\\nb\\nc'.split(/\\n/).join(';')"), "a;b;c");
         // common idiom: strip trailing slash
         assert_eq!(s("'path/'.replace(/\\/+$/, '')"), "path");
         // camelCase → kebab via function
@@ -1306,7 +1382,10 @@ mod tests {
         assert!(b("0 in [9]"));
         assert!(!b("5 in [9]"));
         assert!(b("'a' in {a: 1}"));
-        assert_eq!(num("let a = [1,2,3]; delete a[1]; a[1] === undefined ? 1 : 0"), 1.0);
+        assert_eq!(
+            num("let a = [1,2,3]; delete a[1]; a[1] === undefined ? 1 : 0"),
+            1.0
+        );
         assert_eq!(num("let a = [1,2,3]; delete a[1]; a.length"), 3.0);
     }
 
@@ -1347,10 +1426,16 @@ mod tests {
         assert_eq!(num("new Uint16Array(4).byteLength"), 8.0);
         assert_eq!(num("new Uint8Array([1,2,3])[1]"), 2.0);
         assert_eq!(num("let a = new Uint8Array(3); a[0] = 7; a[0]"), 7.0);
-        assert_eq!(num("let a = new Uint8Array(3); a.length = 9; a.length"), 3.0);
+        assert_eq!(
+            num("let a = new Uint8Array(3); a.length = 9; a.length"),
+            3.0
+        );
         assert!(b("let a = new Uint8Array(2); a instanceof Uint8Array"));
         assert!(b("new Uint8Array(1) instanceof Object"));
-        assert_eq!(num("Uint8Array.BYTES_PER_ELEMENT + Float64Array.BYTES_PER_ELEMENT"), 9.0);
+        assert_eq!(
+            num("Uint8Array.BYTES_PER_ELEMENT + Float64Array.BYTES_PER_ELEMENT"),
+            9.0
+        );
     }
 
     #[test]
@@ -1360,18 +1445,38 @@ mod tests {
         assert_eq!(num("let a = new Uint8Array(1); a[0] = -1; a[0]"), 255.0);
         assert_eq!(num("let a = new Int8Array(1); a[0] = 200; a[0]"), -56.0);
         assert_eq!(num("let a = new Int8Array(1); a[0] = -1; a[0]"), -1.0);
-        assert_eq!(num("let a = new Uint32Array(1); a[0] = -1; a[0]"), 4294967295.0);
-        assert_eq!(num("let a = new Int32Array(1); a[0] = 4294967295; a[0]"), -1.0);
+        assert_eq!(
+            num("let a = new Uint32Array(1); a[0] = -1; a[0]"),
+            4294967295.0
+        );
+        assert_eq!(
+            num("let a = new Int32Array(1); a[0] = 4294967295; a[0]"),
+            -1.0
+        );
         // clamped rounds + clamps
-        assert_eq!(num("let a = new Uint8ClampedArray(2); a[0] = 300; a[1] = -5; a[0] + a[1]"), 255.0);
-        assert_eq!(num("let a = new Uint8ClampedArray(1); a[0] = 2.6; a[0]"), 3.0);
+        assert_eq!(
+            num("let a = new Uint8ClampedArray(2); a[0] = 300; a[1] = -5; a[0] + a[1]"),
+            255.0
+        );
+        assert_eq!(
+            num("let a = new Uint8ClampedArray(1); a[0] = 2.6; a[0]"),
+            3.0
+        );
     }
 
     #[test]
     fn typed_array_views_share() {
-        assert_eq!(num("let b = new ArrayBuffer(8); let v = new Uint8Array(b, 2, 4); v.byteOffset"), 2.0);
-        assert_eq!(num("let b = new ArrayBuffer(8); let v = new Uint8Array(b, 2, 4); v.byteLength"), 4.0);
-        assert!(b("let b = new ArrayBuffer(8); let v = new Uint8Array(b); v.buffer === b"));
+        assert_eq!(
+            num("let b = new ArrayBuffer(8); let v = new Uint8Array(b, 2, 4); v.byteOffset"),
+            2.0
+        );
+        assert_eq!(
+            num("let b = new ArrayBuffer(8); let v = new Uint8Array(b, 2, 4); v.byteLength"),
+            4.0
+        );
+        assert!(b(
+            "let b = new ArrayBuffer(8); let v = new Uint8Array(b); v.buffer === b"
+        ));
         assert_eq!(
             num("let b = new ArrayBuffer(4); let v = new Uint8Array(b); v[1] = 9; new Uint8Array(b)[1]"),
             9.0
@@ -1398,29 +1503,56 @@ mod tests {
 
     #[test]
     fn typed_array_methods() {
-        assert_eq!(s("let a = new Uint8Array([0,0,0]); a.set([9,8], 1); a.join(',')"), "0,9,8");
-        assert_eq!(s("new Uint8Array([1,2,3,4]).fill(0, 1, 3).join(',')"), "1,0,0,4");
-        assert_eq!(s("new Uint8Array([1,2,3,4]).copyWithin(1, 0, 2).join(',')"), "1,1,2,4");
+        assert_eq!(
+            s("let a = new Uint8Array([0,0,0]); a.set([9,8], 1); a.join(',')"),
+            "0,9,8"
+        );
+        assert_eq!(
+            s("new Uint8Array([1,2,3,4]).fill(0, 1, 3).join(',')"),
+            "1,0,0,4"
+        );
+        assert_eq!(
+            s("new Uint8Array([1,2,3,4]).copyWithin(1, 0, 2).join(',')"),
+            "1,1,2,4"
+        );
         assert_eq!(s("new Uint8Array([1,2,3]).reverse().join(',')"), "3,2,1");
         // sort is numeric, not lexicographic
         assert_eq!(s("new Uint8Array([3,10,1]).sort().join(',')"), "1,3,10");
-        assert_eq!(s("new Uint8Array([3,10,1]).sort((a,b)=>b-a).join(',')"), "10,3,1");
+        assert_eq!(
+            s("new Uint8Array([3,10,1]).sort((a,b)=>b-a).join(',')"),
+            "10,3,1"
+        );
         assert_eq!(num("new Uint8Array([1,2,3]).indexOf(2)"), 1.0);
         assert!(b("new Uint8Array([1,2,3]).includes(3)"));
         assert_eq!(num("new Uint8Array([1,2,3]).at(-1)"), 3.0);
-        assert_eq!(s("new Uint8Array([1,2,3]).map(x => x * 2).join(',')"), "2,4,6");
-        assert_eq!(num("new Uint8Array([1,2,3,4]).filter(x => x % 2).length"), 2.0);
-        assert_eq!(num("new Uint8Array([1,2,3,4]).reduce((s,v) => s + v, 0)"), 10.0);
+        assert_eq!(
+            s("new Uint8Array([1,2,3]).map(x => x * 2).join(',')"),
+            "2,4,6"
+        );
+        assert_eq!(
+            num("new Uint8Array([1,2,3,4]).filter(x => x % 2).length"),
+            2.0
+        );
+        assert_eq!(
+            num("new Uint8Array([1,2,3,4]).reduce((s,v) => s + v, 0)"),
+            10.0
+        );
         assert!(b("new Uint8Array([1,2,3]).some(x => x > 2)"));
         assert!(!b("new Uint8Array([1,2,3]).every(x => x > 2)"));
         assert_eq!(num("new Uint8Array([1,2,3]).find(x => x > 1)"), 2.0);
-        assert_eq!(num("let t = 0; new Uint8Array([1,2,3]).forEach(x => t += x); t"), 6.0);
+        assert_eq!(
+            num("let t = 0; new Uint8Array([1,2,3]).forEach(x => t += x); t"),
+            6.0
+        );
         assert_eq!(s("String(new Uint8Array([1,2,3]))"), "1,2,3");
     }
 
     #[test]
     fn typed_array_iteration() {
-        assert_eq!(num("let s = 0; for (let v of new Uint8Array([1,2,3])) s += v; s"), 6.0);
+        assert_eq!(
+            num("let s = 0; for (let v of new Uint8Array([1,2,3])) s += v; s"),
+            6.0
+        );
         assert_eq!(num("[...new Uint8Array([1,2,3])].length"), 3.0);
         assert_eq!(
             num("let n = 0; for (let e of new Uint8Array([5,6]).entries()) n += e[0] + e[1]; n"),
@@ -1471,9 +1603,15 @@ mod tests {
 
     #[test]
     fn text_encoder_decoder() {
-        assert_eq!(s("new TextDecoder().decode(new TextEncoder().encode('héllo'))"), "héllo");
+        assert_eq!(
+            s("new TextDecoder().decode(new TextEncoder().encode('héllo'))"),
+            "héllo"
+        );
         assert_eq!(num("new TextEncoder().encode('héllo').length"), 6.0);
-        assert_eq!(s("new TextDecoder().decode(new Uint8Array([104,105]))"), "hi");
+        assert_eq!(
+            s("new TextDecoder().decode(new Uint8Array([104,105]))"),
+            "hi"
+        );
         assert_eq!(num("new TextEncoder().encode('').length"), 0.0);
         assert_eq!(s("new TextDecoder('utf-8').decode()"), "");
         assert_eq!(
@@ -1501,7 +1639,10 @@ mod tests {
         assert_eq!(s("new URL('https://u:p@ex.com/').username + ':' + new URL('https://u:p@ex.com/').password"), "u:p");
         assert_eq!(s("new URL('https://ex.com/a').origin"), "https://ex.com");
         assert_eq!(s("new URL('https://ex.com/a').href"), "https://ex.com/a");
-        assert_eq!(s("String(new URL('https://ex.com/a?b=1'))"), "https://ex.com/a?b=1");
+        assert_eq!(
+            s("String(new URL('https://ex.com/a?b=1'))"),
+            "https://ex.com/a?b=1"
+        );
     }
 
     #[test]
@@ -1577,7 +1718,9 @@ mod tests {
             num("let f = new FormData(); f.set('a', 1); f.set('a', 2); f.getAll('a').length"),
             1.0
         );
-        assert!(b("let f = new FormData(); f.append('a', 1); f.delete('a'); !f.has('a')"));
+        assert!(b(
+            "let f = new FormData(); f.append('a', 1); f.delete('a'); !f.has('a')"
+        ));
         assert_eq!(
             num("let n = 0; let f = new FormData(); f.append('x', 1); f.append('y', 2); for (let e of f) n++; n"),
             2.0
@@ -1607,12 +1750,21 @@ mod tests {
         assert!(b("typeof XMLHttpRequest === 'function'"));
         assert!(b("typeof crypto === 'object'"));
         assert_eq!(num("let w = new Worker('x.js'); w.postMessage({}); w.terminate(); w.onmessage === null ? 1 : 0"), 1.0);
-        assert_eq!(num("let im = new Image(10, 20); im.width + im.height"), 30.0);
-        assert_eq!(num("let x = new XMLHttpRequest(); x.open('GET', '/'); x.send(); x.readyState"), 0.0);
+        assert_eq!(
+            num("let im = new Image(10, 20); im.width + im.height"),
+            30.0
+        );
+        assert_eq!(
+            num("let x = new XMLHttpRequest(); x.open('GET', '/'); x.send(); x.readyState"),
+            0.0
+        );
         assert_eq!(num("typeof BigInt64Array === 'function' ? 1 : 0"), 1.0);
         assert!(eval("new BigInt64Array(1)").is_err());
         assert!(b("typeof queueMicrotask === 'function'"));
-        assert_eq!(num("typeof URL.createObjectURL(new Blob()) === 'string' ? 1 : 0"), 1.0);
+        assert_eq!(
+            num("typeof URL.createObjectURL(new Blob()) === 'string' ? 1 : 0"),
+            1.0
+        );
     }
 
     #[test]

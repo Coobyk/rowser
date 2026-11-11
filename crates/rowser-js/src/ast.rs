@@ -13,7 +13,10 @@ pub enum Expr {
     /// `super` used as `super(args)` or `super.prop` / `super.prop(...)`.
     Super,
     /// regex literal `/pattern/flags`
-    Regex { pattern: String, flags: String },
+    Regex {
+        pattern: String,
+        flags: String,
+    },
     Template(Vec<TemplPart>),
     Array(Vec<ArrElem>),
     Object(Vec<ObjProp>),

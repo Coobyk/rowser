@@ -2,12 +2,12 @@
 //! stack — the raster side of rowser-layout's borderfx items.
 
 use crate::Canvas;
-use rowser_layout::{BorderEdge, BorderStyle, Color};
 use rowser_image::Image;
 use rowser_layout::colorfx::{
     blend_rgb, clip_covers, resolve_clip, BlendMode, ClipAbs, Effect, FilterOp,
 };
 use rowser_layout::{bgra, offset_item, DisplayItem};
+use rowser_layout::{BorderEdge, BorderStyle, Color};
 use rowser_text::FontCache;
 use std::collections::HashMap;
 
@@ -120,7 +120,11 @@ pub fn border_side(
             let step = (thick * 2.0).max(2.0);
             let mut s = 0.0f32;
             while s + r <= len {
-                let (cx, cy) = if horiz { (x + s + r, y + r) } else { (x + r, y + s + r) };
+                let (cx, cy) = if horiz {
+                    (x + s + r, y + r)
+                } else {
+                    (x + r, y + s + r)
+                };
                 disc(cv, cx, cy, r, color);
                 s += step;
             }
@@ -161,7 +165,11 @@ pub fn border_side(
             let light = shade(color, 0.55);
             let sunken = matches!(style, BorderStyle::Groove | BorderStyle::Inset);
             let outer_dark = matches!(side, BorderEdge::Top | BorderEdge::Left) == sunken;
-            let (outer, inner) = if outer_dark { (dark, light) } else { (light, dark) };
+            let (outer, inner) = if outer_dark {
+                (dark, light)
+            } else {
+                (light, dark)
+            };
             let half = (thick / 2.0).max(0.0);
             if half < 0.5 {
                 cv.fill_rect(x as i32, y as i32, w as u32, h as u32, outer);
@@ -170,18 +178,42 @@ pub fn border_side(
             match side {
                 BorderEdge::Top => {
                     cv.fill_rect(x as i32, y as i32, w as u32, half as u32, outer);
-                    cv.fill_rect(x as i32, (y + half) as i32, w as u32, (h - half) as u32, inner);
+                    cv.fill_rect(
+                        x as i32,
+                        (y + half) as i32,
+                        w as u32,
+                        (h - half) as u32,
+                        inner,
+                    );
                 }
                 BorderEdge::Bottom => {
-                    cv.fill_rect(x as i32, (y + half) as i32, w as u32, (h - half) as u32, outer);
+                    cv.fill_rect(
+                        x as i32,
+                        (y + half) as i32,
+                        w as u32,
+                        (h - half) as u32,
+                        outer,
+                    );
                     cv.fill_rect(x as i32, y as i32, w as u32, half as u32, inner);
                 }
                 BorderEdge::Left => {
                     cv.fill_rect(x as i32, y as i32, half as u32, h as u32, outer);
-                    cv.fill_rect((x + half) as i32, y as i32, (w - half) as u32, h as u32, inner);
+                    cv.fill_rect(
+                        (x + half) as i32,
+                        y as i32,
+                        (w - half) as u32,
+                        h as u32,
+                        inner,
+                    );
                 }
                 BorderEdge::Right => {
-                    cv.fill_rect((x + half) as i32, y as i32, (w - half) as u32, h as u32, outer);
+                    cv.fill_rect(
+                        (x + half) as i32,
+                        y as i32,
+                        (w - half) as u32,
+                        h as u32,
+                        outer,
+                    );
                     cv.fill_rect(x as i32, y as i32, half as u32, h as u32, inner);
                 }
             }
@@ -307,7 +339,10 @@ pub fn box_shadow(
             },
         };
         let (x0, y0) = ((x.floor() as i32).max(bx0), (y.floor() as i32).max(by0));
-        let (x1, y1) = (((x + w).ceil() as i32).min(bx1), ((y + h).ceil() as i32).min(by1));
+        let (x1, y1) = (
+            ((x + w).ceil() as i32).min(bx1),
+            ((y + h).ceil() as i32).min(by1),
+        );
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -332,7 +367,15 @@ pub fn box_shadow(
                 }
                 let cov = mask[j * mw + i];
                 // invert: shadow where the core does not cover
-                blend(cv, &[255u8.saturating_sub(cov)], 1, x0 + i as i32, y0 + j as i32, 0, 0);
+                blend(
+                    cv,
+                    &[255u8.saturating_sub(cov)],
+                    1,
+                    x0 + i as i32,
+                    y0 + j as i32,
+                    0,
+                    0,
+                );
             }
         }
     } else {
@@ -592,9 +635,12 @@ fn apply_op(tile: &mut Tile, op: &FilterOp) {
     match op {
         FilterOp::Matrix(m) => apply_matrix(&mut tile.px, m),
         FilterOp::Blur(s) => blur_tile(&mut tile.px, tile.w, tile.h, *s),
-        FilterOp::DropShadow { dx, dy, blur, color } => {
-            drop_shadow(tile, *dx, *dy, *blur, *color)
-        }
+        FilterOp::DropShadow {
+            dx,
+            dy,
+            blur,
+            color,
+        } => drop_shadow(tile, *dx, *dy, *blur, *color),
     }
 }
 
@@ -881,9 +927,9 @@ fn composite(canvas: &mut Canvas, tile: &Tile) {
             } else {
                 let inv = 255 - a;
                 for k in 0..3 {
-                    canvas.pixels[di + k] =
-                        ((tile.px[si + k] as u32 * a + canvas.pixels[di + k] as u32 * inv) / 255)
-                            as u8;
+                    canvas.pixels[di + k] = ((tile.px[si + k] as u32 * a
+                        + canvas.pixels[di + k] as u32 * inv)
+                        / 255) as u8;
                 }
                 canvas.pixels[di + 3] = 255;
             }
@@ -988,7 +1034,14 @@ mod tests {
             },
             DisplayItem::PopEffect,
         ];
-        let px = crate::paint(&items, &mut f, 20, 20, rowser_layout::WHITE, &HashMap::new());
+        let px = crate::paint(
+            &items,
+            &mut f,
+            20,
+            20,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         let p = px_at(&px, 20, 5, 5);
         assert_eq!(&p[..3], &[255, 255, 0]); // inverted red → cyan (b,g,r)
     }
@@ -1012,7 +1065,14 @@ mod tests {
             },
             DisplayItem::PopEffect,
         ];
-        let px = crate::paint(&items, &mut f, 100, 100, rowser_layout::WHITE, &HashMap::new());
+        let px = crate::paint(
+            &items,
+            &mut f,
+            100,
+            100,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         // center inside circle → red; corner clipped → white
         assert_eq!(px_at(&px, 100, 50, 50)[2], 255);
         assert_eq!(px_at(&px, 100, 2, 2), [255, 255, 255, 255]);
@@ -1040,7 +1100,14 @@ mod tests {
             },
             DisplayItem::PopEffect,
         ];
-        let px = crate::paint(&items, &mut f, 20, 20, rowser_layout::WHITE, &HashMap::new());
+        let px = crate::paint(
+            &items,
+            &mut f,
+            20,
+            20,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         assert_eq!(&px_at(&px, 20, 10, 10)[..3], &[0, 0, 255]);
     }
 
@@ -1058,7 +1125,14 @@ mod tests {
             },
             DisplayItem::PopEffect,
         ];
-        let px = crate::paint(&items, &mut f, 20, 20, rowser_layout::WHITE, &HashMap::new());
+        let px = crate::paint(
+            &items,
+            &mut f,
+            20,
+            20,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         // blur smears beyond the rect's hard edge
         let edge = px_at(&px, 20, 5, 10);
         assert!(edge[0] < 250, "blur should smear beyond the rect");
@@ -1082,7 +1156,14 @@ mod tests {
             },
             DisplayItem::PopEffect,
         ];
-        let px = crate::paint(&items, &mut f, 20, 20, rowser_layout::WHITE, &HashMap::new());
+        let px = crate::paint(
+            &items,
+            &mut f,
+            20,
+            20,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         // shadow sticks out to the right of the red rect → blue channel
         assert_eq!(&px_at(&px, 20, 12, 5)[..3], &[255, 0, 0]);
         // the rect itself still red
@@ -1116,12 +1197,22 @@ mod tests {
             },
             DisplayItem::PopEffect,
         ];
-        let px = crate::paint(&items, &mut f, 20, 20, rowser_layout::WHITE, &HashMap::new());
+        let px = crate::paint(
+            &items,
+            &mut f,
+            20,
+            20,
+            rowser_layout::WHITE,
+            &HashMap::new(),
+        );
         // the element's own rect painted over the blurred backdrop
         assert_eq!(&px_at(&px, 20, 0, 0)[..3], &[255, 255, 255]);
         // the black/white boundary at x=10 smeared into a grey band
         let p = px_at(&px, 20, 10, 10);
-        assert!(p[0] > 60 && p[0] < 200, "boundary should blur to grey, got {p:?}");
+        assert!(
+            p[0] > 60 && p[0] < 200,
+            "boundary should blur to grey, got {p:?}"
+        );
         // far from the boundary the colors survive
         assert!(px_at(&px, 20, 2, 10)[0] < 40);
         assert!(px_at(&px, 20, 18, 10)[0] > 215);

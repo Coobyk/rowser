@@ -13,7 +13,7 @@ out.s
 "#;
     let mut c = rowser_js::Context::new();
     match c.eval(src) {
-        Ok(v)=>println!("=> {}", c.interp.to_str(&v).unwrap_or_default()),
-        Err(e)=>println!("=> ERR {e}"),
+        Ok(v) => println!("=> {}", c.interp.to_str(&v).unwrap_or_default()),
+        Err(e) => println!("=> ERR {e}"),
     }
 }

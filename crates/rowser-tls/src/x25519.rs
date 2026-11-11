@@ -51,8 +51,20 @@ fn carry_pass(h: &mut Fe) {
 
 /// `a * b mod p`. Limbs < 2^54 on input keep every product < 2^113.
 fn fe_mul(a: &Fe, b: &Fe) -> Fe {
-    let (a0, a1, a2, a3, a4) = (a[0] as u128, a[1] as u128, a[2] as u128, a[3] as u128, a[4] as u128);
-    let (b0, b1, b2, b3, b4) = (b[0] as u128, b[1] as u128, b[2] as u128, b[3] as u128, b[4] as u128);
+    let (a0, a1, a2, a3, a4) = (
+        a[0] as u128,
+        a[1] as u128,
+        a[2] as u128,
+        a[3] as u128,
+        a[4] as u128,
+    );
+    let (b0, b1, b2, b3, b4) = (
+        b[0] as u128,
+        b[1] as u128,
+        b[2] as u128,
+        b[3] as u128,
+        b[4] as u128,
+    );
     let b1_19 = b1 * 19;
     let b2_19 = b2 * 19;
     let b3_19 = b3 * 19;

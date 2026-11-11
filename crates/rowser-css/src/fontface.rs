@@ -51,8 +51,7 @@ pub struct FontFace {
 impl FontFace {
     /// Whether the face's unicode-range admits `cp` (unrestricted = yes).
     pub fn covers(&self, cp: u32) -> bool {
-        self.unicode_range.is_empty()
-            || self.unicode_range.iter().any(|&(a, b)| cp >= a && cp <= b)
+        self.unicode_range.is_empty() || self.unicode_range.iter().any(|&(a, b)| cp >= a && cp <= b)
     }
 }
 
@@ -60,8 +59,7 @@ impl FontFace {
 fn unquote(s: &str) -> String {
     let s = s.trim();
     let inner = if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"'))
-            || (s.starts_with('\'') && s.ends_with('\'')))
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
     {
         &s[1..s.len() - 1]
     } else {
@@ -219,10 +217,7 @@ pub fn parse_unicode_range(v: &str) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     for item in v.split(',') {
         let item = item.trim();
-        let Some(hex) = item
-            .strip_prefix("u+")
-            .or_else(|| item.strip_prefix("U+"))
-        else {
+        let Some(hex) = item.strip_prefix("u+").or_else(|| item.strip_prefix("U+")) else {
             continue;
         };
         if let Some((a, b)) = hex.split_once('-') {
@@ -238,9 +233,7 @@ pub fn parse_unicode_range(v: &str) -> Vec<(u32, u32)> {
         if hex.contains('?') {
             let lo = hex.replace('?', "0");
             let hi = hex.replace('?', "f");
-            if let (Ok(lo), Ok(hi)) =
-                (u32::from_str_radix(&lo, 16), u32::from_str_radix(&hi, 16))
-            {
+            if let (Ok(lo), Ok(hi)) = (u32::from_str_radix(&lo, 16), u32::from_str_radix(&hi, 16)) {
                 out.push((lo, hi));
             }
         } else if let Ok(cp) = u32::from_str_radix(hex, 16) {

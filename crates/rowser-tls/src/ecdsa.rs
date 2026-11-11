@@ -41,14 +41,22 @@ pub fn p256() -> Curve {
 /// secp384r1 (OID 1.3.132.0.34).
 pub fn p384() -> Curve {
     Curve {
-        p: big("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe\
-                ffffffff0000000000000000ffffffff"),
-        n: big("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf\
-                581a0db248b0a77aecec196accc52973"),
-        gx: big("aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a38\
-                5502f25dbf55296c3a545e3872760ab7"),
-        gy: big("3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c0\
-                0a60b1ce1d7e819d7a431d7c90ea0e5f"),
+        p: big(
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe\
+                ffffffff0000000000000000ffffffff",
+        ),
+        n: big(
+            "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf\
+                581a0db248b0a77aecec196accc52973",
+        ),
+        gx: big(
+            "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a38\
+                5502f25dbf55296c3a545e3872760ab7",
+        ),
+        gy: big(
+            "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c0\
+                0a60b1ce1d7e819d7a431d7c90ea0e5f",
+        ),
         coord_len: 48,
     }
 }
@@ -99,7 +107,7 @@ fn double(pt: &Pt, p: &Big) -> Pt {
     let delta = sqmod(&pt.z, p); // Z1^2
     let gamma = sqmod(&pt.y, p); // Y1^2
     let beta = mulmod(&pt.x, &gamma, p); // X1*gamma
-    // alpha = 3*(X1-delta)*(X1+delta)
+                                         // alpha = 3*(X1-delta)*(X1+delta)
     let alpha = mulmod(
         &Big::from_u64(3),
         &mulmod(&pt.x.submod(&delta, p), &pt.x.addmod(&delta, p), p),
@@ -110,12 +118,11 @@ fn double(pt: &Pt, p: &Big) -> Pt {
     // X3 = alpha^2 - 8*beta
     let x3 = sqmod(&alpha, p).submod(&eight_beta, p);
     // Z3 = (Y1+Z1)^2 - gamma - delta
-    let z3 = pt
-        .y
-        .addmod(&pt.z, p)
-        .mulmod(&pt.y.addmod(&pt.z, p), p)
-        .submod(&gamma, p)
-        .submod(&delta, p);
+    let z3 =
+        pt.y.addmod(&pt.z, p)
+            .mulmod(&pt.y.addmod(&pt.z, p), p)
+            .submod(&gamma, p)
+            .submod(&delta, p);
     // Y3 = alpha*(4*beta - X3) - 8*gamma^2
     let eight_gamma2 = {
         let g2 = sqmod(&gamma, p);
@@ -123,7 +130,11 @@ fn double(pt: &Pt, p: &Big) -> Pt {
         g4.addmod(&g4, p) // 8*g2
     };
     let y3 = mulmod(&alpha, &four_beta.submod(&x3, p), p).submod(&eight_gamma2, p);
-    Pt { x: x3, y: y3, z: z3 }
+    Pt {
+        x: x3,
+        y: y3,
+        z: z3,
+    }
 }
 
 /// Mixed addition: Jacobian `a` + affine `b` (z2 = 1), madd-2007-bl style
@@ -156,7 +167,11 @@ fn add_mixed(a: &Pt, b: &Pt, p: &Big) -> Pt {
     let y3 = mulmod(&r, &v.submod(&x3, p), p).submod(&mulmod(&a.y, &hhh, p), p);
     // Z3 = Z1*H
     let z3 = mulmod(&a.z, &h, p);
-    Pt { x: x3, y: y3, z: z3 }
+    Pt {
+        x: x3,
+        y: y3,
+        z: z3,
+    }
 }
 
 /// General Jacobian + Jacobian addition (for combining scalar products).
@@ -188,7 +203,11 @@ fn add(a: &Pt, b: &Pt, p: &Big) -> Pt {
     let x3 = sqmod(&r, p).submod(&hhh, p).submod(&two_v, p);
     let y3 = mulmod(&r, &v.submod(&x3, p), p).submod(&mulmod(&s1, &hhh, p), p);
     let z3 = mulmod(&a.z, &mulmod(&b.z, &h, p), p);
-    Pt { x: x3, y: y3, z: z3 }
+    Pt {
+        x: x3,
+        y: y3,
+        z: z3,
+    }
 }
 
 /// `k * pt` — MSB-first double-and-add.
@@ -216,16 +235,12 @@ fn affine_x(pt: &Pt, p: &Big) -> Result<Big> {
 /// Verify an ECDSA signature `(r, s)` over `digest` with public key `q`.
 ///
 /// `pubkey` is the ANSI X9.62 uncompressed point `04 || x || y`.
-pub fn ecdsa_verify(
-    curve: &Curve,
-    pubkey: &[u8],
-    digest: &[u8],
-    r: &Big,
-    s: &Big,
-) -> Result<()> {
+pub fn ecdsa_verify(curve: &Curve, pubkey: &[u8], digest: &[u8], r: &Big, s: &Big) -> Result<()> {
     let p = &curve.p;
     let n = &curve.n;
-    if r.is_zero() || s.is_zero() || r.cmp_big(n) != std::cmp::Ordering::Less
+    if r.is_zero()
+        || s.is_zero()
+        || r.cmp_big(n) != std::cmp::Ordering::Less
         || s.cmp_big(n) != std::cmp::Ordering::Less
     {
         return Err(Error::Verify("ecdsa: r/s out of range"));
@@ -323,12 +338,11 @@ mod tests {
         let c = p256();
         let b = curve_b(&c);
         let lhs = sqmod(&c.gy, &c.p);
-        let rhs = c
-            .gx
-            .mulmod(&c.gx, &c.p)
-            .mulmod(&c.gx, &c.p)
-            .submod(&Big::from_u64(3).mulmod(&c.gx, &c.p), &c.p)
-            .addmod(&b, &c.p);
+        let rhs =
+            c.gx.mulmod(&c.gx, &c.p)
+                .mulmod(&c.gx, &c.p)
+                .submod(&Big::from_u64(3).mulmod(&c.gx, &c.p), &c.p)
+                .addmod(&b, &c.p);
         assert_eq!(lhs, rhs);
     }
 

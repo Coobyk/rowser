@@ -286,7 +286,9 @@ impl Font {
                 adv = be_u16(d, o);
                 self.hmtx.push((adv, be_i16(d, o + 2)));
             } else {
-                let o = self.tables.hmtx + self.num_h_metrics as usize * 4 + (i - self.num_h_metrics as usize) * 2;
+                let o = self.tables.hmtx
+                    + self.num_h_metrics as usize * 4
+                    + (i - self.num_h_metrics as usize) * 2;
                 self.hmtx.push((adv, be_i16(d, o)));
             }
         }
@@ -356,7 +358,13 @@ impl Font {
             }
         }
         let sub = subfamily.to_lowercase();
-        family.map(|f| (f, sub.contains("bold"), sub.contains("italic") || sub.contains("oblique")))
+        family.map(|f| {
+            (
+                f,
+                sub.contains("bold"),
+                sub.contains("italic") || sub.contains("oblique"),
+            )
+        })
     }
 
     /// Map a Unicode scalar to a glyph id (0 = .notdef).
@@ -418,8 +426,7 @@ impl Font {
             if ro == 0 {
                 return (cp as i32 + delta).rem_euclid(65536) as u16;
             }
-            let glyph_idx_off =
-                id_range_off + i * 2 + ro + (cp as usize - start as usize) * 2;
+            let glyph_idx_off = id_range_off + i * 2 + ro + (cp as usize - start as usize) * 2;
             if glyph_idx_off + 2 > d.len() {
                 return 0;
             }
@@ -531,7 +538,9 @@ impl Font {
         if depth > 4 {
             return;
         }
-        let Some(g) = self.glyph_data(gid) else { return };
+        let Some(g) = self.glyph_data(gid) else {
+            return;
+        };
         if g.len() < 10 {
             return;
         }
@@ -692,7 +701,11 @@ impl Font {
                 v
             };
             // args are dx/dy when bit1 set; point-matching unsupported → 0 offset
-            let (cdx, cdy) = if flags & 0x0002 != 0 { (a1, a2) } else { (0.0, 0.0) };
+            let (cdx, cdy) = if flags & 0x0002 != 0 {
+                (a1, a2)
+            } else {
+                (0.0, 0.0)
+            };
             let mut cscale = scale;
             if flags & 0x0008 != 0 {
                 cscale *= f2dot14(be_i16(g, o));
@@ -704,7 +717,14 @@ impl Font {
             } else if flags & 0x0080 != 0 {
                 o += 8; // 2x2 matrix — unsupported, use uniform scale anyway
             }
-            self.outline_into(comp_gid, dx + cdx * scale, dy + cdy * scale, cscale, out, depth + 1);
+            self.outline_into(
+                comp_gid,
+                dx + cdx * scale,
+                dy + cdy * scale,
+                cscale,
+                out,
+                depth + 1,
+            );
             if flags & 0x0020 == 0 {
                 break;
             }
@@ -731,8 +751,7 @@ impl Font {
                 p.1 = -p.1;
             }
         }
-        let (mut min_x, mut min_y, mut max_x, mut max_y) =
-            (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
         for c in &pts {
             for &(x, y) in c {
                 min_x = min_x.min(x);
@@ -741,7 +760,10 @@ impl Font {
                 max_y = max_y.max(y);
             }
         }
-        let (w, h) = ((max_x - min_x).ceil() as i32 + 2, (max_y - min_y).ceil() as i32 + 2);
+        let (w, h) = (
+            (max_x - min_x).ceil() as i32 + 2,
+            (max_y - min_y).ceil() as i32 + 2,
+        );
         if w <= 0 || h <= 0 {
             return None;
         }
@@ -757,7 +779,9 @@ impl Font {
                 let mut sum = 0u32;
                 for sy in 0..SS {
                     for sx in 0..SS {
-                        sum += cov[(y * SS + sy) as usize * (w * SS) as usize + (x * SS + sx) as usize] as u32;
+                        sum += cov
+                            [(y * SS + sy) as usize * (w * SS) as usize + (x * SS + sx) as usize]
+                            as u32;
                     }
                 }
                 alpha[(y * w + x) as usize] = (sum / (SS * SS) as u32) as u8;
@@ -864,10 +888,14 @@ impl FontCache {
     ) -> Option<usize> {
         let generics = |g: &str| -> &[&str] {
             match g {
-                "monospace" | "ui-monospace" | "mono" | "fixed" | "fixed-width"
-                | "consolas" | "menlo" | "sfmono" | "sf mono" => {
-                    &["geist mono", "jetbrains", "noto sans mono", "dejavu sans mono", "mono"]
-                }
+                "monospace" | "ui-monospace" | "mono" | "fixed" | "fixed-width" | "consolas"
+                | "menlo" | "sfmono" | "sf mono" => &[
+                    "geist mono",
+                    "jetbrains",
+                    "noto sans mono",
+                    "dejavu sans mono",
+                    "mono",
+                ],
                 "sans-serif" | "sans" | "system-ui" | "ui-sans-serif" | "-apple-system"
                 | "blinkmacsystemfont" | "-webkit-standard" => {
                     &["liberation sans", "noto sans", "dejavu sans", "geist"]
@@ -891,7 +919,11 @@ impl FontCache {
             }
             let wants: Vec<String> = {
                 let g = generics(want.as_str());
-                if g.is_empty() { vec![want] } else { g.iter().map(|s| s.to_string()).collect() }
+                if g.is_empty() {
+                    vec![want]
+                } else {
+                    g.iter().map(|s| s.to_string()).collect()
+                }
             };
             for want in wants {
                 if let Some(idx) = self.best_face(&want, weight, stretch, italic, ch) {
@@ -1061,7 +1093,15 @@ fn f2dot14(v: i16) -> f32 {
     v as f32 / 16384.0
 }
 
-fn flatten_quad(p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), scale: f32, dx: f32, dy: f32, out: &mut Vec<(f32, f32)>) {
+fn flatten_quad(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    scale: f32,
+    dx: f32,
+    dy: f32,
+    out: &mut Vec<(f32, f32)>,
+) {
     // Flatten quadratic bezier by adaptive subdivision (16 segs is plenty at UI sizes).
     const N: i32 = 16;
     for i in 1..=N {
@@ -1120,8 +1160,10 @@ mod tests {
     use super::*;
 
     fn liberation() -> Font {
-        Font::load(Path::new("/usr/share/fonts/liberation/LiberationSans-Regular.ttf"))
-            .expect("load liberation")
+        Font::load(Path::new(
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        ))
+        .expect("load liberation")
     }
 
     #[test]
@@ -1192,8 +1234,14 @@ mod tests {
             .register_bytes("Ranged", &font_bytes(), 400, false, vec![(0x61, 0x7a)])
             .unwrap();
         // first char of the run picks the covering face
-        assert_eq!(c.resolve_face("ranged", 400, 100, false, Some('H')), Some(up));
-        assert_eq!(c.resolve_face("ranged", 400, 100, false, Some('h')), Some(lo));
+        assert_eq!(
+            c.resolve_face("ranged", 400, 100, false, Some('H')),
+            Some(up)
+        );
+        assert_eq!(
+            c.resolve_face("ranged", 400, 100, false, Some('h')),
+            Some(lo)
+        );
         // no char context → unrestricted resolution still works
         assert!(c.resolve_face("ranged", 400, 100, false, None).is_some());
     }
@@ -1204,7 +1252,10 @@ mod tests {
         let idx = c
             .register_local("Alias Fam", "liberation sans", 700, false, vec![])
             .expect("local match");
-        assert_eq!(c.resolve_face("alias fam", 700, 100, false, None), Some(idx));
+        assert_eq!(
+            c.resolve_face("alias fam", 700, 100, false, None),
+            Some(idx)
+        );
         assert!(c.font(idx).is_some());
     }
 
@@ -1217,5 +1268,3 @@ mod tests {
         assert!(c.resolve("gone fam", false, false).is_none());
     }
 }
-
-

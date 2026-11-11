@@ -62,7 +62,10 @@ fn lucide_icon_is_thin_lines_not_a_box() {
     );
     let cov = covered(&px);
     assert!(cov > 8, "icon strokes some pixels, got {cov}");
-    assert!(cov < 24 * 24 / 3, "icon must not be an opaque box, cov={cov}");
+    assert!(
+        cov < 24 * 24 / 3,
+        "icon must not be an opaque box, cov={cov}"
+    );
     assert_eq!(px[3], 0, "corner pixel transparent");
 }
 
@@ -85,31 +88,48 @@ fn arc_heavy_piece_renders() {
     // geometry covers ~19% of the canvas — flag only parse failures (near-zero)
     assert!(cov > 1200, "piece coverage too low: {cov}");
     let (light, dark) = lum_hist(&px);
-    assert!(light > 50 && dark > 50, "want light fill + dark stroke, got {light}/{dark}");
+    assert!(
+        light > 50 && dark > 50,
+        "want light fill + dark stroke, got {light}/{dark}"
+    );
 }
 
 #[test]
 fn cburnett_pieces_if_fetched() {
-    let pieces = ["wK", "wQ", "wR", "wB", "wN", "wP", "bK", "bQ", "bR", "bB", "bN", "bP"];
+    let pieces = [
+        "wK", "wQ", "wR", "wB", "wN", "wP", "bK", "bQ", "bR", "bB", "bN", "bP",
+    ];
     let mut any = false;
     for p in pieces {
-        let Ok(svg) = std::fs::read_to_string(format!("/tmp/cb_{p}.svg")) else { continue };
+        let Ok(svg) = std::fs::read_to_string(format!("/tmp/cb_{p}.svg")) else {
+            continue;
+        };
         any = true;
         let (d, s) = doc(&svg);
         let px = rowser_layout::svg::render(&d, s, 90, 90, 0xff000000);
         write_ppm(&format!("/tmp/cb_{p}.ppm"), &px, 90, 90);
         let cov = covered(&px);
-        assert!(cov > 90 * 90 / 4, "{p}: coverage too low ({cov}) — likely a parse failure");
+        assert!(
+            cov > 90 * 90 / 4,
+            "{p}: coverage too low ({cov}) — likely a parse failure"
+        );
         let (light, dark) = lum_hist(&px);
         // black pieces are pure silhouettes; only white pieces must show fill
         if p.starts_with('w') {
             assert!(light > 30, "{p}: no light pixels (white fill missing)");
         }
         assert!(dark > 30, "{p}: no dark pixels (black stroke/fill missing)");
-        eprintln!("{p}: cov={} light={} dark={}", cov * 100 / 8100, light, dark);
+        eprintln!(
+            "{p}: cov={} light={} dark={}",
+            cov * 100 / 8100,
+            light,
+            dark
+        );
     }
     if !any {
-        eprintln!("no /tmp/cb_*.svg — fetch with: for p in wK wQ wR wB wN wP bK bQ bR bB bN bP; do \
-                   curl -s https://goonchess.com/pieces/cburnett/$p.svg -o /tmp/cb_$p.svg; done");
+        eprintln!(
+            "no /tmp/cb_*.svg — fetch with: for p in wK wQ wR wB wN wP bK bQ bR bB bN bP; do \
+                   curl -s https://goonchess.com/pieces/cburnett/$p.svg -o /tmp/cb_$p.svg; done"
+        );
     }
 }

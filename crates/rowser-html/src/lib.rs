@@ -98,7 +98,13 @@ impl<'a> Tokenizer<'a> {
                 {
                     let after = self.input.get(end + 2 + tag.len()).copied();
                     if after.is_none_or(|c| {
-                        c == b'>' || c == b'/' || c == b' ' || c == b'\t' || c == b'\n' || c == 0x0c || c == b'\r'
+                        c == b'>'
+                            || c == b'/'
+                            || c == b' '
+                            || c == b'\t'
+                            || c == b'\n'
+                            || c == 0x0c
+                            || c == b'\r'
                     }) {
                         break;
                     }
@@ -182,7 +188,9 @@ impl<'a> Tokenizer<'a> {
                     c if c > 0x10ffff => 0xfffd,
                     c => c,
                 };
-                char::from_u32(cp).map(|c| c.to_string()).or(Some("�".into()))
+                char::from_u32(cp)
+                    .map(|c| c.to_string())
+                    .or(Some("�".into()))
             }
             _ => {
                 let start = self.pos;
@@ -284,9 +292,10 @@ impl<'a> Tokenizer<'a> {
 
     fn tag_name(&mut self) -> String {
         let start = self.pos;
-        while self.peek().is_some_and(|c| {
-            !matches!(c, b' ' | b'\t' | b'\n' | 0x0c | b'\r' | b'/' | b'>' | b'=')
-        }) {
+        while self
+            .peek()
+            .is_some_and(|c| !matches!(c, b' ' | b'\t' | b'\n' | 0x0c | b'\r' | b'/' | b'>' | b'='))
+        {
             self.pos += 1;
         }
         String::from_utf8_lossy(&self.input[start..self.pos]).to_lowercase()
@@ -364,9 +373,7 @@ impl<'a> Tokenizer<'a> {
                             while self.peek().is_some_and(|c| c != q && c != b'&') {
                                 self.pos += 1;
                             }
-                            out.push_str(
-                                &String::from_utf8_lossy(&self.input[start..self.pos]),
-                            );
+                            out.push_str(&String::from_utf8_lossy(&self.input[start..self.pos]));
                         }
                         None => break,
                     }
@@ -386,7 +393,16 @@ impl<'a> Tokenizer<'a> {
                                 self.pos += 1;
                             }
                         }
-                        Some(c) if c == b' ' || c == b'\t' || c == b'\n' || c == 0x0c || c == b'\r' || c == b'>' => break,
+                        Some(c)
+                            if c == b' '
+                                || c == b'\t'
+                                || c == b'\n'
+                                || c == 0x0c
+                                || c == b'\r'
+                                || c == b'>' =>
+                        {
+                            break
+                        }
                         Some(_) => {
                             let start = self.pos;
                             while self.peek().is_some_and(|c| {
@@ -394,9 +410,7 @@ impl<'a> Tokenizer<'a> {
                             }) {
                                 self.pos += 1;
                             }
-                            out.push_str(
-                                &String::from_utf8_lossy(&self.input[start..self.pos]),
-                            );
+                            out.push_str(&String::from_utf8_lossy(&self.input[start..self.pos]));
                         }
                         None => break,
                     }
@@ -583,31 +597,74 @@ fn named_ref(name: &str) -> Option<&'static str> {
 
 /// Windows-1252 remapping for numeric refs 0x80–0x9F.
 const WINDOWS_1252: [u32; 32] = [
-    0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
-    0x2039, 0x0152, 0x008d, 0x017d, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
-    0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+    0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160, 0x2039,
+    0x0152, 0x008d, 0x017d, 0x008f, 0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+    0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
 ];
 
 // ---------- tree construction ----------
 
 const VOID: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
-    "source", "track", "wbr", "command", "keygen",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr", "command", "keygen",
 ];
 
 /// Tags that close an open <p> when their start tag is seen in body.
 const P_CLOSERS: &[&str] = &[
-    "address", "article", "aside", "blockquote", "center", "details", "dialog", "dir", "div",
-    "dl", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5",
-    "h6", "header", "hgroup", "hr", "main", "menu", "nav", "ol", "p", "pre", "section",
-    "summary", "table", "ul",
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "center",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hgroup",
+    "hr",
+    "main",
+    "menu",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "summary",
+    "table",
+    "ul",
 ];
 
-const RAW_TEXT: &[&str] = &["script", "style", "title", "textarea", "iframe", "xmp", "noembed", "noframes", "plaintext"];
+const RAW_TEXT: &[&str] = &[
+    "script",
+    "style",
+    "title",
+    "textarea",
+    "iframe",
+    "xmp",
+    "noembed",
+    "noframes",
+    "plaintext",
+];
 /// Whose raw text is kept as a text child (script/style/title/textarea).
 const KEEP_RAW: &[&str] = &["script", "style", "title", "textarea"];
 
-const HEAD_TAGS: &[&str] = &["base", "basefont", "bgsound", "link", "meta", "title", "style", "script", "noscript", "template"];
+const HEAD_TAGS: &[&str] = &[
+    "base", "basefont", "bgsound", "link", "meta", "title", "style", "script", "noscript",
+    "template",
+];
 
 #[derive(PartialEq)]
 enum Mode {
@@ -1064,7 +1121,6 @@ mod tests {
         assert!(doc.find_deep(doc.root, "br").is_some());
     }
 }
-
 
 #[cfg(test)]
 mod wiki_probe {

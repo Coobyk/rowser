@@ -2,7 +2,7 @@
 //! shelling out to gzip/python. It mirrors the decoder's canonical-Huffman
 //! construction, so a green round-trip cross-checks both directions.
 
-use crate::{DIST_BASE, DIST_EXTRA, LENGTH_BASE, LENGTH_EXTRA, adler32, crc32};
+use crate::{adler32, crc32, DIST_BASE, DIST_EXTRA, LENGTH_BASE, LENGTH_EXTRA};
 
 /// RFC 1951 §3.2.7 order for code-length code lengths (dup of the private
 /// constant in `inflate`).
@@ -27,7 +27,10 @@ pub struct BitWriter {
 
 impl BitWriter {
     pub fn new() -> Self {
-        Self { bytes: Vec::new(), nbits: 0 }
+        Self {
+            bytes: Vec::new(),
+            nbits: 0,
+        }
     }
 
     /// Append `n` bits, least-significant first (header fields, extra bits).
@@ -170,7 +173,11 @@ fn length_sym(len: usize) -> (usize, u32, u8) {
     assert!((3..=258).contains(&len));
     for i in (0..29).rev() {
         if len >= usize::from(LENGTH_BASE[i]) {
-            return (257 + i, (len - usize::from(LENGTH_BASE[i])) as u32, LENGTH_EXTRA[i]);
+            return (
+                257 + i,
+                (len - usize::from(LENGTH_BASE[i])) as u32,
+                LENGTH_EXTRA[i],
+            );
         }
     }
     unreachable!()

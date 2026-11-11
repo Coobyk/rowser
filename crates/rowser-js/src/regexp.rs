@@ -765,11 +765,7 @@ fn resolve_names(n: Node, names: &[(String, usize)]) -> Result<Node, String> {
             idx,
             inner: Box::new(resolve_names(*inner, names)?),
         },
-        Node::Look {
-            inner,
-            neg,
-            behind,
-        } => Node::Look {
+        Node::Look { inner, neg, behind } => Node::Look {
             inner: Box::new(resolve_names(*inner, names)?),
             neg,
             behind,
@@ -882,11 +878,7 @@ fn mat<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
             };
             ok && k(c, pos)
         }
-        Node::Look {
-            inner,
-            neg,
-            behind,
-        } => {
+        Node::Look { inner, neg, behind } => {
             let saved = c.caps.clone();
             let ok = if *behind {
                 // lookbehind: some start ≤ pos must match ending exactly at pos
@@ -1090,8 +1082,7 @@ fn class_match(items: &[ClassItem], c: char, icase: bool) -> bool {
     items.iter().any(|it| match it {
         ClassItem::Ch(w) => ch_eq(c, *w, icase),
         ClassItem::Range(lo, hi) => {
-            (*lo..=*hi).contains(&c)
-                || (icase && (fold(*lo)..=fold(*hi)).contains(&fold(c)))
+            (*lo..=*hi).contains(&c) || (icase && (fold(*lo)..=fold(*hi)).contains(&fold(c)))
         }
         ClassItem::Pre(p) => pre_match(*p, c),
     })

@@ -10,9 +10,8 @@
 //! clipped result filtered, then blended over the backdrop.
 
 use crate::{
-    alpha, bgra_a, ch, fhue, fnum, fn_color, fn_color_srgb, hsl_rgb, hwb_rgb,
-    lab_rgb, oklab_rgb, parse_color_ctx, parse_len, srgb_un, top_args, Color,
-    DisplayItem, Props,
+    alpha, bgra_a, ch, fhue, fn_color, fn_color_srgb, fnum, hsl_rgb, hwb_rgb, lab_rgb, oklab_rgb,
+    parse_color_ctx, parse_len, srgb_un, top_args, Color, DisplayItem, Props,
 };
 
 /// One `filter`/`backdrop-filter` function, resolved for the painter.
@@ -92,11 +91,10 @@ impl CLen {
     fn parse(t: &str, em: f32) -> Option<CLen> {
         let t = t.trim();
         if let Some(p) = t.strip_suffix('%') {
-            return p
-                .trim()
-                .parse::<f32>()
-                .ok()
-                .map(|n| CLen { frac: n / 100.0, px: 0.0 });
+            return p.trim().parse::<f32>().ok().map(|n| CLen {
+                frac: n / 100.0,
+                px: 0.0,
+            });
         }
         parse_len(t, 0.0, em).map(|v| CLen { frac: 0.0, px: v })
     }
@@ -115,11 +113,7 @@ pub enum ClipShape {
         radius: CLen,
     },
     /// `circle([r] [at cx cy])`
-    Circle {
-        r: Option<CLen>,
-        cx: CLen,
-        cy: CLen,
-    },
+    Circle { r: Option<CLen>, cx: CLen, cy: CLen },
     /// `ellipse([rx ry] [at cx cy])` — None = closest-side
     Ellipse {
         rx: Option<CLen>,
@@ -602,8 +596,19 @@ pub fn parse_clip_path(v: &str, size: f32) -> Option<ClipShape> {
 /// ClipShape resolved to absolute px against the reference (border) box.
 #[derive(Debug, Clone)]
 pub enum ClipAbs {
-    Rounded { x: f32, y: f32, w: f32, h: f32, r: f32 },
-    Ellipse { cx: f32, cy: f32, rx: f32, ry: f32 },
+    Rounded {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+    },
+    Ellipse {
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+    },
     Polygon(Vec<(f32, f32)>),
 }
 
@@ -642,7 +647,12 @@ pub fn resolve_clip(s: &ClipShape, rect: [f32; 4]) -> ClipAbs {
                 ry: rr,
             }
         }
-        ClipShape::Ellipse { rx: ex, ry: ey, cx, cy } => {
+        ClipShape::Ellipse {
+            rx: ex,
+            ry: ey,
+            cx,
+            cy,
+        } => {
             let cx = bx + cx.resolve(bw);
             let cy = by + cy.resolve(bh);
             ClipAbs::Ellipse {
@@ -667,7 +677,13 @@ pub fn resolve_clip(s: &ClipShape, rect: [f32; 4]) -> ClipAbs {
 /// Is absolute point (x,y) inside the resolved clip shape?
 pub fn clip_covers(c: &ClipAbs, x: f32, y: f32) -> bool {
     match c {
-        ClipAbs::Rounded { x: rx, y: ry, w, h, r } => {
+        ClipAbs::Rounded {
+            x: rx,
+            y: ry,
+            w,
+            h,
+            r,
+        } => {
             if x < *rx || x >= rx + w || y < *ry || y >= ry + h {
                 return false;
             }
@@ -825,10 +841,7 @@ pub fn blend_rgb(mode: BlendMode, s: (f32, f32, f32), d: (f32, f32, f32)) -> (f3
 /// the caller's normalized percentages; a missing weight drains alpha.
 pub fn color_mix(space: &str, ca: Color, cb: Color, wa: f32, wb: f32) -> Option<Color> {
     let polar = matches!(space, "lch" | "oklch" | "hsl" | "hwb");
-    let (aa, ab) = (
-        alpha(ca) as f32 / 255.0 * wa,
-        alpha(cb) as f32 / 255.0 * wb,
-    );
+    let (aa, ab) = (alpha(ca) as f32 / 255.0 * wa, alpha(cb) as f32 / 255.0 * wb);
     let oa = aa + ab;
     if oa <= 0.0 {
         return Some(bgra_a(0, 0, 0, 0));
@@ -979,7 +992,12 @@ mod tests {
         assert_eq!(ops.len(), 4);
         assert!(matches!(ops[0], FilterOp::Blur(b) if (b - 4.0).abs() < 1e-4));
         match &ops[3] {
-            FilterOp::DropShadow { dx, dy, blur, color } => {
+            FilterOp::DropShadow {
+                dx,
+                dy,
+                blur,
+                color,
+            } => {
                 assert_eq!((*dx, *dy, *blur), (2.0, 3.0, 4.0));
                 assert_eq!(*color, bgra(1, 2, 3));
             }
@@ -1079,7 +1097,10 @@ mod tests {
     fn modern_color_fns() {
         use crate::{ch, parse_color_ctx};
         assert_eq!(parse_color("hsl(0,100%,50%)"), Some(bgra(255, 0, 0)));
-        assert_eq!(parse_color("hsl(0.5turn 100% 50%)"), Some(bgra(0, 255, 255)));
+        assert_eq!(
+            parse_color("hsl(0.5turn 100% 50%)"),
+            Some(bgra(0, 255, 255))
+        );
         assert_eq!(
             parse_color("hsl(2.0943951rad,100%,50%)"),
             Some(bgra(0, 255, 0))

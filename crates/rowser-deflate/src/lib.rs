@@ -34,21 +34,20 @@ impl std::error::Error for InflateError {}
 
 /// Length symbol bases/extra bits (RFC 1951 §3.2.5), indexed by symbol - 257.
 pub const LENGTH_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67,
-    83, 99, 115, 131, 163, 195, 227, 258,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
 ];
 pub const LENGTH_EXTRA: [u8; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5,
-    5, 5, 5, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 /// Distance symbol bases/extra bits, indexed by distance symbol.
 pub const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513,
-    769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
 pub const DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
-    11, 11, 12, 12, 13, 13,
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
 ];
 /// Order in which code-length code lengths are transmitted (RFC 1951 §3.2.7).
 const CL_ORDER: [usize; 19] = [
@@ -68,7 +67,11 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, byte: 0, bit: 0 }
+        Self {
+            data,
+            byte: 0,
+            bit: 0,
+        }
     }
 
     fn bit(&mut self) -> Result<u32, InflateError> {
@@ -214,7 +217,9 @@ pub fn inflate_zlib(data: &[u8]) -> Result<Vec<u8>, InflateError> {
         return Err(InflateError::BadHeader("zlib header check failed"));
     }
     if flg & 0x20 != 0 {
-        return Err(InflateError::BadHeader("zlib preset dictionary unsupported"));
+        return Err(InflateError::BadHeader(
+            "zlib preset dictionary unsupported",
+        ));
     }
     let mut r = BitReader::new(&data[2..]);
     let out = inflate_to(&mut r)?;
@@ -269,7 +274,11 @@ pub fn inflate_gzip(data: &[u8]) -> Result<Vec<u8>, InflateError> {
     if pos > data.len() {
         return Err(InflateError::UnexpectedEof);
     }
-    let mut r = BitReader { data, byte: pos, bit: 0 };
+    let mut r = BitReader {
+        data,
+        byte: pos,
+        bit: 0,
+    };
     let out = inflate_to(&mut r)?;
     r.byte_align();
     let crc = r.u32le()?;
@@ -332,7 +341,9 @@ fn dynamic_tables(r: &mut BitReader) -> Result<(Huffman, Huffman), InflateError>
     let hdist = r.bits(5)? as usize + 1;
     let hclen = r.bits(4)? as usize + 4;
     if hlit > 286 || hdist > 32 {
-        return Err(InflateError::InvalidData("too many length/distance symbols"));
+        return Err(InflateError::InvalidData(
+            "too many length/distance symbols",
+        ));
     }
 
     let mut cl_lengths = [0u8; 19];
@@ -428,7 +439,11 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
     for &b in data {
         crc ^= u32::from(b);
         for _ in 0..8 {
-            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -511,23 +526,26 @@ mod tests {
     #[test]
     fn dynamic_huffman_length_extra_bits() {
         // Length 200 needs extra bits (symbol 283, base 195, 5 extra bits).
-        let d = testutil::deflate_dynamic(&[
-            Op::Lit(b'x'),
-            Op::Match { len: 200, dist: 1 },
-        ]);
+        let d = testutil::deflate_dynamic(&[Op::Lit(b'x'), Op::Match { len: 200, dist: 1 }]);
         assert_eq!(inflate(&d).unwrap(), vec![b'x'; 201]);
     }
 
     #[test]
     fn zlib_roundtrip() {
         let payload = b"zlib-wrapped deflate payload 0123456789";
-        assert_eq!(inflate_zlib(&testutil::zlib_dynamic(payload)).unwrap(), payload);
+        assert_eq!(
+            inflate_zlib(&testutil::zlib_dynamic(payload)).unwrap(),
+            payload
+        );
     }
 
     #[test]
     fn gzip_roundtrip() {
         let payload = b"gzip-wrapped deflate payload, hello hello hello";
-        assert_eq!(inflate_gzip(&testutil::gzip_dynamic(payload)).unwrap(), payload);
+        assert_eq!(
+            inflate_gzip(&testutil::gzip_dynamic(payload)).unwrap(),
+            payload
+        );
     }
 
     #[test]
@@ -549,8 +567,7 @@ mod tests {
         // FNAME flag set: "file.txt\0" between header and deflate body.
         // Payload: 'n' + match len 11 dist 1 → twelve n's.
         let expect = vec![b'n'; 12];
-        let deflate =
-            testutil::deflate_dynamic(&[Op::Lit(b'n'), Op::Match { len: 11, dist: 1 }]);
+        let deflate = testutil::deflate_dynamic(&[Op::Lit(b'n'), Op::Match { len: 11, dist: 1 }]);
         let mut d = vec![0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 0xff];
         d.extend_from_slice(b"file.txt\0");
         d.extend_from_slice(&deflate);
@@ -577,7 +594,10 @@ mod tests {
 
     #[test]
     fn bad_inputs() {
-        assert!(matches!(inflate(&[0x07]), Err(InflateError::InvalidData(_)))); // BTYPE=3
+        assert!(matches!(
+            inflate(&[0x07]),
+            Err(InflateError::InvalidData(_))
+        )); // BTYPE=3
         assert_eq!(inflate(&[0x01]), Err(InflateError::UnexpectedEof));
         assert!(matches!(
             inflate_gzip(b"not gzip at all....."),
@@ -599,7 +619,11 @@ mod wiki_probe {
     fn inflate_real_gzip() {
         let gz = std::fs::read("/tmp/wiki.html").unwrap();
         match crate::inflate_gzip(&gz) {
-            Ok(body) => eprintln!("INFLATED {} bytes, head={:?}", body.len(), String::from_utf8_lossy(&body[..body.len().min(80)])),
+            Ok(body) => eprintln!(
+                "INFLATED {} bytes, head={:?}",
+                body.len(),
+                String::from_utf8_lossy(&body[..body.len().min(80)])
+            ),
             Err(e) => eprintln!("INFLATE ERR {e:?}"),
         }
     }
