@@ -147,6 +147,7 @@ head,title,meta,link,style,script,template,noscript,base{display:none}
 html,body,div,p,blockquote,pre,listing,h1,h2,h3,h4,h5,h6,ul,ol,menu,dir,dl,dd,dt,li,
 section,article,nav,header,footer,main,aside,form,fieldset,figcaption,figure,
 address,table,tr,tbody,thead,tfoot,caption,hr,center{display:block}
+body{margin:8px}
 center{text-align:center}
 table{text-align:left}
 p{margin-top:1em;margin-bottom:1em}
@@ -1919,9 +1920,9 @@ impl<'a> Layouter<'a> {
             font_memo: FxHashMap::default(),
             fonts,
             items: Vec::new(),
-            y: 8.0 - scroll,
-            margin_x: 8.0,
-            avail_w: width - 16.0,
+            y: -scroll,
+            margin_x: 0.0,
+            avail_w: width,
             align: Align::Left,
             line: Vec::new(),
             line_x: 0.0,
@@ -1938,6 +1939,33 @@ impl<'a> Layouter<'a> {
             pct_h: None,
         };
         l.preresolve_styles();
+        // css-backgrounds §2.11: the canvas takes the root element's
+        // background (body's when html's is transparent) — painted
+        // edge-to-edge so the body margin doesn't show a white frame
+        for &el in l.doc.children(l.doc.root) {
+            if l.doc.tag(el) == Some("html") {
+                let p = l.style(el);
+                let mut canvas_bg = l.bg_of(el, &p);
+                if canvas_bg.is_none() {
+                    for &b in l.doc.children(el) {
+                        if l.doc.tag(b) == Some("body") {
+                            let pb = l.style(b);
+                            canvas_bg = l.bg_of(b, &pb);
+                        }
+                    }
+                }
+                if let Some(col) = canvas_bg {
+                    l.backdrop = col;
+                    l.items.push(DisplayItem::FillRect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: width,
+                        h: viewport_h,
+                        color: col,
+                    });
+                }
+            }
+        }
         l.walk(doc.root, &base_style());
         l.flush_line();
         // floats don't consume vertical space at their site; make sure the
@@ -1945,7 +1973,7 @@ impl<'a> Layouter<'a> {
         for f in &l.floats {
             l.y = l.y.max(f.bottom);
         }
-        let h = l.y + scroll + 8.0;
+        let h = l.y + scroll;
         (l.items, h, l.anchors, l.hits)
     }
 
