@@ -8,6 +8,7 @@
 
 pub mod ast;
 pub mod builtins;
+pub mod dom_bridge;
 pub mod interp;
 pub mod lexer;
 pub mod parser;

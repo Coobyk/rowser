@@ -3046,7 +3046,7 @@ fn promise_finally(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(Value::Obj(p2))
 }
 
-fn promise_resolve_static(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+pub(crate) fn promise_resolve_static(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
     if let Value::Obj(o) = &v {
         if matches!(o.borrow().kind, ObjKind::Promise(_)) {
@@ -3059,7 +3059,7 @@ fn promise_resolve_static(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult
     Ok(Value::Obj(p))
 }
 
-fn promise_reject_static(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+pub(crate) fn promise_reject_static(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let p = new_promise(i);
     i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
     p.borrow_mut().kind = ObjKind::Promise(PromiseState::Rejected(Box::new(arg(args, 0))));

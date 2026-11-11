@@ -304,6 +304,10 @@ pub struct Interp {
     pub depth: usize,
     pub sym_counter: u64,
     pub rng: u64,
+    /// Embedder-owned state (e.g. the DOM bridge's `DomState`). Native
+    /// functions receive `&mut Interp`, so host bindings stash their world
+    /// here and downcast. Not touched by the interpreter itself.
+    pub ext: Option<Box<dyn std::any::Any>>,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -349,6 +353,7 @@ impl Interp {
                     .unwrap_or(0x9e3779b97f4a7c15);
                 n ^ 0x9e3779b97f4a7c15
             },
+            ext: None,
         }
     }
 

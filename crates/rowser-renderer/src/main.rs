@@ -104,6 +104,20 @@ fn main() {
                 let t1 = std::time::Instant::now();
                 let doc = rowser_html::parse(&html);
                 pt!("[prof] navigate fetch={t_fetch:?} parse={:?}", t1.elapsed());
+                // JS: run page scripts against the parsed DOM (SPAs build
+                // their UI this way). Errors are logged, never fatal.
+                let t_js = std::time::Instant::now();
+                let (doc, js_logs) = if js_enabled() {
+                    run_page_scripts(doc, &effective, page.viewport)
+                } else {
+                    (doc, Vec::new())
+                };
+                if !js_logs.is_empty() {
+                    pt!("[prof] js exec {:?} ({} log lines)", t_js.elapsed(), js_logs.len());
+                    for l in js_logs {
+                        let _ = send(&mut output, &ToBrowser::Log(l));
+                    }
+                }
                 let title = doc
                     .find_deep(doc.root, "title")
                     .map(|t| doc.text_content(t))
@@ -1071,6 +1085,130 @@ fn load_url(url: &str) -> (String, String) {
         }
     }
     (error_page(url, "unrecognized URL"), url.to_string())
+}
+
+/// `ROWSER_JS=0` kills page script execution entirely.
+fn js_enabled() -> bool {
+    std::env::var("ROWSER_JS").as_deref() != Ok("0")
+}
+
+/// Collect `<script>` elements in document order, fetch external bodies on
+/// the shared fetch pool, then run everything against the Document on a
+/// big-stack JS thread (the tree-walking interpreter burns real stack on
+/// bundle-scale scripts). Returns the possibly-mutated Document plus log
+/// lines for the browser console/Log IPC.
+fn run_page_scripts(
+    doc: rowser_dom::Document,
+    page_url: &str,
+    viewport: (u32, u32),
+) -> (rowser_dom::Document, Vec<String>) {
+    struct Script {
+        src: Option<String>,
+        body: String,
+    }
+    let mut scripts: Vec<Script> = Vec::new();
+    for id in doc.descendants(doc.root) {
+        if doc.tag(id) != Some("script") {
+            continue;
+        }
+        // only executable types — skip json-ld, importmap, templates, etc.
+        let ty = doc.attr(id, "type").unwrap_or("").trim().to_ascii_lowercase();
+        let js_type = matches!(
+            ty.as_str(),
+            "" | "text/javascript"
+                | "application/javascript"
+                | "module"
+                | "text/ecmascript"
+                | "application/ecmascript"
+        );
+        if !js_type || doc.attr(id, "nomodule").is_some() {
+            continue;
+        }
+        let src = doc.attr(id, "src").map(|s| s.to_string());
+        let body = if src.is_none() {
+            doc.children(id)
+                .iter()
+                .filter_map(|&c| doc.text(c))
+                .collect::<String>()
+        } else {
+            String::new()
+        };
+        scripts.push(Script { src, body });
+    }
+    if scripts.is_empty() {
+        return (doc, Vec::new());
+    }
+    // Resolve + fetch external bodies in parallel (same pool/deadline as CSS).
+    let resolved: Vec<String> = scripts
+        .iter()
+        .filter_map(|s| s.src.as_ref())
+        .filter_map(|s| resolve_url(page_url, s))
+        .collect();
+    let bodies = if resolved.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        fetch_pool(&resolved, CSS_FETCH_DEADLINE)
+    };
+    // Script source per script (document order); fetch misses log + skip.
+    let mut sources: Vec<Option<String>> = Vec::with_capacity(scripts.len());
+    let mut pre_logs = Vec::new();
+    for s in &scripts {
+        match &s.src {
+            Some(src) => match resolve_url(page_url, src).and_then(|u| bodies.get(&u)) {
+                Some(b) => sources.push(Some(String::from_utf8_lossy(b).into_owned())),
+                None => {
+                    pre_logs.push(format!("[js] failed to fetch {src}"));
+                    sources.push(None);
+                }
+            },
+            None => sources.push(Some(s.body.clone())),
+        }
+    }
+    // 32+ MiB stack: deep call chains in framework bundles would overflow
+    // the default thread stack.
+    let (vw, vh) = (viewport.0 as f64, viewport.1 as f64);
+    let url = page_url.to_string();
+    let handle = std::thread::Builder::new()
+        .name("rowser-js".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let mut logs = pre_logs;
+            let mut dc = rowser_js::dom_bridge::DomContext::with_viewport(doc, &url, vw, vh);
+            // catch_unwind: a Rust panic inside the interpreter must not
+            // take the Document down with it — return what we have.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for src in sources.iter().flatten() {
+                    if let Err(e) = dc.eval(src) {
+                        logs.push(format!("[js] {e}"));
+                    }
+                }
+                // React-style scheduling: rAF first, then one timers round
+                // (which also drains microtasks + MessageChannel ports).
+                dc.flush_raf();
+                dc.run_timers();
+            }));
+            for e in &dc.errors {
+                logs.push(format!("[js] {e}"));
+            }
+            for line in dc.ctx.take_output() {
+                logs.push(format!("[js console] {line}"));
+            }
+            (dc.take_document(), logs)
+        });
+    match handle {
+        Ok(h) => h.join().unwrap_or_else(|_| {
+            // thread itself died (spawn-side panic before catch_unwind) —
+            // we can't recover the Document; rebuild an empty-ish one.
+            (rowser_html::parse("<html><body></body></html>"), vec![
+                "[js] interpreter thread panicked — page rendered without JS DOM".to_string(),
+            ])
+        }),
+        Err(e) => (
+            // doc moved into the (failed) spawn — render a fallback
+            rowser_html::parse("<html><body></body></html>"),
+            vec![format!("[js] could not spawn interpreter thread: {e}")],
+        ),
+    }
 }
 
 fn error_page(url: &str, why: &str) -> String {

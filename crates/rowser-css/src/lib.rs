@@ -74,6 +74,21 @@ pub fn parse(css: &str) -> StyleSheet {
     parse_vw(css, 1024.0)
 }
 
+/// Parse a single complex selector (e.g. `div.a > .b[x]`, `a b`) for
+/// `querySelector`-style matching via [`matches`]. Selector lists (`a, b`)
+/// are not handled — split on commas and match each.
+pub fn parse_selector(s: &str) -> Option<Selector> {
+    let mut p = CssParser { s: s.as_bytes(), pos: 0, vw: 1024.0 };
+    p.skip_ws_comments();
+    let sel = p.selector()?;
+    p.skip_ws_comments();
+    if p.eof() {
+        Some(sel)
+    } else {
+        None
+    }
+}
+
 pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
     let mut p = CssParser { s: css.as_bytes(), pos: 0, vw };
     let mut rules = Vec::new();
