@@ -130,6 +130,9 @@ pub struct StyleSheet {
     by_class: FxHashMap<String, Vec<u32>>,
     by_id: FxHashMap<String, Vec<u32>>,
     plain: Vec<u32>,
+    /// `@keyframes` name → declarations of its end (`to`/`100%`/last)
+    /// frame, used to emulate animation-fill-mode resting state.
+    pub keyframes: FxHashMap<String, Vec<Decl>>,
 }
 
 pub fn parse(css: &str) -> StyleSheet {
@@ -148,6 +151,7 @@ pub fn parse_selector(s: &str) -> Option<Selector> {
         cur_layer: None,
         layer_map: FxHashMap::default(),
         layer_count: 0,
+        keyframes: Vec::new(),
     };
     p.skip_ws_comments();
     let sel = p.selector()?;
@@ -168,6 +172,7 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         cur_layer: None,
         layer_map: FxHashMap::default(),
         layer_count: 0,
+        keyframes: Vec::new(),
     };
     let mut pairs: Vec<(u32, Rule)> = Vec::new();
     p.skip_ws_comments();
@@ -190,6 +195,7 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         by_class: FxHashMap::default(),
         by_id: FxHashMap::default(),
         plain: Vec::new(),
+        keyframes: p.keyframes.into_iter().collect(),
     };
     sheet.reindex();
     sheet
@@ -293,6 +299,9 @@ struct CssParser<'a> {
     /// Layer name → index, assigned by first mention (block or statement).
     layer_map: FxHashMap<String, u32>,
     layer_count: u32,
+    /// `@keyframes` name → decls of the end (`to`/`100%`) frame, captured
+    /// for animation end-state emulation (non-animating engine).
+    keyframes: Vec<(String, Vec<Decl>)>,
 }
 
 impl<'a> CssParser<'a> {
@@ -349,6 +358,37 @@ impl<'a> CssParser<'a> {
             "layer" => true,
             _ => false,
         };
+        // `@keyframes name { <offset> { decls } ... }` — capture the end
+        // frame's declarations (the animation's resting state) instead of
+        // skipping the block wholesale.
+        if name == "keyframes" && has_block {
+            let kf_name = prelude.trim().to_string();
+            let mut end_decls: Vec<Decl> = Vec::new();
+            loop {
+                self.skip_ws_comments();
+                match self.peek() {
+                    None | Some(b'}') => {
+                        if self.peek() == Some(b'}') {
+                            self.pos += 1;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+                // offset prelude (`from`/`to`/`50%`) until the decl block
+                while !self.eof() && !matches!(self.peek(), Some(b'{') | Some(b'}')) {
+                    self.pos += 1;
+                }
+                if self.peek() == Some(b'{') {
+                    self.pos += 1;
+                    end_decls = self.decl_block(); // last frame wins
+                }
+            }
+            if !kf_name.is_empty() {
+                self.keyframes.push((kf_name, end_decls));
+            }
+            return Some(Vec::new());
+        }
         // At-rules we don't unwrap (@font-face, @keyframes, @charset...)
         // hold declarations/frames, not rules — rule-parsing their block
         // produces garbage selectors and can consume past the closing
@@ -1528,6 +1568,34 @@ impl<'a> StyleCtx<'a> {
             }
             for v in props.values_mut() {
                 *v = resolve_vars(v, &customs);
+            }
+        }
+        // Emulate animation end-state: a named animation rests at its
+        // keyframes' end frame (approximates `forwards`/completed anims —
+        // sites using `opacity-0` + `animate-*` still become visible).
+        if let Some(v) = props
+            .get("animation-name")
+            .or_else(|| props.get("animation"))
+            .cloned()
+        {
+            if let Some(name) = v
+                .split([',', ' '])
+                .map(str::trim)
+                .find(|t| !t.is_empty())
+            {
+                for sheet in &self.sheets {
+                    if let Some(decls) = sheet.keyframes.get(name) {
+                        for d in decls {
+                            if d.prop.starts_with("--") {
+                                continue;
+                            }
+                            let val = resolve_vars(&d.value, &customs);
+                            each_physical(&d.prop, |p| {
+                                props.insert(p.to_string(), val.clone());
+                            });
+                        }
+                    }
+                }
             }
         }
         props

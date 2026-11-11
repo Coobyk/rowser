@@ -255,6 +255,19 @@ fn ch(c: Color, shift: u32) -> u8 {
 fn alpha(c: Color) -> u8 {
     ch(c, 24)
 }
+/// `c` dimmed toward `dst` by `op` — element-opacity approximation for
+/// already-composited item colors.
+fn fade(c: Color, dst: Color, op: f32) -> Color {
+    let o = (op.clamp(0.0, 1.0) * 255.0) as u32;
+    let inv = 255 - o;
+    let m = |s: u8, d: u8| ((s as u32 * o + d as u32 * inv) / 255) as u8;
+    bgra(
+        m(ch(c, 16), ch(dst, 16)),
+        m(ch(c, 8), ch(dst, 8)),
+        m(ch(c, 0), ch(dst, 0)),
+    )
+}
+
 /// Composite possibly-translucent `c` over opaque `dst`.
 fn over(c: Color, dst: Color) -> Color {
     let a = alpha(c) as u32;
@@ -599,22 +612,41 @@ fn bg_color(c: &Props) -> Option<Color> {
         }
     }
     let v = c.get("background")?;
+    // any *-gradient() → first color stop as flat bg (approximation). A
+    // gradient ending in a transparent stop is a glow — dim it rather
+    // than painting a solid disc.
+    if v.contains("-gradient(") {
+        let rest = v[v.find('(')? + 1..].trim_end_matches(')');
+        let mut depth = 0i32;
+        let stops: Vec<&str> = rest
+            .split(|ch| {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                ch == ',' && depth <= 0
+            })
+            .collect();
+        let last = stops.last().map(|s| s.trim()).unwrap_or("");
+        let fades_out = last.starts_with("transparent") || last.contains(" 0)");
+        for part in &stops {
+            let w = part.trim().split_whitespace().next().unwrap_or("");
+            if let Some(col) = parse_color(w) {
+                if alpha(col) == 0 || !fades_out {
+                    return Some(col);
+                }
+                // first stop is opaque but the ramp ends transparent —
+                // average alpha ≈ half across the disc/cone
+                return Some(col & !(0xffu32 << 24) | ((alpha(col) as u32 / 2) << 24));
+            }
+        }
+        return None;
+    }
     // tokens: color | url() | position/size | repeat | attachment — take first color
     for tok in v.split_whitespace() {
         if let Some(col) = parse_color(tok.trim_end_matches(';')) {
             return Some(col);
-        }
-        if let Some(inner) = tok.strip_prefix("linear-gradient(") {
-            let _ = inner;
-            // gradient → take first color stop as flat bg (approximation)
-            let rest = v[v.find('(')? + 1..].trim_end_matches(')');
-            for part in rest.split(',') {
-                let w = part.trim().split_whitespace().next().unwrap_or("");
-                if let Some(col) = parse_color(w) {
-                    return Some(col);
-                }
-            }
-            return None;
         }
     }
     None
@@ -976,6 +1008,62 @@ fn translate_xy(c: &Props, w: f32, h: f32) -> (f32, f32) {
     (dx, dy)
 }
 
+/// `flex` shorthand → (grow, basis): `flex:<g> <shrink>? <basis>?`, with
+/// `flex-grow`/`flex-basis` longhands as fallback/override. Basis `auto`/none
+/// → None (caller uses the item's intrinsic size).
+fn flex_grow_basis(c: &Props, rel: f32) -> (f32, Option<f32>) {
+    let (mut g, mut b): (f32, Option<f32>) = (0.0, None);
+    if let Some(v) = c.get("flex") {
+        let mut it = v.split_whitespace();
+        if let Some(t) = it.next() {
+            if let Ok(n) = t.parse::<f32>() {
+                g = n;
+            } else {
+                b = parse_len(t, rel).or(if t == "auto" { None } else { Some(0.0) });
+            }
+        }
+        let _shrink = it.next();
+        if let Some(t) = it.next() {
+            b = if t == "auto" { None } else { parse_len(t, rel).or(Some(0.0)) };
+        }
+    }
+    if let Some(v) = c.get("flex-grow") {
+        g = v.trim().parse().unwrap_or(g);
+    }
+    if let Some(v) = c.get("flex-basis") {
+        let v = v.trim();
+        b = if v == "auto" { None } else { parse_len(v, rel).or(Some(0.0)) };
+    }
+    (g, b)
+}
+
+/// Does this element's left margin resolve to `auto`? Checks the longhand
+/// and the left slot of `margin`/`margin-inline` shorthands.
+fn has_auto_ml(c: &Props) -> bool {
+    let auto = |v: &String| v.trim() == "auto";
+    if c.get("margin-left").map(&auto).unwrap_or(false) {
+        return true;
+    }
+    if let Some(v) = c.get("margin-inline").or_else(|| c.get("margin-inline-start")) {
+        if auto(v) {
+            return true;
+        }
+    }
+    if let Some(v) = c.get("margin") {
+        let t: Vec<&str> = v.split_whitespace().collect();
+        let l = match t.len() {
+            1 => Some(t[0]),
+            2 | 3 => Some(t[1]),
+            4 => Some(t[3]),
+            _ => None,
+        };
+        if l.map(|s| s == "auto").unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
 /// margin/padding longhands merged over the shorthand.
 /// Returns [top, right, bottom, left] in px (0 when unset).
 fn box_sides(c: &Props, name: &str, rel: f32) -> [f32; 4] {
@@ -1291,9 +1379,18 @@ fn grid_line_val(t: &str) -> GLine {
     }
 }
 
-/// `grid-column`/`grid-row` + `-start`/`-end` → (start, end) line terms.
+/// `grid-column`/`grid-row` + `-start`/`-end`/`grid-area` → (start, end)
+/// line terms. `grid-area: rs/cs/re/ce` sets all four at once.
 fn grid_lines(c: &Props, axis: &str) -> (GLine, GLine) {
     let (mut s, mut e) = (GLine::Auto, GLine::Auto);
+    if let Some(v) = c.get("grid-area") {
+        let parts: Vec<&str> = v.split('/').map(str::trim).collect();
+        if !parts.is_empty() {
+            let (si, ei) = if axis == "row" { (0, 2) } else { (1, 3) };
+            s = grid_line_val(parts.get(si).copied().unwrap_or("auto"));
+            e = grid_line_val(parts.get(ei).copied().unwrap_or("auto"));
+        }
+    }
     if let Some(v) = c.get(&format!("grid-{axis}")) {
         let mut it = v.split('/');
         s = grid_line_val(it.next().unwrap_or(""));
@@ -1536,7 +1633,7 @@ pub struct Layouter<'a> {
     line: Vec<Word>,
     line_x: f32,
     pending_space: bool,
-    list_stack: Vec<(bool, usize)>,
+    list_stack: Vec<(bool, bool, usize)>,
     /// active floats; inset following lines until `y` passes `bottom`
     floats: Vec<Float>,
     /// current scroll offset — `position:fixed` anchors to the viewport
@@ -1738,10 +1835,29 @@ impl<'a> Layouter<'a> {
                     "img" | "svg" | "input" | "select" | "textarea" | "video" | "canvas"
                         | "iframe" | "object" | "embed" | "br"
                 );
+                // `opacity` folds into every emitted item: the painter
+                // stores flattened opaque colors, so each item emitted for
+                // this subtree is faded toward the backdrop beneath it.
+                let op = c
+                    .get("opacity")
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .unwrap_or(1.0)
+                    .clamp(0.0, 1.0);
+                let (i0, h0, bd) = (self.items.len(), self.hits.len(), self.backdrop);
                 match c.get("display").map(String::as_str) {
                     _ if visually_hidden => return,
                     Some("none") => return,
                     _ if replaced => self.inline(node, tag, &c, st),
+                    // CSS 2.1 §9.7: absolute/fixed blockify — an inline
+                    // element like <a> with `position:absolute` lays out as
+                    // a block box so its `top`/`left` offsets take effect
+                    _ if matches!(
+                        c.get("position").map(String::as_str),
+                        Some("absolute") | Some("fixed")
+                    ) =>
+                    {
+                        self.block(node, tag, &c, st);
+                    }
                     Some("block") | Some("list-item") | Some("flex") | Some("grid") => {
                         self.block(node, tag, &c, st);
                     }
@@ -1749,6 +1865,30 @@ impl<'a> Layouter<'a> {
                         self.inline_block(node, &c, st)
                     }
                     _ => self.inline(node, tag, &c, st),
+                }
+                if op <= 0.0 {
+                    // fully transparent: nothing painted, nothing clickable
+                    self.items.truncate(i0);
+                    self.hits.truncate(h0);
+                } else if op < 1.0 {
+                    for it in &mut self.items[i0..] {
+                        match it {
+                            DisplayItem::Text { color, .. }
+                            | DisplayItem::FillRect { color, .. }
+                            | DisplayItem::RoundedRect { color, .. } => {
+                                *color = fade(*color, bd, op);
+                            }
+                            DisplayItem::Raster { pixels, .. } => {
+                                let o = (op * 255.0) as u32;
+                                for p in pixels.chunks_exact_mut(4) {
+                                    for ch in p.iter_mut() {
+                                        *ch = (*ch as u32 * o / 255) as u8;
+                                    }
+                                }
+                            }
+                            DisplayItem::Image { .. } => {}
+                        }
+                    }
                 }
             }
         }
@@ -1920,7 +2060,11 @@ impl<'a> Layouter<'a> {
             w_prop = Some(w_prop.unwrap_or(self.avail_w).min(mxw));
         }
         if let Some(mnw) = c.get("min-width").and_then(|v| parse_len_vp(v, self.avail_w, self.viewport_h, self.avail_w)) {
-            w_prop = Some(w_prop.unwrap_or(0.0).max(mnw));
+            // min-width constrains the box — it must not *create* a width:
+            // `min-width:0` on a width:auto block must stay full-width
+            if mnw > 0.0 {
+                w_prop = Some(w_prop.unwrap_or(self.avail_w).max(mnw));
+            }
         }
         let w_prop = w_prop;
         // does `w_prop` already include padding+border? (border-box, or an
@@ -1940,21 +2084,28 @@ impl<'a> Layouter<'a> {
             }
         }
 
+        // `list-style[-type]:none` on the list or the item hides markers
+        let hide_marker = c.get("list-style-type").is_some_and(|v| v.trim() == "none")
+            || c.get("list-style").is_some_and(|v| v.contains("none"));
         match tag {
-            "ul" | "menu" | "dir" => self.list_stack.push((false, 0)),
-            "ol" => self.list_stack.push((true, 0)),
+            "ul" | "menu" | "dir" => self.list_stack.push((hide_marker, false, 0)),
+            "ol" => self.list_stack.push((hide_marker, true, 0)),
             _ => {}
         }
         // <ol>/<ul> counter only ticks on <li>
-        let marker = if tag == "li" {
-            let (ordered, num) = match self.list_stack.last_mut() {
-                Some((o, n)) => {
+        let marker = if tag == "li" && !hide_marker {
+            let (hide, ordered, num) = match self.list_stack.last_mut() {
+                Some((h, o, n)) => {
                     *n += 1;
-                    (*o, *n)
+                    (*h, *o, *n)
                 }
-                None => (false, 1),
+                None => (false, false, 1),
             };
-            Some(if ordered { format!("{num}. ") } else { "•  ".to_string() })
+            if hide {
+                None
+            } else {
+                Some(if ordered { format!("{num}. ") } else { "•  ".to_string() })
+            }
         } else {
             None
         };
@@ -2292,7 +2443,17 @@ impl<'a> Layouter<'a> {
     /// `display:inline-block`: a box sitting on the text line like a word.
     /// Content is laid out off-screen via `nest`, then emitted offset to the
     /// box's position on the line. Bottom of the box sits on the baseline.
-    fn inline_block(&mut self, node: NodeId, c: &Props, mut st: Style) {
+    /// `hint` overrides the shrink-wrap width (flex items lay at their
+    /// resolved main size — basis+grow share, or max-content base).
+    fn inline_block_w(&mut self, node: NodeId, c: &Props, st: Style, hint: Option<f32>) {
+        self.inline_block_inner(node, c, st, hint)
+    }
+
+    fn inline_block(&mut self, node: NodeId, c: &Props, st: Style) {
+        self.inline_block_inner(node, c, st, None)
+    }
+
+    fn inline_block_inner(&mut self, node: NodeId, c: &Props, mut st: Style, hint: Option<f32>) {
         let size = st.size;
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
         let [_t, mr, mb, ml] = box_sides(c, "margin", size);
@@ -2312,7 +2473,10 @@ impl<'a> Layouter<'a> {
         let bw_v = bw_t + bw_b;
 
         // width property else shrink-wrap (min-content approx; flex sums children)
-        let inner = if let Some(w) = dim(c, "width", self.avail_w) {
+        let inner = if let Some(w) = hint {
+            // resolved flex main size — an outer (border-box) target
+            (w - pl - pr - bw_h).max(1.0)
+        } else if let Some(w) = dim(c, "width", self.avail_w) {
             if bb {
                 w - pl - pr - bw_h
             } else {
@@ -2620,10 +2784,16 @@ impl<'a> Layouter<'a> {
     /// `display:flex` — element children laid as inline-block items on a
     /// row with `gap` spacing.
     fn flex_children(&mut self, node: NodeId, c: &Props, st: Style) {
-        let gap = c
+        // `gap` shorthand then axis longhands (Tailwind emits gap-x/gap-y)
+        let base_gap = c
             .get("gap")
             .and_then(|v| parse_len(v, st.size))
             .unwrap_or(0.0);
+        let col_dir = c.get("flex-direction").map(String::as_str) == Some("column");
+        let gap = c
+            .get(if col_dir { "row-gap" } else { "column-gap" })
+            .and_then(|v| parse_len(v, st.size))
+            .unwrap_or(base_gap);
         // column direction: children stack as blocks, vertical gap.
         // `flex-1`/`grow-*` children share the container's definite height.
         if c.get("flex-direction").map(String::as_str) == Some("column") {
@@ -2702,9 +2872,79 @@ impl<'a> Layouter<'a> {
             }
             return;
         }
-        // justify-content on the main axis: pre-measure total child width
-        let total = self.flex_shrink_width(node, c, &st);
-        let extra = (self.content_width() - total).max(0.0);
+        // justify-content on the main axis: pre-measure total child width.
+        // Each element child's base size is its `width`, flex-basis (grow
+        // items), or max-content — never min-content, which would wrap
+        // `flex:1` labels to one word per line. `margin-left:auto` items share
+        // the leftover space before it (pushed to the row's far edge).
+        let mut base_w: FxHashMap<NodeId, f32> = FxHashMap::default();
+        let mut grow_meta: FxHashMap<NodeId, (f32, f32)> = FxHashMap::default();
+        let mut sum_grow = 0.0f32;
+        let mut n_auto_ml = 0usize;
+        let mut total = 0.0f32;
+        let mut n_vis = 0usize;
+        for &ch in self.doc.children(node) {
+            match self.doc.kind(ch) {
+                NodeKind::Text(t) => {
+                    if let Some(fi) = self.resolve_font(&st) {
+                        if let Some(f) = self.fonts.font(fi) {
+                            total += f.measure(
+                                &t.split_whitespace().collect::<Vec<_>>().join(" "),
+                                st.size,
+                            );
+                        }
+                    }
+                }
+                NodeKind::Element { .. } => {
+                    let cc = self.style(ch);
+                    if cc.get("display").map(String::as_str) == Some("none") {
+                        continue;
+                    }
+                    let mut cst = st.clone();
+                    self.apply_computed(&cc, &mut cst);
+                    let [_t, pr, _b, pl] =
+                        box_sides(&cc, "padding", cst.size).map(|v| v.max(0.0));
+                    let [_t, mr, _b, ml] = box_sides(&cc, "margin", cst.size);
+                    let (g, basis) = flex_grow_basis(&cc, st.size);
+                    let w = if g > 0.0 {
+                        grow_meta.insert(ch, (g, basis.unwrap_or(0.0)));
+                        sum_grow += g;
+                        basis.unwrap_or(0.0)
+                    } else {
+                        dim(&cc, "width", self.avail_w)
+                            .map(|w| {
+                                if border_box(&cc) {
+                                    w - pl - pr
+                                } else {
+                                    w
+                                }
+                            })
+                            .unwrap_or_else(|| self.max_content_width(ch, &cst))
+                    };
+                    base_w.insert(ch, w + pl + pr);
+                    total += w + pl + pr + ml.max(0.0) + mr.max(0.0);
+                    if has_auto_ml(&cc) {
+                        n_auto_ml += 1;
+                    }
+                    n_vis += 1;
+                }
+                _ => {}
+            }
+        }
+        total += gap * n_vis.saturating_sub(1) as f32;
+        let free = (self.content_width() - total).max(0.0);
+        // grow items absorb all leftover space; auto margins only split what
+        // grow leaves (spec: auto margins are 0 when any item grows)
+        let auto_share = if sum_grow > 0.0 || n_auto_ml == 0 {
+            0.0
+        } else {
+            free / n_auto_ml as f32
+        };
+        let extra = if sum_grow > 0.0 || n_auto_ml > 0 {
+            0.0
+        } else {
+            free
+        };
         let n_children = self
             .doc
             .children(node)
@@ -2730,6 +2970,9 @@ impl<'a> Layouter<'a> {
                     }
                     if !first && effective_gap > 0.0 {
                         self.spacer(effective_gap);
+                    }
+                    if has_auto_ml(&cc) && auto_share > 0.0 {
+                        self.spacer(auto_share);
                     }
                     let mut cst = st.clone();
                     self.apply_computed(&cc, &mut cst);
@@ -2764,7 +3007,19 @@ impl<'a> Layouter<'a> {
                         Some(t @ ("input" | "select" | "textarea" | "video" | "canvas" | "iframe" | "object" | "embed" | "br" | "hr")) => {
                             self.inline(ch, t, &cc, cst)
                         }
-                        _ => self.inline_block(ch, &cc, cst),
+                        _ => {
+                            // flex item main size: grow → basis + share of the
+                            // leftover; otherwise its measured base (explicit
+                            // `width` still wins via the `dim` branch inside)
+                            let hint = if let Some(&(g, bpx)) = grow_meta.get(&ch) {
+                                Some(bpx + free * g / sum_grow)
+                            } else if dim(&cc, "width", self.avail_w).is_none() {
+                                base_w.get(&ch).copied()
+                            } else {
+                                None
+                            };
+                            self.inline_block_w(ch, &cc, cst, hint)
+                        }
                     }
                     first = false;
                 }
@@ -3556,12 +3811,78 @@ impl<'a> Layouter<'a> {
         w
     }
 
+    /// max-content width approximation: all descendant text on a single line
+    /// plus replaced children's widths; block-level children contribute their
+    /// own max-content as a lower bound. Explicit `width` and nested flex rows
+    /// contribute their own geometry. Flex items base their size on this —
+    /// shrink-to-fit min-content would wrap labels to one word per line.
+    fn max_content_width(&mut self, node: NodeId, st: &Style) -> f32 {
+        let c = self.style(node);
+        if let Some(ew) = dim(&c, "width", self.avail_w) {
+            return if border_box(&c) {
+                let [_t, pr, _b, pl] =
+                    box_sides(&c, "padding", st.size).map(|v| v.max(0.0));
+                (ew - pl - pr).max(1.0)
+            } else {
+                ew
+            };
+        }
+        if matches!(
+            c.get("display").map(String::as_str),
+            Some("flex") | Some("inline-flex")
+        ) {
+            return self.flex_shrink_width(node, &c, st);
+        }
+        let mut w = 0.0f32;
+        let text = self.doc.text_content(node);
+        if let Some(fi) = self.resolve_font(st) {
+            if let Some(f) = self.fonts.font(fi) {
+                let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                w = f.measure(&joined, st.size);
+            }
+        }
+        for &ch in self.doc.children(node) {
+            if !matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
+                continue;
+            }
+            let cc = self.style(ch);
+            if cc.get("display").map(String::as_str) == Some("none") {
+                continue;
+            }
+            let mut cst = st.clone();
+            self.apply_computed(&cc, &mut cst);
+            match self.doc.tag(ch) {
+                Some("img" | "svg" | "video" | "canvas" | "iframe" | "object" | "embed") => {
+                    // inline replaced content adds to the line its text flows on
+                    w += dim(&cc, "width", self.avail_w)
+                        .unwrap_or_else(|| self.shrink_width(ch, &cst));
+                }
+                Some("br" | "hr" | "script" | "style" | "template" | "head") => {}
+                _ => {
+                    // block-level children stack vertically → only their own
+                    // max-content matters; inline descendants' text already
+                    // counts inside `text`
+                    if matches!(
+                        cc.get("display").map(String::as_str),
+                        Some("block") | Some("flex") | Some("inline-flex") | Some("grid")
+                            | Some("inline-grid") | Some("list-item") | Some("table")
+                            | Some("flow-root")
+                    ) {
+                        w = w.max(self.max_content_width(ch, &cst));
+                    }
+                }
+            }
+        }
+        w.max(1.0)
+    }
+
     /// Intrinsic width of a flex container: children's widths + gaps + their
     /// own padding/margins — a max-content approximation.
     fn flex_shrink_width(&mut self, node: NodeId, c: &Props, st: &Style) -> f32 {
         let gap = c
-            .get("gap")
+            .get("column-gap")
             .and_then(|v| parse_len(v, st.size))
+            .or_else(|| c.get("gap").and_then(|v| parse_len(v, st.size)))
             .unwrap_or(0.0);
         let mut w = 0.0;
         let mut n = 0usize;
@@ -4510,35 +4831,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod dbg3 {
-    use super::*;
-    #[test]
-    fn dbg_nav() {
-        let css = std::fs::read_to_string("/tmp/coobyk.css").unwrap();
-        let sh = rowser_css::parse(&css);
-        let d = rowser_html::parse(&std::fs::read_to_string("/tmp/coobyk.html").unwrap());
-        let mut tags = std::collections::HashMap::<String, usize>::new();
-        for id in d.descendants(d.root) {
-            if let Some(t) = d.tag(id) {
-                *tags.entry(t.to_string()).or_insert(0) += 1;
-            }
-        }
-        eprintln!("TAGS: {:?}", tags);
-        let sh2 = rowser_css::parse(&css);
-        let mut fonts = FontCache::new();
-        let (items, _, _, _) = Layouter::layout(&d, &mut fonts, 800.0, 0.0, &[sh2]);
-        for it in &items {
-            match it {
-                DisplayItem::Image { x, y, w, h, src } => eprintln!("IMG {x:.0},{y:.0} {w:.0}x{h:.0} {src}"),
-                DisplayItem::Text { x, baseline, text, size, .. } if text.contains("Coobyk") || text.contains("I do") => eprintln!("T {x:.0},{baseline:.0} size={size:.0} {text:?}"),
-                _ => {}
-            }
-        }
-        for id in d.descendants(d.root) {
-            if d.tag(id) == Some("h1") {
-                eprintln!("H1 computed: {:?}", rowser_css::computed(&d, id, &[&sh]).iter().filter(|(k,_)| k.starts_with("font")||k.starts_with("padding")).collect::<Vec<_>>());
-            }
-        }
-    }
-}

@@ -2,7 +2,7 @@
 //! gzip content-decoding included. TLS for `https://` lands in a sibling
 //! crate; `fetch` is the seam where it will plug in.
 
-use std::io;
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -220,7 +220,7 @@ fn invalid_data(msg: &'static str) -> io::Error {
 mod tests {
     use super::*;
     use rowser_deflate::testutil;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
