@@ -1155,6 +1155,8 @@ fn shift_item_y(it: &mut rowser_layout::DisplayItem, dy: f32) {
         | D::RoundedRect { y, .. }
         | D::Raster { y, .. }
         | D::Image { y, .. } => *y += dy,
+        D::PushEffect(e) => e.offset_mut(0.0, dy),
+        D::PopEffect => {}
     }
 }
 

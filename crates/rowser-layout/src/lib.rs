@@ -11,6 +11,7 @@
 //! and minimal auto table layout (table/tr/td/th with per-cell borders).
 
 use rowser_css as css;
+pub mod colorfx;
 pub mod svg;
 
 use rowser_dom::{Document, NodeId, NodeKind};
@@ -76,6 +77,11 @@ pub enum DisplayItem {
         h: f32,
         src: String,
     },
+    /// Begin an effect group (filter/clip/blend/backdrop): items until the
+    /// matching `PopEffect` form this element's painted subtree.
+    PushEffect(colorfx::Effect),
+    /// Close the innermost `PushEffect` group.
+    PopEffect,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -202,7 +208,7 @@ fn named_color(name: &str) -> Option<Color> {
         "maroon" => bgra(128, 0, 0),
         "silver" => bgra(192, 192, 192),
         "gray" | "grey" => bgra(128, 128, 128),
-        "darkgray" | "darkgrey" => bgra(64, 64, 64),
+        "darkgray" | "darkgrey" => bgra(169, 169, 169),
         "lightgray" | "lightgrey" => bgra(211, 211, 211),
         "pink" => bgra(255, 192, 203),
         "brown" => bgra(165, 42, 42),
@@ -249,6 +255,81 @@ fn named_color(name: &str) -> Option<Color> {
         "turquoise" => bgra(64, 224, 208),
         "whitesmoke" => bgra(245, 245, 245),
         "yellowgreen" => bgra(154, 205, 50),
+        "aliceblue" => bgra(240, 248, 255),
+        "antiquewhite" => bgra(250, 235, 215),
+        "aquamarine" => bgra(127, 255, 212),
+        "azure" => bgra(240, 255, 255),
+        "bisque" => bgra(255, 228, 196),
+        "blanchedalmond" => bgra(255, 235, 205),
+        "blueviolet" => bgra(138, 43, 226),
+        "burlywood" => bgra(222, 184, 135),
+        "cadetblue" => bgra(95, 158, 160),
+        "chartreuse" => bgra(127, 255, 0),
+        "chocolate" => bgra(210, 105, 30),
+        "cornsilk" => bgra(255, 248, 220),
+        "darkgoldenrod" => bgra(184, 134, 11),
+        "darkkhaki" => bgra(189, 183, 107),
+        "darkolivegreen" => bgra(85, 107, 47),
+        "darksalmon" => bgra(233, 150, 122),
+        "darkseagreen" => bgra(143, 188, 143),
+        "darkslateblue" => bgra(72, 61, 139),
+        "darkturquoise" => bgra(0, 206, 209),
+        "darkviolet" => bgra(148, 0, 211),
+        "deeppink" => bgra(255, 20, 147),
+        "floralwhite" => bgra(255, 250, 240),
+        "gainsboro" => bgra(220, 220, 220),
+        "ghostwhite" => bgra(248, 248, 255),
+        "goldenrod" => bgra(218, 165, 32),
+        "greenyellow" => bgra(173, 255, 47),
+        "honeydew" => bgra(240, 255, 240),
+        "indianred" => bgra(205, 92, 92),
+        "lavender" => bgra(230, 230, 250),
+        "lavenderblush" => bgra(255, 240, 245),
+        "lawngreen" => bgra(124, 252, 0),
+        "lemonchiffon" => bgra(255, 250, 205),
+        "lightcoral" => bgra(240, 128, 128),
+        "lightcyan" => bgra(224, 255, 255),
+        "lightgoldenrodyellow" => bgra(250, 250, 210),
+        "lightpink" => bgra(255, 182, 193),
+        "lightsalmon" => bgra(255, 160, 122),
+        "lightseagreen" => bgra(32, 178, 170),
+        "lightskyblue" => bgra(135, 206, 250),
+        "lightslategray" | "lightslategrey" => bgra(119, 136, 153),
+        "lightsteelblue" => bgra(176, 196, 222),
+        "lightyellow" => bgra(255, 255, 224),
+        "limegreen" => bgra(50, 205, 50),
+        "linen" => bgra(250, 240, 230),
+        "mediumaquamarine" => bgra(102, 205, 170),
+        "mediumblue" => bgra(0, 0, 205),
+        "mediumorchid" => bgra(186, 85, 211),
+        "mediumseagreen" => bgra(60, 179, 113),
+        "mediumslateblue" => bgra(123, 104, 238),
+        "mediumspringgreen" => bgra(0, 250, 154),
+        "mediumturquoise" => bgra(72, 209, 204),
+        "mediumvioletred" => bgra(199, 21, 133),
+        "mintcream" => bgra(245, 255, 250),
+        "mistyrose" => bgra(255, 228, 225),
+        "moccasin" => bgra(255, 228, 181),
+        "navajowhite" => bgra(255, 222, 173),
+        "oldlace" => bgra(253, 245, 230),
+        "olivedrab" => bgra(107, 142, 35),
+        "orangered" => bgra(255, 69, 0),
+        "palegoldenrod" => bgra(238, 232, 170),
+        "palegreen" => bgra(152, 251, 152),
+        "paleturquoise" => bgra(175, 238, 238),
+        "palevioletred" => bgra(219, 112, 147),
+        "papayawhip" => bgra(255, 239, 213),
+        "peachpuff" => bgra(255, 218, 185),
+        "peru" => bgra(205, 133, 63),
+        "powderblue" => bgra(176, 224, 230),
+        "rosybrown" => bgra(188, 143, 143),
+        "saddlebrown" => bgra(139, 69, 19),
+        "sandybrown" => bgra(244, 164, 96),
+        "seashell" => bgra(255, 245, 238),
+        "slateblue" => bgra(106, 90, 205),
+        "snow" => bgra(255, 250, 250),
+        "thistle" => bgra(216, 191, 216),
+        "wheat" => bgra(245, 222, 179),
         _ => return None,
     })
 }
@@ -353,6 +434,14 @@ fn srgb8(v: f32) -> u8 {
     };
     (c * 255.0).round().clamp(0.0, 255.0) as u8
 }
+/// 8-bit-free sRGB component (0..1) → linear-light.
+fn srgb_un(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
 /// CSS `hsl()` → linear-light-free sRGB (0..1).
 fn hsl_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     let h = h.rem_euclid(360.0) / 360.0;
@@ -422,15 +511,36 @@ fn fn_color_srgb(r: f32, g: f32, b: f32, a: f32) -> Color {
 }
 
 pub fn parse_color(v: &str) -> Option<Color> {
+    parse_color_ctx(v, None)
+}
+
+/// `parse_color` with a `currentColor` context: `cur` = the element's own
+/// resolved color (the inherited color when resolving `color` itself).
+pub fn parse_color_ctx(v: &str, cur: Option<Color>) -> Option<Color> {
     let v = v.trim().to_lowercase();
     if v == "transparent" {
         return None;
     }
+    if v == "currentcolor" {
+        return cur;
+    }
+    if let Some(inner) = v
+        .strip_prefix("light-dark(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
+        // light mode only — take the first argument
+        let (a, _) = top_comma(inner).unwrap_or((inner, ""));
+        return parse_color_ctx(a.trim(), cur);
+    }
     if v.starts_with("color-mix(") {
         let inner = v[v.find('(')? + 1..v.rfind(')')?].trim();
         // `in <space>,` prelude optional
+        let mut space = "srgb";
         let inner = match top_comma(inner) {
-            Some((pre, rest)) if pre.trim_start().starts_with("in ") => rest.trim(),
+            Some((pre, rest)) if pre.trim_start().starts_with("in ") => {
+                space = pre.trim_start()[3..].trim();
+                rest.trim()
+            }
             _ => inner,
         };
         let (a, b) = match top_comma(inner) {
@@ -452,12 +562,12 @@ pub fn parse_color(v: &str) -> Option<Color> {
                     let c = if col == "transparent" {
                         bgra_a(0, 0, 0, 0)
                     } else {
-                        parse_color(col)?
+                        parse_color_ctx(col, cur)?
                     };
                     return Some((c, p / 100.0));
                 }
             }
-            Some((parse_color(s)?, -1.0))
+            Some((parse_color_ctx(s, cur)?, -1.0))
         };
         let (ca, wa) = arm(a)?;
         let (cb, wb) = match b {
@@ -479,6 +589,9 @@ pub fn parse_color(v: &str) -> Option<Color> {
             return Some(bgra_a(0, 0, 0, 0));
         }
         let (na, nb) = if sum > 1.0 { (wa / sum, wb / sum) } else { (wa, wb) };
+        if !matches!(space, "" | "srgb") {
+            return colorfx::color_mix(space, ca, cb, na, nb);
+        }
         // premultiplied mix: each arm contributes color*alpha*weight;
         // missing percentage drains alpha (mixing with nothing)
         let (aa, ab) = (alpha(ca) as f32 / 255.0 * na, alpha(cb) as f32 / 255.0 * nb);
@@ -608,6 +721,39 @@ pub fn parse_color(v: &str) -> Option<Color> {
                 let (r, g, b) = oklab_rgb(l, a, b);
                 return Some(fn_color(r, g, b, fa(3)));
             }
+            "color" => {
+                // color(<space> c1 c2 c3 [/ a]) — components 0..1
+                if args.len() < 4 {
+                    return None;
+                }
+                let cp = |s: &str| fpct(s, 1.0);
+                let (x, y, z) = (cp(arg(1)), cp(arg(2)), cp(arg(3)));
+                let (r, g, b) = match arg(0) {
+                    "srgb" => return Some(fn_color_srgb(x, y, z, fa(4))),
+                    "srgb-linear" => (x, y, z),
+                    "display-p3" => {
+                        // P3 shares the sRGB transfer curve; D65 → D65
+                        let (x, y, z) = (srgb_un(x), srgb_un(y), srgb_un(z));
+                        (
+                            1.2249401762 * x - 0.2249401762 * y,
+                            -0.0420569547 * x + 1.0420569547 * y,
+                            -0.0196375546 * x - 0.0786360461 * y + 1.0982736007 * z,
+                        )
+                    }
+                    "xyz" | "xyz-d65" => (
+                        3.2409699419 * x - 1.5373831776 * y - 0.4986107603 * z,
+                        -0.9692436363 * x + 1.8759675015 * y + 0.0415550574 * z,
+                        0.0556300797 * x - 0.2039769589 * y + 1.0569715142 * z,
+                    ),
+                    "xyz-d50" => (
+                        3.1341858371 * x - 1.6172094591 * y - 0.4906945842 * z,
+                        -0.9787487286 * x + 1.9161301227 * y + 0.0334332507 * z,
+                        0.0719529066 * x - 0.2289938547 * y + 1.4053853164 * z,
+                    ),
+                    _ => return None,
+                };
+                return Some(fn_color(r, g, b, fa(4)));
+            }
             _ => return named_color(&v),
         }
     }
@@ -616,16 +762,17 @@ pub fn parse_color(v: &str) -> Option<Color> {
 
 impl Layouter<'_> {
     /// `background-color`/`background` or the legacy `bgcolor` attribute.
-    fn bg_of(&self, node: NodeId, c: &Props) -> Option<Color> {
-        bg_color(c)
-            .or_else(|| self.doc.attr(node, "bgcolor").and_then(|v| parse_color(v)))
+    /// `cur` = element's own color (for `currentcolor`).
+    fn bg_of(&self, node: NodeId, c: &Props, cur: Option<Color>) -> Option<Color> {
+        bg_color(c, cur)
+            .or_else(|| self.doc.attr(node, "bgcolor").and_then(|v| parse_color_ctx(v, cur)))
     }
 }
 
 /// `background-color` or a color inside the `background` shorthand.
-fn bg_color(c: &Props) -> Option<Color> {
+fn bg_color(c: &Props, cur: Option<Color>) -> Option<Color> {
     if let Some(v) = c.get("background-color") {
-        if let Some(col) = parse_color(v) {
+        if let Some(col) = parse_color_ctx(v, cur) {
             return Some(col);
         }
     }
@@ -650,7 +797,7 @@ fn bg_color(c: &Props) -> Option<Color> {
         let fades_out = last.starts_with("transparent") || last.contains(" 0)");
         for part in &stops {
             let w = part.trim().split_whitespace().next().unwrap_or("");
-            if let Some(col) = parse_color(w) {
+            if let Some(col) = parse_color_ctx(w, cur) {
                 if alpha(col) == 0 || !fades_out {
                     return Some(col);
                 }
@@ -663,7 +810,7 @@ fn bg_color(c: &Props) -> Option<Color> {
     }
     // tokens: color | url() | position/size | repeat | attachment — take first color
     for tok in v.split_whitespace() {
-        if let Some(col) = parse_color(tok.trim_end_matches(';')) {
+        if let Some(col) = parse_color_ctx(tok.trim_end_matches(';'), cur) {
             return Some(col);
         }
     }
@@ -728,7 +875,7 @@ fn parse_shadow(c: &Props, size: f32, bd: Color, def: Color) -> Option<(f32, f32
         let col = if col_s.is_empty() {
             def
         } else {
-            parse_color(col_s).unwrap_or(def)
+            parse_color_ctx(col_s, Some(def)).unwrap_or(def)
         };
         if alpha(col) == 0 {
             continue; // fully transparent shadow (e.g. `0 0 #0000`)
@@ -1300,7 +1447,7 @@ fn margin_auto(c: &Props, left: bool) -> bool {
 /// `border: 2px solid red` → (width px, color). The color may contain
 /// spaces (`rgb(...)`/`color-mix(...)`) — the rest of the value is tried
 /// as one color before the bare token.
-fn parse_border(v: &str, em: f32) -> Option<(f32, Color)> {
+fn parse_border(v: &str, em: f32, cur: Color) -> Option<(f32, Color)> {
     let mut width = None;
     let mut color = None;
     let mut rest = v.trim();
@@ -1322,7 +1469,9 @@ fn parse_border(v: &str, em: f32) -> Option<(f32, Color)> {
         ) {
             // style keyword — all styles paint solid edges
         } else {
-            color = parse_color(rest).or_else(|| parse_color(part)).or(color);
+            color = parse_color_ctx(rest, Some(cur))
+                .or_else(|| parse_color_ctx(part, Some(cur)))
+                .or(color);
             break;
         }
         rest = rest[part.len()..].trim_start();
@@ -1334,13 +1483,13 @@ fn parse_border(v: &str, em: f32) -> Option<(f32, Color)> {
 /// `border-width`/`border-<side>-width` → `border-(<side>-)?style` →
 /// `border-color`. Sides are [top, right, bottom, left]. Longhands apply
 /// over the shorthand (preflight `border:0 solid` + `border-t` pattern).
-fn border_sides(c: &Props, size: f32) -> Option<([f32; 4], Color)> {
+fn border_sides(c: &Props, size: f32, cur: Color) -> Option<([f32; 4], Color)> {
     let mut w = [0.0f32; 4];
     let mut col = None;
     if let Some(v) = c.get("border") {
         // `border:none` or an unparseable shorthand contributes nothing;
         // longhands can still re-enable individual sides
-        if let Some((bw, sc)) = parse_border(v, size) {
+        if let Some((bw, sc)) = parse_border(v, size, cur) {
             w = [bw; 4];
             col = Some(sc);
         }
@@ -1363,7 +1512,7 @@ fn border_sides(c: &Props, size: f32) -> Option<([f32; 4], Color)> {
         w = [0.0; 4];
     }
     let mut any = false;
-    if let Some(bc) = c.get("border-color").and_then(|v| parse_color(v)) {
+    if let Some(bc) = c.get("border-color").and_then(|v| parse_color_ctx(v, Some(cur))) {
         col = Some(bc);
     }
     for (i, (wn, sn, cn)) in SIDES.iter().copied().enumerate() {
@@ -1373,7 +1522,7 @@ fn border_sides(c: &Props, size: f32) -> Option<([f32; 4], Color)> {
         if c.get(sn).is_some_and(|v| matches!(v.trim(), "none" | "hidden")) {
             w[i] = 0.0;
         }
-        if let Some(sc) = c.get(cn).and_then(|v| parse_color(v)) {
+        if let Some(sc) = c.get(cn).and_then(|v| parse_color_ctx(v, Some(cur))) {
             col = Some(sc);
         }
         any |= w[i] > 0.0;
@@ -1740,7 +1889,7 @@ struct Float {
 }
 
 /// Translate a display item by (dx, dy).
-fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
+pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
     match it {
         DisplayItem::Raster { x, y, w, h, pixels } => DisplayItem::Raster {
             x: x + dx,
@@ -1792,6 +1941,8 @@ fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             h,
             src,
         },
+        DisplayItem::PushEffect(e) => DisplayItem::PushEffect(e.offset(dx, dy)),
+        DisplayItem::PopEffect => DisplayItem::PopEffect,
     }
 }
 
@@ -1945,12 +2096,12 @@ impl<'a> Layouter<'a> {
         for &el in l.doc.children(l.doc.root) {
             if l.doc.tag(el) == Some("html") {
                 let p = l.style(el);
-                let mut canvas_bg = l.bg_of(el, &p);
+                let mut canvas_bg = l.bg_of(el, &p, None);
                 if canvas_bg.is_none() {
                     for &b in l.doc.children(el) {
                         if l.doc.tag(b) == Some("body") {
                             let pb = l.style(b);
-                            canvas_bg = l.bg_of(b, &pb);
+                            canvas_bg = l.bg_of(b, &pb, None);
                         }
                     }
                 }
@@ -2095,6 +2246,9 @@ impl<'a> Layouter<'a> {
                     .unwrap_or(1.0)
                     .clamp(0.0, 1.0);
                 let (i0, h0, bd) = (self.items.len(), self.hits.len(), self.backdrop);
+                // filter/clip-path/mix-blend-mode/backdrop-filter context —
+                // st moves into the dispatch below
+                let (fx_size, fx_cur) = (st.size, st.color);
                 // visibility:hidden keeps its box but paints nothing — the
                 // same truncation as opacity:0 (a `visibility:visible`
                 // descendant that should re-show is rare and unsupported)
@@ -2144,9 +2298,23 @@ impl<'a> Layouter<'a> {
                                     }
                                 }
                             }
-                            DisplayItem::Image { .. } => {}
+                            DisplayItem::Image { .. }
+                            | DisplayItem::PushEffect(_)
+                            | DisplayItem::PopEffect => {}
                         }
                     }
+                }
+                // filter/clip-path/mix-blend-mode/backdrop-filter wrap this
+                // element's emitted items as one paint-time group; rect =
+                // own border box when it recorded a hit. (inline-block
+                // items go to the line instead — see inline_block_inner.)
+                let rect = self.hits[h0..]
+                    .iter()
+                    .find(|h| h.4 == node)
+                    .map(|h| [h.0, h.1, h.2, h.3]);
+                let fx = colorfx::element_fx(&c, fx_size, fx_cur, rect);
+                if !fx.is_empty() {
+                    colorfx::wrap_vec(&mut self.items, i0, fx);
                 }
             }
         }
@@ -2186,7 +2354,7 @@ impl<'a> Layouter<'a> {
             };
         }
         if let Some(v) = c.get("color") {
-            if let Some(col) = parse_color(v) {
+            if let Some(col) = parse_color_ctx(v, Some(st.color)) {
                 st.color = over(col, self.backdrop);
             }
         }
@@ -2229,7 +2397,7 @@ impl<'a> Layouter<'a> {
                 parse_len(v, st.size, st.size).map(LineH::Px)
             };
         }
-        if let Some(col) = bg_color(c) {
+        if let Some(col) = bg_color(c, Some(st.color)) {
             st.inline_bg = Some(over(col, self.backdrop));
         }
     }
@@ -2297,14 +2465,14 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let bd = self.backdrop;
         let bb = border_box(c);
-        let bg = self.bg_of(node, c).map(|col| over(col, bd));
-        let border = border_sides(c, size)
+        let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
+        let border = border_sides(c, size, st.color)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         // the block's own background paints behind the whole box, not per word
         st.inline_bg = None;
         // this element's text sits on its own bg — re-composite the color
         if let Some(b) = bg {
-            if let Some(col) = c.get("color").and_then(|v| parse_color(v)) {
+            if let Some(col) = c.get("color").and_then(|v| parse_color_ctx(v, Some(st.color))) {
                 st.color = over(col, b);
             }
         }
@@ -2632,8 +2800,8 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
-        let bg = self.bg_of(node, c).map(|col| over(col, bd));
-        let border = border_sides(c, size)
+        let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
+        let border = border_sides(c, size, st.color)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         st.inline_bg = None;
         let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.0).unwrap_or([0.0; 4]);
@@ -2736,12 +2904,12 @@ impl<'a> Layouter<'a> {
         let [_t, mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
         let bb = border_box(c);
-        let bg = self.bg_of(node, c).map(|col| over(col, bd));
-        let border = border_sides(c, size)
+        let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
+        let border = border_sides(c, size, st.color)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         st.inline_bg = None; // the box paints its own bg
         if let Some(b) = bg {
-            if let Some(col) = c.get("color").and_then(|v| parse_color(v)) {
+            if let Some(col) = c.get("color").and_then(|v| parse_color_ctx(v, Some(st.color))) {
                 st.color = over(col, b);
             }
         }
@@ -2831,6 +2999,11 @@ impl<'a> Layouter<'a> {
             side_rects(&mut out, 0.0, 0.0, box_w, box_h, bw2, col);
         }
         out.extend(items);
+        // filter/clip/blend/backdrop group bg+border+content of this box
+        let fx = colorfx::element_fx(c, size, st.color, Some([0.0, 0.0, box_w, box_h]));
+        if !fx.is_empty() && !out.is_empty() {
+            colorfx::wrap_vec(&mut out, 0, fx);
+        }
         // translate/transform: visual offset of the whole box
         let (tx, ty) = translate_xy(c, box_w, box_h, size);
         let nhits: Vec<_> = if tx != 0.0 || ty != 0.0 {
@@ -2875,12 +3048,12 @@ impl<'a> Layouter<'a> {
         let size = st.size;
         let [mt, _mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
-        let bg = self.bg_of(node, c).map(|col| over(col, bd));
-        let border = border_sides(c, size)
+        let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
+        let border = border_sides(c, size, st.color)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         st.inline_bg = None;
         if let Some(b) = bg {
-            if let Some(col) = c.get("color").and_then(|v| parse_color(v)) {
+            if let Some(col) = c.get("color").and_then(|v| parse_color_ctx(v, Some(st.color))) {
                 st.color = over(col, b);
             }
         }
@@ -2943,7 +3116,7 @@ impl<'a> Layouter<'a> {
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
                 let [_t, pr, _b, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
-                let [_, cbw_r, _, cbw_l] = border_sides(&cs, cst.size)
+                let [_, cbw_r, _, cbw_l] = border_sides(&cs, cst.size, cst.color)
                     .or(attr_border)
                     .map(|b| b.0)
                     .unwrap_or([0.0; 4]);
@@ -3060,7 +3233,8 @@ impl<'a> Layouter<'a> {
         };
 
         for row in &rows {
-            // (x, cell w, cell h, bg, border, items in cell-local coords)
+            // (x, cell w, cell h, bg, border, items in cell-local coords,
+            //  hits, element effects)
             let mut boxes: Vec<(
                 f32,
                 f32,
@@ -3069,6 +3243,7 @@ impl<'a> Layouter<'a> {
                 Option<([f32; 4], Color)>,
                 Vec<DisplayItem>,
                 Vec<(f32, f32, f32, f32, NodeId)>,
+                Vec<colorfx::Effect>,
             )> = Vec::new();
             let mut x = self.margin_x;
             let mut row_h = 0.0f32;
@@ -3087,16 +3262,18 @@ impl<'a> Layouter<'a> {
                     _ => {}
                 }
                 let [pt, pr, pb, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
-                let cborder = border_sides(&cs, cst.size)
+                let cborder = border_sides(&cs, cst.size, cst.color)
                     .or(attr_border)
                     .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
                 let [bw_t, bw_r, bw_b, bw_l] =
                     cborder.map(|b| b.0).unwrap_or([0.0; 4]);
                 let cbg = cs
                     .get("background-color")
-                    .and_then(|v| parse_color(v))
+                    .and_then(|v| parse_color_ctx(v, Some(cst.color)))
                     .or_else(|| {
-                        self.doc.attr(cell, "bgcolor").and_then(|v| parse_color(v))
+                        self.doc
+                            .attr(cell, "bgcolor")
+                            .and_then(|v| parse_color_ctx(v, Some(cst.color)))
                     })
                     .map(|col| over(col, bg.unwrap_or(bd)));
                 let inner = (cw - pl - pr - bw_l - bw_r).max(1.0);
@@ -3104,12 +3281,16 @@ impl<'a> Layouter<'a> {
                     self.nest(cell, &cst, pl + bw_l, pt + bw_t, inner, &cs);
                 let min_h = self.eff_line_h(&cst);
                 let cell_h = (y_end + pb + bw_b).max(min_h);
-                boxes.push((x, cw, cell_h, cbg, cborder, items, nhits));
+                // element effects wrap the whole cell (bg rect + borders +
+                // content); the span's own bbox is the reference box
+                let cfx = colorfx::element_fx(&cs, cst.size, cst.color, None);
+                boxes.push((x, cw, cell_h, cbg, cborder, items, nhits, cfx));
                 x += cw;
                 row_h = row_h.max(cell_h);
             }
             // second pass: stretch cell bg/borders to row height, place content
-            for (cx, cw, _ch, cbg, cborder, items, nhits) in boxes {
+            for (cx, cw, _ch, cbg, cborder, items, nhits, cfx) in boxes {
+                let i0 = self.items.len();
                 if let Some(col) = cbg {
                     self.items.push(DisplayItem::FillRect {
                         x: cx,
@@ -3127,6 +3308,9 @@ impl<'a> Layouter<'a> {
                 }
                 for h in nhits {
                     self.hits.push((h.0 + cx, h.1 + self.y, h.2, h.3, h.4));
+                }
+                if !cfx.is_empty() {
+                    colorfx::wrap_vec(&mut self.items, i0, cfx);
                 }
             }
             self.y += row_h;
@@ -3399,6 +3583,16 @@ impl<'a> Layouter<'a> {
                             if let Some((w, h, items, hits)) =
                                 self.replaced_payload(ch, t, &cc, &cst)
                             {
+                                let mut items = items;
+                                let fx = colorfx::element_fx(
+                                    &cc,
+                                    cst.size,
+                                    cst.color,
+                                    Some([0.0, 0.0, w, h]),
+                                );
+                                if !fx.is_empty() && !items.is_empty() {
+                                    colorfx::wrap_vec(&mut items, 0, fx);
+                                }
                                 let (tx, ty) = translate_xy(&cc, w, h, cst.size);
                                 let items = if tx != 0.0 || ty != 0.0 {
                                     items
@@ -3796,8 +3990,8 @@ impl<'a> Layouter<'a> {
             let p = box_sides(&cc, "padding", avail, cst.size).map(|v| v.max(0.0));
             let bd = self.backdrop;
             let bb = border_box(&cc);
-            let bg = self.bg_of(ch, &cc).map(|col| over(col, bd));
-            let border = border_sides(&cc, cst.size)
+            let bg = self.bg_of(ch, &cc, Some(cst.color)).map(|col| over(col, bd));
+            let border = border_sides(&cc, cst.size, cst.color)
                 .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
             let bw = border.map(|b| b.0).unwrap_or([0.0; 4]);
             let radius = parse_radius(&cc, cst.size);
@@ -4147,6 +4341,7 @@ impl<'a> Layouter<'a> {
             // translate/transform shifts the painted box + its hit rects
             let (tx, ty) = translate_xy(&it.cc, box_w, box_h, it.st.size);
             let (ix, iy) = (ix + tx, iy + ty);
+            let gi0 = self.items.len();
             if let Some((ox, oy, sp, col)) = it.shadow {
                 if sp > 0.0 && ox == 0.0 && oy == 0.0 {
                     edge_rects(
@@ -4208,6 +4403,15 @@ impl<'a> Layouter<'a> {
             self.hits.push((ix, iy, box_w, box_h, it.id));
             for h in it.hits.drain(..) {
                 self.hits.push((h.0 + ix, h.1 + iy + dy, h.2, h.3, h.4));
+            }
+            let fx = colorfx::element_fx(
+                &it.cc,
+                it.st.size,
+                it.st.color,
+                Some([ix, iy, box_w, box_h]),
+            );
+            if !fx.is_empty() {
+                colorfx::wrap_vec(&mut self.items, gi0, fx);
             }
         }
 

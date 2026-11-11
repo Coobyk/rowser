@@ -58,6 +58,9 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 }
                 mix(src.as_bytes());
             }
+            _ => {
+                mix(&[9]);
+            }
         }
     }
     h
