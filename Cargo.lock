@@ -4392,6 +4392,10 @@ name = "rowser-ipc"
 version = "0.0.0"
 
 [[package]]
+name = "rowser-js"
+version = "0.0.0"
+
+[[package]]
 name = "rowser-layout"
 version = "0.0.0"
 dependencies = [
