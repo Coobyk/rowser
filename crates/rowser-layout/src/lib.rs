@@ -101,6 +101,9 @@ struct Style {
     pre: bool,
     /// white-space:nowrap (and pre) — lines never break; text overflows
     nowrap: bool,
+    /// overflow-wrap:break-word|anywhere, word-break:break-all — overwide
+    /// words may split mid-word; otherwise they overflow
+    break_word: bool,
     align: Align,
     href: Option<String>,
     /// line-height override: multiplier of font-size or an absolute px length
@@ -131,6 +134,7 @@ fn base_style() -> Style {
         shift: 0.0,
         pre: false,
         nowrap: false,
+        break_word: false,
         align: Align::Left,
         href: None,
         line_h: None,
@@ -878,11 +882,131 @@ fn calc_len(expr: &str, rel: f32, em: f32) -> Option<f32> {
     p.expr()
 }
 
+/// Split a function argument list on top-level commas (nested parens don't
+/// split — `min(1rem, calc(50vw - 10px))` → two args)
+fn top_args(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut last = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(&s[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[last..]);
+    out
+}
+
+/// Recursive math eval for calc()/min()/max()/clamp() bodies — supports
+/// + - * /, parens, and every unit parse_len_vp knows (incl. vw/vh, which
+/// the older calc_len tokenizer lacks).
+fn math_eval(s: &str, rel: f32, em: f32, vh: f32, vw: f32) -> Option<f32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // strip a single enclosing paren group
+    if s.starts_with('(') && s.ends_with(')') {
+        let mut d = 0i32;
+        let mut whole = true;
+        for (i, c) in s.char_indices() {
+            match c {
+                '(' => d += 1,
+                ')' => {
+                    d -= 1;
+                    if d == 0 && i + 1 < s.len() {
+                        whole = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if whole && d == 0 {
+            return math_eval(&s[1..s.len() - 1], rel, em, vh, vw);
+        }
+    }
+    let b = s.as_bytes();
+    // lowest precedence first: top-level +/- (right-to-left for left assoc)
+    let mut depth = 0i32;
+    for i in (0..b.len()).rev() {
+        match b[i] {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' => depth -= 1,
+            b'+' | b'-' if depth == 0 => {
+                if s[..i].trim().is_empty()
+                    || s[..i].trim_end().ends_with(['+', '-', '*', '/'])
+                {
+                    continue; // unary sign
+                }
+                let a = math_eval(&s[..i], rel, em, vh, vw)?;
+                let c = math_eval(&s[i + 1..], rel, em, vh, vw)?;
+                return Some(if b[i] == b'+' { a + c } else { a - c });
+            }
+            _ => {}
+        }
+    }
+    for i in (0..b.len()).rev() {
+        match b[i] {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' => depth -= 1,
+            b'*' | b'/' if depth == 0 => {
+                let a = math_eval(&s[..i], rel, em, vh, vw)?;
+                let c = math_eval(&s[i + 1..], rel, em, vh, vw)?;
+                return Some(if b[i] == b'*' { a * c } else { a / c });
+            }
+            _ => {}
+        }
+    }
+    parse_len_vp(s, rel, em, vh, vw)
+}
+
 /// parse_len plus viewport units (vh/svh/dvh/lvh→vh_px, vw→vw_px).
 /// `em` resolves against `em` (the element's font-size); `%`/`calc()`
 /// percentages against `rel` (containing-block axis size).
 fn parse_len_vp(v: &str, rel: f32, em: f32, vh: f32, vw: f32) -> Option<f32> {
     let v = v.trim().to_lowercase();
+    for fname in ["calc", "min", "max", "clamp"] {
+        if let Some(inner) = v
+            .strip_prefix(fname)
+            .and_then(|x| x.strip_prefix('('))
+            .and_then(|x| x.strip_suffix(')'))
+        {
+            let args = top_args(inner);
+            return match fname {
+                "calc" => math_eval(inner, rel, em, vh, vw),
+                "min" | "max" => {
+                    let mut best: Option<f32> = None;
+                    for a in args {
+                        if let Some(n) = math_eval(a, rel, em, vh, vw) {
+                            best = Some(match (best, fname == "min") {
+                                (None, _) => n,
+                                (Some(b), true) => b.min(n),
+                                (Some(b), false) => b.max(n),
+                            });
+                        }
+                    }
+                    best
+                }
+                _ => {
+                    // clamp(min, val, max)
+                    let lo = args.first().and_then(|a| math_eval(a, rel, em, vh, vw));
+                    let mid = args.get(1).and_then(|a| math_eval(a, rel, em, vh, vw));
+                    let hi = args.get(2).and_then(|a| math_eval(a, rel, em, vh, vw));
+                    match (lo, mid, hi) {
+                        (Some(lo), Some(mid), Some(hi)) => Some(mid.clamp(lo, hi)),
+                        _ => None,
+                    }
+                }
+            };
+        }
+    }
     for suf in ["svh", "dvh", "lvh", "vh"] {
         if let Some(x) = v.strip_suffix(suf) {
             return x.trim().parse::<f32>().ok().map(|n| n * vh / 100.0);
@@ -1294,8 +1418,8 @@ fn track_tokens(s: &str) -> Vec<String> {
     let mut cur = String::new();
     for ch in s.chars() {
         match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
             c if c.is_whitespace() && depth <= 0 => {
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
@@ -1371,18 +1495,34 @@ fn track_spec(t: &str, rel: f32, em: f32, vh: f32, vw: f32) -> GTrack {
     GTrack::Fixed(parse_len_vp(&t, rel, em, vh, vw).unwrap_or(0.0))
 }
 
-/// `grid-template-*`/`grid-auto-*` value → expanded track list.
-/// `none`/empty → []. repeat() expands; auto-fill/auto-fit size against
-/// `avail` using the repeat unit's floor width.
-fn grid_track_list(v: Option<&String>, rel: f32, em: f32, vh: f32, vw: f32, avail: f32, gap: f32) -> Vec<GTrack> {
-    let Some(v) = v else { return Vec::new() };
+/// `grid-template-*`/`grid-auto-*` value → expanded track list plus named
+/// lines: `names[i]` holds the names of the line *before* track i (len =
+/// tracks+1). `none`/empty → ([], []). repeat() expands; auto-fill/auto-fit
+/// size against `avail` using the repeat unit's floor width.
+fn grid_track_list(
+    v: Option<&String>,
+    rel: f32,
+    em: f32,
+    vh: f32,
+    vw: f32,
+    avail: f32,
+    gap: f32,
+) -> (Vec<GTrack>, Vec<Vec<String>>) {
+    let Some(v) = v else { return (Vec::new(), Vec::new()) };
     let v = v.trim();
     if v.is_empty() || v == "none" {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let mut out = Vec::new();
+    let mut out: Vec<GTrack> = Vec::new();
+    let mut names: Vec<Vec<String>> = vec![Vec::new()];
     for tok in track_tokens(v) {
         let t = tok.trim().to_lowercase();
+        if t.starts_with('[') {
+            // [name ...] — names for the line at the current track boundary
+            let inner = t.trim_start_matches('[').trim_end_matches(']');
+            names[out.len()].extend(inner.split_whitespace().map(String::from));
+            continue;
+        }
         if let Some(inner) = t
             .strip_prefix("repeat(")
             .and_then(|x| x.strip_suffix(')'))
@@ -1390,6 +1530,7 @@ fn grid_track_list(v: Option<&String>, rel: f32, em: f32, vh: f32, vw: f32, avai
             let (cnt, rest) = top_comma(inner).unwrap_or((inner, ""));
             let sub: Vec<GTrack> = track_tokens(rest)
                 .iter()
+                .filter(|s| !s.trim().starts_with('['))
                 .map(|s| track_spec(s, rel, em, vh, vw))
                 .collect();
             if sub.is_empty() {
@@ -1409,16 +1550,21 @@ fn grid_track_list(v: Option<&String>, rel: f32, em: f32, vh: f32, vw: f32, avai
         } else {
             out.push(track_spec(&t, rel, em, vh, vw));
         }
+        while names.len() <= out.len() {
+            names.push(Vec::new());
+        }
     }
-    out
+    (out, names)
 }
 
-/// A grid line placement term: `auto`, an integer line, or `span N`.
-#[derive(Clone, Copy, PartialEq)]
+/// A grid line placement term: `auto`, an integer line, `span N`, or a
+/// named line (`content`/`content-start`/`extended-full-end`).
+#[derive(Clone, PartialEq)]
 enum GLine {
     Auto,
     Line(i32),
     Span(i32),
+    Named(String),
 }
 
 fn grid_line_val(t: &str) -> GLine {
@@ -1427,7 +1573,13 @@ fn grid_line_val(t: &str) -> GLine {
         return GLine::Span(rest.trim().parse::<i32>().unwrap_or(1));
     }
     match t.parse::<i32>() {
-        Ok(0) | Err(_) => GLine::Auto,
+        Ok(0) | Err(_) => {
+            if t.is_empty() || t == "auto" {
+                GLine::Auto
+            } else {
+                GLine::Named(t.to_string())
+            }
+        }
         Ok(n) => GLine::Line(n),
     }
 }
@@ -1463,7 +1615,24 @@ fn grid_lines(c: &Props, axis: &str) -> (GLine, GLine) {
 /// Resolve (start, end) line terms → (explicit 0-based track index, span).
 /// Start is None when the item needs auto-placement on this axis.
 /// Negative lines resolve against the explicit track count (-1 = last line).
-fn resolve_axis((s, e): (GLine, GLine), ntracks: usize) -> (Option<usize>, usize) {
+/// `names[i]` are the names of the line before track i; a bare `x` start
+/// term looks for `x-start` then `x`, an end term `x-end` then `x`.
+fn resolve_axis(
+    (s, e): (GLine, GLine),
+    ntracks: usize,
+    names: &[Vec<String>],
+) -> (Option<usize>, usize) {
+    let named = |g: &GLine, is_start: bool| -> GLine {
+        let GLine::Named(n) = g else { return g.clone() };
+        let suffix = if is_start { "-start" } else { "-end" };
+        for w in [format!("{n}{suffix}"), n.clone()] {
+            if let Some(i) = names.iter().position(|ns| ns.iter().any(|x| x == &w)) {
+                return GLine::Line(i as i32 + 1);
+            }
+        }
+        GLine::Auto
+    };
+    let (s, e) = (named(&s, true), named(&e, false));
     // line k>0 → track index k-1; line k<0 → ntracks+1+k (so -1 → ntracks)
     let idx = |l: i32| -> i64 {
         if l > 0 {
@@ -1487,6 +1656,7 @@ fn resolve_axis((s, e): (GLine, GLine), ntracks: usize) -> (Option<usize>, usize
         }
         (GLine::Span(n), _) | (GLine::Auto, GLine::Span(n)) => (None, n.max(1) as usize),
         (GLine::Auto, GLine::Auto) => (None, 1),
+        _ => (None, 1),
     }
 }
 
@@ -1897,6 +2067,13 @@ impl<'a> Layouter<'a> {
                     .unwrap_or(1.0)
                     .clamp(0.0, 1.0);
                 let (i0, h0, bd) = (self.items.len(), self.hits.len(), self.backdrop);
+                // visibility:hidden keeps its box but paints nothing — the
+                // same truncation as opacity:0 (a `visibility:visible`
+                // descendant that should re-show is rare and unsupported)
+                let hidden = matches!(
+                    c.get("visibility").map(String::as_str),
+                    Some("hidden") | Some("collapse")
+                );
                 match c.get("display").map(String::as_str) {
                     _ if visually_hidden => return,
                     Some("none") => return,
@@ -1919,8 +2096,8 @@ impl<'a> Layouter<'a> {
                     }
                     _ => self.inline(node, tag, &c, st),
                 }
-                if op <= 0.0 {
-                    // fully transparent: nothing painted, nothing clickable
+                if op <= 0.0 || hidden {
+                    // fully transparent/hidden: nothing painted, nothing clickable
                     self.items.truncate(i0);
                     self.hits.truncate(h0);
                 } else if op < 1.0 {
@@ -2000,6 +2177,12 @@ impl<'a> Layouter<'a> {
             let v = v.trim();
             st.pre = matches!(v, "pre" | "pre-wrap");
             st.nowrap = matches!(v, "pre" | "pre-wrap" | "nowrap");
+        }
+        if let Some(v) = c.get("overflow-wrap").or_else(|| c.get("word-wrap")) {
+            st.break_word |= matches!(v.trim(), "break-word" | "anywhere");
+        }
+        if let Some(v) = c.get("word-break") {
+            st.break_word |= matches!(v.trim(), "break-all" | "break-word");
         }
         if let Some(v) = c.get("vertical-align") {
             st.shift = match v.as_str() {
@@ -3371,9 +3554,9 @@ impl<'a> Layouter<'a> {
             .map(String::as_str)
             .or(t_rows.as_deref())
             .map(String::from);
-        let col_specs =
+        let (col_specs, col_names) =
             grid_track_list(col_src.as_ref(), avail, st.size, self.viewport_h, avail, avail, col_gap);
-        let row_specs =
+        let (row_specs, row_names) =
             grid_track_list(row_src.as_ref(), row_rel, st.size, self.viewport_h, avail, row_rel, row_gap);
         // `grid-template-areas: 'a b' 'c b'` → name → (row, col, row+1, col+1)
         // bounding box; `grid-area: name` items resolve to those cells.
@@ -3400,10 +3583,24 @@ impl<'a> Layouter<'a> {
                 e.3 = e.3.max(ci);
             }
         }
-        let auto_cols =
-            grid_track_list(c.get("grid-auto-columns"), avail, st.size, self.viewport_h, avail, avail, col_gap);
-        let auto_rows =
-            grid_track_list(c.get("grid-auto-rows"), row_rel, st.size, self.viewport_h, avail, row_rel, row_gap);
+        let (auto_cols, _) = grid_track_list(
+            c.get("grid-auto-columns"),
+            avail,
+            st.size,
+            self.viewport_h,
+            avail,
+            avail,
+            col_gap,
+        );
+        let (auto_rows, _) = grid_track_list(
+            c.get("grid-auto-rows"),
+            row_rel,
+            st.size,
+            self.viewport_h,
+            avail,
+            row_rel,
+            row_gap,
+        );
         let spec_at = |specs: &[GTrack], auto: &[GTrack], i: usize| -> GTrack {
             if let Some(t) = specs.get(i) {
                 return *t;
@@ -3470,8 +3667,8 @@ impl<'a> Layouter<'a> {
                     r1 - r0 + 1,
                 )
             } else {
-                let (ecol, cs) = resolve_axis(grid_lines(&ic, "column"), exp_cols);
-                let (erow, rs) = resolve_axis(grid_lines(&ic, "row"), exp_rows);
+                let (ecol, cs) = resolve_axis(grid_lines(&ic, "column"), exp_cols, &col_names);
+                let (erow, rs) = resolve_axis(grid_lines(&ic, "row"), exp_rows, &row_names);
                 (ecol, cs, erow, rs)
             };
             ncols = ncols.max(ecol.map(|cix| cix + cs).unwrap_or(cs));
@@ -3588,8 +3785,10 @@ impl<'a> Layouter<'a> {
                 // border-box `width` → strip padding+border for content size
                 if bb { w - p[1] - p[3] - bw[1] - bw[3] } else { w }
             });
+            // auto tracks size to the item's max-content contribution
+            // (minmax(0,X) clamps at X) — min-content would wrap every word
             let intrinsic_w = w_prop
-                .unwrap_or_else(|| self.flex_shrink_width(ch, &cc, &cst).min(avail))
+                .unwrap_or_else(|| self.max_content_width(ch, &cst).min(avail))
                 .max(0.0);
             let ps = cc.get("place-self").map(|v| {
                 let mut it = v.split_whitespace();
@@ -4117,7 +4316,7 @@ impl<'a> Layouter<'a> {
                 }
                 Some("grid") | Some("inline-grid") => {
                     // fixed track sum beats text (repeat(8,64px) → 512)
-                    let tracks = grid_track_list(
+                    let (tracks, _) = grid_track_list(
                         c.get("grid-template-columns"),
                         self.avail_w,
                         st.size,
@@ -4721,8 +4920,12 @@ impl<'a> Layouter<'a> {
         {
             self.flush_line();
         }
-        if !st.nowrap && w > self.content_width() + 0.5 && self.line.is_empty() {
-            // word longer than the line — split mid-word
+        if st.break_word
+            && !st.nowrap
+            && w > self.content_width() + 0.5
+            && self.line.is_empty()
+        {
+            // word longer than the line — split mid-word (overflow-wrap etc.)
             let (mut chunk, mut cw) = (String::new(), 0.0f32);
             for c in word.chars() {
                 let fw = self
