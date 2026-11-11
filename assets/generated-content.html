@@ -1,0 +1,30 @@
+<!doctype html>
+<html><head><title>pseudo-content smoke</title><style>
+body { font-family: serif; counter-reset: h }
+.gen::before { content: '[' attr(data-tag) '] '; color: purple }
+.gen::after { content: ' — fin'; font-style: italic }
+h3 { counter-increment: h }
+h3::before { content: counter(h, upper-roman) '. '; color: navy }
+ol.roman > li { list-style-type: lower-roman }
+ul.dash > li { list-style-type: "- " }
+.inside > li { list-style: inside square }
+ol#rev { margin-left: 1em }
+p.drop::first-letter { font-size: 2.4em; color: crimson; font-weight: bold }
+p.fl::first-line { font-weight: bold; color: teal }
+::selection { background-color: goldenrod }
+input::placeholder { color: silver }
+</style></head><body>
+<p class="gen" data-tag="x">between the brackets</p>
+<h3>first</h3><h3>second</h3>
+<ol start="5"><li>five</li><li>six</li></ol>
+<ol class="roman"><li>uno</li><li>duo</li></ol>
+<ul class="dash"><li>dashed</li><li>dashed</li></ul>
+<ul><li>outer<ul><li>nested<ul><li>deep</li></ul></li></ul></li></ul>
+<ol id="rev" reversed><li>third</li><li>second</li><li>first</li></ol>
+<ul class="inside"><li>inside marker text on the same line as the item</li></ul>
+<p class="drop">Drop-cap-ish first letter, then flowing body text that wraps
+around to a second line so the first-line rule below has something to do.</p>
+<p class="fl">First line should be bold teal while the remainder of this
+paragraph — which wraps on — stays in the base text style.</p>
+<input placeholder="styled placeholder">
+</body></html>
