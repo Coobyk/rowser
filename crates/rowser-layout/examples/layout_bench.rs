@@ -58,6 +58,13 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 }
                 mix(src.as_bytes());
             }
+            DisplayItem::PushTransform { m } => {
+                mix(&[6]);
+                for v in m.0 {
+                    mix(&v.to_bits().to_le_bytes());
+                }
+            }
+            DisplayItem::PopTransform => mix(&[7]),
         }
     }
     h

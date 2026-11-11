@@ -157,9 +157,23 @@ fn main() {
                 }
             }
             ToRenderer::Click { x, y } => {
-                // hit-test link regions in document space
+                // hit-test link regions in document space — the transform
+                // stack maps each item's coords to painted position, so
+                // the click is inverse-mapped back into that space
                 let mut found = None;
+                let mut xf: Vec<rowser_layout::xform::Mat> = Vec::new();
                 for it in &page.items {
+                    match it {
+                        rowser_layout::DisplayItem::PushTransform { m } => {
+                            xf.push(*m);
+                            continue;
+                        }
+                        rowser_layout::DisplayItem::PopTransform => {
+                            xf.pop();
+                            continue;
+                        }
+                        _ => {}
+                    }
                     if let rowser_layout::DisplayItem::Text {
                         x: tx,
                         baseline,
@@ -175,8 +189,14 @@ fn main() {
                             .font(*font)
                             .map(|f| f.measure(text, *size))
                             .unwrap_or(0.0);
+                        let (cx, cy) = xf
+                            .iter()
+                            .fold(rowser_layout::xform::Mat::IDENTITY, |a, m| a.mul(m))
+                            .inverse()
+                            .map(|inv| inv.apply(x, y))
+                            .unwrap_or((x, y));
                         // rough hit box: from x to x+width, baseline-ascent to baseline+descent
-                        if x >= *tx && x <= *tx + w && y >= baseline - size && y <= *baseline + size * 0.4 {
+                        if cx >= *tx && cx <= *tx + w && cy >= baseline - size && cy <= *baseline + size * 0.4 {
                             found = Some(href.clone());
                             break;
                         }
@@ -197,8 +217,13 @@ fn main() {
                     let target = page
                         .hits
                         .iter()
-                        .filter(|(hx, hy, hw, hh, _)| {
-                            x >= *hx && x <= hx + hw && y >= *hy && y <= hy + hh
+                        .filter(|(hx, hy, hw, hh, _, m)| {
+                            // inverse-map the click into the hit's
+                            // pre-transform space — exact for rotated /
+                            // skewed / scaled elements, not just a bbox
+                            let Some(inv) = m.inverse() else { return false };
+                            let (px, py) = inv.apply(x, y);
+                            px >= *hx && px <= hx + hw && py >= *hy && py <= hy + hh
                         })
                         .min_by(|a, b| {
                             (a.2 * a.3)
@@ -348,8 +373,10 @@ struct Page {
     /// Live page-JS job channel — the interpreter thread owns the real
     /// document; `doc` is a snapshot refreshed after each dispatched event.
     js: Option<std::sync::mpsc::Sender<JsJob>>,
-    /// Element border boxes (x, y, w, h, node) for click hit-testing.
-    hits: Vec<(f32, f32, f32, f32, rowser_dom::NodeId)>,
+    /// Element border boxes (x, y, w, h, node, transform) for click
+    /// hit-testing — the rect is in pre-transform space; the matrix maps
+    /// it to painted position (inverse-mapped against click points).
+    hits: Vec<rowser_layout::Hit>,
     viewport: (u32, u32),
     scroll: f32,
     content_h: f32,
@@ -833,6 +860,7 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
             }
             for h in &mut self.hits {
                 h.1 -= dy;
+                h.5 = h.5.conjugated(0.0, -dy);
             }
             self.items_scroll = self.scroll;
         }
@@ -1155,6 +1183,10 @@ fn shift_item_y(it: &mut rowser_layout::DisplayItem, dy: f32) {
         | D::RoundedRect { y, .. }
         | D::Raster { y, .. }
         | D::Image { y, .. } => *y += dy,
+        // the wrapped items' coords shift too — conjugate so painted
+        // output moves by the same dy (T(d)·M·T(-d) ∘ p+d = M(p)+d)
+        D::PushTransform { m } => *m = m.conjugated(0.0, dy),
+        D::PopTransform => {}
     }
 }
 
