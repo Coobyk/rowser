@@ -769,6 +769,10 @@ impl<'a> StyleCtx<'a> {
         // `--*` decls from rules matching this node (element_customs folded
         // into the main match pass — one selector match per rule, not two).
         let mut customs: StrMap<String> = StrMap::default();
+        // props whose winning decl is !important — the inline style
+        // attribute may only override those with !important of its own
+        let mut important_props: rustc_hash::FxHashSet<String> =
+            rustc_hash::FxHashSet::default();
         let mut order = 0usize;
         for (origin, sheet) in self.sheets.iter().enumerate() {
             // origin 0 = UA (weakest), later = author
@@ -797,18 +801,52 @@ impl<'a> StyleCtx<'a> {
                     if d.prop.starts_with("--") {
                         customs.insert(d.prop.clone(), d.value.clone());
                     }
-                    each_physical(&d.prop, |prop| match out.get_mut(prop) {
-                        Some(e) => {
-                            if (pri, spec, order) >= (e.1, e.2, e.3) {
-                                *e = (d.value.clone(), pri, spec, order);
-                            }
+                    each_physical(&d.prop, |prop| {
+                        if d.important {
+                            important_props.insert(prop.to_string());
                         }
-                        None => {
-                            out.insert(prop.to_string(), (d.value.clone(), pri, spec, order));
+                        match out.get_mut(prop) {
+                            Some(e) => {
+                                if (pri, spec, order) >= (e.1, e.2, e.3) {
+                                    *e = (d.value.clone(), pri, spec, order);
+                                }
+                            }
+                            None => {
+                                out.insert(prop.to_string(), (d.value.clone(), pri, spec, order));
+                            }
                         }
                     });
                 }
                 order += 1;
+            }
+        }
+        // The inline `style` attribute is the strongest normal source: it
+        // beats author rules but loses to author !important; an !important
+        // decl inside it beats everything.
+        if let Some(s) = doc.attr(node, "style") {
+            for d in inline_decls(s) {
+                if d.prop.starts_with("--") {
+                    customs.insert(d.prop.clone(), d.value.clone());
+                    continue;
+                }
+                if d.important {
+                    each_physical(&d.prop, |prop| {
+                        important_props.insert(prop.to_string());
+                        out.insert(
+                            prop.to_string(),
+                            (d.value.clone(), 250, (u32::MAX, u32::MAX, u32::MAX), usize::MAX),
+                        );
+                    });
+                } else {
+                    each_physical(&d.prop, |prop| {
+                        if !important_props.contains(prop) {
+                            out.insert(
+                                prop.to_string(),
+                                (d.value.clone(), 2, (u32::MAX, u32::MAX, u32::MAX), usize::MAX),
+                            );
+                        }
+                    });
+                }
             }
         }
         let mut props: StrMap<String> =
@@ -909,6 +947,46 @@ fn element_customs(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> StrM
     out
 }
 
+/// Parse an element `style` attribute into declarations: `prop:value` pairs
+/// split on top-level `;` (parens protect `;` inside functions), with the
+/// `!important` suffix stripped into the flag.
+fn inline_decls(style: &str) -> Vec<Decl> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    let flush = |cur: &mut String, out: &mut Vec<Decl>| {
+        let part = cur.trim().to_string();
+        cur.clear();
+        if let Some((p, v)) = part.split_once(':') {
+            let mut value = v.trim().to_string();
+            let important = if value.to_lowercase().ends_with("!important") {
+                value = value[..value.len() - 10].trim().to_string();
+                true
+            } else {
+                false
+            };
+            let prop = p.trim().to_lowercase();
+            if !prop.is_empty() && !value.is_empty() {
+                out.push(Decl { prop, value, important });
+            }
+        }
+    };
+    for ch in style.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ';' if depth <= 0 => {
+                flush(&mut cur, &mut out);
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
 /// Substitute `var(--name)` and `var(--name, fallback)` recursively.
 fn resolve_vars(value: &str, customs: &StrMap<String>) -> String {
     let mut out = value.to_string();
@@ -1004,6 +1082,19 @@ mod tests {
     }
 
     #[test]
+    fn inline_style_attr_wins() {
+        let doc = rowser_html::parse("<body><p style=\"color:green\">hi</p></body>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let author = parse("p { color: red }");
+        let c = computed(&doc, p, &[&author]);
+        assert_eq!(c.get("color").unwrap(), "green");
+        // ...but author !important still beats a normal inline decl
+        let important = parse("p { color: blue !important }");
+        let c = computed(&doc, p, &[&important]);
+        assert_eq!(c.get("color").unwrap(), "blue");
+    }
+
+    #[test]
     fn cascade_important() {
         let doc = rowser_html::parse("<body><p id=a>hi</p></body>");
         let p = doc.find_deep(doc.root, "p").unwrap();
@@ -1056,6 +1147,12 @@ fn supports_matches(q: &str) -> bool {
         "margin-left", "padding", "padding-top", "padding-right", "padding-bottom",
         "padding-left", "border", "width", "height", "line-height", "float", "gap",
         "border-collapse",
+        "grid-template-columns", "grid-template-rows", "grid-column", "grid-row",
+        "grid-column-start", "grid-column-end", "grid-row-start", "grid-row-end",
+        "grid-auto-flow", "grid-auto-rows", "grid-auto-columns", "row-gap",
+        "column-gap", "place-items", "place-content", "place-self", "align-items",
+        "justify-items", "align-content", "justify-content", "align-self",
+        "justify-self", "aspect-ratio",
     ];
     let mut ok = true;
     for part in q.split('(').skip(1) {

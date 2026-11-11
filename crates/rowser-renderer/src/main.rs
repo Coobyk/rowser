@@ -472,6 +472,40 @@ impl Page {
         }
     }
 
+/// Rasterize an SVG document body to an Image — `<img src="*.svg">` pieces
+/// and icons. Rendered at 4× natural size for downscale antialiasing.
+fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
+    let text = std::str::from_utf8(body).ok()?;
+    if !text.trim_start().starts_with('<') || !text[..text.len().min(512)].contains("<svg") {
+        return None;
+    }
+    let doc = rowser_html::parse(text);
+    let svg = doc.find_deep(doc.root, "svg")?;
+    let dim = |name: &str| -> Option<f32> {
+        doc.attr(svg, name)
+            .and_then(|v| v.trim_end_matches("px").parse().ok())
+    };
+    let (w, h) = match (dim("width"), dim("height")) {
+        (Some(w), Some(h)) => (w, h),
+        _ => doc
+            .attr(svg, "viewBox")
+            .or_else(|| doc.attr(svg, "viewbox"))
+            .and_then(|v| {
+                let n: Vec<f32> = v
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter_map(|t| t.parse().ok())
+                    .collect();
+                (n.len() >= 4).then(|| (n[2], n[3]))
+            })?,
+    };
+    let (rw, rh) = ((w * 4.0) as u32, (h * 4.0) as u32);
+    Some(rowser_image::Image {
+        width: rw,
+        height: rh,
+        pixels: rowser_layout::svg::render(&doc, svg, rw, rh, 0xff000000),
+    })
+}
+
     /// Spawn a worker pool decoding fetched bodies to Images — CPU-heavy,
     /// so it only runs at fill time when nothing else is on the main thread.
     fn spawn_decode_workers(&mut self, jobs: Vec<(String, Vec<u8>)>) {
@@ -487,7 +521,7 @@ impl Page {
             std::thread::spawn(move || loop {
                 let job = queue.lock().unwrap().pop_front();
                 let Some((url, body)) = job else { break };
-                let img = rowser_image::decode(&body).ok();
+                let img = rowser_image::decode(&body).ok().or_else(|| Self::decode_svg(&body));
                 if tx.send((url, ImgMsg::Decoded(img))).is_err() {
                     break;
                 }

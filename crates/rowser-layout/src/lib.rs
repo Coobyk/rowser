@@ -11,7 +11,7 @@
 //! and minimal auto table layout (table/tr/td/th with per-cell borders).
 
 use rowser_css as css;
-mod svg;
+pub mod svg;
 
 use rowser_dom::{Document, NodeId, NodeKind};
 use rowser_text::FontCache;
@@ -704,6 +704,274 @@ fn parse_border(v: &str, _rel: f32) -> Option<(f32, Color)> {
     width.zip(color.or(Some(BLACK)))
 }
 
+// ---------- CSS Grid (autoplacement-capable subset) ----------
+
+/// `aspect-ratio: <a>/<b>` (or a bare number) → w/h ratio.
+fn aspect_ratio(c: &Props) -> Option<f32> {
+    let v = c.get("aspect-ratio")?.trim().replace("auto", "");
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let (a, b) = v
+        .split_once('/')
+        .map(|(a, b)| (a.trim(), b.trim()))
+        .unwrap_or((v, "1"));
+    let (a, b) = (a.parse::<f32>().ok()?, b.parse::<f32>().ok()?);
+    (a > 0.0 && b > 0.0).then_some(a / b)
+}
+
+/// A track size parsed from `grid-template-*`/`grid-auto-*`.
+#[derive(Clone, Copy)]
+enum GTrack {
+    /// Fixed length (px already resolved).
+    Fixed(f32),
+    /// `Nfr` fraction of leftover space, with a floor (from minmax min).
+    Fr(f32, f32),
+    /// Content-sized track clamped to [min, max] (auto, minmax, fit-content).
+    Auto(f32, f32),
+}
+
+/// Whitespace-split `s` into tokens, keeping `fn(...)` groups together.
+fn track_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            c if c.is_whitespace() && depth <= 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(ch);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Split on the first top-level comma (for repeat()/minmax() args).
+fn top_comma(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth <= 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn track_floor(t: &GTrack) -> f32 {
+    match *t {
+        GTrack::Fixed(x) => x,
+        GTrack::Fr(_, m) => m,
+        GTrack::Auto(m, _) => m,
+    }
+}
+
+/// One non-repeat track token → GTrack. `rel` is the %/em base (axis size).
+fn track_spec(t: &str, rel: f32, vh: f32, vw: f32) -> GTrack {
+    let t = t.trim().to_lowercase();
+    if let Some(f) = t.strip_suffix("fr") {
+        return GTrack::Fr(f.trim().parse::<f32>().unwrap_or(1.0).max(0.0), 0.0);
+    }
+    if t == "auto" || t == "min-content" || t == "max-content" {
+        return GTrack::Auto(0.0, f32::MAX);
+    }
+    if let Some(inner) = t
+        .strip_prefix("minmax(")
+        .and_then(|x| x.strip_suffix(')'))
+    {
+        let (a, b) = top_comma(inner).unwrap_or((inner, "auto"));
+        let min = if a.trim() == "auto" {
+            0.0
+        } else {
+            parse_len_vp(a.trim(), rel, vh, vw).unwrap_or(0.0)
+        };
+        let b = b.trim();
+        if let Some(f) = b.strip_suffix("fr") {
+            return GTrack::Fr(f.trim().parse::<f32>().unwrap_or(1.0).max(0.0), min);
+        }
+        if b == "auto" || b == "min-content" || b == "max-content" {
+            return GTrack::Auto(min, f32::MAX);
+        }
+        return GTrack::Auto(min, parse_len_vp(b, rel, vh, vw).unwrap_or(f32::MAX));
+    }
+    if let Some(inner) = t
+        .strip_prefix("fit-content(")
+        .and_then(|x| x.strip_suffix(')'))
+    {
+        return GTrack::Auto(0.0, parse_len_vp(inner.trim(), rel, vh, vw).unwrap_or(f32::MAX));
+    }
+    GTrack::Fixed(parse_len_vp(&t, rel, vh, vw).unwrap_or(0.0))
+}
+
+/// `grid-template-*`/`grid-auto-*` value → expanded track list.
+/// `none`/empty → []. repeat() expands; auto-fill/auto-fit size against
+/// `avail` using the repeat unit's floor width.
+fn grid_track_list(v: Option<&String>, rel: f32, vh: f32, vw: f32, avail: f32, gap: f32) -> Vec<GTrack> {
+    let Some(v) = v else { return Vec::new() };
+    let v = v.trim();
+    if v.is_empty() || v == "none" {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for tok in track_tokens(v) {
+        let t = tok.trim().to_lowercase();
+        if let Some(inner) = t
+            .strip_prefix("repeat(")
+            .and_then(|x| x.strip_suffix(')'))
+        {
+            let (cnt, rest) = top_comma(inner).unwrap_or((inner, ""));
+            let sub: Vec<GTrack> = track_tokens(rest)
+                .iter()
+                .map(|s| track_spec(s, rel, vh, vw))
+                .collect();
+            if sub.is_empty() {
+                continue;
+            }
+            let cnt = cnt.trim();
+            let n = if cnt == "auto-fill" || cnt == "auto-fit" {
+                let unit: f32 =
+                    sub.iter().map(track_floor).sum::<f32>() + gap * (sub.len() - 1) as f32;
+                (((avail + gap) / (unit + gap).max(1.0)).floor() as usize).max(1)
+            } else {
+                cnt.parse::<usize>().unwrap_or(1)
+            };
+            for _ in 0..n.min(1000) {
+                out.extend_from_slice(&sub);
+            }
+        } else {
+            out.push(track_spec(&t, rel, vh, vw));
+        }
+    }
+    out
+}
+
+/// A grid line placement term: `auto`, an integer line, or `span N`.
+#[derive(Clone, Copy, PartialEq)]
+enum GLine {
+    Auto,
+    Line(i32),
+    Span(i32),
+}
+
+fn grid_line_val(t: &str) -> GLine {
+    let t = t.trim().to_lowercase();
+    if let Some(rest) = t.strip_prefix("span") {
+        return GLine::Span(rest.trim().parse::<i32>().unwrap_or(1));
+    }
+    match t.parse::<i32>() {
+        Ok(0) | Err(_) => GLine::Auto,
+        Ok(n) => GLine::Line(n),
+    }
+}
+
+/// `grid-column`/`grid-row` + `-start`/`-end` → (start, end) line terms.
+fn grid_lines(c: &Props, axis: &str) -> (GLine, GLine) {
+    let (mut s, mut e) = (GLine::Auto, GLine::Auto);
+    if let Some(v) = c.get(&format!("grid-{axis}")) {
+        let mut it = v.split('/');
+        s = grid_line_val(it.next().unwrap_or(""));
+        if let Some(t) = it.next() {
+            e = grid_line_val(t);
+        }
+    }
+    if let Some(v) = c.get(&format!("grid-{axis}-start")) {
+        s = grid_line_val(v);
+    }
+    if let Some(v) = c.get(&format!("grid-{axis}-end")) {
+        e = grid_line_val(v);
+    }
+    (s, e)
+}
+
+/// Resolve (start, end) line terms → (explicit 0-based track index, span).
+/// Start is None when the item needs auto-placement on this axis.
+/// Negative lines resolve against the explicit track count (-1 = last line).
+fn resolve_axis((s, e): (GLine, GLine), ntracks: usize) -> (Option<usize>, usize) {
+    // line k>0 → track index k-1; line k<0 → ntracks+1+k (so -1 → ntracks)
+    let idx = |l: i32| -> i64 {
+        if l > 0 {
+            l as i64 - 1
+        } else {
+            ntracks as i64 + 1 + l as i64
+        }
+    };
+    match (s, e) {
+        (GLine::Line(a), GLine::Line(b)) => {
+            let (a, b) = (idx(a), idx(b));
+            let (lo, hi) = (a.min(b), a.max(b));
+            (Some(lo.max(0) as usize), (hi - lo).max(1) as usize)
+        }
+        (GLine::Line(a), GLine::Span(n)) => (Some(idx(a).max(0) as usize), n.max(1) as usize),
+        (GLine::Line(a), GLine::Auto) => (Some(idx(a).max(0) as usize), 1),
+        (GLine::Auto, GLine::Line(b)) => (Some((idx(b) - 1).max(0) as usize), 1),
+        (GLine::Span(n), GLine::Line(b)) => {
+            let end = idx(b);
+            (Some((end - n as i64).max(0) as usize), n.max(1) as usize)
+        }
+        (GLine::Span(n), _) | (GLine::Auto, GLine::Span(n)) => (None, n.max(1) as usize),
+        (GLine::Auto, GLine::Auto) => (None, 1),
+    }
+}
+
+/// Item/box alignment along one axis (justify-items/self, align-items/self).
+#[derive(Clone, Copy, PartialEq)]
+enum GAlign {
+    Stretch,
+    Start,
+    End,
+    Center,
+}
+
+fn galign(v: Option<&String>) -> Option<GAlign> {
+    Some(match v?.trim() {
+        "start" | "flex-start" | "left" | "top" | "self-start" | "baseline" => GAlign::Start,
+        "end" | "flex-end" | "right" | "bottom" | "self-end" => GAlign::End,
+        "center" => GAlign::Center,
+        "stretch" | "normal" | "auto" => GAlign::Stretch,
+        _ => return None,
+    })
+}
+
+/// *-content distribution: leftover space → (extra per gap, start offset).
+fn content_offset(v: Option<&String>, extra: f32, n: usize) -> (f32, f32) {
+    let kw = v.map(|s| s.as_str()).unwrap_or("start");
+    let kw = kw.split_whitespace().last().unwrap_or("start");
+    match kw {
+        "end" | "right" | "flex-end" | "bottom" => (0.0, extra),
+        "center" => (0.0, extra / 2.0),
+        "space-between" if n > 1 => (extra / (n - 1) as f32, 0.0),
+        "space-around" => (extra / n.max(1) as f32, extra / n.max(1) as f32 / 2.0),
+        "space-evenly" => (extra / (n + 1) as f32, extra / (n + 1) as f32),
+        _ => (0.0, 0.0),
+    }
+}
+
+/// Is the r×c rect of `rs`×`cs` cells free in the occupancy grid?
+fn grid_free(occ: &[Vec<bool>], ncols: usize, r: usize, c: usize, rs: usize, cs: usize) -> bool {
+    if c + cs > ncols {
+        return false;
+    }
+    for row in occ.iter().skip(r).take(rs) {
+        if row[c..c + cs].iter().any(|&x| x) {
+            return false;
+        }
+    }
+    true
+}
+
 // ---------- the layouter ----------
 
 struct Word {
@@ -844,6 +1112,13 @@ pub struct Layouter<'a> {
     anchors: Vec<(String, f32)>,
     /// viewport height — vh/svh units and flex justify-center
     viewport_h: f32,
+    /// definite height of the current containing block — the nearest
+    /// positioned ancestor with an explicit height; drives `top`+`bottom`
+    /// stretching on `position:absolute` descendants
+    cb_h: Option<f32>,
+    /// `top`+`bottom` stretch of the block currently laying its children —
+    /// feeds `grid_children`'s definite container height
+    inset_h: Option<f32>,
 }
 
 impl<'a> Layouter<'a> {
@@ -892,6 +1167,8 @@ impl<'a> Layouter<'a> {
             scroll,
             anchors: Vec::new(),
             viewport_h,
+            cb_h: None,
+            inset_h: None,
         };
         l.preresolve_styles();
         l.walk(doc.root, &base_style());
@@ -1003,10 +1280,12 @@ impl<'a> Layouter<'a> {
                 self.apply_computed(&c, &mut st);
                 match c.get("display").map(String::as_str) {
                     Some("none") => return,
-                    Some("block") | Some("list-item") | Some("flex") => {
+                    Some("block") | Some("list-item") | Some("flex") | Some("grid") => {
                         self.block(node, tag, &c, st);
                     }
-                    Some("inline-block") => self.inline_block(node, &c, st),
+                    Some("inline-block") | Some("inline-flex") | Some("inline-grid") => {
+                        self.inline_block(node, &c, st)
+                    }
                     _ => self.inline(node, tag, &c, st),
                 }
             }
@@ -1101,11 +1380,23 @@ impl<'a> Layouter<'a> {
             c.get("position").map(String::as_str),
             Some("fixed") | Some("sticky") | Some("absolute")
         );
+        // explicit `height` — definite containing-block height for positioned
+        // descendants and a floor for this box's own extent
+        let h_prop = side(c, "height", self.viewport_h);
+        // `inset` shorthand + longhands merged into [top, right, bottom, left]
+        let ish = sides(c, "inset", self.avail_w);
+        let inset_l = |name: &str, i: usize, rel: f32| {
+            c.get(name).and_then(|v| parse_len(v, rel)).or(ish[i])
+        };
+        let ins_t = inset_l("top", 0, st.size);
+        let ins_r = inset_l("right", 1, self.avail_w);
+        let ins_b = inset_l("bottom", 2, st.size);
+        let ins_l = inset_l("left", 3, self.avail_w);
         let flow_y = if positioned {
             let fy = self.y;
             let fmx = self.margin_x;
             let pos = c.get("position").map(String::as_str);
-            if let Some(t) = c.get("top").and_then(|v| parse_len(v, st.size)) {
+            if let Some(t) = ins_t {
                 // y is viewport-mapped (scroll already baked in): fixed pins
                 // to `top`, sticky clamps at `top` once scrolled past
                 self.y = match pos {
@@ -1114,13 +1405,21 @@ impl<'a> Layouter<'a> {
                     _ => t,
                 };
             }
-            if let Some(l) = c.get("left").and_then(|v| parse_len(v, self.avail_w)) {
-                self.margin_x = l.max(0.0);
+            if let Some(l) = ins_l {
+                self.margin_x = fmx + l.max(0.0);
             }
             Some((fy, fmx))
         } else {
             None
         };
+        // `left`+`right`/`top`+`bottom` on a positioned box stretch it to the
+        // containing block (approx: current available width / viewport height)
+        let inset_w = ins_l
+            .zip(ins_r)
+            .map(|(l, r)| (self.avail_w - l - r).max(0.0));
+        let inset_h = ins_t
+            .zip(ins_b)
+            .map(|(t, b)| (self.cb_h.unwrap_or(self.viewport_h) - t - b).max(0.0));
         let size = st.size;
         let [mt, mr, mb, ml] = box_sides(c, "margin", size);
         let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
@@ -1140,7 +1439,7 @@ impl<'a> Layouter<'a> {
         // `width` caps the content box; `margin-?:auto` splits leftover space
         let mut ml = ml;
         let mut mr = mr;
-        let mut w_prop = side(c, "width", self.avail_w);
+        let mut w_prop = side(c, "width", self.avail_w).or(inset_w);
         if let Some(mxw) = c.get("max-width").and_then(|v| parse_len_vp(v, self.avail_w, self.viewport_h, self.avail_w)) {
             w_prop = Some(w_prop.unwrap_or(self.avail_w).min(mxw));
         }
@@ -1238,18 +1537,33 @@ impl<'a> Layouter<'a> {
             if let Some(m) = marker {
                 self.word(&m, &st);
             }
-            if matches!(c.get("display").map(String::as_str), Some("flex")) {
-                self.flex_children(node, c, st);
-            } else {
-                for &ch in self.doc.children(node) {
-                    self.walk(ch, &st);
+            // containing-block height for positioned descendants: a box with
+            // position + a definite height anchors `inset`-stretched children
+            let saved_cb_h = self.cb_h;
+            let saved_inset = self.inset_h;
+            if positioned || c.get("position").map(String::as_str) == Some("relative") {
+                if let Some(h) = h_prop {
+                    self.cb_h = Some(h);
                 }
             }
+            self.inset_h = inset_h;
+            match c.get("display").map(String::as_str) {
+                Some("flex") | Some("inline-flex") => self.flex_children(node, c, st),
+                Some("grid") | Some("inline-grid") => self.grid_children(node, c, &st),
+                _ => {
+                    for &ch in self.doc.children(node) {
+                        self.walk(ch, &st);
+                    }
+                }
+            }
+            self.cb_h = saved_cb_h;
+            self.inset_h = saved_inset;
             self.flush_line();
-            // min-height: grow the box; centered flex columns shift children
+            // min-height/height: grow the box; centered flex columns shift children
             if let Some(mh) = c
                 .get("min-height")
                 .and_then(|v| parse_len_vp(v, self.avail_w, self.viewport_h, self.avail_w))
+                .or(h_prop)
             {
                 let extra = mh - (self.y - content_top);
                 if extra > 0.0 {
@@ -1270,6 +1584,14 @@ impl<'a> Layouter<'a> {
                     }
                     self.y += extra;
                 }
+            }
+        }
+        // positioned box with `top`+`bottom` (e.g. `inset:0`): stretch to the
+        // containing height even when content is shorter
+        if let Some(ih) = inset_h {
+            let extra = ih - (self.y - content_top);
+            if extra > 0.0 {
+                self.y += extra;
             }
         }
         // padding-bottom + border extend the painted box below content
@@ -1417,7 +1739,10 @@ impl<'a> Layouter<'a> {
         let inner = (box_w - pl - pr - 2.0 * bw).max(1.0);
 
         let (items, y_end) = self.nest(node, &st, pl + bw, pt + bw, inner, c);
-        let box_h = side(c, "height", self.avail_w).unwrap_or(y_end + pb + bw).max(1.0);
+        let box_h = side(c, "height", self.avail_w)
+            .or_else(|| aspect_ratio(c).map(|r| box_w / r))
+            .unwrap_or(y_end + pb + bw)
+            .max(1.0);
 
         let mut out: Vec<DisplayItem> = Vec::new();
         if let Some(col) = bg {
@@ -1713,6 +2038,559 @@ impl<'a> Layouter<'a> {
         }
     }
 
+    /// `display:grid|inline-grid` children. Resolve the track templates,
+    /// place items (explicit line numbers or row/column auto-flow), size
+    /// tracks (fixed lengths, `fr` shares of leftover space, content-sized
+    /// auto/minmax), then lay each item into its cell rect via `nest` and
+    /// emit its box at the aligned offset.
+    /// Subset: no named lines/areas/subgrid; non-element children skipped.
+    fn grid_children(&mut self, node: NodeId, c: &Props, st: &Style) {
+        struct GItem {
+            id: NodeId,
+            r: usize,
+            c: usize,
+            rs: usize,
+            cs: usize,
+            st: Style,
+            cc: Rc<Props>,
+            m: [f32; 4],
+            p: [f32; 4],
+            bw: f32,
+            bg: Option<Color>,
+            border: Option<(f32, Color)>,
+            radius: f32,
+            shadow: Option<(f32, f32, Color)>,
+            w_prop: Option<f32>,
+            h_prop: Option<f32>,
+            min_h: Option<f32>,
+            max_h: Option<f32>,
+            intrinsic_w: f32,
+            ratio: Option<f32>,
+            just: GAlign,
+            al: GAlign,
+            laid: Vec<DisplayItem>,
+            /// border-box height of the laid content (pre-stretch)
+            box_h_intr: f32,
+        }
+        let avail = self.avail_w.max(1.0);
+        let x0 = self.margin_x;
+        let y0 = self.y;
+        // definite container height (`height` prop, or `top`+`bottom` stretch
+        // on a positioned grid) — drives fr rows and align-content; % resolves
+        // against the viewport as approximation
+        let cont_h = c
+            .get("height")
+            .and_then(|v| parse_len_vp(v, self.viewport_h, self.viewport_h, avail))
+            .or(self.inset_h)
+            .filter(|h| *h > 0.0);
+
+        // gaps: `gap: <row> <col>?`, then longhands override
+        let (mut row_gap, mut col_gap) = (0.0f32, 0.0f32);
+        if let Some(v) = c.get("gap") {
+            let mut it = v.split_whitespace();
+            row_gap = it
+                .next()
+                .and_then(|t| parse_len_vp(t, cont_h.unwrap_or(avail), self.viewport_h, avail))
+                .unwrap_or(0.0);
+            col_gap = it
+                .next()
+                .and_then(|t| parse_len_vp(t, avail, self.viewport_h, avail))
+                .unwrap_or(row_gap);
+        }
+        if let Some(v) = c.get("row-gap") {
+            row_gap = parse_len_vp(v, cont_h.unwrap_or(avail), self.viewport_h, avail)
+                .unwrap_or(row_gap);
+        }
+        if let Some(v) = c.get("column-gap") {
+            col_gap = parse_len_vp(v, avail, self.viewport_h, avail).unwrap_or(col_gap);
+        }
+
+        let row_rel = cont_h.unwrap_or(avail);
+        let col_specs =
+            grid_track_list(c.get("grid-template-columns"), avail, self.viewport_h, avail, avail, col_gap);
+        let row_specs =
+            grid_track_list(c.get("grid-template-rows"), row_rel, self.viewport_h, avail, row_rel, row_gap);
+        let auto_cols =
+            grid_track_list(c.get("grid-auto-columns"), avail, self.viewport_h, avail, avail, col_gap);
+        let auto_rows =
+            grid_track_list(c.get("grid-auto-rows"), row_rel, self.viewport_h, avail, row_rel, row_gap);
+        let spec_at = |specs: &[GTrack], auto: &[GTrack], i: usize| -> GTrack {
+            if let Some(t) = specs.get(i) {
+                return *t;
+            }
+            if auto.is_empty() {
+                GTrack::Auto(0.0, f32::MAX)
+            } else {
+                auto[(i - specs.len()) % auto.len()]
+            }
+        };
+
+        // container-level item alignment defaults
+        let (pi_a, pi_j) = c
+            .get("place-items")
+            .map(|v| {
+                let mut it = v.split_whitespace();
+                let a = it.next().unwrap_or("normal").to_string();
+                let j = it.next().map(String::from).unwrap_or_else(|| a.clone());
+                (a, j)
+            })
+            .unwrap_or_default();
+        let def_align = galign(c.get("align-items"))
+            .or_else(|| galign(Some(&pi_a)))
+            .unwrap_or(GAlign::Stretch);
+        let def_just = galign(c.get("justify-items"))
+            .or_else(|| galign(Some(&pi_j)))
+            .unwrap_or(GAlign::Stretch);
+
+        // element children only — grid blockifies them; display:none skipped
+        let kids: Vec<NodeId> = self
+            .doc
+            .children(node)
+            .iter()
+            .copied()
+            .filter(|&ch| matches!(self.doc.kind(ch), NodeKind::Element { .. }))
+            .collect();
+        let mut kids2: Vec<NodeId> = Vec::with_capacity(kids.len());
+        for ch in kids {
+            if self.style(ch).get("display").map(String::as_str) != Some("none") {
+                kids2.push(ch);
+            }
+        }
+
+        // ---- placement ----
+        let exp_cols = col_specs.len();
+        let exp_rows = row_specs.len();
+        let mut ncols = exp_cols.max(1);
+        let mut req: Vec<(NodeId, Option<usize>, usize, Option<usize>, usize)> =
+            Vec::with_capacity(kids2.len());
+        for &ch in &kids2 {
+            let ic = self.style(ch);
+            let (ecol, cs) = resolve_axis(grid_lines(&ic, "column"), exp_cols);
+            let (erow, rs) = resolve_axis(grid_lines(&ic, "row"), exp_rows);
+            ncols = ncols.max(ecol.map(|cix| cix + cs).unwrap_or(cs));
+            req.push((ch, ecol, cs, erow, rs));
+        }
+
+        let col_flow = c
+            .get("grid-auto-flow")
+            .is_some_and(|v| v.contains("column"));
+        let mut occ: Vec<Vec<bool>> = Vec::new();
+        let mut placed: Vec<(NodeId, usize, usize, usize, usize)> = Vec::with_capacity(req.len());
+        let (mut cur_r, mut cur_c) = (0usize, 0usize);
+        let row_bound = exp_rows.max(1); // wrap bound for column flow
+        for &(ch, ecol, cs, erow, rs) in &req {
+            let (r, cix) = match (erow, ecol) {
+                (Some(r), Some(cix)) => (r, cix),
+                (Some(r), None) => {
+                    let mut cix = 0usize;
+                    while cix + cs <= ncols && !grid_free(&occ, ncols, r, cix, rs, cs) {
+                        cix += 1;
+                    }
+                    if cix + cs > ncols {
+                        cix = 0; // no fit — overlap at the row start
+                    }
+                    (r, cix)
+                }
+                (None, Some(cix)) => {
+                    let mut r = 0usize;
+                    while !grid_free(&occ, ncols, r, cix, rs, cs) {
+                        r += 1;
+                    }
+                    (r, cix)
+                }
+                (None, None) => {
+                    if col_flow {
+                        loop {
+                            if cur_r + rs > row_bound {
+                                cur_r = 0;
+                                cur_c += 1;
+                                continue;
+                            }
+                            if cur_c + cs > ncols {
+                                ncols = cur_c + cs; // implicit columns
+                                for row in occ.iter_mut() {
+                                    row.resize(ncols, false);
+                                }
+                            }
+                            if grid_free(&occ, ncols, cur_r, cur_c, rs, cs) {
+                                break;
+                            }
+                            cur_r += 1;
+                        }
+                        let p = (cur_r, cur_c);
+                        cur_r += rs;
+                        p
+                    } else {
+                        loop {
+                            if cur_c + cs > ncols {
+                                cur_c = 0;
+                                cur_r += 1;
+                                continue;
+                            }
+                            if grid_free(&occ, ncols, cur_r, cur_c, rs, cs) {
+                                break;
+                            }
+                            cur_c += 1;
+                        }
+                        let p = (cur_r, cur_c);
+                        cur_c += cs;
+                        p
+                    }
+                }
+            };
+            while occ.len() < r + rs {
+                occ.push(vec![false; ncols]);
+            }
+            for row in occ.iter_mut().skip(r).take(rs) {
+                for cell in row.iter_mut().skip(cix).take(cs) {
+                    *cell = true;
+                }
+            }
+            placed.push((ch, r, cix, rs, cs));
+        }
+        let nrows = occ.len().max(exp_rows).max(1);
+
+        // ---- column track sizes ----
+        let col_spec: Vec<GTrack> = (0..ncols).map(|i| spec_at(&col_specs, &auto_cols, i)).collect();
+        let mut cw: Vec<f32> = col_spec.iter().map(track_floor).collect();
+        // pre-measure each item's box metrics + intrinsic width
+        let mut items: Vec<GItem> = Vec::with_capacity(placed.len());
+        for &(ch, r, cix, rs, cs) in &placed {
+            let cc = self.style(ch);
+            let mut cst = st.clone();
+            self.apply_computed(&cc, &mut cst);
+            cst.inline_bg = None;
+            let m = box_sides(&cc, "margin", cst.size);
+            let p = box_sides(&cc, "padding", cst.size).map(|v| v.max(0.0));
+            let bg = bg_color(&cc);
+            let border = cc
+                .get("border")
+                .and_then(|v| parse_border(v, cst.size))
+                .or_else(|| split_border(&cc, cst.size));
+            let bw = border.map(|b| b.0).unwrap_or(0.0);
+            let radius = parse_radius(&cc, cst.size);
+            let shadow = parse_shadow(&cc, cst.size);
+            let w_prop = side(&cc, "width", avail).map(|w| {
+                let mut w = w;
+                if let Some(mx) = cc.get("max-width").and_then(|v| parse_len_vp(v, avail, self.viewport_h, avail)) {
+                    w = w.min(mx);
+                }
+                if let Some(mn) = cc.get("min-width").and_then(|v| parse_len_vp(v, avail, self.viewport_h, avail)) {
+                    w = w.max(mn);
+                }
+                w
+            });
+            let intrinsic_w = w_prop
+                .unwrap_or_else(|| self.flex_shrink_width(ch, &cc, &cst).min(avail))
+                .max(0.0);
+            let ps = cc.get("place-self").map(|v| {
+                let mut it = v.split_whitespace();
+                let a = it.next().unwrap_or("auto").to_string();
+                let j = it.next().map(String::from).unwrap_or_else(|| a.clone());
+                (a, j)
+            });
+            let al = galign(cc.get("align-self"))
+                .or_else(|| ps.as_ref().and_then(|(a, _)| galign(Some(a))))
+                .unwrap_or(def_align);
+            let just = galign(cc.get("justify-self"))
+                .or_else(|| ps.as_ref().and_then(|(_, j)| galign(Some(j))))
+                .unwrap_or(def_just);
+            let h_prop = side(&cc, "height", cont_h.unwrap_or(avail));
+            let min_h = cc
+                .get("min-height")
+                .and_then(|v| parse_len_vp(v, avail, self.viewport_h, avail));
+            let max_h = cc
+                .get("max-height")
+                .and_then(|v| parse_len_vp(v, avail, self.viewport_h, avail));
+            let ratio = aspect_ratio(&cc);
+            items.push(GItem {
+                id: ch,
+                r,
+                c: cix,
+                rs,
+                cs,
+                st: cst,
+                cc,
+                m,
+                p,
+                bw,
+                bg,
+                border,
+                radius,
+                shadow,
+                w_prop,
+                h_prop,
+                min_h,
+                max_h,
+                intrinsic_w,
+                ratio,
+                just,
+                al,
+                laid: Vec::new(),
+                box_h_intr: 0.0,
+            });
+        }
+
+        // auto columns take the widest single-span item's margin-box width
+        for it in &items {
+            let need = it.intrinsic_w + it.p[1] + it.p[3] + 2.0 * it.bw + it.m[1] + it.m[3];
+            if it.cs == 1 {
+                if let GTrack::Auto(_, mx) = col_spec[it.c] {
+                    cw[it.c] = cw[it.c].max(need.min(mx));
+                }
+            }
+        }
+        for it in &items {
+            if it.cs > 1 {
+                let need = it.intrinsic_w + it.p[1] + it.p[3] + 2.0 * it.bw + it.m[1] + it.m[3];
+                let have: f32 = cw[it.c..it.c + it.cs].iter().sum::<f32>()
+                    + col_gap * (it.cs - 1) as f32;
+                if need > have {
+                    let add = (need - have) / it.cs as f32;
+                    for w in cw.iter_mut().skip(it.c).take(it.cs) {
+                        *w += add;
+                    }
+                }
+            }
+        }
+        // fr columns share the leftover space
+        let total_fr: f32 = col_spec
+            .iter()
+            .map(|t| if let GTrack::Fr(f, _) = t { *f } else { 0.0 })
+            .sum();
+        if total_fr > 0.0 {
+            let non_fr: f32 = cw
+                .iter()
+                .zip(&col_spec)
+                .map(|(w, t)| if matches!(t, GTrack::Fr(..)) { 0.0 } else { *w })
+                .sum();
+            let leftover = (avail - col_gap * ncols.saturating_sub(1) as f32 - non_fr).max(0.0);
+            for (i, t) in col_spec.iter().enumerate() {
+                if let GTrack::Fr(f, m) = t {
+                    cw[i] = (*m).max(leftover * *f / total_fr);
+                }
+            }
+        }
+        // ---- measure items at their final content width ----
+        for it in items.iter_mut() {
+            let cell_w: f32 =
+                cw[it.c..it.c + it.cs].iter().sum::<f32>() + col_gap * (it.cs - 1) as f32;
+            let inner_w = (cell_w - it.m[1] - it.m[3] - it.p[1] - it.p[3] - 2.0 * it.bw).max(1.0);
+            let content_w = it
+                .w_prop
+                .map(|w| w.min(inner_w))
+                .unwrap_or(match it.just {
+                    GAlign::Stretch => inner_w,
+                    _ => it.intrinsic_w.min(inner_w),
+                })
+                .max(1.0);
+            let (laid, bottom) = self.nest(
+                it.id,
+                &it.st,
+                it.p[3] + it.bw,
+                it.p[0] + it.bw,
+                content_w,
+                &it.cc,
+            );
+            it.laid = laid;
+            let content_h = bottom + it.p[2] + it.bw; // border-box height
+            let box_w = content_w + it.p[1] + it.p[3] + 2.0 * it.bw;
+            let mut box_h = it
+                .h_prop
+                .map(|h| h + it.p[0] + it.p[2] + 2.0 * it.bw)
+                .or_else(|| it.ratio.map(|r| box_w / r))
+                .unwrap_or(content_h);
+            if let Some(mn) = it.min_h {
+                box_h = box_h.max(mn + it.p[0] + it.p[2] + 2.0 * it.bw);
+            }
+            if let Some(mx) = it.max_h {
+                box_h = box_h.min(mx + it.p[0] + it.p[2] + 2.0 * it.bw);
+            }
+            it.box_h_intr = box_h;
+        }
+
+        // ---- row track sizes ----
+        let row_spec: Vec<GTrack> = (0..nrows).map(|i| spec_at(&row_specs, &auto_rows, i)).collect();
+        // fr rows with an indefinite container height behave as auto
+        let mut rh: Vec<f32> = row_spec
+            .iter()
+            .map(|t| match *t {
+                GTrack::Fixed(x) => x,
+                GTrack::Fr(_, m) if cont_h.is_some() => m,
+                _ => track_floor(&GTrack::Auto(track_floor(t), f32::MAX)),
+            })
+            .collect();
+        for it in &items {
+            let need = it.box_h_intr + it.m[0] + it.m[2];
+            if it.rs == 1 {
+                let autoish = match row_spec[it.r] {
+                    GTrack::Auto(..) => true,
+                    GTrack::Fr(..) => cont_h.is_none(),
+                    GTrack::Fixed(_) => false,
+                };
+                if autoish {
+                    if let GTrack::Auto(_, mx) | GTrack::Fr(_, mx) = row_spec[it.r] {
+                        let cap = if cont_h.is_none() { f32::MAX } else { mx };
+                        rh[it.r] = rh[it.r].max(need.min(cap));
+                    }
+                }
+            }
+        }
+        for it in &items {
+            if it.rs > 1 {
+                let need = it.box_h_intr + it.m[0] + it.m[2];
+                let have: f32 = rh[it.r..it.r + it.rs].iter().sum::<f32>()
+                    + row_gap * (it.rs - 1) as f32;
+                if need > have {
+                    let add = (need - have) / it.rs as f32;
+                    for h in rh.iter_mut().skip(it.r).take(it.rs) {
+                        *h += add;
+                    }
+                }
+            }
+        }
+        if let Some(ch) = cont_h {
+            let total_fr: f32 = row_spec
+                .iter()
+                .map(|t| if let GTrack::Fr(f, _) = t { *f } else { 0.0 })
+                .sum();
+            if total_fr > 0.0 {
+                let non_fr: f32 = rh
+                    .iter()
+                    .zip(&row_spec)
+                    .map(|(h, t)| if matches!(t, GTrack::Fr(..)) { 0.0 } else { *h })
+                    .sum();
+                let leftover =
+                    (ch - row_gap * nrows.saturating_sub(1) as f32 - non_fr).max(0.0);
+                for (i, t) in row_spec.iter().enumerate() {
+                    if let GTrack::Fr(f, m) = t {
+                        rh[i] = (*m).max(leftover * *f / total_fr);
+                    }
+                }
+            }
+        }
+
+        // ---- emit ----
+        let tracks_w = cw.iter().sum::<f32>() + col_gap * ncols.saturating_sub(1) as f32;
+        let tracks_h = rh.iter().sum::<f32>() + row_gap * nrows.saturating_sub(1) as f32;
+        let (pc_a, pc_j) = c
+            .get("place-content")
+            .map(|v| {
+                let mut it = v.split_whitespace();
+                let a = it.next().unwrap_or("start").to_string();
+                let j = it.next().map(String::from).unwrap_or_else(|| a.clone());
+                (a, j)
+            })
+            .unwrap_or_default();
+        let jc = c.get("justify-content").or(if pc_j.is_empty() { None } else { Some(&pc_j) });
+        let ac = c.get("align-content").or(if pc_a.is_empty() { None } else { Some(&pc_a) });
+        let (egap_x, off_x) = content_offset(jc, (avail - tracks_w).max(0.0), ncols);
+        let (egap_y, off_y) = content_offset(
+            ac,
+            (cont_h.unwrap_or(tracks_h) - tracks_h).max(0.0),
+            nrows,
+        );
+        let egx = col_gap + egap_x;
+        let egy = row_gap + egap_y;
+        let mut col_x = vec![0.0f32; ncols + 1];
+        for i in 0..ncols {
+            col_x[i + 1] = col_x[i] + cw[i] + egx;
+        }
+        let mut row_y = vec![0.0f32; nrows + 1];
+        for i in 0..nrows {
+            row_y[i + 1] = row_y[i] + rh[i] + egy;
+        }
+
+        for it in items.iter_mut() {
+            let cell_x = x0 + off_x + col_x[it.c];
+            let cell_w = cw[it.c..it.c + it.cs].iter().sum::<f32>() + egx * (it.cs - 1) as f32;
+            let cell_y = y0 + off_y + row_y[it.r];
+            let cell_h = rh[it.r..it.r + it.rs].iter().sum::<f32>() + egy * (it.rs - 1) as f32;
+            let content_w = it
+                .w_prop
+                .map(|w| w.min(cell_w - it.m[1] - it.m[3] - it.p[1] - it.p[3] - 2.0 * it.bw).max(1.0))
+                .unwrap_or(match it.just {
+                    GAlign::Stretch => {
+                        (cell_w - it.m[1] - it.m[3] - it.p[1] - it.p[3] - 2.0 * it.bw).max(1.0)
+                    }
+                    _ => it.intrinsic_w
+                        .min(cell_w - it.m[1] - it.m[3] - it.p[1] - it.p[3] - 2.0 * it.bw)
+                        .max(1.0),
+                });
+            let box_w = content_w + it.p[1] + it.p[3] + 2.0 * it.bw;
+            let mut box_h = if let Some(h) = it.h_prop {
+                h + it.p[0] + it.p[2] + 2.0 * it.bw
+            } else if let Some(r) = it.ratio {
+                box_w / r
+            } else if it.al == GAlign::Stretch {
+                (cell_h - it.m[0] - it.m[2]).max(1.0)
+            } else {
+                it.box_h_intr
+            };
+            if let Some(mn) = it.min_h {
+                box_h = box_h.max(mn + it.p[0] + it.p[2] + 2.0 * it.bw);
+            }
+            if let Some(mx) = it.max_h {
+                box_h = box_h.min(mx + it.p[0] + it.p[2] + 2.0 * it.bw);
+            }
+            let room_w = (cell_w - it.m[1] - it.m[3]).max(0.0);
+            let ix = cell_x
+                + it.m[3]
+                + match it.just {
+                    GAlign::End => (room_w - box_w).max(0.0),
+                    GAlign::Center => ((room_w - box_w) / 2.0).max(0.0),
+                    _ => 0.0,
+                };
+            let room_h = (cell_h - it.m[0] - it.m[2]).max(0.0);
+            let iy = cell_y
+                + it.m[0]
+                + match it.al {
+                    GAlign::End => (room_h - box_h).max(0.0),
+                    GAlign::Center => ((room_h - box_h) / 2.0).max(0.0),
+                    _ => 0.0,
+                };
+            if let Some((ox, oy, col)) = it.shadow {
+                self.items.push(DisplayItem::RoundedRect {
+                    x: ix + ox,
+                    y: iy + oy,
+                    w: box_w,
+                    h: box_h,
+                    radius: it.radius,
+                    color: col,
+                });
+            }
+            if let Some(col) = it.bg {
+                if it.radius > 0.5 {
+                    self.items.push(DisplayItem::RoundedRect {
+                        x: ix,
+                        y: iy,
+                        w: box_w,
+                        h: box_h,
+                        radius: it.radius,
+                        color: col,
+                    });
+                } else {
+                    self.items.push(DisplayItem::FillRect {
+                        x: ix,
+                        y: iy,
+                        w: box_w,
+                        h: box_h,
+                        color: col,
+                    });
+                }
+            }
+            if let Some((bw2, col)) = it.border {
+                edge_rects(&mut self.items, ix, iy, box_w, box_h, bw2, col);
+            }
+            for di in it.laid.drain(..) {
+                self.items.push(offset_item(di, ix, iy));
+            }
+        }
+
+        // the container consumes max(content, declared height) in flow
+        self.y = y0 + tracks_h.max(cont_h.unwrap_or(0.0));
+    }
+
     fn nest(
         &mut self,
         node: NodeId,
@@ -1734,13 +2612,26 @@ impl<'a> Layouter<'a> {
         self.align = st.align;
         self.line_x = 0.0;
         self.pending_space = false;
-        if matches!(c.get("display").map(String::as_str), Some("flex")) {
-            self.flex_children(node, c, st.clone());
-        } else {
-            for &ch in self.doc.children(node) {
-                self.walk(ch, st);
+        // containing-block height for positioned descendants
+        let saved_cb_h = self.cb_h;
+        if matches!(
+            c.get("position").map(String::as_str),
+            Some("relative") | Some("absolute") | Some("fixed") | Some("sticky")
+        ) {
+            if let Some(h) = side(c, "height", self.viewport_h) {
+                self.cb_h = Some(h);
             }
         }
+        match c.get("display").map(String::as_str) {
+            Some("flex") | Some("inline-flex") => self.flex_children(node, c, st.clone()),
+            Some("grid") | Some("inline-grid") => self.grid_children(node, c, st),
+            _ => {
+                for &ch in self.doc.children(node) {
+                    self.walk(ch, st);
+                }
+            }
+        }
+        self.cb_h = saved_cb_h;
         self.flush_line();
         let bottom = self.y;
         let items = std::mem::replace(&mut self.items, saved_items);
@@ -1757,6 +2648,8 @@ impl<'a> Layouter<'a> {
 
     /// min-content width approximation: the longest word inside `node`
     /// measured in the current font (or a default for textless content).
+    /// Explicit `width`, nested flex rows, and fixed-track grids contribute
+    /// their own geometry rather than text width.
     fn shrink_width(&mut self, node: NodeId, st: &Style) -> f32 {
         let text = self.doc.text_content(node);
         let mut w = 0.0f32;
@@ -1765,6 +2658,54 @@ impl<'a> Layouter<'a> {
                 for word in text.split_whitespace() {
                     w = w.max(f.measure(word, st.size));
                 }
+            }
+        }
+        // layout-aware: nested containers out-measure their text
+        let c = self.style(node);
+        if let Some(ew) = side(&c, "width", self.avail_w) {
+            w = w.max(ew);
+        } else {
+            match c.get("display").map(String::as_str) {
+                Some("flex") | Some("inline-flex") => {
+                    if c.get("flex-direction").map(String::as_str) == Some("column") {
+                        // column: widest child's contribution
+                        for &ch in self.doc.children(node) {
+                            if matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
+                                let mut cst = st.clone();
+                                let cc = self.style(ch);
+                                self.apply_computed(&cc, &mut cst);
+                                w = w.max(
+                                    side(&cc, "width", self.avail_w)
+                                        .unwrap_or_else(|| self.shrink_width(ch, &cst)),
+                                );
+                            }
+                        }
+                    } else {
+                        w = w.max(self.flex_shrink_width(node, &c, st));
+                    }
+                }
+                Some("grid") | Some("inline-grid") => {
+                    // fixed track sum beats text (repeat(8,64px) → 512)
+                    let tracks = grid_track_list(
+                        c.get("grid-template-columns"),
+                        st.size,
+                        self.viewport_h,
+                        self.avail_w,
+                        self.avail_w,
+                        0.0,
+                    );
+                    let fixed: f32 = tracks
+                        .iter()
+                        .map(|t| match t {
+                            GTrack::Fixed(p) => *p,
+                            GTrack::Fr(_, floor) | GTrack::Auto(_, floor) => *floor,
+                        })
+                        .sum();
+                    if fixed > 0.0 {
+                        w = w.max(fixed);
+                    }
+                }
+                _ => {}
             }
         }
         if w <= 0.0 {
@@ -1802,7 +2743,12 @@ impl<'a> Layouter<'a> {
             self.apply_computed(&cc, &mut cst);
             let [_t, pr, _b, pl] = box_sides(&cc, "padding", cst.size);
             let [_t, mr, _b, ml] = box_sides(&cc, "margin", cst.size);
-            w += self.shrink_width(ch, &cst) + pl.max(0.0) + pr.max(0.0) + ml + mr;
+            // an explicit `width` contributes itself, not the content's
+            // min-content estimate (a 512px board inside a flex row is 512
+            // no matter how small its text is)
+            let cw = side(&cc, "width", self.avail_w)
+                .unwrap_or_else(|| self.shrink_width(ch, &cst));
+            w += cw + pl.max(0.0) + pr.max(0.0) + ml + mr;
             n += 1;
         }
         (w + gap * n.saturating_sub(1) as f32).max(st.size)
@@ -1925,11 +2871,15 @@ impl<'a> Layouter<'a> {
             }
             "img" => {
                 self.flush_line();
-                let w = self.doc.attr(node, "width")
-                    .and_then(|v| v.trim_end_matches("px").parse().ok())
+                // CSS width/height beat the attributes (inline style and
+                // utility classes size almost every modern <img>)
+                let w = side(c, "width", self.avail_w)
+                    .or_else(|| self.doc.attr(node, "width")
+                        .and_then(|v| v.trim_end_matches("px").parse().ok()))
                     .unwrap_or(64.0f32);
-                let h = self.doc.attr(node, "height")
-                    .and_then(|v| v.trim_end_matches("px").parse().ok())
+                let h = side(c, "height", self.avail_w)
+                    .or_else(|| self.doc.attr(node, "height")
+                        .and_then(|v| v.trim_end_matches("px").parse().ok()))
                     .unwrap_or(48.0f32);
                 let line_h = self.eff_line_h(&st);
                 if let Some(src) = self.doc.attr(node, "src") {
@@ -2436,6 +3386,183 @@ mod tests {
         let (_, ya) = text_pos(&items, "a");
         let (_, yb) = text_pos(&items, "b");
         assert!(yb - ya > 40.0, "line-height 3x16 separates baselines: {yb} - {ya}");
+    }
+
+    // ---------- grid ----------
+
+    #[test]
+    fn grid_fixed_columns() {
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:100px 100px}</style>\
+             <div class=g><div>a1</div><div>b1</div><div>a2</div><div>b2</div></div>",
+        );
+        let (xa1, ya1) = text_pos(&items, "a1");
+        let (xb1, _) = text_pos(&items, "b1");
+        let (xa2, ya2) = text_pos(&items, "a2");
+        let (xb2, _) = text_pos(&items, "b2");
+        assert!((xb1 - xa1 - 100.0).abs() < 1.0, "col step 100: {xa1} -> {xb1}");
+        assert!(ya2 > ya1, "second row below first");
+        assert!((xa2 - xa1).abs() < 1.0, "col 0 aligned across rows");
+        assert!((xb2 - xb1).abs() < 1.0, "col 1 aligned across rows");
+    }
+
+    #[test]
+    fn grid_repeat_fr_distribution() {
+        // avail 784 (800-16) minus 20 gap → two equal fr columns
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:repeat(2,1fr);gap:20px}</style>\
+             <div class=g><div>a</div><div>b</div></div>",
+        );
+        let (xa, _) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        let fr = (784.0 - 20.0) / 2.0;
+        assert!((xb - xa - fr - 20.0).abs() < 2.0, "fr column step: {xa} -> {xb}");
+    }
+
+    #[test]
+    fn grid_minmax() {
+        // minmax(60px,1fr) + fixed 100px → fr column eats the rest (684)
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:minmax(60px,1fr) 100px}</style>\
+             <div class=g><div>a</div><div>b</div></div>",
+        );
+        let (_xa, _) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        assert!((xb - 8.0 - 684.0).abs() < 2.0, "minmax fr grows: b at {xb}");
+    }
+
+    #[test]
+    fn grid_gaps_and_spans() {
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:100px 100px;gap:10px}\
+             .wide{grid-column:span 2}</style>\
+             <div class=g><div class=wide>a</div><div>b</div><div>c</div></div>",
+        );
+        let (xa, ya) = text_pos(&items, "a");
+        let (xb, yb) = text_pos(&items, "b");
+        let (xc, yc) = text_pos(&items, "c");
+        // wide spans row0; b and c land on row1 in cols 0 and 1
+        assert!((xb - xa).abs() < 1.0, "b under a's start");
+        assert!((xc - xb - 110.0).abs() < 1.0, "col step incl gap: {xb} -> {xc}");
+        assert!((yb - ya).abs() > 10.0, "row below");
+        assert!((yc - yb).abs() < 1.0, "same row");
+    }
+
+    #[test]
+    fn grid_implicit_rows_auto() {
+        // no template rows → implicit rows size to content
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:50px 50px}</style>\
+             <div class=g><div>a</div><div>b</div><div>c</div></div>",
+        );
+        let (xa, ya) = text_pos(&items, "a");
+        let (xc, yc) = text_pos(&items, "c");
+        assert!(yc > ya, "implicit second row below");
+        assert!((xc - xa).abs() < 1.0, "wraps to column 0");
+    }
+
+    #[test]
+    fn grid_aspect_ratio_cell() {
+        // aspect-ratio:1 cells in 64px tracks → square boxes
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:repeat(2,64px)}\
+             .sq{aspect-ratio:1;background:#ff0000}</style>\
+             <div class=g><div class=sq></div><div class=sq></div></div>",
+        );
+        let sqs: Vec<(f32, f32, f32, f32)> = items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::FillRect { x, y, w, h, color } if *color == bgra(255, 0, 0) => {
+                    Some((*x, *y, *w, *h))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sqs.len(), 2);
+        for (_, _, w, h) in &sqs {
+            assert!((w - 64.0).abs() < 1.0 && (h - 64.0).abs() < 1.0, "square cell {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn grid_item_alignment() {
+        // place-items:center centers a fixed-size item in its cell
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:200px;grid-template-rows:100px;\
+             place-items:center}.i{width:50px;height:20px;background:#ff0000}</style>\
+             <div class=g><div class=i></div></div>",
+        );
+        let r = items
+            .iter()
+            .find(|i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)));
+        let Some(DisplayItem::FillRect { x, y, w, h, .. }) = r else {
+            panic!("cell bg not found")
+        };
+        assert!((*x - 8.0 - 75.0).abs() < 1.0, "centered x {x}");
+        assert!((*y - 8.0 - 40.0).abs() < 1.0, "centered y {y}");
+        assert!((*w - 50.0).abs() < 1.0 && (*h - 20.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn grid_explicit_placement() {
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:100px 100px}\
+             .x{grid-column:2;grid-row:1}</style>\
+             <div class=g><div>a</div><div class=x>b</div><div>c</div></div>",
+        );
+        let (xa, ya) = text_pos(&items, "a");
+        let (xb, yb) = text_pos(&items, "b");
+        let (_xc, yc) = text_pos(&items, "c");
+        assert!((xb - xa - 100.0).abs() < 1.0, "b pinned to col 2: {xa} -> {xb}");
+        assert!((yb - ya).abs() < 1.0, "b on row 1");
+        assert!(yc > ya, "c auto-places on the next row");
+    }
+
+    #[test]
+    fn grid_nested_grid() {
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:200px}.in{display:grid;\
+             grid-template-columns:50px 50px}</style>\
+             <div class=g><div class=in><div>a</div><div>b</div></div></div>",
+        );
+        let (xa, _) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        assert!((xb - xa - 50.0).abs() < 1.0, "nested grid columns: {xa} -> {xb}");
+    }
+
+    #[test]
+    fn grid_board_8x8_inline_style() {
+        // the goonchess case: inline-style grid, 64 square cells
+        let mut cells = String::new();
+        for _ in 0..64 {
+            cells.push_str("<button style=\"aspect-ratio:1;background:#123456\"></button>");
+        }
+        let html = format!(
+            "<div class=board-grid-shadow style=\"display:grid;\
+             grid-template-columns:repeat(8,64px);grid-template-rows:repeat(8,64px)\">{cells}</div>"
+        );
+        let (items, _, _) = lay(&html);
+        let mut rects: Vec<(f32, f32, f32, f32)> = items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::FillRect { x, y, w, h, color } if *color == bgra(0x12, 0x34, 0x56) => {
+                    Some((*x, *y, *w, *h))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rects.len(), 64, "64 board cells");
+        rects.sort_by(|a, b| (a.1, a.0).partial_cmp(&(b.1, b.0)).unwrap());
+        for (i, r) in rects.iter().enumerate() {
+            let (ex, ey) = (8.0 + (i % 8) as f32 * 64.0, 8.0 + (i / 8) as f32 * 64.0);
+            assert!(
+                (r.0 - ex).abs() < 1.0 && (r.1 - ey).abs() < 1.0,
+                "cell {i} at ({},{}) want ({ex},{ey})",
+                r.0,
+                r.1
+            );
+            assert!((r.2 - 64.0).abs() < 1.0 && (r.3 - 64.0).abs() < 1.0, "square cell");
+        }
     }
 
     #[test]
