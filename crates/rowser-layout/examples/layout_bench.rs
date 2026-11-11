@@ -58,6 +58,51 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 }
                 mix(src.as_bytes());
             }
+            DisplayItem::BorderSide { x, y, w, h, side, style, color } => {
+                mix(&[6]);
+                for v in [x, y, w, h] {
+                    mix(&v.to_bits().to_le_bytes());
+                }
+                mix(&[*side as u8, *style as u8]);
+                mix(&color.to_le_bytes());
+            }
+            DisplayItem::RoundedRect2 { x, y, w, h, radii, color } => {
+                mix(&[7]);
+                for v in [x, y, w, h] {
+                    mix(&v.to_bits().to_le_bytes());
+                }
+                for c in radii {
+                    for v in c {
+                        mix(&v.to_bits().to_le_bytes());
+                    }
+                }
+                mix(&color.to_le_bytes());
+            }
+            DisplayItem::Shadow { x, y, w, h, dx, dy, blur, spread, radii, color, inset } => {
+                mix(&[8]);
+                for v in [x, y, w, h, dx, dy, blur, spread] {
+                    mix(&v.to_bits().to_le_bytes());
+                }
+                for c in radii {
+                    for v in c {
+                        mix(&v.to_bits().to_le_bytes());
+                    }
+                }
+                mix(&color.to_le_bytes());
+                mix(&[*inset as u8]);
+            }
+            DisplayItem::PushClip { x, y, w, h, radii } => {
+                mix(&[9]);
+                for v in [x, y, w, h] {
+                    mix(&v.to_bits().to_le_bytes());
+                }
+                for c in radii {
+                    for v in c {
+                        mix(&v.to_bits().to_le_bytes());
+                    }
+                }
+            }
+            DisplayItem::PopClip => mix(&[10]),
         }
     }
     h

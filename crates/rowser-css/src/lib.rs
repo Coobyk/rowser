@@ -1540,17 +1540,106 @@ fn each_physical(prop: &str, mut f: impl FnMut(&str)) {
     }
 }
 
+/// Whitespace-split a declaration value, keeping `fn(...)` groups whole —
+/// `calc(50% - 1em)` and `rgb(0 0 0)` stay single tokens.
+fn decl_tokens(v: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut st = 0usize;
+    let b = v.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            c if c.is_ascii_whitespace() && depth <= 0 => {
+                if st < i {
+                    out.push(&v[st..i]);
+                }
+                st = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if st < b.len() {
+        out.push(&v[st..]);
+    }
+    out
+}
+
+/// The i-th of a 1–4 value list in the usual corner pattern (tl, tr, br, bl).
+fn nth4<'a>(t: &[&'a str], i: usize) -> &'a str {
+    match t.len() {
+        1 => t[0],
+        2 => t[i % 2],
+        3 => t[[0, 1, 2, 1][i]],
+        _ => t[i.min(3)],
+    }
+}
+
+/// `border-radius` shorthand → per-corner `border-<corner>-radius` values
+/// in `h [v]` form — a `/` splits horizontal from vertical radii, each
+/// side taking the usual 1–4 corner pattern (tl, tr, br, bl).
+fn radius_corners(value: &str) -> [Option<String>; 4] {
+    let (h, v) = match value.find('/') {
+        Some(i) => (&value[..i], &value[i + 1..]),
+        None => (value, ""),
+    };
+    let hs = decl_tokens(h);
+    let vs = if v.trim().is_empty() {
+        hs.clone()
+    } else {
+        decl_tokens(v)
+    };
+    let mut out: [Option<String>; 4] = Default::default();
+    if hs.is_empty() || vs.is_empty() {
+        return out;
+    }
+    for i in 0..4 {
+        let (hc, vc) = (nth4(&hs, i), nth4(&vs, i));
+        out[i] = Some(if hc == vc { hc.to_string() } else { format!("{hc} {vc}") });
+    }
+    out
+}
+
 /// Expands a declaration into the physical longhands the engine reads, per
 /// the cascade: a rule's `margin:0` must beat a *less specific* rule's
 /// `margin-left:1.6em` — only per-side expansion makes that possible.
 /// `each_physical` maps 1:1 logical → physical; box shorthands
-/// (`margin`/`padding`/`inset`) additionally split their value across the
-/// four sides (the shorthand prop itself is also kept for direct readers).
-fn each_decl<'v>(prop: &str, value: &'v str, mut f: impl FnMut(&str, &'v str)) {
+/// (`margin`/`padding`/`inset`/`border-width|style|color`) additionally
+/// split their value across the four sides, `border`/`border-<side>` fan
+/// their whole token list into the width/style/color longhands (layout
+/// picks its component out — the keyword classes are disjoint),
+/// `border-radius` becomes the four corner longhands, `outline` its three,
+/// `overflow` its two axes. The shorthand prop itself is always kept for
+/// direct readers.
+fn each_decl(prop: &str, value: &str, mut f: impl FnMut(&str, &str)) {
+    each_physical(prop, |p| expand_decl(p, value, &mut f));
+}
+
+/// Physical-property expansion shared by `each_decl` — see its docs.
+fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
     let sides = match prop {
         "margin" => Some(("margin-top", "margin-right", "margin-bottom", "margin-left")),
         "padding" => Some(("padding-top", "padding-right", "padding-bottom", "padding-left")),
         "inset" => Some(("top", "right", "bottom", "left")),
+        "border-width" => Some((
+            "border-top-width",
+            "border-right-width",
+            "border-bottom-width",
+            "border-left-width",
+        )),
+        "border-style" => Some((
+            "border-top-style",
+            "border-right-style",
+            "border-bottom-style",
+            "border-left-style",
+        )),
+        "border-color" => Some((
+            "border-top-color",
+            "border-right-color",
+            "border-bottom-color",
+            "border-left-color",
+        )),
         _ => None,
     };
     if let Some((t, r, b, l)) = sides {
@@ -1564,8 +1653,51 @@ fn each_decl<'v>(prop: &str, value: &'v str, mut f: impl FnMut(&str, &'v str)) {
         f(r, vr);
         f(b, vb);
         f(l, vl);
-    } else {
-        each_physical(prop, |p| f(p, value));
+        return;
+    }
+    match prop {
+        // `border` resets every longhand of all four sides.
+        "border" => {
+            f("border", value);
+            for side in ["top", "right", "bottom", "left"] {
+                f(&format!("border-{side}-width"), value);
+                f(&format!("border-{side}-style"), value);
+                f(&format!("border-{side}-color"), value);
+            }
+        }
+        "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            f(prop, value);
+            f(&format!("{prop}-width"), value);
+            f(&format!("{prop}-style"), value);
+            f(&format!("{prop}-color"), value);
+        }
+        "border-radius" => {
+            f("border-radius", value);
+            let c = radius_corners(value);
+            const CORNERS: [&str; 4] = [
+                "border-top-left-radius",
+                "border-top-right-radius",
+                "border-bottom-right-radius",
+                "border-bottom-left-radius",
+            ];
+            for i in 0..4 {
+                if let Some(v) = &c[i] {
+                    f(CORNERS[i], v);
+                }
+            }
+        }
+        "outline" => {
+            f("outline", value);
+            f("outline-width", value);
+            f("outline-style", value);
+            f("outline-color", value);
+        }
+        "overflow" => {
+            f("overflow", value);
+            f("overflow-x", value);
+            f("overflow-y", value);
+        }
+        _ => f(prop, value),
     }
 }
 
@@ -2368,5 +2500,51 @@ mod sel4 {
         let p = doc.find_deep(doc.root, "p").unwrap();
         let c = computed(&doc, p, &[&sh]);
         eprintln!("  p computed props: {}", c.len());
+    }
+
+    #[test]
+    fn border_shorthands_expand() {
+        let doc = rowser_html::parse("<body><p>hi</p></body>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let s = parse("p{border:2px dashed red;border-top-color:blue}");
+        let c = computed(&doc, p, &[&s]);
+        // side shorthands carry the full token list for component extraction
+        assert_eq!(c.get("border-left-width").unwrap(), "2px dashed red");
+        assert_eq!(c.get("border-left-style").unwrap(), "2px dashed red");
+        assert_eq!(c.get("border-top-color").unwrap(), "blue");
+    }
+
+    #[test]
+    fn border_width_style_split() {
+        let doc = rowser_html::parse("<body><p>hi</p></body>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let s = parse("p{border-width:1px 2px;border-style:solid dotted}");
+        let c = computed(&doc, p, &[&s]);
+        assert_eq!(c.get("border-top-width").unwrap(), "1px");
+        assert_eq!(c.get("border-right-width").unwrap(), "2px");
+        assert_eq!(c.get("border-bottom-style").unwrap(), "solid");
+        assert_eq!(c.get("border-right-style").unwrap(), "dotted");
+    }
+
+    #[test]
+    fn border_radius_expands_corners() {
+        let doc = rowser_html::parse("<body><p>hi</p></body>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let s = parse("p{border-radius:10px 20px/5px}");
+        let c = computed(&doc, p, &[&s]);
+        assert_eq!(c.get("border-top-left-radius").unwrap(), "10px 5px");
+        assert_eq!(c.get("border-top-right-radius").unwrap(), "20px 5px");
+        assert_eq!(c.get("border-bottom-right-radius").unwrap(), "10px 5px");
+        assert_eq!(c.get("border-bottom-left-radius").unwrap(), "20px 5px");
+    }
+
+    #[test]
+    fn outline_overflow_expand() {
+        let doc = rowser_html::parse("<body><p>hi</p></body>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let s = parse("p{outline:2px solid red;overflow:hidden}");
+        let c = computed(&doc, p, &[&s]);
+        assert_eq!(c.get("outline-width").unwrap(), "2px solid red");
+        assert_eq!(c.get("overflow-x").unwrap(), "hidden");
     }
 }

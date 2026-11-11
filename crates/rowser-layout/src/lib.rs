@@ -11,7 +11,10 @@
 //! and minimal auto table layout (table/tr/td/th with per-cell borders).
 
 use rowser_css as css;
+mod borderfx;
 pub mod svg;
+
+use borderfx::{Borders, BoxShadow, Outline, RadiusSpec};
 
 use rowser_dom::{Document, NodeId, NodeKind};
 use rowser_text::FontCache;
@@ -30,6 +33,30 @@ pub const fn bgra(r: u8, g: u8, b: u8) -> Color {
 pub const BLACK: Color = bgra(0x11, 0x11, 0x11);
 pub const WHITE: Color = bgra(0xff, 0xff, 0xff);
 pub const RULE: Color = bgra(0x99, 0x99, 0x99);
+
+/// Which box edge a `DisplayItem::BorderSide` paints — dashes run along
+/// the edge's length, bevels shade by orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+/// `border-style`/`outline-style` — everything but `none`/`hidden`
+/// (those zero the side's width during resolution instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorderStyle {
+    Solid,
+    Dotted,
+    Dashed,
+    Double,
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+}
 
 #[derive(Debug, Clone)]
 pub enum DisplayItem {
@@ -76,6 +103,54 @@ pub enum DisplayItem {
         h: f32,
         src: String,
     },
+    /// One border/outline edge — `x,y,w,h` is the edge's own rect; `side`
+    /// orients dashes (top/bottom run along x) and bevel shading.
+    BorderSide {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        side: BorderEdge,
+        style: BorderStyle,
+        color: Color,
+    },
+    /// Filled rect with per-corner elliptical radii — corners in
+    /// [top-left, top-right, bottom-right, bottom-left] order as (rx, ry).
+    RoundedRect2 {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [[f32; 2]; 4],
+        color: Color,
+    },
+    /// box-shadow: alpha mask of the box — spread-expanded, radii-adjusted,
+    /// offset by (dx,dy) — blurred, then blended with `color`. `inset`
+    /// draws inside the box; outer shadows knock out the box interior.
+    Shadow {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        dx: f32,
+        dy: f32,
+        blur: f32,
+        spread: f32,
+        radii: [[f32; 2]; 4],
+        color: Color,
+        inset: bool,
+    },
+    /// Begin clipping subsequent items to this (optionally rounded) rect —
+    /// pairs with `PopClip` (overflow:hidden|clip|scroll|auto).
+    PushClip {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [[f32; 2]; 4],
+    },
+    /// End the most recent `PushClip`.
+    PopClip,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -677,86 +752,6 @@ fn bg_color(c: &Props) -> Option<Color> {
     None
 }
 
-/// `box-shadow: [inset]? x y [blur] [spread] [color], ...` → first visible
-/// shadow as (dx, dy, spread, color). Blur is ignored (solid-offset-blob
-/// approximation); a zero-offset positive-spread shadow is a ring and
-/// callers draw edges instead of a filled rect. The color is composited
-/// over `bd`; `def` stands in for `currentcolor` when none is given.
-fn parse_shadow(c: &Props, size: f32, bd: Color, def: Color) -> Option<(f32, f32, f32, Color)> {
-    let v = c.get("box-shadow")?;
-    if v.trim() == "none" {
-        return None;
-    }
-    let mut depth = 0i32;
-    for sh in v.split(|ch| {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            _ => {}
-        }
-        ch == ',' && depth <= 0
-    }) {
-        // tokens: lengths first, then a (possibly space-containing) color
-        let mut nums = Vec::new();
-        let mut col_s = "";
-        let b = sh.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
-            while i < b.len() && (b[i] as char).is_whitespace() {
-                i += 1;
-            }
-            let st = i;
-            let mut d = 0i32;
-            while i < b.len() && (d > 0 || !(b[i] as char).is_whitespace()) {
-                match b[i] {
-                    b'(' => d += 1,
-                    b')' => d -= 1,
-                    _ => {}
-                }
-                i += 1;
-            }
-            let tok = &sh[st..i];
-            if tok.is_empty() {
-                break;
-            }
-            if tok == "inset" {
-                continue;
-            }
-            if let Some(n) = parse_len(tok, size, size) {
-                nums.push(n);
-            } else {
-                col_s = sh[st..].trim();
-                break;
-            }
-        }
-        if nums.len() < 2 {
-            continue;
-        }
-        let col = if col_s.is_empty() {
-            def
-        } else {
-            parse_color(col_s).unwrap_or(def)
-        };
-        if alpha(col) == 0 {
-            continue; // fully transparent shadow (e.g. `0 0 #0000`)
-        }
-        let spread = nums.get(3).copied().unwrap_or(0.0).max(0.0);
-        return Some((nums[0], nums[1], spread, over(col, bd)));
-    }
-    None
-}
-
-/// `border-radius` → uniform max radius (px).
-fn parse_radius(c: &Props, size: f32) -> f32 {
-    c.get("border-radius")
-        .and_then(|v| {
-            v.split_whitespace()
-                .filter_map(|t| parse_len(t, size, size))
-                .reduce(f32::max)
-        })
-        .unwrap_or(0.0)
-}
-
 /// CSS length → px. `em`/`%` resolve against `rel` (usually parent font size).
 /// Tiny `calc()` evaluator: numbers with units, + - * / and parens.
 /// `%` resolves against `rel`; unitless numbers pass through.
@@ -1340,93 +1335,6 @@ fn margin_auto(c: &Props, left: bool) -> bool {
     false
 }
 
-/// `border: 2px solid red` → (width px, color). The color may contain
-/// spaces (`rgb(...)`/`color-mix(...)`) — the rest of the value is tried
-/// as one color before the bare token.
-fn parse_border(v: &str, em: f32) -> Option<(f32, Color)> {
-    let mut width = None;
-    let mut color = None;
-    let mut rest = v.trim();
-    while !rest.is_empty() {
-        let part = rest.split_whitespace().next().unwrap();
-        if part == "none" || part == "hidden" {
-            return None;
-        }
-        if parse_len(part, 16.0, em).is_some() || matches!(part, "thin" | "medium" | "thick") {
-            width = Some(match part {
-                "thin" => 1.0,
-                "thick" => 6.0,
-                "medium" => 3.0,
-                p => parse_len(p, 16.0, em).unwrap_or(1.0),
-            });
-        } else if matches!(
-            part,
-            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"
-        ) {
-            // style keyword — all styles paint solid edges
-        } else {
-            color = parse_color(rest).or_else(|| parse_color(part)).or(color);
-            break;
-        }
-        rest = rest[part.len()..].trim_start();
-    }
-    width.zip(color.or(Some(BLACK)))
-}
-
-/// Per-side border widths + color, merged: `border` shorthand →
-/// `border-width`/`border-<side>-width` → `border-(<side>-)?style` →
-/// `border-color`. Sides are [top, right, bottom, left]. Longhands apply
-/// over the shorthand (preflight `border:0 solid` + `border-t` pattern).
-fn border_sides(c: &Props, size: f32) -> Option<([f32; 4], Color)> {
-    let mut w = [0.0f32; 4];
-    let mut col = None;
-    if let Some(v) = c.get("border") {
-        // `border:none` or an unparseable shorthand contributes nothing;
-        // longhands can still re-enable individual sides
-        if let Some((bw, sc)) = parse_border(v, size) {
-            w = [bw; 4];
-            col = Some(sc);
-        }
-    }
-    let sh = sides(c, "border-width", size, size);
-    for (i, s) in sh.iter().copied().enumerate() {
-        if let Some(v) = s {
-            w[i] = v;
-        }
-    }
-    const SIDES: [(&str, &str, &str); 4] = [
-        ("border-top-width", "border-top-style", "border-top-color"),
-        ("border-right-width", "border-right-style", "border-right-color"),
-        ("border-bottom-width", "border-bottom-style", "border-bottom-color"),
-        ("border-left-width", "border-left-style", "border-left-color"),
-    ];
-    if c.get("border-style")
-        .is_some_and(|v| matches!(v.trim(), "none" | "hidden"))
-    {
-        w = [0.0; 4];
-    }
-    let mut any = false;
-    if let Some(bc) = c.get("border-color").and_then(|v| parse_color(v)) {
-        col = Some(bc);
-    }
-    for (i, (wn, sn, cn)) in SIDES.iter().copied().enumerate() {
-        if let Some(v) = c.get(wn).and_then(|v| parse_len(v, size, size)) {
-            w[i] = v;
-        }
-        if c.get(sn).is_some_and(|v| matches!(v.trim(), "none" | "hidden")) {
-            w[i] = 0.0;
-        }
-        if let Some(sc) = c.get(cn).and_then(|v| parse_color(v)) {
-            col = Some(sc);
-        }
-        any |= w[i] > 0.0;
-    }
-    if !any {
-        return None;
-    }
-    Some((w, col.unwrap_or(BLACK)))
-}
-
 // ---------- CSS Grid (autoplacement-capable subset) ----------
 
 /// `aspect-ratio: <a>/<b>` (or a bare number) → w/h ratio.
@@ -1835,44 +1743,95 @@ fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             h,
             src,
         },
+        DisplayItem::BorderSide { x, y, w, h, side, style, color } => DisplayItem::BorderSide {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            side,
+            style,
+            color,
+        },
+        DisplayItem::RoundedRect2 { x, y, w, h, radii, color } => DisplayItem::RoundedRect2 {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            radii,
+            color,
+        },
+        DisplayItem::Shadow {
+            x,
+            y,
+            w,
+            h,
+            dx: sdx,
+            dy: sdy,
+            blur,
+            spread,
+            radii,
+            color,
+            inset,
+        } => DisplayItem::Shadow {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            dx: sdx,
+            dy: sdy,
+            blur,
+            spread,
+            radii,
+            color,
+            inset,
+        },
+        DisplayItem::PushClip { x, y, w, h, radii } => DisplayItem::PushClip {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            radii,
+        },
+        DisplayItem::PopClip => DisplayItem::PopClip,
     }
 }
 
-/// Push the 4 edge FillRects of a `w`×`h` box border.
-fn edge_rects(out: &mut Vec<DisplayItem>, x: f32, y: f32, w: f32, h: f32, bw: f32, color: Color) {
-    out.push(DisplayItem::FillRect { x, y, w, h: bw, color });
-    out.push(DisplayItem::FillRect { x, y: y + h - bw, w, h: bw, color });
-    out.push(DisplayItem::FillRect { x, y, w: bw, h, color });
-    out.push(DisplayItem::FillRect { x: x + w - bw, y, w: bw, h, color });
-}
-
-/// Push a FillRect per non-zero side of a per-side border.
-fn side_rects(out: &mut Vec<DisplayItem>, x: f32, y: f32, w: f32, h: f32, bw: [f32; 4], color: Color) {
-    if bw[0] > 0.0 {
-        out.push(DisplayItem::FillRect { x, y, w, h: bw[0], color });
-    }
-    if bw[1] > 0.0 {
-        out.push(DisplayItem::FillRect { x: x + w - bw[1], y, w: bw[1], h, color });
-    }
-    if bw[2] > 0.0 {
-        out.push(DisplayItem::FillRect { x, y: y + h - bw[2], w, h: bw[2], color });
-    }
-    if bw[3] > 0.0 {
-        out.push(DisplayItem::FillRect { x, y, w: bw[3], h, color });
-    }
-}
-
-struct BlockPatch {
-    /// index of first of up to 9 placeholder rects
-    /// (bg + 4 border edges + 4 shadow/ring edges)
-    idx: usize,
+/// Drop descendant hit rects poking outside a clip rect, intersecting the
+/// rest — `hits[start..]` are the subtree's boxes in the same coords.
+fn clip_hits(
+    hits: &mut Vec<(f32, f32, f32, f32, NodeId)>,
+    start: usize,
     x: f32,
     y: f32,
     w: f32,
+    h: f32,
+) {
+    let tail: Vec<_> = hits.drain(start..).collect();
+    hits.extend(tail.into_iter().filter_map(|(hx, hy, hw, hh, n)| {
+        let (x0, y0) = (hx.max(x), hy.max(y));
+        let (x1, y1) = ((hx + hw).min(x + w), (hy + hh).min(y + h));
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1 - x0, y1 - y0, n))
+    }));
+}
+
+struct BlockPatch {
+    /// index of first of `nslots` placeholders: outer shadows + bg +
+    /// inset shadows + 4 border edges (+ PushClip when overflow clips —
+    /// the clip marker must precede the children items).
+    idx: usize,
+    nslots: usize,
+    x: f32,
+    y: f32,
+    w: f32,
+    /// element font size — em/% resolution base for radii
+    em: f32,
     bg: Option<Color>,
-    border: Option<([f32; 4], Color)>,
-    radius: f32,
-    shadow: Option<(f32, f32, f32, Color)>,
+    border: Option<Borders>,
+    radii: RadiusSpec,
+    shadows: Vec<BoxShadow>,
+    /// overflow clip — last slot is a PushClip on the padding box
+    clip: bool,
+    outline: Option<Outline>,
 }
 
 pub struct Layouter<'a> {
@@ -2177,7 +2136,10 @@ impl<'a> Layouter<'a> {
                         match it {
                             DisplayItem::Text { color, .. }
                             | DisplayItem::FillRect { color, .. }
-                            | DisplayItem::RoundedRect { color, .. } => {
+                            | DisplayItem::RoundedRect { color, .. }
+                            | DisplayItem::RoundedRect2 { color, .. }
+                            | DisplayItem::BorderSide { color, .. }
+                            | DisplayItem::Shadow { color, .. } => {
                                 *color = fade(*color, bd, op);
                             }
                             DisplayItem::Raster { pixels, .. } => {
@@ -2188,7 +2150,9 @@ impl<'a> Layouter<'a> {
                                     }
                                 }
                             }
-                            DisplayItem::Image { .. } => {}
+                            DisplayItem::Image { .. }
+                            | DisplayItem::PushClip { .. }
+                            | DisplayItem::PopClip => {}
                         }
                     }
                 }
@@ -2338,8 +2302,12 @@ impl<'a> Layouter<'a> {
         let bd = self.backdrop;
         let bb = border_box(c);
         let bg = self.bg_of(node, c).map(|col| over(col, bd));
-        let border = border_sides(c, size)
-            .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
+        let border = borderfx::borders(c, size).map(|mut b| {
+            for col in b.color.iter_mut() {
+                *col = over(*col, bg.unwrap_or(bd));
+            }
+            b
+        });
         // the block's own background paints behind the whole box, not per word
         st.inline_bg = None;
         // this element's text sits on its own bg — re-composite the color
@@ -2348,7 +2316,7 @@ impl<'a> Layouter<'a> {
                 st.color = over(col, b);
             }
         }
-        let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.0).unwrap_or([0.0; 4]);
+        let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let bw_h = bw_l + bw_r; // horizontal border total
         let bw_v = bw_t + bw_b; // vertical border total
 
@@ -2445,11 +2413,23 @@ impl<'a> Layouter<'a> {
 
         // background/border need the final rect — reserve placeholders.
         // The patch covers the border box (padding included).
-        // 9 slots: 4 shadow/ring edges (or 1 blob) + 1 bg + 4 border edges
-        let shadow = parse_shadow(c, size, bd, st.color);
-        let patch = if bg.is_some() || border.is_some() || shadow.is_some() {
+        // slots: outer shadows + bg + inset shadows + 4 border edges
+        // (+ 1 PushClip when overflow clips, right before the children)
+        let shadows = borderfx::parse_shadows(c, size, bd, st.color);
+        let outline = borderfx::outline(c, size, bd, st.color);
+        let clip = borderfx::clips_overflow(c);
+        let radii = borderfx::radius_spec(c);
+        let patch = if bg.is_some()
+            || border.is_some()
+            || !shadows.is_empty()
+            || outline.is_some()
+            || clip
+            || !radii.none()
+        {
             let idx = self.items.len();
-            for _ in 0..9 {
+            let n_out = shadows.iter().filter(|s| !s.inset).count();
+            let nslots = n_out + 1 + (shadows.len() - n_out) + 4 + clip as usize;
+            for _ in 0..nslots {
                 self.items.push(DisplayItem::FillRect {
                     x: 0.0,
                     y: 0.0,
@@ -2460,13 +2440,17 @@ impl<'a> Layouter<'a> {
             }
             Some(BlockPatch {
                 idx,
+                nslots,
                 x: self.margin_x - pl - bw_l,
                 y: self.y,
                 w: pl + inner_w + pr + bw_h,
+                em: size,
                 bg,
                 border,
-                radius: parse_radius(c, size),
-                shadow,
+                radii,
+                shadows,
+                clip,
+                outline,
             })
         } else {
             None
@@ -2599,6 +2583,13 @@ impl<'a> Layouter<'a> {
 
         if let Some(p) = patch.as_ref() {
             self.finish_patch(p);
+            if p.clip {
+                // descendant hits outside the padding box are dropped
+                let h = self.y - p.y;
+                let bw = p.border.map(|b| b.w).unwrap_or([0.0; 4]);
+                let (cx, cy, cw, chh) = borderfx::padding_box(p.x, p.y, p.w, h, bw);
+                clip_hits(&mut self.hits, children_hits_start, cx, cy, cw, chh);
+            }
         }
         // element border box → click hit-test map
         self.hits.push((
@@ -2629,7 +2620,7 @@ impl<'a> Layouter<'a> {
                 self.items[i] = offset_item(it, tx, ty);
             }
             if let Some(p) = &patch {
-                for i in p.idx..p.idx + 9usize.min(self.items.len() - p.idx) {
+                for i in p.idx..p.idx + p.nslots.min(self.items.len() - p.idx) {
                     let it = std::mem::replace(
                         &mut self.items[i],
                         DisplayItem::FillRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0, color: 0 },
@@ -2673,10 +2664,14 @@ impl<'a> Layouter<'a> {
         let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
         let bg = self.bg_of(node, c).map(|col| over(col, bd));
-        let border = border_sides(c, size)
-            .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
+        let border = borderfx::borders(c, size).map(|mut b| {
+            for col in b.color.iter_mut() {
+                *col = over(*col, bg.unwrap_or(bd));
+            }
+            b
+        });
         st.inline_bg = None;
-        let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.0).unwrap_or([0.0; 4]);
+        let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let bw_h = bw_l + bw_r;
         let right = c.get("float").is_some_and(|v| v.trim() == "right");
 
@@ -2703,10 +2698,21 @@ impl<'a> Layouter<'a> {
         self.avail_w = inner;
         self.align = st.align;
 
-        let shadow = parse_shadow(c, size, bd, st.color);
-        let patch = if bg.is_some() || border.is_some() || shadow.is_some() {
+        let shadows = borderfx::parse_shadows(c, size, bd, st.color);
+        let outline = borderfx::outline(c, size, bd, st.color);
+        let clip = borderfx::clips_overflow(c);
+        let radii = borderfx::radius_spec(c);
+        let patch = if bg.is_some()
+            || border.is_some()
+            || !shadows.is_empty()
+            || outline.is_some()
+            || clip
+            || !radii.none()
+        {
             let idx = self.items.len();
-            for _ in 0..9 {
+            let n_out = shadows.iter().filter(|s| !s.inset).count();
+            let nslots = n_out + 1 + (shadows.len() - n_out) + 4 + clip as usize;
+            for _ in 0..nslots {
                 self.items.push(DisplayItem::FillRect {
                     x: 0.0,
                     y: 0.0,
@@ -2717,13 +2723,17 @@ impl<'a> Layouter<'a> {
             }
             Some(BlockPatch {
                 idx,
+                nslots,
                 x: outer_x,
                 y: self.y,
                 w: box_w,
+                em: size,
                 bg,
                 border,
-                radius: parse_radius(c, size),
-                shadow,
+                radii,
+                shadows,
+                clip,
+                outline,
             })
         } else {
             None
@@ -2734,6 +2744,7 @@ impl<'a> Layouter<'a> {
         if let Some(b) = bg {
             self.backdrop = b;
         }
+        let children_hits_start = self.hits.len();
         for &ch in self.doc.children(node) {
             self.walk(ch, &st);
         }
@@ -2742,6 +2753,12 @@ impl<'a> Layouter<'a> {
         self.y += pb + bw_b;
         if let Some(p) = patch {
             self.finish_patch(&p);
+            if p.clip {
+                let h = self.y - p.y;
+                let bw = p.border.map(|b| b.w).unwrap_or([0.0; 4]);
+                let (cx, cy, cw, chh) = borderfx::padding_box(p.x, p.y, p.w, h, bw);
+                clip_hits(&mut self.hits, children_hits_start, cx, cy, cw, chh);
+            }
         }
         let bottom = self.y + mb.max(0.0);
 
@@ -2777,15 +2794,19 @@ impl<'a> Layouter<'a> {
         let bd = self.backdrop;
         let bb = border_box(c);
         let bg = self.bg_of(node, c).map(|col| over(col, bd));
-        let border = border_sides(c, size)
-            .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
+        let border = borderfx::borders(c, size).map(|mut b| {
+            for col in b.color.iter_mut() {
+                *col = over(*col, bg.unwrap_or(bd));
+            }
+            b
+        });
         st.inline_bg = None; // the box paints its own bg
         if let Some(b) = bg {
             if let Some(col) = c.get("color").and_then(|v| parse_color(v)) {
                 st.color = over(col, b);
             }
         }
-        let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.0).unwrap_or([0.0; 4]);
+        let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let bw_h = bw_l + bw_r;
         let bw_v = bw_t + bw_b;
 
@@ -2857,20 +2878,34 @@ impl<'a> Layouter<'a> {
             _ => natural.max(1.0),
         };
 
+        let shadows = borderfx::parse_shadows(c, size, bd, st.color);
+        let radii = borderfx::radius_spec(c).resolve(box_w, box_h, size);
+        let outline = borderfx::outline(c, size, bd, st.color);
+        let clip = borderfx::clips_overflow(c);
         let mut out: Vec<DisplayItem> = Vec::new();
-        if let Some(col) = bg {
-            out.push(DisplayItem::FillRect {
-                x: 0.0,
-                y: 0.0,
-                w: box_w,
-                h: box_h,
-                color: col,
-            });
-        }
-        if let Some((bw2, col)) = border {
-            side_rects(&mut out, 0.0, 0.0, box_w, box_h, bw2, col);
-        }
-        out.extend(items);
+        borderfx::emit_box(
+            &mut out,
+            0.0,
+            0.0,
+            box_w,
+            box_h,
+            bg,
+            border.as_ref(),
+            &radii,
+            &shadows,
+            clip,
+            outline.as_ref(),
+            items,
+        );
+        let nhits: Vec<_> = if clip {
+            let bw = border.map(|b| b.w).unwrap_or([0.0; 4]);
+            let (cx, cy, cw, chh) = borderfx::padding_box(0.0, 0.0, box_w, box_h, bw);
+            let mut v = nhits;
+            clip_hits(&mut v, 0, cx, cy, cw, chh);
+            v
+        } else {
+            nhits
+        };
         // translate/transform: visual offset of the whole box
         let (tx, ty) = translate_xy(c, box_w, box_h, size);
         let nhits: Vec<_> = if tx != 0.0 || ty != 0.0 {
@@ -2916,8 +2951,12 @@ impl<'a> Layouter<'a> {
         let [mt, _mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
         let bg = self.bg_of(node, c).map(|col| over(col, bd));
-        let border = border_sides(c, size)
-            .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
+        let border = borderfx::borders(c, size).map(|mut b| {
+            for col in b.color.iter_mut() {
+                *col = over(*col, bg.unwrap_or(bd));
+            }
+            b
+        });
         st.inline_bg = None;
         if let Some(b) = bg {
             if let Some(col) = c.get("color").and_then(|v| parse_color(v)) {
@@ -2930,7 +2969,11 @@ impl<'a> Layouter<'a> {
             .attr(node, "border")
             .and_then(|v| v.trim().parse::<f32>().ok())
             .filter(|w| *w > 0.0)
-            .map(|w| ([w; 4], BLACK));
+            .map(|w| Borders {
+                w: [w; 4],
+                style: [BorderStyle::Solid; 4],
+                color: [BLACK; 4],
+            });
 
         // gather rows: direct <tr> children plus tr inside row groups
         let cells_of = |doc: &Document, tr: NodeId| -> Vec<NodeId> {
@@ -2983,9 +3026,9 @@ impl<'a> Layouter<'a> {
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
                 let [_t, pr, _b, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
-                let [_, cbw_r, _, cbw_l] = border_sides(&cs, cst.size)
+                let [_, cbw_r, _, cbw_l] = borderfx::borders(&cs, cst.size)
                     .or(attr_border)
-                    .map(|b| b.0)
+                    .map(|b| b.w)
                     .unwrap_or([0.0; 4]);
                 let cbw_h = cbw_l + cbw_r;
                 let mut w = self.shrink_width(cell, &cst) + pl + pr + cbw_h;
@@ -3073,10 +3116,21 @@ impl<'a> Layouter<'a> {
             self.margin_x += avail - table_w;
         }
 
-        let shadow = parse_shadow(c, size, bd, st.color);
-        let patch = if bg.is_some() || border.is_some() || shadow.is_some() {
+        let shadows = borderfx::parse_shadows(c, size, bd, st.color);
+        let outline = borderfx::outline(c, size, bd, st.color);
+        let clip = borderfx::clips_overflow(c);
+        let radii = borderfx::radius_spec(c);
+        let patch = if bg.is_some()
+            || border.is_some()
+            || !shadows.is_empty()
+            || outline.is_some()
+            || clip
+            || !radii.none()
+        {
             let idx = self.items.len();
-            for _ in 0..9 {
+            let n_out = shadows.iter().filter(|s| !s.inset).count();
+            let nslots = n_out + 1 + (shadows.len() - n_out) + 4 + clip as usize;
+            for _ in 0..nslots {
                 self.items.push(DisplayItem::FillRect {
                     x: 0.0,
                     y: 0.0,
@@ -3087,26 +3141,32 @@ impl<'a> Layouter<'a> {
             }
             Some(BlockPatch {
                 idx,
+                nslots,
                 x: self.margin_x,
                 y: self.y,
                 w: table_w,
+                em: size,
                 bg,
                 border,
-                radius: parse_radius(c, st.size),
-                shadow,
+                radii,
+                shadows,
+                clip,
+                outline,
             })
         } else {
             None
         };
+        let children_hits_start = self.hits.len();
 
         for row in &rows {
-            // (x, cell w, cell h, bg, border, items in cell-local coords)
+            // (x, cell w, cell h, bg, border, clips, items in cell-local coords)
             let mut boxes: Vec<(
                 f32,
                 f32,
                 f32,
                 Option<Color>,
-                Option<([f32; 4], Color)>,
+                Option<Borders>,
+                bool,
                 Vec<DisplayItem>,
                 Vec<(f32, f32, f32, f32, NodeId)>,
             )> = Vec::new();
@@ -3127,11 +3187,16 @@ impl<'a> Layouter<'a> {
                     _ => {}
                 }
                 let [pt, pr, pb, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
-                let cborder = border_sides(&cs, cst.size)
+                let cborder = borderfx::borders(&cs, cst.size)
                     .or(attr_border)
-                    .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
+                    .map(|mut b| {
+                        for col in b.color.iter_mut() {
+                            *col = over(*col, bg.unwrap_or(bd));
+                        }
+                        b
+                    });
                 let [bw_t, bw_r, bw_b, bw_l] =
-                    cborder.map(|b| b.0).unwrap_or([0.0; 4]);
+                    cborder.map(|b| b.w).unwrap_or([0.0; 4]);
                 let cbg = cs
                     .get("background-color")
                     .and_then(|v| parse_color(v))
@@ -3144,12 +3209,13 @@ impl<'a> Layouter<'a> {
                     self.nest(cell, &cst, pl + bw_l, pt + bw_t, inner, &cs);
                 let min_h = self.eff_line_h(&cst);
                 let cell_h = (y_end + pb + bw_b).max(min_h);
-                boxes.push((x, cw, cell_h, cbg, cborder, items, nhits));
+                let cell_clip = borderfx::clips_overflow(&cs);
+                boxes.push((x, cw, cell_h, cbg, cborder, cell_clip, items, nhits));
                 x += cw;
                 row_h = row_h.max(cell_h);
             }
             // second pass: stretch cell bg/borders to row height, place content
-            for (cx, cw, _ch, cbg, cborder, items, nhits) in boxes {
+            for (cx, cw, _ch, cbg, cborder, cell_clip, items, mut nhits) in boxes {
                 if let Some(col) = cbg {
                     self.items.push(DisplayItem::FillRect {
                         x: cx,
@@ -3159,11 +3225,26 @@ impl<'a> Layouter<'a> {
                         color: col,
                     });
                 }
-                if let Some((bw2, col)) = cborder {
-                    side_rects(&mut self.items, cx, self.y, cw, row_h, bw2, col);
+                if let Some(b2) = cborder {
+                    borderfx::emit_borders(&mut self.items, cx, self.y, cw, row_h, &b2);
+                }
+                if cell_clip {
+                    let bw = cborder.map(|b| b.w).unwrap_or([0.0; 4]);
+                    let (lx, ly, lw, lh) = borderfx::padding_box(0.0, 0.0, cw, row_h, bw);
+                    self.items.push(DisplayItem::PushClip {
+                        x: cx + lx,
+                        y: self.y + ly,
+                        w: lw,
+                        h: lh,
+                        radii: [[0.0; 2]; 4],
+                    });
+                    clip_hits(&mut nhits, 0, lx, ly, lw, lh);
                 }
                 for it in items {
                     self.items.push(offset_item(it, cx, self.y));
+                }
+                if cell_clip {
+                    self.items.push(DisplayItem::PopClip);
                 }
                 for h in nhits {
                     self.hits.push((h.0 + cx, h.1 + self.y, h.2, h.3, h.4));
@@ -3174,6 +3255,12 @@ impl<'a> Layouter<'a> {
 
         if let Some(p) = patch {
             self.finish_patch(&p);
+            if p.clip {
+                let h = self.y - p.y;
+                let bw = p.border.map(|b| b.w).unwrap_or([0.0; 4]);
+                let (cx, cy, cw, chh) = borderfx::padding_box(p.x, p.y, p.w, h, bw);
+                clip_hits(&mut self.hits, children_hits_start, cx, cy, cw, chh);
+            }
         }
         self.margin_x = saved.0;
         self.avail_w = saved.1;
@@ -3530,9 +3617,12 @@ impl<'a> Layouter<'a> {
             p: [f32; 4],
             bw: [f32; 4],
             bg: Option<Color>,
-            border: Option<([f32; 4], Color)>,
-            radius: f32,
-            shadow: Option<(f32, f32, f32, Color)>,
+            border: Option<Borders>,
+            radius: RadiusSpec,
+            shadows: Vec<BoxShadow>,
+            outline: Option<Outline>,
+            /// overflow clips descendants to the padding box
+            clip: bool,
             bb: bool,
             w_prop: Option<f32>,
             h_prop: Option<f32>,
@@ -3837,11 +3927,17 @@ impl<'a> Layouter<'a> {
             let bd = self.backdrop;
             let bb = border_box(&cc);
             let bg = self.bg_of(ch, &cc).map(|col| over(col, bd));
-            let border = border_sides(&cc, cst.size)
-                .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
-            let bw = border.map(|b| b.0).unwrap_or([0.0; 4]);
-            let radius = parse_radius(&cc, cst.size);
-            let shadow = parse_shadow(&cc, cst.size, bd, cst.color);
+            let border = borderfx::borders(&cc, cst.size).map(|mut b| {
+                for col in b.color.iter_mut() {
+                    *col = over(*col, bg.unwrap_or(bd));
+                }
+                b
+            });
+            let bw = border.map(|b| b.w).unwrap_or([0.0; 4]);
+            let radius = borderfx::radius_spec(&cc);
+            let shadows = borderfx::parse_shadows(&cc, cst.size, bd, cst.color);
+            let outline = borderfx::outline(&cc, cst.size, bd, cst.color);
+            let clip = borderfx::clips_overflow(&cc);
             let w_prop = dim(&cc, "width", avail, cst.size).map(|w| {
                 let mut w = w;
                 if let Some(mx) = cc.get("max-width").and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail)) {
@@ -3898,7 +3994,9 @@ impl<'a> Layouter<'a> {
                 bg,
                 border,
                 radius,
-                shadow,
+                shadows,
+                outline,
+                clip,
                 bb,
                 w_prop,
                 h_prop,
@@ -4187,51 +4285,7 @@ impl<'a> Layouter<'a> {
             // translate/transform shifts the painted box + its hit rects
             let (tx, ty) = translate_xy(&it.cc, box_w, box_h, it.st.size);
             let (ix, iy) = (ix + tx, iy + ty);
-            if let Some((ox, oy, sp, col)) = it.shadow {
-                if sp > 0.0 && ox == 0.0 && oy == 0.0 {
-                    edge_rects(
-                        &mut self.items,
-                        ix - sp,
-                        iy - sp,
-                        box_w + 2.0 * sp,
-                        box_h + 2.0 * sp,
-                        sp,
-                        col,
-                    );
-                } else {
-                    self.items.push(DisplayItem::RoundedRect {
-                        x: ix + ox,
-                        y: iy + oy,
-                        w: box_w,
-                        h: box_h,
-                        radius: it.radius,
-                        color: col,
-                    });
-                }
-            }
-            if let Some(col) = it.bg {
-                if it.radius > 0.5 {
-                    self.items.push(DisplayItem::RoundedRect {
-                        x: ix,
-                        y: iy,
-                        w: box_w,
-                        h: box_h,
-                        radius: it.radius,
-                        color: col,
-                    });
-                } else {
-                    self.items.push(DisplayItem::FillRect {
-                        x: ix,
-                        y: iy,
-                        w: box_w,
-                        h: box_h,
-                        color: col,
-                    });
-                }
-            }
-            if let Some((bw2, col)) = it.border {
-                side_rects(&mut self.items, ix, iy, box_w, box_h, bw2, col);
-            }
+            let radii = it.radius.resolve(box_w, box_h, it.st.size);
             // `align-items:center` on the item centers its content inside the
             // (possibly stretched) box
             let dy = if matches!(
@@ -4242,13 +4296,37 @@ impl<'a> Layouter<'a> {
             } else {
                 0.0
             };
-            for di in it.laid.drain(..) {
-                self.items.push(offset_item(di, ix, iy + dy));
-            }
+            let laid: Vec<DisplayItem> = it
+                .laid
+                .drain(..)
+                .map(|di| offset_item(di, ix, iy + dy))
+                .collect();
+            borderfx::emit_box(
+                &mut self.items,
+                ix,
+                iy,
+                box_w,
+                box_h,
+                it.bg,
+                it.border.as_ref(),
+                &radii,
+                &it.shadows,
+                it.clip,
+                it.outline.as_ref(),
+                laid,
+            );
             self.hits.push((ix, iy, box_w, box_h, it.id));
-            for h in it.hits.drain(..) {
-                self.hits.push((h.0 + ix, h.1 + iy + dy, h.2, h.3, h.4));
+            let mut hv: Vec<_> = it
+                .hits
+                .drain(..)
+                .map(|h| (h.0 + ix, h.1 + iy + dy, h.2, h.3, h.4))
+                .collect();
+            if it.clip {
+                let bw = it.border.map(|b| b.w).unwrap_or([0.0; 4]);
+                let (cx, cy, cw, chh) = borderfx::padding_box(ix, iy, box_w, box_h, bw);
+                clip_hits(&mut hv, 0, cx, cy, cw, chh);
             }
+            self.hits.extend(hv);
         }
 
         // the container consumes max(content, declared height) in flow
@@ -4708,41 +4786,50 @@ impl<'a> Layouter<'a> {
 
     fn finish_patch(&mut self, p: &BlockPatch) {
         let h = self.y - p.y;
-        let mut put = |i: usize, it: DisplayItem| self.items[p.idx + i] = it;
-        // paint order = slot order: shadow (0-3) behind bg (4) behind
-        // border edges (5-8)
-        if let Some((ox, oy, sp, col)) = p.shadow {
-            if sp > 0.0 && ox == 0.0 && oy == 0.0 {
-                // ring (Tailwind `ring-*`): outline just outside the box
-                let mut tmp = Vec::with_capacity(4);
-                edge_rects(&mut tmp, p.x - sp, p.y - sp, p.w + 2.0 * sp, h + 2.0 * sp, sp, col);
-                for (i, it) in tmp.into_iter().enumerate() {
-                    put(i, it);
-                }
-            } else {
-                put(0, DisplayItem::RoundedRect {
-                    x: p.x + ox,
-                    y: p.y + oy,
-                    w: p.w,
-                    h,
-                    radius: p.radius,
-                    color: col,
-                });
-            }
+        let radii = p.radii.resolve(p.w, h, p.em);
+        let mut slot = p.idx;
+        // paint order = slot order: outer shadows under the box (listed
+        // order reversed — first CSS shadow topmost), bg, inset shadows,
+        // border edges, then the clip marker right before the children.
+        for s in p.shadows.iter().filter(|s| !s.inset).rev() {
+            self.items[slot] = borderfx::shadow_item(s, p.x, p.y, p.w, h, &radii);
+            slot += 1;
         }
         if let Some(bg) = p.bg {
-            if p.radius > 0.5 {
-                put(4, DisplayItem::RoundedRect { x: p.x, y: p.y, w: p.w, h, radius: p.radius, color: bg });
-            } else {
-                put(4, DisplayItem::FillRect { x: p.x, y: p.y, w: p.w, h, color: bg });
+            self.items[slot] = borderfx::bg_item(p.x, p.y, p.w, h, bg, &radii);
+            slot += 1;
+        }
+        for s in p.shadows.iter().filter(|s| s.inset).rev() {
+            self.items[slot] = borderfx::shadow_item(s, p.x, p.y, p.w, h, &radii);
+            slot += 1;
+        }
+        if let Some(b) = &p.border {
+            let mut tmp = Vec::with_capacity(4);
+            borderfx::emit_borders(&mut tmp, p.x, p.y, p.w, h, b);
+            for it in tmp {
+                self.items[slot] = it;
+                slot += 1;
             }
         }
-        if let Some((bw, col)) = p.border {
-            let mut tmp = Vec::with_capacity(4);
-            side_rects(&mut tmp, p.x, p.y, p.w, h, bw, col);
-            for (i, it) in tmp.into_iter().enumerate() {
-                put(5 + i, it);
-            }
+        if p.clip {
+            // overflow clips descendants to the padding box — pull the
+            // border-box radii in by the border widths. The clip marker is
+            // the last reserved slot; PopClip + outline land after the
+            // children items appended since.
+            let bw = p.border.map(|b| b.w).unwrap_or([0.0; 4]);
+            let (cx, cy, cw, ch) = borderfx::padding_box(p.x, p.y, p.w, h, bw);
+            let pr = radii.inset(bw);
+            self.items[p.idx + p.nslots - 1] = DisplayItem::PushClip {
+                x: cx,
+                y: cy,
+                w: cw,
+                h: ch,
+                radii: pr.0,
+            };
+            self.items.push(DisplayItem::PopClip);
+        }
+        if let Some(o) = &p.outline {
+            borderfx::emit_outline(&mut self.items, p.x, p.y, p.w, h, o);
         }
     }
 
@@ -5637,6 +5724,109 @@ mod tests {
         assert_eq!(font_weight_value("lighter", 900), 700);
         assert_eq!(font_stretch_value("condensed"), 75);
         assert_eq!(font_stretch_value("120%"), 120);
+    }
+
+    #[test]
+    fn dashed_border_emits_border_side() {
+        let (items, _, _) =
+            lay("<style>.b{border:4px dashed #ff0000}</style><div class=b>x</div>");
+        assert!(items.iter().any(|i| matches!(
+            i,
+            DisplayItem::BorderSide { style, .. } if *style == BorderStyle::Dashed
+        )));
+    }
+
+    #[test]
+    fn per_side_border_styles() {
+        let (items, _, _) = lay(
+            "<style>.b{border-width:2px;border-style:solid double;\
+             border-color:#ff0000}</style><div class=b>x</div>",
+        );
+        // solid sides stay FillRects; double sides become BorderSide items
+        assert!(items.iter().any(|i| matches!(
+            i,
+            DisplayItem::BorderSide { style, .. } if *style == BorderStyle::Double
+        )));
+        assert!(items.iter().any(|i| matches!(
+            i,
+            DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)
+        )));
+    }
+
+    #[test]
+    fn corner_radius_emits_rounded2() {
+        let (items, _, _) = lay(
+            "<style>.r{border-top-left-radius:20px;background:#ff0000;\
+             width:100px;height:100px}</style><div class=r></div>",
+        );
+        assert!(items.iter().any(|i| matches!(
+            i,
+            DisplayItem::RoundedRect2 { radii, .. } if radii[0][0] > 10.0
+        )));
+    }
+
+    #[test]
+    fn slash_radius_resolves_per_corner() {
+        let (items, _, _) = lay(
+            "<style>.r{border-radius:10px 20px/5px;background:#ff0000;\
+             width:100px;height:100px}</style><div class=r></div>",
+        );
+        let r = items.iter().find_map(|i| match i {
+            DisplayItem::RoundedRect2 { radii, .. } => Some(*radii),
+            _ => None,
+        });
+        let Some(radii) = r else {
+            panic!("no RoundedRect2 emitted")
+        };
+        assert!((radii[0][0] - 10.0).abs() < 0.5 && (radii[0][1] - 5.0).abs() < 0.5);
+        assert!((radii[1][0] - 20.0).abs() < 0.5 && (radii[1][1] - 5.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn box_shadow_multiple_and_inset() {
+        let (items, _, _) = lay(
+            "<style>.s{box-shadow:2px 3px red,inset 0 0 4px blue;\
+             width:10px;height:10px}</style><div class=s>x</div>",
+        );
+        let sh: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, DisplayItem::Shadow { .. }))
+            .collect();
+        assert_eq!(sh.len(), 2);
+        let ins = sh.iter().any(|i| matches!(
+            i,
+            DisplayItem::Shadow { inset: true, blur, .. } if *blur > 0.0
+        ));
+        assert!(ins, "one inset shadow with blur");
+    }
+
+    #[test]
+    fn overflow_hidden_clips_children() {
+        let (items, _, _) = lay(
+            "<style>.o{overflow:hidden;width:100px;height:10px}</style>\
+             <div class=o><div>inner text</div></div>",
+        );
+        let pos = |pred: &dyn Fn(&DisplayItem) -> bool| items.iter().position(pred);
+        let push = pos(&|i| matches!(i, DisplayItem::PushClip { .. })).expect("PushClip");
+        let pop = pos(&|i| matches!(i, DisplayItem::PopClip)).expect("PopClip");
+        let txt = pos(&|i| matches!(i, DisplayItem::Text { .. })).expect("text");
+        assert!(push < txt && txt < pop, "children inside the clip");
+    }
+
+    #[test]
+    fn outline_paints_outside_border() {
+        let (items, _, _) = lay(
+            "<style>.o{outline:2px solid #ff0000;width:50px;height:20px}</style>\
+             <div class=o>x</div>",
+        );
+        let reds = items
+            .iter()
+            .filter(|i| matches!(
+                i,
+                DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)
+            ))
+            .count();
+        assert!(reds >= 4, "four outline edges");
     }
 }
 

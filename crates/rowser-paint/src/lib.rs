@@ -9,26 +9,42 @@ use rowser_layout::{Color, DisplayItem};
 use std::collections::HashMap;
 use rowser_text::FontCache;
 
+pub mod fx;
+use fx::Clip;
+
 pub struct Canvas {
     pub width: u32,
     pub height: u32,
     /// BGRA bytes
     pub pixels: Vec<u8>,
+    /// Active overflow-clip stack (DisplayItem::PushClip/PopClip).
+    pub clips: Vec<Clip>,
 }
 
 impl Canvas {
     pub fn new(width: u32, height: u32, bg: Color) -> Self {
         let mut px = vec![0u8; (width * height * 4) as usize];
-        fill(&mut px, width, height, 0, 0, width, height, bg);
+        fill(&mut px, width, height, 0, 0, width, height, bg, &[]);
         Self {
             width,
             height,
             pixels: px,
+            clips: Vec::new(),
         }
     }
 
     pub fn fill_rect(&mut self, x: i32, y: i32, w: u32, h: u32, color: Color) {
-        fill(&mut self.pixels, self.width, self.height, x, y, w, h, color);
+        fill(
+            &mut self.pixels,
+            self.width,
+            self.height,
+            x,
+            y,
+            w,
+            h,
+            color,
+            &self.clips,
+        );
     }
 
     /// Filled rect with uniform rounded corners (quarter-circle arcs).
@@ -58,18 +74,95 @@ impl Canvas {
         }
     }
 
+    /// Filled rect with per-corner elliptical radii — scanline fill: each
+    /// row is shortened where a corner ellipse cuts it. Corner order
+    /// [top-left, top-right, bottom-right, bottom-left], each (rx, ry).
+    pub fn fill_rounded_radii(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        radii: [[f32; 2]; 4],
+        color: Color,
+    ) {
+        let (wf, hf) = (w as f32, h as f32);
+        let mut r = radii;
+        // scale corners so adjacent radii never overshoot a shared edge
+        let mut f = 1.0f32;
+        for (a, b, len, ax) in [(0, 1, wf, 0), (2, 3, wf, 0), (0, 3, hf, 1), (1, 2, hf, 1)] {
+            let s = r[a][ax] + r[b][ax];
+            if s > len && s > 0.0 {
+                f = f.min(len / s);
+            }
+        }
+        if f < 1.0 {
+            for c in r.iter_mut() {
+                c[0] *= f;
+                c[1] *= f;
+            }
+        }
+        if r.iter().all(|c| c[0] < 0.5 && c[1] < 0.5) {
+            return self.fill_rect(x, y, w, h, color);
+        }
+        for dy in 0..h as i32 {
+            let py = y + dy;
+            let t = dy as f32 + 0.5;
+            let (mut xl, mut xr) = (x, x + w as i32);
+            // top corners cut rows [0, ry); bottom cut rows (h - ry, h)
+            for (cx, corner) in [(0usize, 0usize), (1, 1)] {
+                let [rx, ry] = r[corner];
+                if rx > 0.0 && ry > 0.0 && t < ry {
+                    let dyy = ry - t;
+                    let cut = rx * (1.0 - (dyy * dyy) / (ry * ry)).max(0.0).sqrt();
+                    if cx == 0 {
+                        xl = xl.max(x + (rx - cut).ceil() as i32);
+                    } else {
+                        xr = xr.min(x + w as i32 - (rx - cut).ceil() as i32);
+                    }
+                }
+            }
+            let tb = hf - t;
+            for (cx, corner) in [(0usize, 3usize), (1, 2)] {
+                let [rx, ry] = r[corner];
+                if rx > 0.0 && ry > 0.0 && tb < ry {
+                    let dyy = ry - tb;
+                    let cut = rx * (1.0 - (dyy * dyy) / (ry * ry)).max(0.0).sqrt();
+                    if cx == 0 {
+                        xl = xl.max(x + (rx - cut).ceil() as i32);
+                    } else {
+                        xr = xr.min(x + w as i32 - (rx - cut).ceil() as i32);
+                    }
+                }
+            }
+            if xr > xl {
+                self.fill_rect(xl, py, (xr - xl) as u32, 1, color);
+            }
+        }
+    }
+
     /// Blend a coverage bitmap with `color` onto the canvas at (x, y).
     pub fn blend_alpha(&mut self, x: i32, y: i32, w: u32, h: u32, alpha: &[u8], color: Color) {
         let (cw, ch) = (self.width as i32, self.height as i32);
+        let (sx0, sy0, sx1, sy1) = fx::scissor(&self.clips, cw, ch);
+        let clipped = !self.clips.is_empty();
         let [b, g, r, _] = color.to_le_bytes();
         for gy in 0..h as i32 {
             let dy = y + gy;
-            if dy < 0 || dy >= ch {
+            if dy < sy0 || dy >= sy1 {
                 continue;
             }
             for gx in 0..w as i32 {
                 let dx = x + gx;
-                if dx < 0 || dx >= cw {
+                if dx < sx0 || dx >= sx1 {
+                    continue;
+                }
+                if clipped
+                    && !self
+                        .clips
+                        .iter()
+                        .all(|c| c.contains(dx as f32 + 0.5, dy as f32 + 0.5))
+                {
                     continue;
                 }
                 let a = alpha[(gy * w as i32 + gx) as usize] as u32;
@@ -89,15 +182,30 @@ impl Canvas {
     }
 }
 
-fn fill(px: &mut [u8], w: u32, h: u32, x: i32, y: i32, rw: u32, rh: u32, color: Color) {
+fn fill(
+    px: &mut [u8],
+    w: u32,
+    h: u32,
+    x: i32,
+    y: i32,
+    rw: u32,
+    rh: u32,
+    color: Color,
+    clips: &[Clip],
+) {
     let (w, h) = (w as i32, h as i32);
     let [b, g, r, _] = color.to_le_bytes();
-    let x0 = x.max(0);
-    let y0 = y.max(0);
-    let x1 = (x + rw as i32).min(w);
-    let y1 = (y + rh as i32).min(h);
+    let (sx0, sy0, sx1, sy1) = fx::scissor(clips, w, h);
+    let x0 = x.max(0).max(sx0);
+    let y0 = y.max(0).max(sy0);
+    let x1 = (x + rw as i32).min(w).min(sx1);
+    let y1 = (y + rh as i32).min(h).min(sy1);
+    let clipped = !clips.is_empty();
     for yy in y0..y1 {
         for xx in x0..x1 {
+            if clipped && !clips.iter().all(|c| c.contains(xx as f32 + 0.5, yy as f32 + 0.5)) {
+                continue;
+            }
             let i = ((yy * w + xx) * 4) as usize;
             px[i] = b;
             px[i + 1] = g;
@@ -135,11 +243,19 @@ pub fn paint_into(
         let (top, bot) = match item {
             DisplayItem::FillRect { y, h, .. }
             | DisplayItem::RoundedRect { y, h, .. }
+            | DisplayItem::RoundedRect2 { y, h, .. }
+            | DisplayItem::BorderSide { y, h, .. }
             | DisplayItem::Raster { y, h, .. }
             | DisplayItem::Image { y, h, .. } => (*y, *y + *h),
             DisplayItem::Text { baseline, size, .. } => {
                 (baseline - size * 4.0, baseline + size * 4.0)
             }
+            // PushClip/PopClip/Shadow are never culled — a skipped PushClip
+            // would un-clip its children, and a shadow's halo reaches
+            // beyond its box.
+            DisplayItem::PushClip { .. }
+            | DisplayItem::PopClip
+            | DisplayItem::Shadow { .. } => (0.0, ch),
         };
         if bot < 0.0 || top > ch {
             continue;
@@ -166,6 +282,43 @@ pub fn paint_into(
             }
             DisplayItem::FillRect { x, y, w, h, color } => {
                 canvas.fill_rect(*x as i32, *y as i32, *w as u32, *h as u32, *color);
+            }
+            DisplayItem::BorderSide { x, y, w, h, side, style, color } => {
+                fx::border_side(canvas, *x, *y, *w, *h, *side, *style, *color);
+            }
+            DisplayItem::RoundedRect2 { x, y, w, h, radii, color } => {
+                canvas.fill_rounded_radii(
+                    *x as i32, *y as i32, *w as u32, *h as u32, *radii, *color,
+                );
+            }
+            DisplayItem::Shadow {
+                x,
+                y,
+                w,
+                h,
+                dx,
+                dy,
+                blur,
+                spread,
+                radii,
+                color,
+                inset,
+            } => {
+                fx::box_shadow(
+                    canvas, *x, *y, *w, *h, *dx, *dy, *blur, *spread, *radii, *color, *inset,
+                );
+            }
+            DisplayItem::PushClip { x, y, w, h, radii } => {
+                canvas.clips.push(Clip {
+                    x: *x,
+                    y: *y,
+                    w: *w,
+                    h: *h,
+                    radii: *radii,
+                });
+            }
+            DisplayItem::PopClip => {
+                canvas.clips.pop();
             }
             DisplayItem::Text {
                 x,
@@ -260,6 +413,121 @@ mod tests {
         // red rect top-left
         assert_eq!(px[2], 255);
     }
+
+    #[test]
+    fn push_clip_clips_fill() {
+        let mut fonts = FontCache::new();
+        let items = vec![
+            DisplayItem::PushClip {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+                radii: [[0.0; 2]; 4],
+            },
+            DisplayItem::FillRect {
+                x: 0.0,
+                y: 0.0,
+                w: 50.0,
+                h: 50.0,
+                color: bgra(255, 0, 0),
+            },
+            DisplayItem::PopClip,
+        ];
+        let px = paint(&items, &mut fonts, 100, 100, rowser_layout::WHITE, &HashMap::new());
+        let at = |x: usize, y: usize| &px[(y * 100 + x) * 4..(y * 100 + x) * 4 + 3];
+        // red pixel has blue channel 0; white bg has 255
+        assert_eq!(at(5, 5)[0], 0, "inside clip painted red");
+        assert_eq!(at(5, 5)[2], 255);
+        assert_eq!(at(30, 30)[0], 255, "outside clip stays white");
+        assert_eq!(at(30, 30)[2], 255);
+    }
+
+    #[test]
+    fn dashed_border_has_gaps() {
+        let mut fonts = FontCache::new();
+        let items = vec![DisplayItem::BorderSide {
+            x: 0.0,
+            y: 0.0,
+            w: 30.0,
+            h: 4.0,
+            side: rowser_layout::BorderEdge::Top,
+            style: rowser_layout::BorderStyle::Dashed,
+            color: bgra(0, 0, 0),
+        }];
+        let px = paint(&items, &mut fonts, 40, 10, rowser_layout::WHITE, &HashMap::new());
+        // pixel dark when all channels < 128 (black dash vs white bg)
+        let dark = |x: usize| (0..3).all(|ch| px[(2 * 40 + x) * 4 + ch] < 128);
+        let (mut painted, mut empty) = (0, 0);
+        for x in 0..30 {
+            if dark(x) {
+                painted += 1
+            } else {
+                empty += 1
+            }
+        }
+        assert!(painted > 0 && empty > 0, "dashes and gaps both present");
+    }
+
+    #[test]
+    fn double_border_two_bands() {
+        let mut fonts = FontCache::new();
+        let items = vec![DisplayItem::BorderSide {
+            x: 0.0,
+            y: 0.0,
+            w: 30.0,
+            h: 6.0,
+            side: rowser_layout::BorderEdge::Top,
+            style: rowser_layout::BorderStyle::Double,
+            color: bgra(0, 0, 0),
+        }];
+        let px = paint(&items, &mut fonts, 40, 10, rowser_layout::WHITE, &HashMap::new());
+        let dark = |y: usize| (0..3).all(|ch| px[(y * 40 + 15) * 4 + ch] < 128);
+        let light = |y: usize| (0..3).all(|ch| px[(y * 40 + 15) * 4 + ch] > 200);
+        assert!(dark(0) && dark(5), "two lines painted");
+        assert!(light(2) || light(3), "gap between lines");
+    }
+
+    #[test]
+    fn outer_shadow_blurs() {
+        let mut fonts = FontCache::new();
+        let items = vec![DisplayItem::Shadow {
+            x: 20.0,
+            y: 20.0,
+            w: 20.0,
+            h: 20.0,
+            dx: 0.0,
+            dy: 0.0,
+            blur: 5.0,
+            spread: 0.0,
+            radii: [[0.0; 2]; 4],
+            color: bgra(0, 0, 0),
+            inset: false,
+        }];
+        let px = paint(&items, &mut fonts, 80, 80, rowser_layout::WHITE, &HashMap::new());
+        let edge = px[(30 * 80 + 14) * 4 + 2]; // 6px left of the box — halo
+        assert!(edge < 250 && edge > 100, "soft shadow halo present: {edge}");
+        let far = px[(30 * 80 + 5) * 4 + 2]; // beyond blur reach — stays white
+        assert!(far > 240, "no shadow beyond the halo: {far}");
+    }
+
+    #[test]
+    fn rounded2_clips_corner() {
+        let mut fonts = FontCache::new();
+        let items = vec![DisplayItem::RoundedRect2 {
+            x: 0.0,
+            y: 0.0,
+            w: 40.0,
+            h: 40.0,
+            radii: [[20.0, 20.0], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+            color: bgra(255, 0, 0),
+        }];
+        let px = paint(&items, &mut fonts, 50, 50, rowser_layout::WHITE, &HashMap::new());
+        // blue channel: white bg 255, red fill 0
+        assert_eq!(px[0], 255, "top-left corner cut to bg");
+        let center = px[(20 * 50 + 20) * 4];
+        assert_eq!(center, 0, "interior painted red");
+    }
 }
 
 
@@ -277,9 +545,19 @@ impl Canvas {
             return;
         }
         let (cw, ch) = (self.width as i32, self.height as i32);
-        for y in dy.max(0)..(dy + dh).min(ch) {
+        let (sx0, sy0, sx1, sy1) = fx::scissor(&self.clips, cw, ch);
+        let clipped = !self.clips.is_empty();
+        for y in dy.max(0).max(sy0)..(dy + dh).min(ch).min(sy1) {
             let sy = ((y - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
-            for x in dx.max(0)..(dx + dw).min(cw) {
+            for x in dx.max(0).max(sx0)..(dx + dw).min(cw).min(sx1) {
+                if clipped
+                    && !self
+                        .clips
+                        .iter()
+                        .all(|c| c.contains(x as f32 + 0.5, y as f32 + 0.5))
+                {
+                    continue;
+                }
                 let sx = ((x - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
                 let si = ((sy * img.width + sx) * 4) as usize;
                 let di = ((y * cw + x) * 4) as usize;
