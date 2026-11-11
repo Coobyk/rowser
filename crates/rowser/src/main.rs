@@ -97,6 +97,36 @@ struct BrowserView {
     /// In-progress page-text drag: the anchor point in document-space
     /// device px (set on mouse-down, cleared on mouse-up).
     drag: Option<(f32, f32)>,
+    /// Cursor the page asked for (`ToBrowser::Cursor`) — applied while
+    /// the pointer is over the webview.
+    page_cursor: CursorStyle,
+}
+
+/// Map a CSS `cursor` keyword (renderer → `ToBrowser::Cursor`) to a GPUI
+/// `CursorStyle`. Unknown/empty/auto keywords fall back to the arrow.
+fn css_cursor(css: &str) -> CursorStyle {
+    match css.trim() {
+        "pointer" => CursorStyle::PointingHand,
+        "text" => CursorStyle::IBeam,
+        "vertical-text" => CursorStyle::IBeamCursorForVerticalLayout,
+        "crosshair" => CursorStyle::Crosshair,
+        "grab" => CursorStyle::OpenHand,
+        "grabbing" => CursorStyle::ClosedHand,
+        "not-allowed" => CursorStyle::OperationNotAllowed,
+        "alias" => CursorStyle::DragLink,
+        "copy" => CursorStyle::DragCopy,
+        "context-menu" => CursorStyle::ContextualMenu,
+        "w-resize" => CursorStyle::ResizeLeft,
+        "e-resize" => CursorStyle::ResizeRight,
+        "ew-resize" | "col-resize" => CursorStyle::ResizeLeftRight,
+        "n-resize" => CursorStyle::ResizeUp,
+        "s-resize" => CursorStyle::ResizeDown,
+        "ns-resize" | "row-resize" => CursorStyle::ResizeUpDown,
+        "nesw-resize" => CursorStyle::ResizeUpLeftDownRight,
+        "nwse-resize" => CursorStyle::ResizeUpRightDownLeft,
+        "none" => CursorStyle::None,
+        _ => CursorStyle::Arrow,
+    }
 }
 
 /// Append a timestamped line to the shared event log (renderer writes
@@ -137,6 +167,7 @@ impl BrowserView {
             inspector: false,
             dom_dump: String::new(),
             drag: None,
+            page_cursor: CursorStyle::Arrow,
         };
 
         // Drain renderer messages into the UI. Polling via gpui::Timer keeps
@@ -451,6 +482,7 @@ impl BrowserView {
                         }
                     }
                     ToBrowser::SelText(t) => tab.sel_text = t,
+                    ToBrowser::Cursor(css) => self.page_cursor = css_cursor(&css),
                     ToBrowser::Log(m) => self.logs.push(format!("tab {id}: {m}")),
                 },
                 TabEvent::Disconnected => {
@@ -859,6 +891,7 @@ impl Render for BrowserView {
         } else if let Some(frame) = &active.frame {
             div()
                 .size_full()
+                .cursor(self.page_cursor)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|view, e: &MouseDownEvent, window, cx| {
@@ -873,24 +906,38 @@ impl Render for BrowserView {
                         // Possible start of a text-selection drag — the
                         // click itself is deferred to mouse-up so a drag
                         // that begins on a link doesn't navigate.
-                        view.drag = Some((f32::from(p.x) * sf, (f32::from(p.y) - CHROME_PX) * sf));
+                        let (dx, dy) = (f32::from(p.x) * sf, (f32::from(p.y) - CHROME_PX) * sf);
+                        view.drag = Some((dx, dy));
+                        let i = view.active;
+                        view.tabs[i].send(&ToRenderer::MouseDown { x: dx, y: dy });
                         cx.notify();
                     }),
                 )
                 .on_mouse_move(cx.listener(|view, e: &MouseMoveEvent, window, cx| {
+                    let sf = window.scale_factor();
+                    let (mx, my) = (
+                        f32::from(e.position.x) * sf,
+                        (f32::from(e.position.y) - CHROME_PX) * sf,
+                    );
+                    let i = view.active;
+                    // hover/active tracking — the renderer hit-tests and
+                    // replies with a Cursor only when the value changes
+                    view.tabs[i].send(&ToRenderer::MouseMove {
+                        x: mx,
+                        y: my,
+                        down: e.pressed_button.is_some(),
+                    });
                     if e.pressed_button != Some(MouseButton::Left) {
                         // Missed the up (released outside) — drop the drag.
                         view.drag = None;
                         return;
                     }
                     let Some((x0, y0)) = view.drag else { return };
-                    let sf = window.scale_factor();
-                    let i = view.active;
                     view.tabs[i].send(&ToRenderer::Select {
                         x0,
                         y0,
-                        x1: f32::from(e.position.x) * sf,
-                        y1: (f32::from(e.position.y) - CHROME_PX) * sf,
+                        x1: mx,
+                        y1: my,
                     });
                     cx.notify();
                 }))

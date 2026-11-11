@@ -8,9 +8,10 @@
 //! pseudo-classes (`:nth-*`, `:first/last/only-*`, `:empty`, `:checked`,
 //! `:disabled`, `:enabled`), functional `:is`/`:where`/`:not`/`:has`, `:root`,
 //! `:host`, `&` (nesting ref — matches any element). Dynamic-state pseudos
-//! (`:hover` etc.) parse as valid but never match; `::before`/`::after`/
-//! `::marker`/`::first-letter`/`::first-line`/`::selection`/`::placeholder`
-//! parse to [`Simple::PseudoElem`] and style generated boxes via
+//! (`:hover`, `:focus`, `:active`, `:target`, `:link`...) match against a
+//! [`PseudoState`] carried by [`StyleCtx`]; `::before`/`::after`/`::marker`/
+//! `::first-letter`/`::first-line`/`::selection`/`::placeholder` parse to
+//! [`Simple::PseudoElem`] and style generated boxes via
 //! [`StyleCtx::computed_pseudo`]. Other `::pseudo-elements` never match.
 //!
 //! The cascade: user-agent sheet < author sheets, then !important author >
@@ -119,8 +120,24 @@ pub enum Simple {
     Not(Vec<Selector>),
     /// `:has(rel-list)` — relative selectors anchored on this element.
     Has(Vec<Selector>),
-    /// Valid-but-never-matching: dynamic-state pseudos (`:hover`, `:focus`,
-    /// ...) and `::pseudo-elements` we don't generate boxes for.
+    /// `:hover` — node is the hovered element or an ancestor of it.
+    Hover,
+    /// `:focus` — node is the focused element.
+    Focus,
+    /// `:focus-within` — node is the focused element or an ancestor of it.
+    FocusWithin,
+    /// `:focus-visible` — approximated as `:focus` (no focus modality yet).
+    FocusVisible,
+    /// `:active` — node is the activated element or an ancestor of it.
+    Active,
+    /// `:link` — `<a>`/`<area>` with `href` (no history → always unvisited).
+    Link,
+    /// `:visited` — never matches: no history database.
+    Visited,
+    /// `:target` — element whose `id` equals the current URL fragment.
+    Target,
+    /// Valid-but-never-matching: `::pseudo-elements` we don't generate
+    /// boxes for, and functional pseudos we don't support.
     Never,
     /// `::pseudo-element` in the rightmost compound — never matches a real
     /// element; [`StyleCtx::computed_pseudo`] finds the rules styling an
@@ -140,6 +157,23 @@ pub enum PseudoElem {
     FirstLine,
     Selection,
     Placeholder,
+}
+
+/// Dynamic-interaction state the `:hover`/`:focus`/`:active`/`:target`
+/// selectors match against. One per rendered page: the event loop updates
+/// it (pointer move/down/up, click-to-focus, `#frag` navigation) and hands
+/// it to [`StyleCtx::set_state`] before each layout.
+#[derive(Debug, Clone, Default)]
+pub struct PseudoState {
+    /// Element under the pointer — `:hover` also matches its ancestors.
+    pub hovered: Option<NodeId>,
+    /// Element holding focus — `:focus`/`:focus-visible` match it,
+    /// `:focus-within` matches its ancestors too.
+    pub focused: Option<NodeId>,
+    /// Element the pointer is pressed on — `:active` also matches ancestors.
+    pub active: Option<NodeId>,
+    /// URL fragment (`#x`) for `:target`.
+    pub target_frag: Option<String>,
 }
 
 pub struct StyleSheet {
@@ -925,10 +959,17 @@ impl<'a> CssParser<'a> {
                         None => Simple::Never,
                     }
                 }
+                "hover" => Simple::Hover,
+                "focus" => Simple::Focus,
+                "focus-within" => Simple::FocusWithin,
+                "focus-visible" => Simple::FocusVisible,
+                "active" => Simple::Active,
+                "link" | "any-link" => Simple::Link,
+                "visited" => Simple::Visited,
+                "target" => Simple::Target,
                 _ => {
-                    // dynamic-state pseudos (:hover, :focus, :visited,
-                    // :link, :focus-within, :target, :lang(...), ...) —
-                    // valid, but we have no interaction state to match.
+                    // remaining functional/dynamic pseudos (:lang(...),
+                    // :modal, ...) — valid, but we have no state to match.
                     self.skip_paren_arg();
                     Simple::Never
                 }
@@ -1132,6 +1173,14 @@ fn specificity(sel: &Selector) -> (u32, u32, u32) {
                 | Simple::Disabled
                 | Simple::Enabled
                 | Simple::Root
+                | Simple::Hover
+                | Simple::Focus
+                | Simple::FocusWithin
+                | Simple::FocusVisible
+                | Simple::Active
+                | Simple::Link
+                | Simple::Visited
+                | Simple::Target
                 | Simple::Never
                 | Simple::Unsupported => cls += 1,
                 Simple::Tag(_) | Simple::PseudoElem(_) => tag += 1,
@@ -1256,7 +1305,20 @@ fn attr_op_matches(doc: &Document, node: NodeId, a: &str, op: &AttrOp, v: &str, 
     }
 }
 
-fn simple_matches(doc: &Document, node: NodeId, s: &Simple) -> bool {
+/// `node` is `anchor` itself or a strict ancestor of it — the chain
+/// relation `:hover`/`:focus-within`/`:active` light up.
+fn on_chain(doc: &Document, node: NodeId, anchor: NodeId) -> bool {
+    let mut cur = Some(anchor);
+    while let Some(c) = cur {
+        if c == node {
+            return true;
+        }
+        cur = doc.parent(c);
+    }
+    false
+}
+
+fn simple_matches(doc: &Document, node: NodeId, s: &Simple, st: &PseudoState) -> bool {
     match s {
         Simple::Universal | Simple::Nest => true,
         Simple::Tag(t) => doc.tag(node) == Some(t.as_str()),
@@ -1295,26 +1357,38 @@ fn simple_matches(doc: &Document, node: NodeId, s: &Simple) -> bool {
             ) && doc.attr(node, "disabled").is_none()
         }
         Simple::Root => doc.tag(node) == Some("html"),
-        Simple::Is(l) | Simple::Where(l) => l.iter().any(|s| matches(doc, node, s)),
-        Simple::Not(l) => !l.iter().any(|s| matches(doc, node, s)),
-        Simple::Has(l) => l.iter().any(|rel| has_match(doc, node, rel)),
+        Simple::Is(l) | Simple::Where(l) => l.iter().any(|s| matches_st(doc, node, s, st)),
+        Simple::Not(l) => !l.iter().any(|s| matches_st(doc, node, s, st)),
+        Simple::Has(l) => l.iter().any(|rel| has_match(doc, node, rel, st)),
+        Simple::Hover => st.hovered.is_some_and(|h| on_chain(doc, node, h)),
+        Simple::Focus | Simple::FocusVisible => st.focused == Some(node),
+        Simple::FocusWithin => st.focused.is_some_and(|f| on_chain(doc, node, f)),
+        Simple::Active => st.active.is_some_and(|a| on_chain(doc, node, a)),
+        Simple::Link => {
+            matches!(doc.tag(node), Some("a") | Some("area")) && doc.attr(node, "href").is_some()
+        }
+        Simple::Visited => false,
+        Simple::Target => st
+            .target_frag
+            .as_deref()
+            .is_some_and(|f| !f.is_empty() && doc.attr(node, "id") == Some(f)),
         Simple::Never | Simple::Unsupported | Simple::PseudoElem(_) => false,
     }
 }
 
 /// `:has(rel)` — does a relative selector match, anchored on `node`?
-fn has_match(doc: &Document, node: NodeId, rel: &Selector) -> bool {
-    rel_step(doc, node, rel, 0)
+fn has_match(doc: &Document, node: NodeId, rel: &Selector, st: &PseudoState) -> bool {
+    rel_step(doc, node, rel, 0, st)
 }
 
 /// Match relative-selector part `i` against a node reachable from `from`
 /// via that part's combinator, then continue left-to-right.
-fn rel_step(doc: &Document, from: NodeId, rel: &Selector, i: usize) -> bool {
+fn rel_step(doc: &Document, from: NodeId, rel: &Selector, i: usize, st: &PseudoState) -> bool {
     if i >= rel.parts.len() {
         return true;
     }
     let (comb, simples) = &rel.parts[i];
-    let hit = |c: NodeId| compound_matches(doc, c, simples) && rel_step(doc, c, rel, i + 1);
+    let hit = |c: NodeId| compound_matches(doc, c, simples, st) && rel_step(doc, c, rel, i + 1, st);
     match comb {
         Combinator::Child => doc
             .children(from)
@@ -1371,18 +1445,26 @@ fn rightmost_ok(doc: &Document, node: NodeId, s: &Selector) -> bool {
     true
 }
 
-fn compound_matches(doc: &Document, node: NodeId, simples: &[Simple]) -> bool {
-    simples.iter().all(|s| simple_matches(doc, node, s))
+fn compound_matches(doc: &Document, node: NodeId, simples: &[Simple], st: &PseudoState) -> bool {
+    simples.iter().all(|s| simple_matches(doc, node, s, st))
 }
 
-/// Match a selector against an element node (right-to-left).
+/// Match a selector against an element node (right-to-left), with no
+/// interaction state — `:hover`/`:focus`/... never match here; callers
+/// holding a [`PseudoState`] should use `matches_st` (or `StyleCtx`).
 pub fn matches(doc: &Document, node: NodeId, sel: &Selector) -> bool {
+    matches_st(doc, node, sel, &PseudoState::default())
+}
+
+/// Match a selector under an explicit interaction state — same walk as
+/// [`matches`], but the dynamic-state simples consult `st`.
+fn matches_st(doc: &Document, node: NodeId, sel: &Selector, st: &PseudoState) -> bool {
     let n = sel.parts.len();
     if n == 0 {
         return false;
     }
     let (_, last) = &sel.parts[n - 1];
-    if !compound_matches(doc, node, last) {
+    if !compound_matches(doc, node, last, st) {
         return false;
     }
     // walk leftward: parts[i].0 is the combinator between compounds i-1
@@ -1396,7 +1478,7 @@ pub fn matches(doc: &Document, node: NodeId, sel: &Selector) -> bool {
                 let Some(p) = doc.parent(cur) else {
                     return false;
                 };
-                if doc.tag(p).is_none() || !compound_matches(doc, p, simples) {
+                if doc.tag(p).is_none() || !compound_matches(doc, p, simples, st) {
                     return false;
                 }
                 cur = p;
@@ -1405,7 +1487,7 @@ pub fn matches(doc: &Document, node: NodeId, sel: &Selector) -> bool {
                 let Some(s) = prev_elem_sibling(doc, cur) else {
                     return false;
                 };
-                if !compound_matches(doc, s, simples) {
+                if !compound_matches(doc, s, simples, st) {
                     return false;
                 }
                 cur = s;
@@ -1414,7 +1496,7 @@ pub fn matches(doc: &Document, node: NodeId, sel: &Selector) -> bool {
                 let mut s = prev_elem_sibling(doc, cur);
                 let found = loop {
                     match s {
-                        Some(c) if compound_matches(doc, c, simples) => break Some(c),
+                        Some(c) if compound_matches(doc, c, simples, st) => break Some(c),
                         Some(c) => s = prev_elem_sibling(doc, c),
                         None => break None,
                     }
@@ -1427,7 +1509,7 @@ pub fn matches(doc: &Document, node: NodeId, sel: &Selector) -> bool {
                 loop {
                     match p {
                         Some(a) => {
-                            if doc.tag(a).is_some() && compound_matches(doc, a, simples) {
+                            if doc.tag(a).is_some() && compound_matches(doc, a, simples, st) {
                                 cur = a;
                                 break;
                             }
@@ -1457,6 +1539,8 @@ pub struct StyleCtx<'a> {
     /// pass. Queried nodes themselves are not stored (layout has its own
     /// Rc'd style_cache).
     node_memo: FxHashMap<NodeId, cascade::NodeOut>,
+    /// Interaction state `:hover`/`:focus`/... match against.
+    state: PseudoState,
 }
 
 /// Cascade ordering of declaration keys (important, origin, layer, spec,
@@ -1500,7 +1584,14 @@ impl<'a> StyleCtx<'a> {
             buf: Vec::new(),
             root_customs: None,
             node_memo: FxHashMap::default(),
+            state: PseudoState::default(),
         }
+    }
+
+    /// Install the interaction state (`:hover`, `:focus`, `:active`,
+    /// `:target`) the next `computed` calls match against.
+    pub fn set_state(&mut self, state: PseudoState) {
+        self.state = state;
     }
 
     /// The `<html>` element's own custom-property declarations, computed
@@ -3065,6 +3156,91 @@ mod sel4 {
         assert_eq!(c.get("k").unwrap(), "v");
         // :not(never-matching) = matches
         assert!(matches(&doc, p, &sel("p:not(::placeholder)")));
+    }
+
+    #[test]
+    fn pseudo_state_hover() {
+        let doc = rowser_html::parse("<body><ul><li><a href=\"/x\">l</a></li></ul></body>");
+        let (a, li, ul) = (
+            doc.find_deep(doc.root, "a").unwrap(),
+            doc.find_deep(doc.root, "li").unwrap(),
+            doc.find_deep(doc.root, "ul").unwrap(),
+        );
+        let st = PseudoState {
+            hovered: Some(a),
+            ..PseudoState::default()
+        };
+        // the hovered element and every ancestor match :hover
+        assert!(matches_st(&doc, a, &sel("a:hover"), &st));
+        assert!(matches_st(&doc, li, &sel("li:hover"), &st));
+        assert!(matches_st(&doc, li, &sel("ul:hover li"), &st));
+        assert!(!matches_st(&doc, ul, &sel("ul:focus"), &st));
+        // a different hover target rewrites the chain
+        let off = PseudoState {
+            hovered: Some(ul),
+            ..PseudoState::default()
+        };
+        assert!(matches_st(&doc, ul, &sel("ul:hover"), &off));
+        assert!(!matches_st(&doc, a, &sel("a:hover"), &off));
+        assert!(!matches_st(
+            &doc,
+            a,
+            &sel("a:hover"),
+            &PseudoState::default()
+        ));
+    }
+
+    #[test]
+    fn pseudo_state_link_visited_target() {
+        let doc =
+            rowser_html::parse("<body><a href=\"/x\" id=t>l</a><a>no</a><p id=t2>p</p></body>");
+        let st = PseudoState::default();
+        let links = all(&doc, "a");
+        assert!(matches_st(&doc, links[0], &sel("a:link"), &st));
+        assert!(!matches_st(&doc, links[1], &sel("a:link"), &st));
+        // no history → :visited never matches
+        assert!(!matches_st(&doc, links[0], &sel("a:visited"), &st));
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let tgt = PseudoState {
+            target_frag: Some("t2".into()),
+            ..PseudoState::default()
+        };
+        assert!(matches_st(&doc, p, &sel(":target"), &tgt));
+        assert!(!matches_st(&doc, links[0], &sel(":target"), &tgt));
+    }
+
+    #[test]
+    fn pseudo_state_focus_active() {
+        let doc = rowser_html::parse("<body><form><button>b</button></form></body>");
+        let (form, btn) = (
+            doc.find_deep(doc.root, "form").unwrap(),
+            doc.find_deep(doc.root, "button").unwrap(),
+        );
+        let st = PseudoState {
+            focused: Some(btn),
+            active: Some(btn),
+            ..PseudoState::default()
+        };
+        assert!(matches_st(&doc, btn, &sel("button:focus"), &st));
+        assert!(matches_st(&doc, btn, &sel(":focus-visible"), &st));
+        assert!(matches_st(&doc, form, &sel("form:focus-within"), &st));
+        assert!(matches_st(&doc, form, &sel("form:active"), &st));
+        assert!(!matches_st(&doc, form, &sel("form:focus"), &st));
+    }
+
+    #[test]
+    fn pseudo_state_styles() {
+        // a:hover{color:red} applies only while the <a> is hovered
+        let doc = rowser_html::parse("<body><a href=\"/x\">x</a></body>");
+        let a = doc.find_deep(doc.root, "a").unwrap();
+        let sheet = parse("a { color: blue } a:hover { color: red }");
+        let mut ctx = StyleCtx::new(&doc, &[&sheet]);
+        assert_eq!(ctx.computed(a).get("color").unwrap(), "blue");
+        ctx.set_state(PseudoState {
+            hovered: Some(a),
+            ..PseudoState::default()
+        });
+        assert_eq!(ctx.computed(a).get("color").unwrap(), "red");
     }
 
     #[test]

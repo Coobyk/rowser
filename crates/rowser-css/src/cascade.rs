@@ -10,7 +10,7 @@
 //! compound), and the extra media features evaluated at parse time.
 
 use crate::{
-    decl_wins, each_decl, inline_decls, matches, rightmost_ok, specificity, StrMap, StyleCtx,
+    decl_wins, each_decl, inline_decls, matches_st, rightmost_ok, specificity, StrMap, StyleCtx,
 };
 use rowser_dom::NodeId;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -726,7 +726,7 @@ impl<'a> StyleCtx<'a> {
                 let mut spec = (0u32, 0u32, 0u32);
                 let mut matched = false;
                 for s in &rule.selectors {
-                    if rightmost_ok(doc, node, s) && matches(doc, node, s) {
+                    if rightmost_ok(doc, node, s) && matches_st(doc, node, s, &self.state) {
                         matched = true;
                         let sp = specificity(s);
                         if sp > spec {
@@ -793,7 +793,7 @@ impl<'a> StyleCtx<'a> {
                 let mut spec = (0u32, 0u32, 0u32);
                 let mut matched = false;
                 for s in &rule.selectors {
-                    if rightmost_ok(doc, node, s) && matches(doc, node, s) {
+                    if rightmost_ok(doc, node, s) && matches_st(doc, node, s, &self.state) {
                         matched = true;
                         let sp = specificity(s);
                         if sp > spec {

@@ -94,11 +94,19 @@ fn main() {
                 let same_page = !page.cur_url.is_empty()
                     && (base == page.cur_url || (base.is_empty() && !frag.is_empty()));
                 if same_page && !frag.is_empty() {
+                    // :target styles may change layout — full repaint, then
+                    // scroll to the (freshly laid-out) anchor
+                    page.state.target_frag = Some(frag.to_string());
+                    page.repaint(&mut fonts);
                     if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
-                        page.scroll = (*y - 8.0).clamp(0.0, page.max_scroll());
-                        page.repaint_scrolled(&mut fonts);
-                        let _ = send(&mut output, &frame_msg(&page));
+                        let y = *y;
+                        let new = (y - 8.0).clamp(0.0, page.max_scroll());
+                        if new != page.scroll {
+                            page.scroll = new;
+                            page.repaint_scrolled(&mut fonts);
+                        }
                     }
+                    let _ = send(&mut output, &frame_msg(&page));
                     let _ = send(&mut output, &ToBrowser::LoadDone);
                     continue;
                 }
@@ -134,6 +142,11 @@ fn main() {
                 page.load(doc, effective, title.clone());
                 page.js = js;
                 load_web_fonts(&page, &mut fonts);
+                page.state.target_frag = if frag.is_empty() {
+                    None
+                } else {
+                    Some(frag.to_string())
+                };
                 page.repaint(&mut fonts);
                 if !frag.is_empty() {
                     if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
@@ -165,10 +178,79 @@ fn main() {
                     );
                 }
             }
+            ToRenderer::MouseMove { x, y, down } => {
+                if !page.has_doc() {
+                    continue;
+                }
+                // coalesce queued moves — only the latest position matters
+                let (mut mx, mut my, mut md) = (x, y, down);
+                while let Ok(p) = rx.try_recv() {
+                    match ToRenderer::decode(&p) {
+                        Ok(ToRenderer::MouseMove { x, y, down }) => {
+                            mx = x;
+                            my = y;
+                            md = down;
+                        }
+                        Ok(m) => {
+                            pending.push_back(m);
+                            break;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                let hit = page.hit_at(mx, my);
+                let mut dirty = false;
+                if page.state.hovered != hit {
+                    page.state.hovered = hit;
+                    dirty = true;
+                }
+                // button release anywhere ends :active
+                if !md && page.state.active.is_some() {
+                    page.state.active = None;
+                    dirty = true;
+                }
+                if dirty {
+                    page.repaint(&mut fonts);
+                    let _ = send(&mut output, &frame_msg(&page));
+                }
+                // cursor: CSS `cursor` on the hovered element (or default)
+                let cur = hit.map(|n| page.hover_cursor(n)).unwrap_or_default();
+                if cur != page.last_cursor {
+                    page.last_cursor = cur.clone();
+                    let _ = send(&mut output, &ToBrowser::Cursor(cur));
+                }
+            }
+            ToRenderer::MouseDown { x, y } => {
+                if page.has_doc() {
+                    let hit = page.hit_at(x, y);
+                    if page.state.active != hit {
+                        page.state.active = hit;
+                        page.repaint(&mut fonts);
+                        let _ = send(&mut output, &frame_msg(&page));
+                    }
+                }
+            }
             ToRenderer::Click { x, y } => {
                 // hit-test link regions in document space — the transform
                 // stack maps each item's coords to painted position, so
                 // the click is inverse-mapped back into that space
+                // release ends :active; focus moves to the nearest
+                // focusable ancestor of the hit (or clears)
+                let mut state_dirty = false;
+                if page.state.active.is_some() {
+                    page.state.active = None;
+                    state_dirty = true;
+                }
+                let focus = page.hit_at(x, y).and_then(|n| page.focus_target(n));
+                if page.state.focused != focus {
+                    page.state.focused = focus;
+                    state_dirty = true;
+                }
+                if state_dirty && page.has_doc() {
+                    page.repaint(&mut fonts);
+                    let _ = send(&mut output, &frame_msg(&page));
+                }
+                // hit-test link regions in document space
                 let mut found = None;
                 let mut xf: Vec<rowser_layout::xform::Mat> = Vec::new();
                 for it in &page.items {
@@ -431,6 +513,12 @@ struct Page {
     /// `::selection` background tint (r,g,b) resolved from the document's
     /// stylesheets — lazily computed on the first apply_sel.
     sel_tint: Option<(u32, u32, u32)>,
+    /// Interaction state (`:hover`/`:focus`/`:active`/`:target`) — fed
+    /// into every layout pass so dynamic pseudo-classes restyle.
+    state: rowser_css::PseudoState,
+    /// Last cursor keyword reported to the browser — `Cursor` frames are
+    /// only sent when the resolved value changes.
+    last_cursor: String,
 }
 
 impl Page {
@@ -462,6 +550,8 @@ impl Page {
             sel: Vec::new(),
             sel_text: String::new(),
             sel_tint: None,
+            state: rowser_css::PseudoState::default(),
+            last_cursor: String::new(),
         }
     }
 
@@ -480,6 +570,8 @@ impl Page {
         self.sel.clear();
         self.sel_text.clear();
         self.sel_tint = None;
+        self.state = rowser_css::PseudoState::default();
+        self.last_cursor.clear();
         self.images.clear();
         self.img_failed.clear();
         self.img_waited = false;
@@ -871,6 +963,51 @@ impl Page {
         (self.content_h - self.viewport.1 as f32).max(0.0)
     }
 
+    /// Deepest (smallest-area) element box containing the point — the same
+    /// pick click dispatch uses, now shared by hover/active/focus.
+    fn hit_at(&self, x: f32, y: f32) -> Option<rowser_dom::NodeId> {
+        self.hits
+            .iter()
+            .filter(|(hx, hy, hw, hh, _, m)| {
+                // inverse-map the point into the hit's pre-transform space
+                let Some(inv) = m.inverse() else { return false };
+                let (px, py) = inv.apply(x, y);
+                px >= *hx && px <= hx + hw && py >= *hy && py <= hy + hh
+            })
+            .min_by(|a, b| {
+                (a.2 * a.3)
+                    .partial_cmp(&(b.2 * b.3))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|h| h.4)
+    }
+
+    /// Nearest focusable element at or above `node` — links, form
+    /// controls, and anything with a `tabindex`.
+    fn focus_target(&self, node: rowser_dom::NodeId) -> Option<rowser_dom::NodeId> {
+        let doc = self.doc.as_ref()?;
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            let focusable = matches!(
+                doc.tag(n),
+                Some("a") | Some("button") | Some("input") | Some("select") | Some("textarea")
+            ) || doc.attr(n, "tabindex").is_some();
+            if focusable {
+                return Some(n);
+            }
+            cur = doc.parent(n);
+        }
+        None
+    }
+
+    /// CSS `cursor` keyword for `node` under the current pseudo-state.
+    fn hover_cursor(&self, node: rowser_dom::NodeId) -> String {
+        let Some(doc) = &self.doc else {
+            return String::new();
+        };
+        rowser_layout::cursor_for(doc, self.viewport.0 as f32, &self.sheets, node, &self.state)
+    }
+
     /// Repaint after a scroll. Pages without fixed/sticky positioning keep
     /// their display list — items just translate by the scroll delta, so a
     /// scroll costs one paint instead of a full re-layout.
@@ -916,13 +1053,14 @@ impl Page {
     fn repaint(&mut self, fonts: &mut FontCache) {
         let Some(doc) = &self.doc else { return };
         let t0 = std::time::Instant::now();
-        let (items, height, anchors, hits) = Layouter::layout_vh(
+        let (items, height, anchors, hits) = Layouter::layout_vh_st(
             doc,
             fonts,
             self.viewport.0 as f32,
             self.scroll,
             self.viewport.1 as f32,
             &self.sheets,
+            &self.state,
         );
         let t_layout = t0.elapsed();
         self.content_h = height;

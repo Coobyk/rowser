@@ -248,6 +248,12 @@ struct Style {
     /// shifts; flow geometry is unaffected
     rel_x: f32,
     rel_y: f32,
+    /// deepest inline element producing the current words — stamped onto
+    /// each word so hit-testing sees inline elements, not just blocks.
+    hit_owner: Option<NodeId>,
+    /// `pointer-events:none` in effect (inherited) — the element and its
+    /// descendants contribute no hit rects; `pointer-events:auto` resets it.
+    pe_none: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -280,6 +286,8 @@ fn base_style() -> Style {
         stretch: 100,
         rel_x: 0.0,
         rel_y: 0.0,
+        hit_owner: None,
+        pe_none: false,
     }
 }
 
@@ -319,6 +327,8 @@ b,strong{font-weight:bold}
 i,em,dfn,var,cite,address{font-style:italic}
 code,kbd,samp,tt{font-family:monospace}
 a{color:#0000ee;text-decoration:underline}
+a[href],area[href]{cursor:pointer}
+input,textarea{cursor:text}
 u,ins{text-decoration:underline}
 s,strike,del{text-decoration:line-through}
 small{font-size:.83em}
@@ -2239,6 +2249,9 @@ struct Word {
     /// transform spec of the enclosing transformed inline-level element —
     /// a consecutive run of words sharing it wraps at flush_line
     xf: Option<Rc<xform::Spec>>,
+    /// inline element that produced this word — flushed into `hits` so
+    /// links/spans are hoverable/clickable (`None` = block-owned).
+    owner: Option<NodeId>,
 }
 
 /// A floated box: horizontal margin-box extent [x0,x1] (emission coords)
@@ -2566,6 +2579,12 @@ pub struct Layouter<'a> {
     flet: Option<Style>,
     /// open-quote nesting depth for `content:*-quote`
     quote_depth: i32,
+    /// interaction state `:hover`/`:focus`/... selectors match against —
+    /// cloned into each pre-resolve worker's StyleCtx
+    pstate: css::PseudoState,
+    /// `pointer-events:none` is in effect on the current walk path — hit
+    /// pushes are dropped while set (an `auto` descendant re-enables).
+    pe_blocked: bool,
 }
 
 impl<'a> Layouter<'a> {
@@ -2589,6 +2608,28 @@ impl<'a> Layouter<'a> {
         scroll: f32,
         viewport_h: f32,
         external: &[css::StyleSheet],
+    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<Hit>) {
+        Self::layout_vh_st(
+            doc,
+            fonts,
+            width,
+            scroll,
+            viewport_h,
+            external,
+            &css::PseudoState::default(),
+        )
+    }
+
+    /// `layout_vh` + an interaction state — `:hover`/`:focus`/`:active`/
+    /// `:target` selectors match against `pstate` for this pass.
+    pub fn layout_vh_st(
+        doc: &'a Document,
+        fonts: &'a mut FontCache,
+        width: f32,
+        scroll: f32,
+        viewport_h: f32,
+        external: &[css::StyleSheet],
+        pstate: &css::PseudoState,
     ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<Hit>) {
         let author = css::document_sheets_vw(doc, width);
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
@@ -2630,7 +2671,10 @@ impl<'a> Layouter<'a> {
             fl_style: None,
             flet: None,
             quote_depth: 0,
+            pstate: pstate.clone(),
+            pe_blocked: false,
         };
+        l.ctx.set_state(pstate.clone());
         l.preresolve_styles();
         // css-backgrounds §2.11: the canvas takes the root element's
         // background (body's when html's is transparent) — painted
@@ -2880,10 +2924,12 @@ impl<'a> Layouter<'a> {
             std::iter::repeat_with(|| None).take(elems.len()).collect();
         let doc = self.doc;
         let sheets = &self.sheets[..];
+        let pstate = &self.pstate;
         std::thread::scope(|s| {
             for (work, oc) in elems.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 s.spawn(move || {
                     let mut ctx = css::StyleCtx::new(doc, sheets);
+                    ctx.set_state(pstate.clone());
                     for (i, &id) in work.iter().enumerate() {
                         oc[i] = Some(ctx.computed(id));
                     }
@@ -3009,9 +3055,20 @@ impl<'a> Layouter<'a> {
                 } else {
                     self.counters.enter(&c)
                 };
+                // pointer-events:none: suppress hits for the element and
+                // its subtree — an `auto` descendant re-enables (st.pe_none
+                // already folds inheritance into this element's flag)
+                let pe_save = self.pe_blocked;
+                self.pe_blocked = st.pe_none;
                 match disp {
-                    _ if visually_hidden => return,
-                    Some("none") => return,
+                    _ if visually_hidden => {
+                        self.pe_blocked = pe_save;
+                        return;
+                    }
+                    Some("none") => {
+                        self.pe_blocked = pe_save;
+                        return;
+                    }
                     // display:contents — the element makes no box; children
                     // participate in the parent context (styles still apply
                     // to the element itself for inheritance)
@@ -3061,6 +3118,7 @@ impl<'a> Layouter<'a> {
                 if let Some(prev) = saved_xf {
                     self.cur_xf = prev;
                 }
+                self.pe_blocked = pe_save;
                 if op <= 0.0 || hidden {
                     // fully transparent/hidden: nothing painted, nothing clickable
                     self.items.truncate(i0);
@@ -3116,6 +3174,13 @@ impl<'a> Layouter<'a> {
                 }
                 self.counters.leave(counter_scope);
             }
+        }
+    }
+
+    /// Record a hit rect unless `pointer-events:none` is in effect.
+    fn push_hit(&mut self, h: Hit) {
+        if !self.pe_blocked {
+            self.hits.push(h);
         }
     }
 
@@ -3194,6 +3259,9 @@ impl<'a> Layouter<'a> {
         }
         if let Some(col) = bg_color(c, Some(st.color)) {
             st.inline_bg = Some(over(col, self.backdrop));
+        }
+        if let Some(v) = c.get("pointer-events") {
+            st.pe_none = matches!(v.trim(), "none");
         }
     }
 
@@ -3668,7 +3736,7 @@ impl<'a> Layouter<'a> {
             }
         }
         // element border box → click hit-test map
-        self.hits.push((
+        self.push_hit((
             self.margin_x - pl - bw_l,
             content_top - pt - bw_t,
             inner_w + pl + pr + bw_h,
@@ -4084,6 +4152,7 @@ impl<'a> Layouter<'a> {
             mb.max(0.0),
             self.rel_offset(c, size),
             ascent,
+            Some(node),
         );
         if let Some(sv) = saved_xf {
             self.cur_xf = sv;
@@ -4442,7 +4511,7 @@ impl<'a> Layouter<'a> {
                     self.items.push(offset_item(it.clone(), cx, row_y + dy));
                 }
                 for h in &ci.hits {
-                    self.hits.push(xform::off_hit(*h, cx, row_y + dy));
+                    self.push_hit(xform::off_hit(*h, cx, row_y + dy));
                 }
             }
             row_y += row_h[r] + sp_y;
@@ -6024,7 +6093,9 @@ impl<'a> Layouter<'a> {
                 clip_hits(&mut hv, 0, cx, cy, cw, chh);
             }
             // hits join the list before wrap_span tags this span's [h0..]
-            self.hits.extend(hv.drain(..));
+            for h in hv.drain(..) {
+                self.push_hit(h);
+            }
             if let Some(sp) = gspec {
                 self.wrap_span(&sp, it.id, i0, h0);
             }
@@ -6190,7 +6261,28 @@ impl<'a> Layouter<'a> {
     /// Emit one line word's items (and hit rects) at pen position `x`.
     /// `m` is the transform wrapping the run it belongs to — hit rects
     /// compose it after their own (inner) transforms.
-    fn emit_word(&mut self, w: Word, x: f32, baseline: f32, m: Option<&xform::Mat>) {
+    fn emit_word(
+        &mut self,
+        w: Word,
+        x: f32,
+        baseline: f32,
+        line_top: f32,
+        line_h: f32,
+        m: Option<&xform::Mat>,
+    ) {
+        // hit for the owning inline element (e.g. <a> over its text)
+        if !self.pe_blocked {
+            if let Some(o) = w.owner {
+                self.hits.push((
+                    x,
+                    line_top,
+                    w.width,
+                    line_h,
+                    o,
+                    m.copied().unwrap_or(xform::Mat::IDENTITY),
+                ));
+            }
+        }
         if let Some(items) = w.items {
             // inline-block: box bottom sits on the baseline
             let dy = baseline - w.box_h;
@@ -6701,6 +6793,7 @@ impl<'a> Layouter<'a> {
             dx: 0.0,
             dy: 0.0,
             xf: self.cur_xf.clone(),
+            owner: None,
         });
         self.line_x += w;
     }
@@ -6717,6 +6810,7 @@ impl<'a> Layouter<'a> {
         mb: f32,
         rel: (f32, f32),
         ascent: f32,
+        owner: Option<NodeId>,
     ) {
         if self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line();
@@ -6740,6 +6834,7 @@ impl<'a> Layouter<'a> {
             dx: rel.0,
             dy: rel.1,
             xf: self.cur_xf.clone(),
+            owner,
         });
         self.line_x += w;
     }
@@ -6953,6 +7048,9 @@ impl<'a> Layouter<'a> {
         let (rx, ry) = self.rel_offset(c, st.size);
         st.rel_x += rx;
         st.rel_y += ry;
+        // this element owns the words it emits — hit rects let links and
+        // other inline elements be hovered/clicked over their text
+        st.hit_owner = Some(node);
         // inline margins become spacing around the element's runs
         let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, st.size);
         if ml > 0.0 {
@@ -6978,7 +7076,7 @@ impl<'a> Layouter<'a> {
                         self.items.push(offset_item(it, x + tx, y + ty));
                     }
                     for hd in hits {
-                        self.hits.push(xform::off_hit(hd, x + tx, y + ty));
+                        self.push_hit(xform::off_hit(hd, x + tx, y + ty));
                     }
                     let lh = self.eff_line_h(&st);
                     self.y += h.max(lh);
@@ -7210,6 +7308,7 @@ impl<'a> Layouter<'a> {
                             dx: 0.0,
                             dy: 0.0,
                             xf: self.cur_xf.clone(),
+                            owner: fst.hit_owner,
                         });
                         self.line_x += fw;
                         chs.as_str()
@@ -7274,6 +7373,7 @@ impl<'a> Layouter<'a> {
                         dx: st.rel_x,
                         dy: st.rel_y,
                         xf: self.cur_xf.clone(),
+                        owner: st.hit_owner,
                     });
                     self.flush_line();
                     chunk.clear();
@@ -7302,6 +7402,7 @@ impl<'a> Layouter<'a> {
                     dx: st.rel_x,
                     dy: st.rel_y,
                     xf: self.cur_xf.clone(),
+                    owner: st.hit_owner,
                 });
                 self.line_x += cw;
             }
@@ -7326,6 +7427,7 @@ impl<'a> Layouter<'a> {
             dx: st.rel_x,
             dy: st.rel_y,
             xf: self.cur_xf.clone(),
+            owner: st.hit_owner,
         });
         self.line_x += w;
     }
@@ -7455,7 +7557,14 @@ impl<'a> Layouter<'a> {
             for k in i..end {
                 let w = line[k].take().unwrap();
                 let (dx, dy) = (w.dx, w.dy);
-                self.emit_word(w, xs[k] + dx, baseline + dy, m.as_ref());
+                self.emit_word(
+                    w,
+                    xs[k] + dx,
+                    baseline + dy,
+                    self.y + dy,
+                    line_h,
+                    m.as_ref(),
+                );
             }
             if m.is_some() {
                 self.items.push(DisplayItem::PopTransform);
@@ -7715,6 +7824,36 @@ impl<'a> Layouter<'a> {
         }
         None
     }
+}
+
+/// Computed `cursor` keyword for `node` under `pstate`, resolved with the
+/// same sheet stack as layout (UA + external + author). `cursor` is
+/// inherited — ancestors are climbed until one declares it. "auto"/""
+/// means the default pointer.
+pub fn cursor_for(
+    doc: &Document,
+    width: f32,
+    external: &[css::StyleSheet],
+    node: NodeId,
+    pstate: &css::PseudoState,
+) -> String {
+    let author = css::document_sheets_vw(doc, width);
+    let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
+    sheets.extend(external.iter());
+    sheets.extend(author.iter());
+    let mut ctx = css::StyleCtx::new(doc, &sheets);
+    ctx.set_state(pstate.clone());
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if doc.tag(n).is_none() {
+            break;
+        }
+        if let Some(v) = ctx.computed(n).get("cursor") {
+            return v.trim().to_string();
+        }
+        cur = doc.parent(n);
+    }
+    "auto".to_string()
 }
 
 #[cfg(test)]
