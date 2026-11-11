@@ -697,7 +697,7 @@ fn parse_shadow(c: &Props, size: f32, bd: Color, def: Color) -> Option<(f32, f32
             if tok == "inset" {
                 continue;
             }
-            if let Some(n) = parse_len(tok, size) {
+            if let Some(n) = parse_len(tok, size, size) {
                 nums.push(n);
             } else {
                 col_s = sh[st..].trim();
@@ -726,7 +726,7 @@ fn parse_radius(c: &Props, size: f32) -> f32 {
     c.get("border-radius")
         .and_then(|v| {
             v.split_whitespace()
-                .filter_map(|t| parse_len(t, size))
+                .filter_map(|t| parse_len(t, size, size))
                 .reduce(f32::max)
         })
         .unwrap_or(0.0)
@@ -735,11 +735,12 @@ fn parse_radius(c: &Props, size: f32) -> f32 {
 /// CSS length → px. `em`/`%` resolve against `rel` (usually parent font size).
 /// Tiny `calc()` evaluator: numbers with units, + - * / and parens.
 /// `%` resolves against `rel`; unitless numbers pass through.
-fn calc_len(expr: &str, rel: f32) -> Option<f32> {
+fn calc_len(expr: &str, rel: f32, em: f32) -> Option<f32> {
     struct P<'a> {
         t: Vec<Tok>,
         i: usize,
         rel: f32,
+        em: f32,
         _m: std::marker::PhantomData<&'a ()>,
     }
     #[derive(Clone, Copy, PartialEq)]
@@ -754,6 +755,7 @@ fn calc_len(expr: &str, rel: f32) -> Option<f32> {
         None,
         Px,
         Em,
+        Rem,
         Pct,
     }
     fn toks(s: &str) -> Option<Vec<Tok>> {
@@ -778,9 +780,13 @@ fn calc_len(expr: &str, rel: f32) -> Option<f32> {
                     u = Unit::Px;
                     i += 2;
                 } else if b[i..].starts_with(b"rem") || b[i..].starts_with(b"em") {
-                    let w = if b[i..].starts_with(b"rem") { 3 } else { 2 };
-                    u = Unit::Em;
-                    i += w;
+                    if b[i..].starts_with(b"rem") {
+                        u = Unit::Rem;
+                        i += 3;
+                    } else {
+                        u = Unit::Em;
+                        i += 2;
+                    }
                 } else if b[i..].starts_with(b"pt") {
                     u = Unit::Px;
                     i += 2;
@@ -804,11 +810,12 @@ fn calc_len(expr: &str, rel: f32) -> Option<f32> {
         }
         Some(out)
     }
-    // em/rem always mean root font size here; `rel` is the %-base.
-    fn px(n: f32, u: Unit, rel: f32) -> f32 {
+    // `em` = element font-size, `rem` = root size, `rel` = %-base.
+    fn px(n: f32, u: Unit, rel: f32, em: f32) -> f32 {
         match u {
             Unit::Px | Unit::None => n,
-            Unit::Em => n * 16.0,
+            Unit::Em => n * em,
+            Unit::Rem => n * BASE_SIZE,
             Unit::Pct => n * rel / 100.0,
         }
     }
@@ -835,7 +842,7 @@ fn calc_len(expr: &str, rel: f32) -> Option<f32> {
             match self.t.get(self.i).copied() {
                 Some(Tok::Num(n, u)) => {
                     self.i += 1;
-                    Some(px(n, u, self.rel))
+                    Some(px(n, u, self.rel, self.em))
                 }
                 Some(Tok::L) => {
                     self.i += 1;
@@ -854,12 +861,14 @@ fn calc_len(expr: &str, rel: f32) -> Option<f32> {
         }
     }
     let t = toks(&expr.to_lowercase())?;
-    let mut p = P { t, i: 0, rel, _m: std::marker::PhantomData };
+    let mut p = P { t, i: 0, rel, em, _m: std::marker::PhantomData };
     p.expr()
 }
 
 /// parse_len plus viewport units (vh/svh/dvh/lvh→vh_px, vw→vw_px).
-fn parse_len_vp(v: &str, rel: f32, vh: f32, vw: f32) -> Option<f32> {
+/// `em` resolves against `em` (the element's font-size); `%`/`calc()`
+/// percentages against `rel` (containing-block axis size).
+fn parse_len_vp(v: &str, rel: f32, em: f32, vh: f32, vw: f32) -> Option<f32> {
     let v = v.trim().to_lowercase();
     for suf in ["svh", "dvh", "lvh", "vh"] {
         if let Some(x) = v.strip_suffix(suf) {
@@ -871,13 +880,13 @@ fn parse_len_vp(v: &str, rel: f32, vh: f32, vw: f32) -> Option<f32> {
             return x.trim().parse::<f32>().ok().map(|n| n * vw / 100.0);
         }
     }
-    parse_len(&v, rel)
+    parse_len(&v, rel, em)
 }
 
-fn parse_len(v: &str, rel: f32) -> Option<f32> {
+fn parse_len(v: &str, rel: f32, em: f32) -> Option<f32> {
     let v = v.trim().to_lowercase();
     if let Some(inner) = v.strip_prefix("calc(").and_then(|x| x.strip_suffix(')')) {
-        return calc_len(inner, rel);
+        return calc_len(inner, rel, em);
     }
     let num = |s: &str| s.trim().parse::<f32>().ok();
     if let Some(x) = v.strip_suffix("px") {
@@ -885,7 +894,7 @@ fn parse_len(v: &str, rel: f32) -> Option<f32> {
     } else if let Some(x) = v.strip_suffix("rem") {
         num(x).map(|n| n * BASE_SIZE)
     } else if let Some(x) = v.strip_suffix("em") {
-        num(x).map(|n| n * rel)
+        num(x).map(|n| n * em)
     } else if let Some(x) = v.strip_suffix('%') {
         num(x).map(|n| n * rel / 100.0)
     } else if let Some(x) = v.strip_suffix("pt") {
@@ -906,16 +915,16 @@ fn parse_font_size(v: &str, parent: f32) -> f32 {
         "xx-large" => BASE_SIZE * 2.0,
         "larger" => parent * 1.2,
         "smaller" => parent / 1.2,
-        other => parse_len(other, parent).unwrap_or(parent).max(4.0),
+        other => parse_len(other, parent, parent).unwrap_or(parent).max(4.0),
     }
 }
 
 /// Shorthand sides (top, right, bottom, left) from 1–4 values.
-fn sides(c: &Props, name: &str, rel: f32) -> [Option<f32>; 4] {
+fn sides(c: &Props, name: &str, rel: f32, em: f32) -> [Option<f32>; 4] {
     if let Some(v) = c.get(name) {
         let vals: Vec<Option<f32>> = v
             .split_whitespace()
-            .map(|p| parse_len(p, rel))
+            .map(|p| parse_len(p, rel, em))
             .collect();
         let get = |i: usize| vals.get(i).copied().flatten();
         match vals.len() {
@@ -929,18 +938,18 @@ fn sides(c: &Props, name: &str, rel: f32) -> [Option<f32>; 4] {
     }
 }
 
-fn side(c: &Props, name: &str, rel: f32) -> Option<f32> {
-    c.get(name).and_then(|v| parse_len(v, rel))
+fn side(c: &Props, name: &str, rel: f32, em: f32) -> Option<f32> {
+    c.get(name).and_then(|v| parse_len(v, rel, em))
 }
 
 /// `width`/`height` with the `size` shorthand as fallback (first token for
 /// width, second-or-first for height).
-fn dim(c: &Props, name: &str, rel: f32) -> Option<f32> {
-    side(c, name, rel).or_else(|| {
+fn dim(c: &Props, name: &str, rel: f32, em: f32) -> Option<f32> {
+    side(c, name, rel, em).or_else(|| {
         c.get("size").and_then(|v| {
             let mut it = v.split_whitespace();
-            let a = it.next().and_then(|t| parse_len(t, rel));
-            let b = it.next().and_then(|t| parse_len(t, rel)).or(a);
+            let a = it.next().and_then(|t| parse_len(t, rel, em));
+            let b = it.next().and_then(|t| parse_len(t, rel, em)).or(a);
             if name == "width" {
                 a
             } else {
@@ -948,6 +957,19 @@ fn dim(c: &Props, name: &str, rel: f32) -> Option<f32> {
             }
         })
     })
+}
+
+/// `dim` for intrinsic sizing: a percentage width has an indefinite basis
+/// while measuring intrinsic sizes, so it's treated as `auto` (content
+/// sized). Without this `nav{width:100%}` inside a flex item reports the
+/// full containing block as its max-content and forces a wrap.
+fn dim_intrinsic(c: &Props, name: &str, rel: f32, em: f32) -> Option<f32> {
+    if let Some(v) = c.get(name) {
+        if v.contains('%') {
+            return None;
+        }
+    }
+    dim(c, name, rel, em)
 }
 
 /// Tailwind sets `box-sizing:border-box` globally — `width`/`height` then
@@ -959,13 +981,13 @@ fn border_box(c: &Props) -> bool {
 /// `translate` property + `transform: translate*(...)` → (dx, dy) px.
 /// Percentages resolve against the element's own border box (w, h).
 /// scale/rotate/matrix are ignored (report-only).
-fn translate_xy(c: &Props, w: f32, h: f32) -> (f32, f32) {
+fn translate_xy(c: &Props, w: f32, h: f32, em: f32) -> (f32, f32) {
     let (mut dx, mut dy) = (0.0f32, 0.0f32);
     if let Some(v) = c.get("translate") {
         if v.trim() != "none" {
             let mut it = v.split_whitespace();
-            dx += it.next().and_then(|t| parse_len(t, w)).unwrap_or(0.0);
-            dy += it.next().and_then(|t| parse_len(t, h)).unwrap_or(0.0);
+            dx += it.next().and_then(|t| parse_len(t, w, em)).unwrap_or(0.0);
+            dy += it.next().and_then(|t| parse_len(t, h, em)).unwrap_or(0.0);
         }
     }
     if let Some(v) = c.get("transform") {
@@ -988,11 +1010,11 @@ fn translate_xy(c: &Props, w: f32, h: f32) -> (f32, f32) {
             let mut it = inner.split(',');
             let x = it
                 .next()
-                .and_then(|t| parse_len(t.trim(), w))
+                .and_then(|t| parse_len(t.trim(), w, em))
                 .unwrap_or(0.0);
             let y = it
                 .next()
-                .and_then(|t| parse_len(t.trim(), h))
+                .and_then(|t| parse_len(t.trim(), h, em))
                 .unwrap_or(0.0);
             match axis {
                 0 => dx += x,
@@ -1011,7 +1033,7 @@ fn translate_xy(c: &Props, w: f32, h: f32) -> (f32, f32) {
 /// `flex` shorthand → (grow, basis): `flex:<g> <shrink>? <basis>?`, with
 /// `flex-grow`/`flex-basis` longhands as fallback/override. Basis `auto`/none
 /// → None (caller uses the item's intrinsic size).
-fn flex_grow_basis(c: &Props, rel: f32) -> (f32, Option<f32>) {
+fn flex_grow_basis(c: &Props, rel: f32, em: f32) -> (f32, Option<f32>) {
     let (mut g, mut b): (f32, Option<f32>) = (0.0, None);
     if let Some(v) = c.get("flex") {
         let mut it = v.split_whitespace();
@@ -1019,12 +1041,12 @@ fn flex_grow_basis(c: &Props, rel: f32) -> (f32, Option<f32>) {
             if let Ok(n) = t.parse::<f32>() {
                 g = n;
             } else {
-                b = parse_len(t, rel).or(if t == "auto" { None } else { Some(0.0) });
+                b = parse_len(t, rel, em).or(if t == "auto" { None } else { Some(0.0) });
             }
         }
         let _shrink = it.next();
         if let Some(t) = it.next() {
-            b = if t == "auto" { None } else { parse_len(t, rel).or(Some(0.0)) };
+            b = if t == "auto" { None } else { parse_len(t, rel, em).or(Some(0.0)) };
         }
     }
     if let Some(v) = c.get("flex-grow") {
@@ -1032,9 +1054,27 @@ fn flex_grow_basis(c: &Props, rel: f32) -> (f32, Option<f32>) {
     }
     if let Some(v) = c.get("flex-basis") {
         let v = v.trim();
-        b = if v == "auto" { None } else { parse_len(v, rel).or(Some(0.0)) };
+        b = if v == "auto" { None } else { parse_len(v, rel, em).or(Some(0.0)) };
     }
     (g, b)
+}
+
+/// `flex-shrink`: middle token of the `flex` shorthand, else the longhand;
+/// default 1 (every item shrinks unless it opts out).
+fn flex_shrink_factor(c: &Props) -> f32 {
+    if let Some(v) = c.get("flex-shrink") {
+        return v.trim().parse().unwrap_or(1.0f32).max(0.0);
+    }
+    if let Some(v) = c.get("flex") {
+        let mut it = v.split_whitespace();
+        let _grow = it.next();
+        if let Some(t) = it.next() {
+            if let Ok(n) = t.parse::<f32>() {
+                return n.max(0.0f32);
+            }
+        }
+    }
+    1.0
 }
 
 /// Does this element's left margin resolve to `auto`? Checks the longhand
@@ -1066,8 +1106,8 @@ fn has_auto_ml(c: &Props) -> bool {
 
 /// margin/padding longhands merged over the shorthand.
 /// Returns [top, right, bottom, left] in px (0 when unset).
-fn box_sides(c: &Props, name: &str, rel: f32) -> [f32; 4] {
-    let sh = sides(c, name, rel);
+fn box_sides(c: &Props, name: &str, rel: f32, em: f32) -> [f32; 4] {
+    let sh = sides(c, name, rel, em);
     // static longhand names — the old format!() allocated 4 strings per call
     let (t, r, b, l) = match name {
         "margin" => ("margin-top", "margin-right", "margin-bottom", "margin-left"),
@@ -1079,18 +1119,18 @@ fn box_sides(c: &Props, name: &str, rel: f32) -> [f32; 4] {
         ),
         _ => {
             return [
-                side(c, &format!("{name}-top"), rel).or(sh[0]).unwrap_or(0.0),
-                side(c, &format!("{name}-right"), rel).or(sh[1]).unwrap_or(0.0),
-                side(c, &format!("{name}-bottom"), rel).or(sh[2]).unwrap_or(0.0),
-                side(c, &format!("{name}-left"), rel).or(sh[3]).unwrap_or(0.0),
+                side(c, &format!("{name}-top"), rel, em).or(sh[0]).unwrap_or(0.0),
+                side(c, &format!("{name}-right"), rel, em).or(sh[1]).unwrap_or(0.0),
+                side(c, &format!("{name}-bottom"), rel, em).or(sh[2]).unwrap_or(0.0),
+                side(c, &format!("{name}-left"), rel, em).or(sh[3]).unwrap_or(0.0),
             ];
         }
     };
     [
-        side(c, t, rel).or(sh[0]).unwrap_or(0.0),
-        side(c, r, rel).or(sh[1]).unwrap_or(0.0),
-        side(c, b, rel).or(sh[2]).unwrap_or(0.0),
-        side(c, l, rel).or(sh[3]).unwrap_or(0.0),
+        side(c, t, rel, em).or(sh[0]).unwrap_or(0.0),
+        side(c, r, rel, em).or(sh[1]).unwrap_or(0.0),
+        side(c, b, rel, em).or(sh[2]).unwrap_or(0.0),
+        side(c, l, rel, em).or(sh[3]).unwrap_or(0.0),
     ]
 }
 
@@ -1122,7 +1162,7 @@ fn margin_auto(c: &Props, left: bool) -> bool {
 /// `border: 2px solid red` → (width px, color). The color may contain
 /// spaces (`rgb(...)`/`color-mix(...)`) — the rest of the value is tried
 /// as one color before the bare token.
-fn parse_border(v: &str, _rel: f32) -> Option<(f32, Color)> {
+fn parse_border(v: &str, em: f32) -> Option<(f32, Color)> {
     let mut width = None;
     let mut color = None;
     let mut rest = v.trim();
@@ -1131,12 +1171,12 @@ fn parse_border(v: &str, _rel: f32) -> Option<(f32, Color)> {
         if part == "none" || part == "hidden" {
             return None;
         }
-        if parse_len(part, 16.0).is_some() || matches!(part, "thin" | "medium" | "thick") {
+        if parse_len(part, 16.0, em).is_some() || matches!(part, "thin" | "medium" | "thick") {
             width = Some(match part {
                 "thin" => 1.0,
                 "thick" => 6.0,
                 "medium" => 3.0,
-                p => parse_len(p, 16.0).unwrap_or(1.0),
+                p => parse_len(p, 16.0, em).unwrap_or(1.0),
             });
         } else if matches!(
             part,
@@ -1167,7 +1207,7 @@ fn border_sides(c: &Props, size: f32) -> Option<([f32; 4], Color)> {
             col = Some(sc);
         }
     }
-    let sh = sides(c, "border-width", size);
+    let sh = sides(c, "border-width", size, size);
     for (i, s) in sh.iter().copied().enumerate() {
         if let Some(v) = s {
             w[i] = v;
@@ -1189,7 +1229,7 @@ fn border_sides(c: &Props, size: f32) -> Option<([f32; 4], Color)> {
         col = Some(bc);
     }
     for (i, (wn, sn, cn)) in SIDES.iter().copied().enumerate() {
-        if let Some(v) = c.get(wn).and_then(|v| parse_len(v, size)) {
+        if let Some(v) = c.get(wn).and_then(|v| parse_len(v, size, size)) {
             w[i] = v;
         }
         if c.get(sn).is_some_and(|v| matches!(v.trim(), "none" | "hidden")) {
@@ -1282,7 +1322,7 @@ fn track_floor(t: &GTrack) -> f32 {
 }
 
 /// One non-repeat track token → GTrack. `rel` is the %/em base (axis size).
-fn track_spec(t: &str, rel: f32, vh: f32, vw: f32) -> GTrack {
+fn track_spec(t: &str, rel: f32, em: f32, vh: f32, vw: f32) -> GTrack {
     let t = t.trim().to_lowercase();
     if let Some(f) = t.strip_suffix("fr") {
         return GTrack::Fr(f.trim().parse::<f32>().unwrap_or(1.0).max(0.0), 0.0);
@@ -1298,7 +1338,7 @@ fn track_spec(t: &str, rel: f32, vh: f32, vw: f32) -> GTrack {
         let min = if a.trim() == "auto" {
             0.0
         } else {
-            parse_len_vp(a.trim(), rel, vh, vw).unwrap_or(0.0)
+            parse_len_vp(a.trim(), rel, em, vh, vw).unwrap_or(0.0)
         };
         let b = b.trim();
         if let Some(f) = b.strip_suffix("fr") {
@@ -1307,21 +1347,21 @@ fn track_spec(t: &str, rel: f32, vh: f32, vw: f32) -> GTrack {
         if b == "auto" || b == "min-content" || b == "max-content" {
             return GTrack::Auto(min, f32::MAX);
         }
-        return GTrack::Auto(min, parse_len_vp(b, rel, vh, vw).unwrap_or(f32::MAX));
+        return GTrack::Auto(min, parse_len_vp(b, rel, em, vh, vw).unwrap_or(f32::MAX));
     }
     if let Some(inner) = t
         .strip_prefix("fit-content(")
         .and_then(|x| x.strip_suffix(')'))
     {
-        return GTrack::Auto(0.0, parse_len_vp(inner.trim(), rel, vh, vw).unwrap_or(f32::MAX));
+        return GTrack::Auto(0.0, parse_len_vp(inner.trim(), rel, em, vh, vw).unwrap_or(f32::MAX));
     }
-    GTrack::Fixed(parse_len_vp(&t, rel, vh, vw).unwrap_or(0.0))
+    GTrack::Fixed(parse_len_vp(&t, rel, em, vh, vw).unwrap_or(0.0))
 }
 
 /// `grid-template-*`/`grid-auto-*` value → expanded track list.
 /// `none`/empty → []. repeat() expands; auto-fill/auto-fit size against
 /// `avail` using the repeat unit's floor width.
-fn grid_track_list(v: Option<&String>, rel: f32, vh: f32, vw: f32, avail: f32, gap: f32) -> Vec<GTrack> {
+fn grid_track_list(v: Option<&String>, rel: f32, em: f32, vh: f32, vw: f32, avail: f32, gap: f32) -> Vec<GTrack> {
     let Some(v) = v else { return Vec::new() };
     let v = v.trim();
     if v.is_empty() || v == "none" {
@@ -1337,7 +1377,7 @@ fn grid_track_list(v: Option<&String>, rel: f32, vh: f32, vw: f32, avail: f32, g
             let (cnt, rest) = top_comma(inner).unwrap_or((inner, ""));
             let sub: Vec<GTrack> = track_tokens(rest)
                 .iter()
-                .map(|s| track_spec(s, rel, vh, vw))
+                .map(|s| track_spec(s, rel, em, vh, vw))
                 .collect();
             if sub.is_empty() {
                 continue;
@@ -1354,7 +1394,7 @@ fn grid_track_list(v: Option<&String>, rel: f32, vh: f32, vw: f32, avail: f32, g
                 out.extend_from_slice(&sub);
             }
         } else {
-            out.push(track_spec(&t, rel, vh, vw));
+            out.push(track_spec(&t, rel, em, vh, vw));
         }
     }
     out
@@ -1684,7 +1724,7 @@ impl<'a> Layouter<'a> {
         viewport_h: f32,
         external: &[css::StyleSheet],
     ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<(f32, f32, f32, f32, NodeId)>) {
-        let author = css::document_sheets(doc);
+        let author = css::document_sheets_vw(doc, width);
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
         sheets.extend(external.iter());
         sheets.extend(author.iter());
@@ -1825,8 +1865,8 @@ impl<'a> Layouter<'a> {
                 // the `.sr-only` a11y pattern — a 1x1 overflow:hidden clip.
                 // Laying it out would wrap its text into a visible strip.
                 let visually_hidden = c.get("overflow").map(String::as_str) == Some("hidden")
-                    && dim(c.as_ref(), "width", self.avail_w).is_some_and(|w| w <= 2.0)
-                    && dim(c.as_ref(), "height", self.avail_w).is_some_and(|h| h <= 2.0);
+                    && dim(c.as_ref(), "width", self.avail_w, st.size).is_some_and(|w| w <= 2.0)
+                    && dim(c.as_ref(), "height", self.avail_w, st.size).is_some_and(|h| h <= 2.0);
                 // replaced/void elements emit their payload via inline()
                 // whatever `display` says (Tailwind blocks imgs with
                 // `display:block` — that must not swallow the image)
@@ -1847,10 +1887,9 @@ impl<'a> Layouter<'a> {
                 match c.get("display").map(String::as_str) {
                     _ if visually_hidden => return,
                     Some("none") => return,
-                    _ if replaced => self.inline(node, tag, &c, st),
-                    // CSS 2.1 §9.7: absolute/fixed blockify — an inline
-                    // element like <a> with `position:absolute` lays out as
-                    // a block box so its `top`/`left` offsets take effect
+                    // CSS 2.1 §9.7: absolute/fixed blockify AND leave normal
+                    // flow — an <input> overlay (Vector's dropdown checkbox)
+                    // or an <a> must not contribute line box size either
                     _ if matches!(
                         c.get("position").map(String::as_str),
                         Some("absolute") | Some("fixed")
@@ -1858,6 +1897,7 @@ impl<'a> Layouter<'a> {
                     {
                         self.block(node, tag, &c, st);
                     }
+                    _ if replaced => self.inline(node, tag, &c, st),
                     Some("block") | Some("list-item") | Some("flex") | Some("grid") => {
                         self.block(node, tag, &c, st);
                     }
@@ -1960,7 +2000,7 @@ impl<'a> Layouter<'a> {
             } else if let Ok(n) = v.parse::<f32>() {
                 Some(LineH::Mul(n))
             } else {
-                parse_len(v, st.size).map(LineH::Px)
+                parse_len(v, st.size, st.size).map(LineH::Px)
             };
         }
         if let Some(col) = bg_color(c) {
@@ -1985,14 +2025,14 @@ impl<'a> Layouter<'a> {
         // explicit `height` — definite containing-block height for positioned
         // descendants and a floor for this box's own extent. % resolves
         // against the nearest definite ancestor height, else the viewport.
-        let h_prop = dim(c, "height", self.pct_h.unwrap_or(self.viewport_h));
+        let h_prop = dim(c, "height", self.pct_h.unwrap_or(self.viewport_h), st.size);
         // `inset` shorthand + longhands merged into [top, right, bottom, left];
         // % on the block axis resolves against the containing height
         let hrel = self.cb_h.or(self.pct_h).unwrap_or(self.viewport_h);
-        let ish = sides(c, "inset", self.avail_w);
-        let ish_h = sides(c, "inset", hrel);
+        let ish = sides(c, "inset", self.avail_w, st.size);
+        let ish_h = sides(c, "inset", hrel, st.size);
         let inset_l = |name: &str, i: usize, rel: f32| {
-            c.get(name).and_then(|v| parse_len(v, rel)).or(if i % 2 == 0 { ish_h[i] } else { ish[i] })
+            c.get(name).and_then(|v| parse_len(v, rel, st.size)).or(if i % 2 == 0 { ish_h[i] } else { ish[i] })
         };
         let ins_t = inset_l("top", 0, hrel);
         let ins_r = inset_l("right", 1, self.avail_w);
@@ -2027,8 +2067,8 @@ impl<'a> Layouter<'a> {
             .zip(ins_b)
             .map(|(t, b)| (self.cb_h.unwrap_or(self.viewport_h) - t - b).max(0.0));
         let size = st.size;
-        let [mt, mr, mb, ml] = box_sides(c, "margin", size);
-        let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
+        let [mt, mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
+        let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let bd = self.backdrop;
         let bb = border_box(c);
         let bg = bg_color(c).map(|col| over(col, bd));
@@ -2054,12 +2094,12 @@ impl<'a> Layouter<'a> {
         let mut ml = ml;
         let mut mr = mr;
         // inset-stretched boxes are sized by left+right, a border-box length
-        let w_explicit = dim(c, "width", self.avail_w);
+        let w_explicit = dim(c, "width", self.avail_w, size);
         let mut w_prop = w_explicit.or(inset_w);
-        if let Some(mxw) = c.get("max-width").and_then(|v| parse_len_vp(v, self.avail_w, self.viewport_h, self.avail_w)) {
+        if let Some(mxw) = c.get("max-width").and_then(|v| parse_len_vp(v, self.avail_w, size, self.viewport_h, self.avail_w)) {
             w_prop = Some(w_prop.unwrap_or(self.avail_w).min(mxw));
         }
-        if let Some(mnw) = c.get("min-width").and_then(|v| parse_len_vp(v, self.avail_w, self.viewport_h, self.avail_w)) {
+        if let Some(mnw) = c.get("min-width").and_then(|v| parse_len_vp(v, self.avail_w, size, self.viewport_h, self.avail_w)) {
             // min-width constrains the box — it must not *create* a width:
             // `min-width:0` on a width:auto block must stay full-width
             if mnw > 0.0 {
@@ -2173,13 +2213,13 @@ impl<'a> Layouter<'a> {
         let mut mh_prop = h_prop;
         if let Some(mn) = c
             .get("min-height")
-            .and_then(|v| parse_len_vp(v, hrel, self.viewport_h, self.avail_w))
+            .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
         {
             mh_prop = Some(mh_prop.map_or(mn, |h| h.max(mn)));
         }
         if let Some(mx) = c
             .get("max-height")
-            .and_then(|v| parse_len_vp(v, hrel, self.viewport_h, self.avail_w))
+            .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
         {
             mh_prop = mh_prop.map(|h| h.min(mx));
         }
@@ -2298,6 +2338,7 @@ impl<'a> Layouter<'a> {
             c,
             inner_w + pl + pr + bw_h,
             self.y - (content_top - pt - bw_t),
+            size,
         );
         if c.get("position").map(String::as_str) == Some("relative") {
             tx += ins_l.unwrap_or(0.0) - ins_r.unwrap_or(0.0);
@@ -2352,8 +2393,8 @@ impl<'a> Layouter<'a> {
         mb: f32,
     ) {
         let size = st.size;
-        let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
-        let [_t, mr, _b, ml] = box_sides(c, "margin", size);
+        let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
+        let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
         let bg = bg_color(c).map(|col| over(col, bd));
         let border = border_sides(c, size)
@@ -2363,7 +2404,7 @@ impl<'a> Layouter<'a> {
         let bw_h = bw_l + bw_r;
         let right = c.get("float").is_some_and(|v| v.trim() == "right");
 
-        let inner = if let Some(w) = dim(c, "width", self.avail_w) {
+        let inner = if let Some(w) = dim(c, "width", self.avail_w, size) {
             let w = if border_box(c) { w - pl - pr - bw_h } else { w };
             w.max(1.0)
         } else {
@@ -2455,8 +2496,8 @@ impl<'a> Layouter<'a> {
 
     fn inline_block_inner(&mut self, node: NodeId, c: &Props, mut st: Style, hint: Option<f32>) {
         let size = st.size;
-        let [pt, pr, pb, pl] = box_sides(c, "padding", size).map(|v| v.max(0.0));
-        let [_t, mr, mb, ml] = box_sides(c, "margin", size);
+        let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
+        let [_t, mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
         let bb = border_box(c);
         let bg = bg_color(c).map(|col| over(col, bd));
@@ -2476,7 +2517,7 @@ impl<'a> Layouter<'a> {
         let inner = if let Some(w) = hint {
             // resolved flex main size — an outer (border-box) target
             (w - pl - pr - bw_h).max(1.0)
-        } else if let Some(w) = dim(c, "width", self.avail_w) {
+        } else if let Some(w) = dim(c, "width", self.avail_w, size) {
             if bb {
                 w - pl - pr - bw_h
             } else {
@@ -2487,7 +2528,7 @@ impl<'a> Layouter<'a> {
             c.get("display").map(String::as_str),
             Some("flex") | Some("inline-flex") | Some("inline-grid")
         ) {
-            self.flex_shrink_width(node, c, &st)
+            self.flex_maxc_width(node, c, &st)
         } else {
             self.shrink_width(node, &st)
         };
@@ -2500,16 +2541,16 @@ impl<'a> Layouter<'a> {
         let hrel = self.pct_h.unwrap_or(self.viewport_h);
         let outer_h = |v: f32| if bb { v } else { v + pt + pb + bw_v };
         let mut h_prop =
-            dim(c, "height", hrel).or_else(|| aspect_ratio(c).map(|r| box_w / r));
+            dim(c, "height", hrel, size).or_else(|| aspect_ratio(c).map(|r| box_w / r));
         if let Some(mn) = c
             .get("min-height")
-            .and_then(|v| parse_len_vp(v, hrel, self.viewport_h, self.avail_w))
+            .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
         {
             h_prop = Some(h_prop.map_or(mn, |h| h.max(mn)));
         }
         if let Some(mx) = c
             .get("max-height")
-            .and_then(|v| parse_len_vp(v, hrel, self.viewport_h, self.avail_w))
+            .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
         {
             h_prop = h_prop.map(|h| h.min(mx));
         }
@@ -2529,7 +2570,7 @@ impl<'a> Layouter<'a> {
         // explicit height/aspect-ratio/max-height may pin the painted box;
         // min-height alone only floors it
         let natural = y_end + pb + bw_b;
-        let pinned = dim(c, "height", hrel).is_some()
+        let pinned = dim(c, "height", hrel, size).is_some()
             || aspect_ratio(c).is_some()
             || c.get("max-height").is_some();
         let box_h = match (h_prop, pinned) {
@@ -2553,7 +2594,7 @@ impl<'a> Layouter<'a> {
         }
         out.extend(items);
         // translate/transform: visual offset of the whole box
-        let (tx, ty) = translate_xy(c, box_w, box_h);
+        let (tx, ty) = translate_xy(c, box_w, box_h, size);
         let nhits: Vec<_> = if tx != 0.0 || ty != 0.0 {
             out = out.into_iter().map(|it| offset_item(it, tx, ty)).collect();
             nhits.into_iter().map(|h| (h.0 + tx, h.1 + ty, h.2, h.3, h.4)).collect()
@@ -2594,7 +2635,7 @@ impl<'a> Layouter<'a> {
     /// (border-collapse ≈ same visual since cells abut), rows don't wrap.
     fn table(&mut self, node: NodeId, c: &Props, mut st: Style) {
         let size = st.size;
-        let [mt, _mr, mb, ml] = box_sides(c, "margin", size);
+        let [mt, _mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
         let bg = bg_color(c).map(|col| over(col, bd));
         let border = border_sides(c, size)
@@ -2647,14 +2688,14 @@ impl<'a> Layouter<'a> {
                 let cs = self.style(cell);
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
-                let [_t, pr, _b, pl] = box_sides(&cs, "padding", cst.size).map(|v| v.max(0.0));
+                let [_t, pr, _b, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
                 let [_, cbw_r, _, cbw_l] = border_sides(&cs, cst.size)
                     .or(attr_border)
                     .map(|b| b.0)
                     .unwrap_or([0.0; 4]);
                 let cbw_h = cbw_l + cbw_r;
                 let mut w = self.shrink_width(cell, &cst) + pl + pr + cbw_h;
-                if let Some(wp) = dim(&cs, "width", cst.size) {
+                if let Some(wp) = dim(&cs, "width", self.avail_w, cst.size) {
                     let wp = if border_box(&cs) { wp } else { wp + pl + pr + cbw_h };
                     w = w.max(wp);
                 }
@@ -2723,7 +2764,7 @@ impl<'a> Layouter<'a> {
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
                 cst.inline_bg = None; // cell bg paints the whole cell
-                let [pt, pr, pb, pl] = box_sides(&cs, "padding", cst.size).map(|v| v.max(0.0));
+                let [pt, pr, pb, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
                 let cborder = border_sides(&cs, cst.size)
                     .or(attr_border)
                     .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
@@ -2787,12 +2828,12 @@ impl<'a> Layouter<'a> {
         // `gap` shorthand then axis longhands (Tailwind emits gap-x/gap-y)
         let base_gap = c
             .get("gap")
-            .and_then(|v| parse_len(v, st.size))
+            .and_then(|v| parse_len(v, self.avail_w, st.size))
             .unwrap_or(0.0);
         let col_dir = c.get("flex-direction").map(String::as_str) == Some("column");
         let gap = c
             .get(if col_dir { "row-gap" } else { "column-gap" })
-            .and_then(|v| parse_len(v, st.size))
+            .and_then(|v| parse_len(v, self.avail_w, st.size))
             .unwrap_or(base_gap);
         // column direction: children stack as blocks, vertical gap.
         // `flex-1`/`grow-*` children share the container's definite height.
@@ -2805,7 +2846,7 @@ impl<'a> Layouter<'a> {
             // this box's target when its own props set a height, else an
             // ancestor's (must not stretch to that).
             let hrel = self.pct_h.unwrap_or(self.viewport_h);
-            let own_def = dim(c, "height", hrel).is_some()
+            let own_def = dim(c, "height", hrel, st.size).is_some()
                 || c.get("min-height").is_some()
                 || self.inset_h.is_some();
             let target = if own_def { self.pct_h } else { None };
@@ -2879,19 +2920,27 @@ impl<'a> Layouter<'a> {
         // the leftover space before it (pushed to the row's far edge).
         let mut base_w: FxHashMap<NodeId, f32> = FxHashMap::default();
         let mut grow_meta: FxHashMap<NodeId, (f32, f32)> = FxHashMap::default();
+        let mut min_w: FxHashMap<NodeId, f32> = FxHashMap::default();
+        let mut shrink_f: FxHashMap<NodeId, f32> = FxHashMap::default();
+        let mut oof: Vec<NodeId> = Vec::new();
         let mut sum_grow = 0.0f32;
+        let mut shrink_w = 0.0f32;
         let mut n_auto_ml = 0usize;
-        let mut total = 0.0f32;
+        let mut total = 0.0f32; // flex-item bases only
+        let mut text_w = 0.0f32;
+        let mut margins = 0.0f32; // positive outer margins (excluded from shrink)
         let mut n_vis = 0usize;
         for &ch in self.doc.children(node) {
             match self.doc.kind(ch) {
                 NodeKind::Text(t) => {
                     if let Some(fi) = self.resolve_font(&st) {
                         if let Some(f) = self.fonts.font(fi) {
-                            total += f.measure(
+                            let tw = f.measure(
                                 &t.split_whitespace().collect::<Vec<_>>().join(" "),
                                 st.size,
                             );
+                            text_w += tw;
+                            total += tw;
                         }
                     }
                 }
@@ -2900,18 +2949,27 @@ impl<'a> Layouter<'a> {
                     if cc.get("display").map(String::as_str) == Some("none") {
                         continue;
                     }
+                    // out-of-flow children aren't flex items — they still
+                    // paint, laid out after the row (below)
+                    if matches!(
+                        cc.get("position").map(String::as_str),
+                        Some("absolute") | Some("fixed")
+                    ) {
+                        oof.push(ch);
+                        continue;
+                    }
                     let mut cst = st.clone();
                     self.apply_computed(&cc, &mut cst);
                     let [_t, pr, _b, pl] =
-                        box_sides(&cc, "padding", cst.size).map(|v| v.max(0.0));
-                    let [_t, mr, _b, ml] = box_sides(&cc, "margin", cst.size);
-                    let (g, basis) = flex_grow_basis(&cc, st.size);
+                        box_sides(&cc, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
+                    let [_t, mr, _b, ml] = box_sides(&cc, "margin", self.avail_w, cst.size);
+                    let (g, basis) = flex_grow_basis(&cc, self.avail_w, cst.size);
                     let w = if g > 0.0 {
                         grow_meta.insert(ch, (g, basis.unwrap_or(0.0)));
                         sum_grow += g;
                         basis.unwrap_or(0.0)
                     } else {
-                        dim(&cc, "width", self.avail_w)
+                        dim(&cc, "width", self.avail_w, cst.size)
                             .map(|w| {
                                 if border_box(&cc) {
                                     w - pl - pr
@@ -2922,7 +2980,19 @@ impl<'a> Layouter<'a> {
                             .unwrap_or_else(|| self.max_content_width(ch, &cst))
                     };
                     base_w.insert(ch, w + pl + pr);
-                    total += w + pl + pr + ml.max(0.0) + mr.max(0.0);
+                    total += w + pl + pr;
+                    margins += ml.max(0.0) + mr.max(0.0);
+                    // flex-shrink + min-content floor: an overflowing row
+                    // shrinks items ∝ shrink×base, floored at min-width
+                    // (auto → min-content, like real flexbox)
+                    let floor = dim(&cc, "min-width", self.avail_w, cst.size)
+                        .unwrap_or_else(|| self.shrink_width(ch, &cst) + pl + pr);
+                    min_w.insert(ch, floor.max(1.0));
+                    let sh = flex_shrink_factor(&cc);
+                    if sh > 0.0 {
+                        shrink_w += sh * (w + pl + pr);
+                        shrink_f.insert(ch, sh);
+                    }
                     if has_auto_ml(&cc) {
                         n_auto_ml += 1;
                     }
@@ -2931,8 +3001,23 @@ impl<'a> Layouter<'a> {
                 _ => {}
             }
         }
-        total += gap * n_vis.saturating_sub(1) as f32;
-        let free = (self.content_width() - total).max(0.0);
+        let gaps = gap * n_vis.saturating_sub(1) as f32;
+        let cw = self.content_width();
+        let overflow = total + margins + gaps - cw;
+        if overflow > 0.0 && shrink_w > 0.0 {
+            // negative free space → shrink bases ∝ shrink×base, floored at
+            // min-width (one pass; floors can leave residual overflow)
+            for (ch, sh) in &shrink_f {
+                if let Some(b) = base_w.get_mut(ch) {
+                    // floor never exceeds the pre-shrink base: a min-content
+                    // estimate larger than the base would grow, not shrink
+                    let floor = min_w.get(ch).copied().unwrap_or(1.0).min(*b);
+                    *b = (*b - overflow * sh * *b / shrink_w).max(floor);
+                }
+            }
+            total = text_w + base_w.values().sum::<f32>();
+        }
+        let free = (cw - total - margins - gaps).max(0.0);
         // grow items absorb all leftover space; auto margins only split what
         // grow leaves (spec: auto margins are 0 when any item grows)
         let auto_share = if sum_grow > 0.0 || n_auto_ml == 0 {
@@ -2968,6 +3053,12 @@ impl<'a> Layouter<'a> {
                     if cc.get("display").map(String::as_str) == Some("none") {
                         continue;
                     }
+                    if matches!(
+                        cc.get("position").map(String::as_str),
+                        Some("absolute") | Some("fixed")
+                    ) {
+                        continue; // in `oof` — painted after the row
+                    }
                     if !first && effective_gap > 0.0 {
                         self.spacer(effective_gap);
                     }
@@ -2983,7 +3074,7 @@ impl<'a> Layouter<'a> {
                             if let Some((w, h, items, hits)) =
                                 self.replaced_payload(ch, t, &cc, &cst)
                             {
-                                let (tx, ty) = translate_xy(&cc, w, h);
+                                let (tx, ty) = translate_xy(&cc, w, h, cst.size);
                                 let items = if tx != 0.0 || ty != 0.0 {
                                     items
                                         .into_iter()
@@ -3000,7 +3091,7 @@ impl<'a> Layouter<'a> {
                                     hits
                                 };
                                 let mb =
-                                    box_sides(&cc, "margin", cst.size)[2].max(0.0);
+                                    box_sides(&cc, "margin", self.avail_w, cst.size)[2].max(0.0);
                                 self.push_box(w, h, items, hits, mb);
                             }
                         }
@@ -3010,21 +3101,47 @@ impl<'a> Layouter<'a> {
                         _ => {
                             // flex item main size: grow → basis + share of the
                             // leftover; otherwise its measured base (explicit
-                            // `width` still wins via the `dim` branch inside)
-                            let hint = if let Some(&(g, bpx)) = grow_meta.get(&ch) {
+                            // `width` still wins via the `dim` branch inside).
+                            // `min-width:auto` floors at min-content.
+                            let mut hint = if let Some(&(g, bpx)) = grow_meta.get(&ch) {
                                 Some(bpx + free * g / sum_grow)
-                            } else if dim(&cc, "width", self.avail_w).is_none() {
+                            } else if dim(&cc, "width", self.avail_w, cst.size).is_none() {
                                 base_w.get(&ch).copied()
                             } else {
                                 None
                             };
+                            // min-content floor — capped at the item's own base
+                            // size: a floor above base inflates the item past
+                            // what the free-space math budgeted → phantom wrap
+                            if let (Some(h), Some(&fl)) = (hint, min_w.get(&ch)) {
+                                let cap = base_w.get(&ch).copied().unwrap_or(h);
+                                hint = Some(h.max(fl.min(cap)));
+                            }
                             self.inline_block_w(ch, &cc, cst, hint)
                         }
                     }
                     first = false;
                 }
-                NodeKind::Text(t) => self.text(t, &st),
+                NodeKind::Text(t) => {
+                    // whitespace between flex items collapses in real flexbox;
+                    // a pending_space here would add a phantom gap that can
+                    // wrap an edge-aligned item past the row's end
+                    if !t.trim().is_empty() {
+                        self.text(t, &st)
+                    }
+                }
                 _ => {}
+            }
+        }
+        // out-of-flow children paint last, as plain blocks (position
+        // offsets resolve against the nearest positioned ancestor's cb)
+        if !oof.is_empty() {
+            self.flush_line();
+            for ch in oof {
+                let cc = self.style(ch);
+                let mut cst = st.clone();
+                self.apply_computed(&cc, &mut cst);
+                self.block(ch, self.doc.tag(ch).unwrap_or("div"), &cc, cst);
             }
         }
     }
@@ -3073,7 +3190,7 @@ impl<'a> Layouter<'a> {
         // definite container height (`height` prop, or `top`+`bottom` stretch
         // on a positioned grid) — drives fr rows and align-content; % resolves
         // against the viewport as approximation
-        let cont_h = dim(c, "height", self.viewport_h)
+        let cont_h = dim(c, "height", self.viewport_h, st.size)
             .or(self.inset_h)
             .filter(|h| *h > 0.0);
 
@@ -3083,30 +3200,96 @@ impl<'a> Layouter<'a> {
             let mut it = v.split_whitespace();
             row_gap = it
                 .next()
-                .and_then(|t| parse_len_vp(t, cont_h.unwrap_or(avail), self.viewport_h, avail))
+                .and_then(|t| parse_len_vp(t, cont_h.unwrap_or(avail), st.size, self.viewport_h, avail))
                 .unwrap_or(0.0);
             col_gap = it
                 .next()
-                .and_then(|t| parse_len_vp(t, avail, self.viewport_h, avail))
+                .and_then(|t| parse_len_vp(t, avail, st.size, self.viewport_h, avail))
                 .unwrap_or(row_gap);
         }
         if let Some(v) = c.get("row-gap") {
-            row_gap = parse_len_vp(v, cont_h.unwrap_or(avail), self.viewport_h, avail)
+            row_gap = parse_len_vp(v, cont_h.unwrap_or(avail), st.size, self.viewport_h, avail)
                 .unwrap_or(row_gap);
         }
         if let Some(v) = c.get("column-gap") {
-            col_gap = parse_len_vp(v, avail, self.viewport_h, avail).unwrap_or(col_gap);
+            col_gap = parse_len_vp(v, avail, st.size, self.viewport_h, avail).unwrap_or(col_gap);
         }
 
         let row_rel = cont_h.unwrap_or(avail);
+        // `grid-template` shorthand: `rows / cols`, rows may carry inline
+        // area names ('a a' 1fr / 1fr) — strip quoted segments for tracks,
+        // collect them as area rows when `grid-template-areas` is absent
+        let (t_rows, t_cols, t_areas) = c
+            .get("grid-template")
+            .map(|v| {
+                let (rows, cols) = v.split_once('/').unwrap_or((v.as_str(), ""));
+                let mut tracks = String::new();
+                let mut names: Vec<String> = Vec::new();
+                let mut seg = String::new();
+                let mut in_q = false;
+                for ch in rows.chars() {
+                    match ch {
+                        '\'' | '"' => {
+                            if in_q {
+                                names.push(seg.trim().to_string());
+                                seg.clear();
+                            }
+                            in_q = !in_q;
+                        }
+                        _ if in_q => seg.push(ch),
+                        _ => tracks.push(ch),
+                    }
+                }
+                (
+                    Some(tracks.trim().to_string()).filter(|s| !s.is_empty()),
+                    Some(cols.trim().to_string()).filter(|s| !s.is_empty()),
+                    names,
+                )
+            })
+            .unwrap_or_default();
+        let col_src = c
+            .get("grid-template-columns")
+            .map(String::as_str)
+            .or(t_cols.as_deref())
+            .map(String::from);
+        let row_src = c
+            .get("grid-template-rows")
+            .map(String::as_str)
+            .or(t_rows.as_deref())
+            .map(String::from);
         let col_specs =
-            grid_track_list(c.get("grid-template-columns"), avail, self.viewport_h, avail, avail, col_gap);
+            grid_track_list(col_src.as_ref(), avail, st.size, self.viewport_h, avail, avail, col_gap);
         let row_specs =
-            grid_track_list(c.get("grid-template-rows"), row_rel, self.viewport_h, avail, row_rel, row_gap);
+            grid_track_list(row_src.as_ref(), row_rel, st.size, self.viewport_h, avail, row_rel, row_gap);
+        // `grid-template-areas: 'a b' 'c b'` → name → (row, col, row+1, col+1)
+        // bounding box; `grid-area: name` items resolve to those cells.
+        let mut areas: FxHashMap<String, (usize, usize, usize, usize)> = FxHashMap::default();
+        let area_rows: Vec<String> = c
+            .get("grid-template-areas")
+            .map(|v| {
+                v.split('\'')
+                    .enumerate()
+                    .filter(|(i, _)| i % 2 == 1)
+                    .map(|(_, s)| s.to_string())
+                    .collect()
+            })
+            .unwrap_or(t_areas);
+        for (r, seg) in area_rows.iter().enumerate() {
+            for (ci, name) in seg.split_whitespace().enumerate() {
+                if name == "." {
+                    continue;
+                }
+                let e = areas.entry(name.to_string()).or_insert((r, ci, r, ci));
+                e.0 = e.0.min(r);
+                e.1 = e.1.min(ci);
+                e.2 = e.2.max(r);
+                e.3 = e.3.max(ci);
+            }
+        }
         let auto_cols =
-            grid_track_list(c.get("grid-auto-columns"), avail, self.viewport_h, avail, avail, col_gap);
+            grid_track_list(c.get("grid-auto-columns"), avail, st.size, self.viewport_h, avail, avail, col_gap);
         let auto_rows =
-            grid_track_list(c.get("grid-auto-rows"), row_rel, self.viewport_h, avail, row_rel, row_gap);
+            grid_track_list(c.get("grid-auto-rows"), row_rel, st.size, self.viewport_h, avail, row_rel, row_gap);
         let spec_at = |specs: &[GTrack], auto: &[GTrack], i: usize| -> GTrack {
             if let Some(t) = specs.get(i) {
                 return *t;
@@ -3158,8 +3341,25 @@ impl<'a> Layouter<'a> {
             Vec::with_capacity(kids2.len());
         for &ch in &kids2 {
             let ic = self.style(ch);
-            let (ecol, cs) = resolve_axis(grid_lines(&ic, "column"), exp_cols);
-            let (erow, rs) = resolve_axis(grid_lines(&ic, "row"), exp_rows);
+            // `grid-area: <name>` → the named area's cell box; falls back to
+            // line terms when the name isn't declared
+            let named = ic
+                .get("grid-area")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty() && !v.contains('/'))
+                .and_then(|v| areas.get(v));
+            let (ecol, cs, erow, rs) = if let Some(&(r0, c0, r1, c1)) = named {
+                (
+                    Some(c0),
+                    c1 - c0 + 1,
+                    Some(r0),
+                    r1 - r0 + 1,
+                )
+            } else {
+                let (ecol, cs) = resolve_axis(grid_lines(&ic, "column"), exp_cols);
+                let (erow, rs) = resolve_axis(grid_lines(&ic, "row"), exp_rows);
+                (ecol, cs, erow, rs)
+            };
             ncols = ncols.max(ecol.map(|cix| cix + cs).unwrap_or(cs));
             req.push((ch, ecol, cs, erow, rs));
         }
@@ -3253,8 +3453,8 @@ impl<'a> Layouter<'a> {
             let mut cst = st.clone();
             self.apply_computed(&cc, &mut cst);
             cst.inline_bg = None;
-            let m = box_sides(&cc, "margin", cst.size);
-            let p = box_sides(&cc, "padding", cst.size).map(|v| v.max(0.0));
+            let m = box_sides(&cc, "margin", avail, cst.size);
+            let p = box_sides(&cc, "padding", avail, cst.size).map(|v| v.max(0.0));
             let bd = self.backdrop;
             let bb = border_box(&cc);
             let bg = bg_color(&cc).map(|col| over(col, bd));
@@ -3263,12 +3463,12 @@ impl<'a> Layouter<'a> {
             let bw = border.map(|b| b.0).unwrap_or([0.0; 4]);
             let radius = parse_radius(&cc, cst.size);
             let shadow = parse_shadow(&cc, cst.size, bd, cst.color);
-            let w_prop = dim(&cc, "width", avail).map(|w| {
+            let w_prop = dim(&cc, "width", avail, cst.size).map(|w| {
                 let mut w = w;
-                if let Some(mx) = cc.get("max-width").and_then(|v| parse_len_vp(v, avail, self.viewport_h, avail)) {
+                if let Some(mx) = cc.get("max-width").and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail)) {
                     w = w.min(mx);
                 }
-                if let Some(mn) = cc.get("min-width").and_then(|v| parse_len_vp(v, avail, self.viewport_h, avail)) {
+                if let Some(mn) = cc.get("min-width").and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail)) {
                     w = w.max(mn);
                 }
                 // border-box `width` → strip padding+border for content size
@@ -3293,14 +3493,14 @@ impl<'a> Layouter<'a> {
             let hconv =
                 |v: f32| if bb { v - p[0] - p[2] - bw[0] - bw[2] } else { v };
             let ihrel = cont_h.or(self.pct_h).unwrap_or(avail);
-            let h_prop = dim(&cc, "height", ihrel).map(hconv);
+            let h_prop = dim(&cc, "height", ihrel, cst.size).map(hconv);
             let min_h = cc
                 .get("min-height")
-                .and_then(|v| parse_len_vp(v, ihrel, self.viewport_h, avail))
+                .and_then(|v| parse_len_vp(v, ihrel, cst.size, self.viewport_h, avail))
                 .map(hconv);
             let max_h = cc
                 .get("max-height")
-                .and_then(|v| parse_len_vp(v, ihrel, self.viewport_h, avail))
+                .and_then(|v| parse_len_vp(v, ihrel, cst.size, self.viewport_h, avail))
                 .map(hconv);
             let ratio = aspect_ratio(&cc);
             items.push(GItem {
@@ -3604,7 +3804,7 @@ impl<'a> Layouter<'a> {
                     _ => 0.0,
                 };
             // translate/transform shifts the painted box + its hit rects
-            let (tx, ty) = translate_xy(&it.cc, box_w, box_h);
+            let (tx, ty) = translate_xy(&it.cc, box_w, box_h, it.st.size);
             let (ix, iy) = (ix + tx, iy + ty);
             if let Some((ox, oy, sp, col)) = it.shadow {
                 if sp > 0.0 && ox == 0.0 && oy == 0.0 {
@@ -3702,7 +3902,7 @@ impl<'a> Layouter<'a> {
             c.get("position").map(String::as_str),
             Some("relative") | Some("absolute") | Some("fixed") | Some("sticky")
         ) {
-            if let Some(h) = dim(c, "height", self.viewport_h) {
+            if let Some(h) = dim(c, "height", self.viewport_h, st.size) {
                 self.cb_h = Some(h);
             }
         }
@@ -3752,10 +3952,10 @@ impl<'a> Layouter<'a> {
         }
         // layout-aware: nested containers out-measure their text
         let c = self.style(node);
-        if let Some(ew) = dim(&c, "width", self.avail_w) {
+        if let Some(ew) = dim_intrinsic(&c, "width", self.avail_w, st.size) {
             // border-box `width` already includes the box's own padding
             let ew = if border_box(&c) {
-                let [_t, pr, _b, pl] = box_sides(&c, "padding", st.size).map(|v| v.max(0.0));
+                let [_t, pr, _b, pl] = box_sides(&c, "padding", self.avail_w, st.size).map(|v| v.max(0.0));
                 ew - pl - pr
             } else {
                 ew
@@ -3772,7 +3972,7 @@ impl<'a> Layouter<'a> {
                                 let cc = self.style(ch);
                                 self.apply_computed(&cc, &mut cst);
                                 w = w.max(
-                                    dim(&cc, "width", self.avail_w)
+                                    dim_intrinsic(&cc, "width", self.avail_w, cst.size)
                                         .unwrap_or_else(|| self.shrink_width(ch, &cst)),
                                 );
                             }
@@ -3785,6 +3985,7 @@ impl<'a> Layouter<'a> {
                     // fixed track sum beats text (repeat(8,64px) → 512)
                     let tracks = grid_track_list(
                         c.get("grid-template-columns"),
+                        self.avail_w,
                         st.size,
                         self.viewport_h,
                         self.avail_w,
@@ -3811,17 +4012,19 @@ impl<'a> Layouter<'a> {
         w
     }
 
-    /// max-content width approximation: all descendant text on a single line
-    /// plus replaced children's widths; block-level children contribute their
-    /// own max-content as a lower bound. Explicit `width` and nested flex rows
-    /// contribute their own geometry. Flex items base their size on this —
-    /// shrink-to-fit min-content would wrap labels to one word per line.
+    /// max-content width approximation: the widest unbroken inline line in
+    /// the subtree. Block-level children interrupt the line and contribute
+    /// only their own max-content as a lower bound — concatenating all
+    /// descendant text onto one line would grossly oversize menus. Explicit
+    /// `width` and nested flex rows contribute their own geometry. Flex
+    /// items base their size on this — shrink-to-fit min-content would wrap
+    /// labels to one word per line.
     fn max_content_width(&mut self, node: NodeId, st: &Style) -> f32 {
         let c = self.style(node);
-        if let Some(ew) = dim(&c, "width", self.avail_w) {
+        if let Some(ew) = dim_intrinsic(&c, "width", self.avail_w, st.size) {
             return if border_box(&c) {
                 let [_t, pr, _b, pl] =
-                    box_sides(&c, "padding", st.size).map(|v| v.max(0.0));
+                    box_sides(&c, "padding", self.avail_w, st.size).map(|v| v.max(0.0));
                 (ew - pl - pr).max(1.0)
             } else {
                 ew
@@ -3831,49 +4034,132 @@ impl<'a> Layouter<'a> {
             c.get("display").map(String::as_str),
             Some("flex") | Some("inline-flex")
         ) {
-            return self.flex_shrink_width(node, &c, st);
+            return self.flex_maxc_width(node, &c, st);
         }
-        let mut w = 0.0f32;
-        let text = self.doc.text_content(node);
-        if let Some(fi) = self.resolve_font(st) {
-            if let Some(f) = self.fonts.font(fi) {
-                let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                w = f.measure(&joined, st.size);
-            }
-        }
+        let (mut line, mut best) = (0.0f32, 0.0f32);
+        self.maxc_inline(node, st, &mut line, &mut best);
+        best.max(line).max(1.0)
+    }
+
+    /// max-content of a flex container: each child's own max-content plus
+    /// gaps/padding/margins — `flex_shrink_width` is the *min*-content sum
+    /// and would under-measure `a > span + icon` links.
+    fn flex_maxc_width(&mut self, node: NodeId, c: &Props, st: &Style) -> f32 {
+        let gap = c
+            .get("column-gap")
+            .and_then(|v| parse_len(v, self.avail_w, st.size))
+            .or_else(|| c.get("gap").and_then(|v| parse_len(v, self.avail_w, st.size)))
+            .unwrap_or(0.0);
+        let mut w = 0.0;
+        let mut n = 0usize;
         for &ch in self.doc.children(node) {
+            if let NodeKind::Text(t) = self.doc.kind(ch) {
+                if let Some(fi) = self.resolve_font(st) {
+                    if let Some(f) = self.fonts.font(fi) {
+                        w += f.measure(
+                            &t.split_whitespace().collect::<Vec<_>>().join(" "),
+                            st.size,
+                        );
+                    }
+                }
+                continue;
+            }
             if !matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
                 continue;
             }
             let cc = self.style(ch);
-            if cc.get("display").map(String::as_str) == Some("none") {
-                continue;
+            if cc.get("display").map(String::as_str) == Some("none")
+                || matches!(
+                    cc.get("position").map(String::as_str),
+                    Some("absolute") | Some("fixed")
+                )
+            {
+                continue; // hidden or out-of-flow: no intrinsic size
             }
             let mut cst = st.clone();
             self.apply_computed(&cc, &mut cst);
-            match self.doc.tag(ch) {
-                Some("img" | "svg" | "video" | "canvas" | "iframe" | "object" | "embed") => {
-                    // inline replaced content adds to the line its text flows on
-                    w += dim(&cc, "width", self.avail_w)
-                        .unwrap_or_else(|| self.shrink_width(ch, &cst));
-                }
-                Some("br" | "hr" | "script" | "style" | "template" | "head") => {}
-                _ => {
-                    // block-level children stack vertically → only their own
-                    // max-content matters; inline descendants' text already
-                    // counts inside `text`
-                    if matches!(
-                        cc.get("display").map(String::as_str),
-                        Some("block") | Some("flex") | Some("inline-flex") | Some("grid")
-                            | Some("inline-grid") | Some("list-item") | Some("table")
-                            | Some("flow-root")
-                    ) {
-                        w = w.max(self.max_content_width(ch, &cst));
+            let [_t, pr, _b, pl] = box_sides(&cc, "padding", self.avail_w, cst.size);
+            let [_t, mr, _b, ml] = box_sides(&cc, "margin", self.avail_w, cst.size);
+            let cw = dim_intrinsic(&cc, "width", self.avail_w, cst.size)
+                .map(|w| {
+                    if border_box(&cc) {
+                        w - pl.max(0.0) - pr.max(0.0)
+                    } else {
+                        w
+                    }
+                })
+                .unwrap_or_else(|| self.max_content_width(ch, &cst));
+            w += cw + pl.max(0.0) + pr.max(0.0) + ml + mr;
+            n += 1;
+        }
+        (w + gap * n.saturating_sub(1) as f32).max(st.size)
+    }
+
+    /// Inline-order max-content walk: text words accumulate on `line`;
+    /// atomic inline boxes (replaced, inline-block) add their own width;
+    /// block-level children flush the line and contribute a lower bound.
+    fn maxc_inline(&mut self, node: NodeId, st: &Style, line: &mut f32, best: &mut f32) {
+        for &ch in self.doc.children(node) {
+            match self.doc.kind(ch) {
+                NodeKind::Text(t) => {
+                    if let Some(fi) = self.resolve_font(st) {
+                        if let Some(f) = self.fonts.font(fi) {
+                            for word in t.split_whitespace() {
+                                let sp = if *line > 0.0 {
+                                    f.measure(" ", st.size)
+                                } else {
+                                    0.0
+                                };
+                                *line += sp + f.measure(word, st.size);
+                            }
+                        }
                     }
                 }
+                NodeKind::Element { .. } => {
+                    let cc = self.style(ch);
+                    let disp = cc.get("display").map(String::as_str);
+                    if disp == Some("none")
+                        || matches!(
+                            cc.get("position").map(String::as_str),
+                            Some("absolute") | Some("fixed")
+                        )
+                    {
+                        continue;
+                    }
+                    let mut cst = st.clone();
+                    self.apply_computed(&cc, &mut cst);
+                    let tag = self.doc.tag(ch).unwrap_or("");
+                    let atomic = matches!(
+                        tag,
+                        "img" | "svg" | "input" | "select" | "textarea" | "video"
+                            | "canvas" | "iframe" | "object" | "embed"
+                    ) || matches!(
+                        disp,
+                        Some("inline-block") | Some("inline-flex") | Some("inline-grid")
+                    );
+                    if atomic {
+                        *line += dim_intrinsic(&cc, "width", self.avail_w, cst.size)
+                            .unwrap_or_else(|| self.max_content_width(ch, &cst));
+                    } else if tag == "br" || matches!(
+                        disp,
+                        Some("block") | Some("list-item") | Some("flex") | Some("grid")
+                            | Some("table") | Some("flow-root")
+                    ) {
+                        *best = (*best).max(*line);
+                        *line = 0.0;
+                        if tag != "br" {
+                            *best = (*best).max(self.max_content_width(ch, &cst));
+                        }
+                    } else {
+                        let [_t, mr, _b, ml] = box_sides(&cc, "margin", self.avail_w, cst.size);
+                        *line += ml.max(0.0);
+                        self.maxc_inline(ch, &cst, line, best);
+                        *line += mr.max(0.0);
+                    }
+                }
+                _ => {}
             }
         }
-        w.max(1.0)
     }
 
     /// Intrinsic width of a flex container: children's widths + gaps + their
@@ -3881,8 +4167,8 @@ impl<'a> Layouter<'a> {
     fn flex_shrink_width(&mut self, node: NodeId, c: &Props, st: &Style) -> f32 {
         let gap = c
             .get("column-gap")
-            .and_then(|v| parse_len(v, st.size))
-            .or_else(|| c.get("gap").and_then(|v| parse_len(v, st.size)))
+            .and_then(|v| parse_len(v, self.avail_w, st.size))
+            .or_else(|| c.get("gap").and_then(|v| parse_len(v, self.avail_w, st.size)))
             .unwrap_or(0.0);
         let mut w = 0.0;
         let mut n = 0usize;
@@ -3899,18 +4185,23 @@ impl<'a> Layouter<'a> {
                 continue;
             }
             let cc = self.style(ch);
-            if cc.get("display").map(String::as_str) == Some("none") {
+            if cc.get("display").map(String::as_str) == Some("none")
+                || matches!(
+                    cc.get("position").map(String::as_str),
+                    Some("absolute") | Some("fixed")
+                )
+            {
                 continue;
             }
             let mut cst = st.clone();
             self.apply_computed(&cc, &mut cst);
-            let [_t, pr, _b, pl] = box_sides(&cc, "padding", cst.size);
-            let [_t, mr, _b, ml] = box_sides(&cc, "margin", cst.size);
+            let [_t, pr, _b, pl] = box_sides(&cc, "padding", self.avail_w, cst.size);
+            let [_t, mr, _b, ml] = box_sides(&cc, "margin", self.avail_w, cst.size);
             // an explicit `width` contributes itself, not the content's
             // min-content estimate (a 512px board inside a flex row is 512
             // no matter how small its text is). border-box widths already
             // include the padding.
-            let cw = dim(&cc, "width", self.avail_w)
+            let cw = dim_intrinsic(&cc, "width", self.avail_w, cst.size)
                 .map(|w| {
                     if border_box(&cc) {
                         w - pl.max(0.0) - pr.max(0.0)
@@ -3971,7 +4262,7 @@ impl<'a> Layouter<'a> {
         hits: Vec<(f32, f32, f32, f32, NodeId)>,
         mb: f32,
     ) {
-        if self.line_x + w > self.content_width() && !self.line.is_empty() {
+        if self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line();
         }
         self.line.push(Word {
@@ -4048,10 +4339,10 @@ impl<'a> Layouter<'a> {
         let hrel = self.pct_h.unwrap_or(self.avail_w);
         match tag {
             "svg" => {
-                let w = dim(c, "width", self.avail_w)
-                    .or_else(|| dim(c, "height", hrel))
+                let w = dim(c, "width", self.avail_w, st.size)
+                    .or_else(|| dim(c, "height", hrel, st.size))
                     .unwrap_or(24.0);
-                let h = dim(c, "height", hrel).unwrap_or(w);
+                let h = dim(c, "height", hrel, st.size).unwrap_or(w);
                 let color = st.color;
                 let pixels =
                     svg::render(self.doc, node, w.max(1.0) as u32, h.max(1.0) as u32, color);
@@ -4065,16 +4356,16 @@ impl<'a> Layouter<'a> {
             "img" => {
                 // CSS width/height beat the attributes (inline style and
                 // utility classes size almost every modern <img>)
-                let w = dim(c, "width", self.avail_w)
+                let w = dim(c, "width", self.avail_w, st.size)
                     .or_else(|| self.doc.attr(node, "width")
                         .and_then(|v| v.trim_end_matches("px").parse().ok()))
                     .or_else(|| {
                         // only height given + aspect-ratio/intrinsic guess
-                        dim(c, "height", hrel).filter(|_| aspect_ratio(c).is_some())
+                        dim(c, "height", hrel, st.size).filter(|_| aspect_ratio(c).is_some())
                             .map(|h| h * aspect_ratio(c).unwrap())
                     })
                     .unwrap_or(64.0f32);
-                let h = dim(c, "height", hrel)
+                let h = dim(c, "height", hrel, st.size)
                     .or_else(|| self.doc.attr(node, "height")
                         .and_then(|v| v.trim_end_matches("px").parse().ok()))
                     .or_else(|| aspect_ratio(c).map(|r| w / r))
@@ -4103,7 +4394,7 @@ impl<'a> Layouter<'a> {
             st.href = self.doc.attr(node, "href").map(String::from);
         }
         // inline margins become spacing around the element's runs
-        let [_t, mr, _b, ml] = box_sides(c, "margin", st.size);
+        let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, st.size);
         if ml > 0.0 {
             self.spacer(ml);
         }
@@ -4112,7 +4403,7 @@ impl<'a> Layouter<'a> {
             "svg" | "img" => {
                 self.flush_line();
                 if let Some((w, h, items, hits)) = self.replaced_payload(node, tag, c, &st) {
-                    let (tx, ty) = translate_xy(c, w, h);
+                    let (tx, ty) = translate_xy(c, w, h, st.size);
                     let x = self.line_origin();
                     let y = self.y;
                     for it in items {
@@ -4270,10 +4561,10 @@ impl<'a> Layouter<'a> {
                 },
             )
         };
-        if self.line_x + w > self.content_width() && !self.line.is_empty() {
+        if self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line();
         }
-        if w > self.content_width() && self.line.is_empty() {
+        if w > self.content_width() + 0.5 && self.line.is_empty() {
             // word longer than the line — split mid-word
             let (mut chunk, mut cw) = (String::new(), 0.0f32);
             for c in word.chars() {
@@ -4284,7 +4575,7 @@ impl<'a> Layouter<'a> {
                         f.advance_units(f.glyph_id(c)) as f32 * st.size / f.units_per_em() as f32
                     })
                     .unwrap_or(st.size * 0.5);
-                if cw + fw > self.content_width() && !chunk.is_empty() {
+                if cw + fw > self.content_width() + 0.5 && !chunk.is_empty() {
                     self.line.push(Word {
                         text: chunk.clone(),
                         font,

@@ -475,8 +475,10 @@ impl Page {
         pt!("[prof] css fetch {} urls in {:?}", resolved.len(), t.elapsed());
         for u in &resolved {
             if let Some(b) = bodies.get(u) {
-                self.sheets
-                    .push(rowser_css::parse(&String::from_utf8_lossy(b)));
+                self.sheets.push(rowser_css::parse_vw(
+                    &String::from_utf8_lossy(b),
+                    self.viewport.0 as f32,
+                ));
             }
         }
     }

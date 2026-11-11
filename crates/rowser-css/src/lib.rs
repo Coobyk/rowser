@@ -341,7 +341,7 @@ impl<'a> CssParser<'a> {
     /// skipped. Returns (layer, rule) pairs to append.
     fn at_rule_rules(&mut self) -> Option<Vec<(u32, Rule)>> {
         self.pos += 1; // '@'
-        let name = self.ident();
+        let name = self.ident().to_lowercase();
         self.skip_ws_comments();
         let st = self.pos;
         while !self.eof() && self.peek() != Some(b'{') && self.peek() != Some(b';') {
@@ -509,7 +509,10 @@ impl<'a> CssParser<'a> {
                     self.pos += 1;
                 }
             } else if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_') || c >= 0x80 {
-                out.push((c as char).to_ascii_lowercase());
+                // case preserved — class/id/attr-value identifiers are
+                // case-sensitive; callers wanting ASCII-CI (tags, props,
+                // at-rule names, pseudos) lowercase the result themselves
+                out.push(c as char);
                 self.pos += 1;
             } else {
                 break;
@@ -679,7 +682,7 @@ impl<'a> CssParser<'a> {
                     None => return None,
                 },
                 Some(c) if c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c >= 0x80 => {
-                    let name = self.ident();
+                    let name = self.ident().to_lowercase();
                     simples.push(Simple::Tag(name));
                 }
                 _ => break,
@@ -693,7 +696,7 @@ impl<'a> CssParser<'a> {
     fn attr_sel(&mut self) -> Option<Simple> {
         self.pos += 1; // '['
         self.skip_ws_comments();
-        let name = self.ident();
+        let name = self.ident().to_lowercase();
         if name.is_empty() {
             return None;
         }
@@ -746,7 +749,7 @@ impl<'a> CssParser<'a> {
         // optional `i`/`s` flag
         let mut ci = false;
         if self.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
-            ci = self.ident() == "i";
+            ci = self.ident().to_lowercase() == "i";
         }
         self.skip_ws_comments();
         self.skip_to(b']');
@@ -774,7 +777,7 @@ impl<'a> CssParser<'a> {
         } else {
             false
         };
-        let name = self.ident();
+        let name = self.ident().to_lowercase();
         if name.is_empty() {
             return None;
         }
@@ -955,7 +958,7 @@ impl<'a> CssParser<'a> {
                     self.pos += 1;
                 }
                 _ => {
-                    let prop = self.ident();
+                    let prop = self.ident().to_lowercase();
                     if prop.is_empty() {
                         // garbage — skip to ; or }
                         while !self.eof() && !matches!(self.peek(), Some(b';') | Some(b'}')) {
@@ -1451,7 +1454,7 @@ impl<'a> StyleCtx<'a> {
                         customs.insert(d.prop.clone(), d.value.clone());
                     }
                     let nk = (d.important, origin as u8, layer, spec, order);
-                    each_physical(&d.prop, |prop| {
+                    each_decl(&d.prop, &d.value, |prop, val| {
                         if d.important {
                             important_props.insert(prop.to_string());
                         }
@@ -1459,7 +1462,7 @@ impl<'a> StyleCtx<'a> {
                             Some(e) => {
                                 if decl_wins(nk, (e.1, e.2, e.3, e.4, e.5)) {
                                     *e = (
-                                        d.value.clone(),
+                                        val.to_string(),
                                         d.important,
                                         origin as u8,
                                         layer,
@@ -1472,7 +1475,7 @@ impl<'a> StyleCtx<'a> {
                                 out.insert(
                                     prop.to_string(),
                                     (
-                                        d.value.clone(),
+                                        val.to_string(),
                                         d.important,
                                         origin as u8,
                                         layer,
@@ -1508,13 +1511,13 @@ impl<'a> StyleCtx<'a> {
                         (u32::MAX, u32::MAX, u32::MAX),
                         usize::MAX,
                     );
-                    each_physical(&d.prop, |prop| {
+                    each_decl(&d.prop, &d.value, |prop, val| {
                         important_props.insert(prop.to_string());
                         match out.get_mut(prop) {
                             Some(e) => {
                                 if decl_wins(nk, (e.1, e.2, e.3, e.4, e.5)) {
                                     *e = (
-                                        d.value.clone(),
+                                        val.to_string(),
                                         true,
                                         1,
                                         u32::MAX,
@@ -1527,7 +1530,7 @@ impl<'a> StyleCtx<'a> {
                                 out.insert(
                                     prop.to_string(),
                                     (
-                                        d.value.clone(),
+                                        val.to_string(),
                                         true,
                                         1,
                                         u32::MAX,
@@ -1539,12 +1542,12 @@ impl<'a> StyleCtx<'a> {
                         }
                     });
                 } else {
-                    each_physical(&d.prop, |prop| {
+                    each_decl(&d.prop, &d.value, |prop, val| {
                         if !important_props.contains(prop) {
                             out.insert(
                                 prop.to_string(),
                                 (
-                                    d.value.clone(),
+                                    val.to_string(),
                                     false,
                                     u8::MAX,
                                     u32::MAX,
@@ -1590,8 +1593,8 @@ impl<'a> StyleCtx<'a> {
                                 continue;
                             }
                             let val = resolve_vars(&d.value, &customs);
-                            each_physical(&d.prop, |p| {
-                                props.insert(p.to_string(), val.clone());
+                            each_decl(&d.prop, &val, |p, v| {
+                                props.insert(p.to_string(), v.to_string());
                             });
                         }
                     }
@@ -1655,6 +1658,35 @@ fn each_physical(prop: &str, mut f: impl FnMut(&str)) {
         "inset-block-start" => f("top"),
         "inset-block-end" => f("bottom"),
         p => f(p),
+    }
+}
+
+/// Expands a declaration into the physical longhands the engine reads, per
+/// the cascade: a rule's `margin:0` must beat a *less specific* rule's
+/// `margin-left:1.6em` — only per-side expansion makes that possible.
+/// `each_physical` maps 1:1 logical → physical; box shorthands
+/// (`margin`/`padding`/`inset`) additionally split their value across the
+/// four sides (the shorthand prop itself is also kept for direct readers).
+fn each_decl<'v>(prop: &str, value: &'v str, mut f: impl FnMut(&str, &'v str)) {
+    let sides = match prop {
+        "margin" => Some(("margin-top", "margin-right", "margin-bottom", "margin-left")),
+        "padding" => Some(("padding-top", "padding-right", "padding-bottom", "padding-left")),
+        "inset" => Some(("top", "right", "bottom", "left")),
+        _ => None,
+    };
+    if let Some((t, r, b, l)) = sides {
+        let v: Vec<&str> = value.split_whitespace().collect();
+        let vt = v.first().copied().unwrap_or("0");
+        let vr = v.get(1).copied().unwrap_or(vt);
+        let vb = v.get(2).copied().unwrap_or(vt);
+        let vl = v.get(3).copied().unwrap_or(vr);
+        f(prop, value);
+        f(t, vt);
+        f(r, vr);
+        f(b, vb);
+        f(l, vl);
+    } else {
+        each_physical(prop, |p| f(p, value));
     }
 }
 
