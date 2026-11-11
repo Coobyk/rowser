@@ -1153,8 +1153,13 @@ fn shift_item_y(it: &mut rowser_layout::DisplayItem, dy: f32) {
         D::Text { baseline, .. } => *baseline += dy,
         D::FillRect { y, .. }
         | D::RoundedRect { y, .. }
+        | D::RoundedRect2 { y, .. }
+        | D::BorderSide { y, .. }
+        | D::Shadow { y, .. }
+        | D::PushClip { y, .. }
         | D::Raster { y, .. }
         | D::Image { y, .. } => *y += dy,
+        D::PopClip => {}
     }
 }
 
