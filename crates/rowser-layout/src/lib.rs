@@ -2582,8 +2582,18 @@ impl<'a> Layouter<'a> {
             if let Some((bw2, col)) = it.border {
                 edge_rects(&mut self.items, ix, iy, box_w, box_h, bw2, col);
             }
+            // `align-items:center` on the item centers its content inside the
+            // (possibly stretched) box
+            let dy = if matches!(
+                it.cc.get("align-items").or_else(|| it.cc.get("place-items")).map(String::as_str),
+                Some("center")
+            ) {
+                ((box_h - it.box_h_intr) / 2.0).max(0.0)
+            } else {
+                0.0
+            };
             for di in it.laid.drain(..) {
-                self.items.push(offset_item(di, ix, iy));
+                self.items.push(offset_item(di, ix, iy + dy));
             }
         }
 

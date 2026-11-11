@@ -662,6 +662,8 @@ fn install_globals(i: &mut Interp) {
         ("isFinite", g_is_finite),
         ("encodeURIComponent", g_encode_uri_component),
         ("decodeURIComponent", g_decode_uri_component),
+        ("escape", g_escape),
+        ("unescape", g_unescape),
         ("encodeURI", g_identity_str),
         ("decodeURI", g_identity_str),
         ("$dyn_import", g_dyn_import),
@@ -3930,6 +3932,60 @@ fn g_decode_uri_component(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult
     Ok(Value::Str(Rc::from(
         String::from_utf8_lossy(&out).to_string().as_str(),
     )))
+}
+
+/// Legacy `escape()`: %XX for non-unreserved bytes, %uXXXX for non-ASCII
+/// code points.
+fn g_escape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let s = i.to_str(&arg(args, 0))?;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let cp = ch as u32;
+        if ch.is_ascii_alphanumeric()
+            || matches!(ch, '@' | '*' | '_' | '+' | '-' | '.' | '/')
+        {
+            out.push(ch);
+        } else if cp < 256 {
+            out.push_str(&format!("%{cp:02X}"));
+        } else {
+            out.push_str(&format!("%u{cp:04X}"));
+        }
+    }
+    Ok(Value::Str(Rc::from(out.as_str())))
+}
+
+/// Legacy `unescape()` — inverse of `escape`.
+fn g_unescape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let s = i.to_str(&arg(args, 0))?;
+    let b: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut k = 0;
+    while k < b.len() {
+        if b[k] == '%' {
+            if b.get(k + 1) == Some(&'u') && k + 5 < b.len() {
+                let hex: String = b[k + 2..k + 6].iter().collect();
+                if let Ok(v) = u32::from_str_radix(&hex, 16) {
+                    if let Some(c) = char::from_u32(v) {
+                        out.push(c);
+                        k += 6;
+                        continue;
+                    }
+                }
+            } else if k + 2 < b.len() {
+                let hex: String = b[k + 1..k + 3].iter().collect();
+                if let Ok(v) = u32::from_str_radix(&hex, 16) {
+                    if let Some(c) = char::from_u32(v) {
+                        out.push(c);
+                        k += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(b[k]);
+        k += 1;
+    }
+    Ok(Value::Str(Rc::from(out.as_str())))
 }
 
 fn g_set_timeout(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
