@@ -99,6 +99,8 @@ struct Style {
     strike: bool,
     shift: f32,
     pre: bool,
+    /// white-space:nowrap (and pre) — lines never break; text overflows
+    nowrap: bool,
     align: Align,
     href: Option<String>,
     /// line-height override: multiplier of font-size or an absolute px length
@@ -128,6 +130,7 @@ fn base_style() -> Style {
         strike: false,
         shift: 0.0,
         pre: false,
+        nowrap: false,
         align: Align::Left,
         href: None,
         line_h: None,
@@ -1984,7 +1987,9 @@ impl<'a> Layouter<'a> {
             };
         }
         if let Some(v) = c.get("white-space") {
-            st.pre = v.as_str() == "pre";
+            let v = v.trim();
+            st.pre = matches!(v, "pre" | "pre-wrap");
+            st.nowrap = matches!(v, "pre" | "pre-wrap" | "nowrap");
         }
         if let Some(v) = c.get("vertical-align") {
             st.shift = match v.as_str() {
@@ -4561,10 +4566,13 @@ impl<'a> Layouter<'a> {
                 },
             )
         };
-        if self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
+        if !st.nowrap
+            && self.line_x + w > self.content_width() + 0.5
+            && !self.line.is_empty()
+        {
             self.flush_line();
         }
-        if w > self.content_width() + 0.5 && self.line.is_empty() {
+        if !st.nowrap && w > self.content_width() + 0.5 && self.line.is_empty() {
             // word longer than the line — split mid-word
             let (mut chunk, mut cw) = (String::new(), 0.0f32);
             for c in word.chars() {
