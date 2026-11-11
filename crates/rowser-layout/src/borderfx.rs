@@ -665,7 +665,12 @@ pub fn emit_outline(out: &mut Vec<DisplayItem>, x: f32, y: f32, w: f32, h: f32, 
 /// the box's laid children in the same coordinate space (grid/table/
 /// inline-block payloads).
 #[allow(clippy::too_many_arguments)]
-pub fn emit_box(
+/// Decoration prefix in paint order: outer shadows, bg, bg-image layers,
+/// inset shadows, borders, then the clip marker children nest inside.
+/// `emit_deco` + inner + `emit_tail` = `emit_box` — the prefix is emitted
+/// separately so a flex/grid restretch can repaint just the box chrome.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_deco(
     out: &mut Vec<DisplayItem>,
     x: f32,
     y: f32,
@@ -676,9 +681,7 @@ pub fn emit_box(
     radii: &Radii,
     shadows: &[BoxShadow],
     clip: bool,
-    outline: Option<&Outline>,
     layers: Vec<DisplayItem>,
-    inner: Vec<DisplayItem>,
 ) {
     for s in shadows.iter().filter(|s| !s.inset).rev() {
         out.push(shadow_item(s, x, y, w, h, radii));
@@ -705,11 +708,43 @@ pub fn emit_box(
             radii: pr.0,
         });
     }
-    out.extend(inner);
+}
+
+/// Trailing items after children: the clip pop and the outline ring.
+pub fn emit_tail(
+    out: &mut Vec<DisplayItem>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    clip: bool,
+    outline: Option<&Outline>,
+) {
     if clip {
         out.push(DisplayItem::PopClip);
     }
     if let Some(o) = outline {
         emit_outline(out, x, y, w, h, o);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_box(
+    out: &mut Vec<DisplayItem>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    bg: Option<Color>,
+    border: Option<&Borders>,
+    radii: &Radii,
+    shadows: &[BoxShadow],
+    clip: bool,
+    outline: Option<&Outline>,
+    layers: Vec<DisplayItem>,
+    inner: Vec<DisplayItem>,
+) {
+    emit_deco(out, x, y, w, h, bg, border, radii, shadows, clip, layers);
+    out.extend(inner);
+    emit_tail(out, x, y, w, h, clip, outline);
 }

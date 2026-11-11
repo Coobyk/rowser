@@ -1927,6 +1927,46 @@ fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
         f(l, vl);
         return;
     }
+    if prop == "flex" {
+        // `flex` shorthand → grow/shrink/basis longhands at this decl's
+        // cascade position, so a less specific `flex:1` can't beat a more
+        // specific `flex-grow`. Keywords: none→0 0 auto, auto→1 1 auto,
+        // initial→0 1 auto. Otherwise number tokens fill grow then shrink,
+        // a non-number token is the basis; omitted components default to
+        // grow=1, shrink=1, basis=0% (spec shorthand defaults).
+        let v = value.trim();
+        let (g, s, b) = match v {
+            "none" => ("0", "0", "auto"),
+            "auto" => ("1", "1", "auto"),
+            "initial" => ("0", "1", "auto"),
+            _ => {
+                let (mut g, mut s, mut b) = ("1", "1", "0%");
+                let (mut gseen, mut bseen) = (false, false);
+                for t in v.split_whitespace() {
+                    if t.parse::<f32>().is_ok() {
+                        if !gseen {
+                            g = t;
+                            gseen = true;
+                        } else {
+                            s = t;
+                        }
+                    } else {
+                        b = t;
+                        bseen = true;
+                    }
+                }
+                if !bseen && gseen {
+                    b = "0%"; // `flex:<n>` → `n 1 0%`
+                }
+                (g, s, b)
+            }
+        };
+        f(prop, value);
+        f("flex-grow", g);
+        f("flex-shrink", s);
+        f("flex-basis", b);
+        return;
+    }
     match prop {
         // `border` resets every longhand of all four sides.
         "border" => {
@@ -2961,5 +3001,36 @@ mod sel4 {
         assert_eq!(c.get("background-attachment").unwrap(), "scroll, local");
         // shorthand without a color resets background-color
         assert_eq!(c.get("background-color").unwrap(), "transparent");
+    }
+
+    #[test]
+    fn flex_shorthand_expands_to_longhands() {
+        // `flex` → flex-grow/flex-shrink/flex-basis at the decl's own
+        // cascade position; keywords map to their spec expansions
+        let doc = rowser_html::parse(
+            "<body><div class=a></div><span class=b></span><p class=c></p><em class=d></em></body>",
+        );
+        let sh = parse(".a{flex:2} .b{flex:none} .c{flex:1 0 30px} .d{flex:auto}");
+        let a = computed(&doc, doc.find_deep(doc.root, "div").unwrap(), &[&sh]);
+        assert_eq!(a.get("flex-grow").map(String::as_str), Some("2"));
+        assert_eq!(a.get("flex-shrink").map(String::as_str), Some("1"));
+        assert_eq!(a.get("flex-basis").map(String::as_str), Some("0%"));
+        let b = computed(&doc, doc.find_deep(doc.root, "span").unwrap(), &[&sh]);
+        assert_eq!(b.get("flex-grow").map(String::as_str), Some("0"));
+        assert_eq!(b.get("flex-shrink").map(String::as_str), Some("0"));
+        assert_eq!(b.get("flex-basis").map(String::as_str), Some("auto"));
+        let c = computed(&doc, doc.find_deep(doc.root, "p").unwrap(), &[&sh]);
+        assert_eq!(c.get("flex-grow").map(String::as_str), Some("1"));
+        assert_eq!(c.get("flex-shrink").map(String::as_str), Some("0"));
+        assert_eq!(c.get("flex-basis").map(String::as_str), Some("30px"));
+        let d = computed(&doc, doc.find_deep(doc.root, "em").unwrap(), &[&sh]);
+        assert_eq!(d.get("flex-grow").map(String::as_str), Some("1"));
+        assert_eq!(d.get("flex-shrink").map(String::as_str), Some("1"));
+        assert_eq!(d.get("flex-basis").map(String::as_str), Some("auto"));
+        // a more specific longhand still beats the shorthand's expansion
+        let doc = rowser_html::parse("<body><div class='a x'></div></body>");
+        let sh = parse(".a{flex:1} .a.x{flex-grow:3}");
+        let e = computed(&doc, doc.find_deep(doc.root, "div").unwrap(), &[&sh]);
+        assert_eq!(e.get("flex-grow").map(String::as_str), Some("3"));
     }
 }

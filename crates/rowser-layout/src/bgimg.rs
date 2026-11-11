@@ -11,6 +11,7 @@
 use crate::{alpha, bgra_a, ch, fhue, parse_color, parse_len_vp, top_args, DisplayItem, Props};
 
 /// One `background-image` layer with its per-layer sub-properties merged.
+#[derive(Clone)]
 pub(crate) struct Layer {
     img: Img,
     /// tile offset per axis = f*(pa - tile) + a (CSS <position> semantics:
@@ -30,6 +31,7 @@ pub(crate) struct Layer {
     fixed: bool,
 }
 
+#[derive(Clone)]
 enum Img {
     Url(String),
     Grad(Box<Grad>),
@@ -46,6 +48,7 @@ enum Sz {
 
 /// Parsed layers + the box metrics `items_for` needs to map
 /// origin/clip keywords to rects.
+#[derive(Clone)]
 pub(crate) struct BoxBgs {
     layers: Vec<Layer>,
     /// padding widths [t,r,b,l]
@@ -618,6 +621,7 @@ fn parse_image(t: &str, em: f32, vh: f32, vw: f32, current: u32) -> Option<Img> 
 
 // ---------- gradients ----------
 
+#[derive(Clone)]
 enum Grad {
     Linear {
         dir: LinDir,
@@ -640,6 +644,7 @@ enum Grad {
     },
 }
 
+#[derive(Clone)]
 enum LinDir {
     /// angle in degrees (0 = toward top, clockwise)
     Deg(f32),
@@ -648,6 +653,7 @@ enum LinDir {
     Corner(f32, f32),
 }
 
+#[derive(Clone)]
 enum RadSize {
     ClosestSide,
     FarthestSide,
@@ -662,6 +668,7 @@ enum RLen {
     Pct(f32),
 }
 
+#[derive(Clone)]
 struct Stop {
     c: u32,
     pos: Option<PosV>,
@@ -1007,6 +1014,7 @@ fn sample(stops: &[(f32, u32)], t: f32, rep: bool) -> u32 {
 }
 
 /// Gradient resolved against concrete tile dimensions.
+#[derive(Clone)]
 enum RGrad {
     Linear {
         dx: f32,

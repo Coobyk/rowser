@@ -14,6 +14,7 @@ use rowser_css as css;
 mod bgimg;
 mod borderfx;
 pub mod colorfx;
+mod flexbox;
 mod stacking;
 pub mod svg;
 
@@ -1423,91 +1424,6 @@ fn translate_xy(c: &Props, w: f32, h: f32, em: f32) -> (f32, f32) {
         }
     }
     (dx, dy)
-}
-
-/// `flex` shorthand → (grow, basis): `flex:<g> <shrink>? <basis>?`, with
-/// `flex-grow`/`flex-basis` longhands as fallback/override. Basis `auto`/none
-/// → None (caller uses the item's intrinsic size).
-fn flex_grow_basis(c: &Props, rel: f32, em: f32) -> (f32, Option<f32>) {
-    let (mut g, mut b): (f32, Option<f32>) = (0.0, None);
-    if let Some(v) = c.get("flex") {
-        let mut it = v.split_whitespace();
-        if let Some(t) = it.next() {
-            if let Ok(n) = t.parse::<f32>() {
-                g = n;
-            } else {
-                b = parse_len(t, rel, em).or(if t == "auto" { None } else { Some(0.0) });
-            }
-        }
-        let _shrink = it.next();
-        if let Some(t) = it.next() {
-            b = if t == "auto" {
-                None
-            } else {
-                parse_len(t, rel, em).or(Some(0.0))
-            };
-        }
-    }
-    if let Some(v) = c.get("flex-grow") {
-        g = v.trim().parse().unwrap_or(g);
-    }
-    if let Some(v) = c.get("flex-basis") {
-        let v = v.trim();
-        b = if v == "auto" {
-            None
-        } else {
-            parse_len(v, rel, em).or(Some(0.0))
-        };
-    }
-    (g, b)
-}
-
-/// `flex-shrink`: middle token of the `flex` shorthand, else the longhand;
-/// default 1 (every item shrinks unless it opts out).
-fn flex_shrink_factor(c: &Props) -> f32 {
-    if let Some(v) = c.get("flex-shrink") {
-        return v.trim().parse().unwrap_or(1.0f32).max(0.0);
-    }
-    if let Some(v) = c.get("flex") {
-        let mut it = v.split_whitespace();
-        let _grow = it.next();
-        if let Some(t) = it.next() {
-            if let Ok(n) = t.parse::<f32>() {
-                return n.max(0.0f32);
-            }
-        }
-    }
-    1.0
-}
-
-/// Does this element's left margin resolve to `auto`? Checks the longhand
-/// and the left slot of `margin`/`margin-inline` shorthands.
-fn has_auto_ml(c: &Props) -> bool {
-    let auto = |v: &String| v.trim() == "auto";
-    if c.get("margin-left").map(&auto).unwrap_or(false) {
-        return true;
-    }
-    if let Some(v) = c
-        .get("margin-inline")
-        .or_else(|| c.get("margin-inline-start"))
-    {
-        if auto(v) {
-            return true;
-        }
-    }
-    if let Some(v) = c.get("margin") {
-        let t: Vec<&str> = v.split_whitespace().collect();
-        let l = match t.len() {
-            1 => Some(t[0]),
-            2 | 3 => Some(t[1]),
-            4 => Some(t[3]),
-            _ => None,
-        };
-        if l.map(|s| s == "auto").unwrap_or(false) {
-            return true;
-        }
-    }
-    false
 }
 
 /// margin/padding longhands merged over the shorthand.
@@ -3228,41 +3144,12 @@ impl<'a> Layouter<'a> {
             // catch them here; item ranges are still in emission order
             self.drain_stickies(st0, content_top, self.y.max(sticky_bot));
             self.flush_line();
-            // grow the box to the content-height target computed above;
-            // centered flex content shifts down by half the surplus
+            // grow the box to the content-height target computed above.
+            // (flex alignment/justification is handled inside flex_layout —
+            // no post-hoc shifting needed here)
             if let Some(mh) = mh_prop {
                 let extra = mh - (self.y - content_top);
                 if extra > 0.0 {
-                    // flex row `items-center` / any `justify-content:center`:
-                    // children shift down by half the surplus
-                    let is_col = c.get("flex-direction").map(String::as_str) == Some("column");
-                    let centered = c.get("display").map(String::as_str) == Some("flex")
-                        && (matches!(
-                            c.get("justify-content").map(String::as_str),
-                            Some("center") | Some("space-evenly") | Some("space-around")
-                        ) || (!is_col
-                            && (c.get("align-items").map(String::as_str) == Some("center")
-                                || c.get("place-items").map(String::as_str) == Some("center"))));
-                    if centered {
-                        let dy = extra / 2.0;
-                        for i in children_items_start..self.items.len() {
-                            let it = std::mem::replace(
-                                &mut self.items[i],
-                                DisplayItem::FillRect {
-                                    x: 0.0,
-                                    y: 0.0,
-                                    w: 0.0,
-                                    h: 0.0,
-                                    color: 0,
-                                },
-                            );
-                            self.items[i] = offset_item(it, 0.0, dy);
-                        }
-                        for h in self.hits.iter_mut().skip(children_hits_start) {
-                            h.1 += dy;
-                            h.5 = h.5.conjugated(0.0, dy);
-                        }
-                    }
                     self.y += extra;
                 }
             }
@@ -3652,183 +3539,21 @@ impl<'a> Layouter<'a> {
     }
 
     /// `display:inline-block`: a box sitting on the text line like a word.
-    /// Content is laid out off-screen via `nest`, then emitted offset to the
-    /// box's position on the line. Bottom of the box sits on the baseline.
-    /// `hint` overrides the shrink-wrap width (flex items lay at their
-    /// resolved main size — basis+grow share, or max-content base).
-    fn inline_block_w(&mut self, node: NodeId, c: &Props, st: Style, hint: Option<f32>) {
-        self.inline_block_inner(node, c, st, hint)
-    }
-
+    /// Content is laid out off-screen via `item_box`/`nest`, then emitted
+    /// offset to the box's position on the line, sharing the line baseline.
     fn inline_block(&mut self, node: NodeId, c: &Props, st: Style) {
         self.inline_block_inner(node, c, st, None)
     }
 
-    fn inline_block_inner(&mut self, node: NodeId, c: &Props, mut st: Style, hint: Option<f32>) {
+    fn inline_block_inner(&mut self, node: NodeId, c: &Props, st: Style, hint: Option<f32>) {
         let size = st.size;
-        let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let [_t, mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
-        let bd = self.backdrop;
-        let bb = border_box(c);
-        let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
-        let border = borderfx::borders(c, size, st.color).map(|mut b| {
-            for col in b.color.iter_mut() {
-                *col = over(*col, bg.unwrap_or(bd));
-            }
-            b
-        });
-        st.inline_bg = None; // the box paints its own bg
-        if let Some(b) = bg {
-            if let Some(col) = c
-                .get("color")
-                .and_then(|v| parse_color_ctx(v, Some(st.color)))
-            {
-                st.color = over(col, b);
-            }
-        }
-        let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
-        let bw_h = bw_l + bw_r;
-        let bw_v = bw_t + bw_b;
-
-        // width property else shrink-wrap (min-content approx; flex sums children)
-        let inner = if let Some(w) = hint {
-            // resolved flex main size — an outer (border-box) target
-            (w - pl - pr - bw_h).max(1.0)
-        } else if let Some(w) = dim(c, "width", self.avail_w, size) {
-            if bb { w - pl - pr - bw_h } else { w }.max(1.0)
-        } else if matches!(
-            c.get("display").map(String::as_str),
-            Some("flex") | Some("inline-flex") | Some("inline-grid")
-        ) {
-            self.flex_maxc_width(node, c, &st)
-        } else {
-            // shrink-to-fit ≈ max-content — capped by the remaining line room
-            // in `box_w` below (spec: min(max-content, available))
-            self.max_content_width(node, &st)
-        };
-        let room = self.content_width();
-        let box_w = (inner + pl + pr + bw_h).min(room);
-        let inner = (box_w - pl - pr - bw_h).max(1.0);
-
-        // `height`/aspect-ratio/min|max-height: under border-box these are
-        // border-box lengths; content-box adds padding+border.
-        let hrel = self.pct_h.unwrap_or(self.viewport_h);
-        let outer_h = |v: f32| if bb { v } else { v + pt + pb + bw_v };
-        let mut h_prop =
-            dim(c, "height", hrel, size).or_else(|| aspect_ratio(c).map(|r| box_w / r));
-        if let Some(mn) = c
-            .get("min-height")
-            .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
-        {
-            h_prop = Some(h_prop.map_or(mn, |h| h.max(mn)));
-        }
-        if let Some(mx) = c
-            .get("max-height")
-            .and_then(|v| parse_len_vp(v, hrel, size, self.viewport_h, self.avail_w))
-        {
-            h_prop = h_prop.map(|h| h.min(mx));
-        }
-        let saved_bd = self.backdrop;
-        if let Some(b) = bg {
-            self.backdrop = b;
-        }
-        // %-height children resolve against this box's definite content height
-        let saved_ph = self.pct_h;
-        self.pct_h = h_prop
-            .map(|h| if bb { h - pt - pb - bw_v } else { h })
-            .or(saved_ph);
-        let (items, y_end, nhits) = self.nest(node, &st, pl + bw_l, pt + bw_t, inner, c);
-        self.backdrop = saved_bd;
-        self.pct_h = saved_ph;
-        // explicit height/aspect-ratio/max-height may pin the painted box;
-        // min-height alone only floors it
-        let natural = y_end + pb + bw_b;
-        let pinned = dim(c, "height", hrel, size).is_some()
-            || aspect_ratio(c).is_some()
-            || c.get("max-height").is_some();
-        let box_h = match (h_prop, pinned) {
-            (Some(h), true) => outer_h(h).max(1.0),
-            (Some(h), false) => outer_h(h).max(natural),
-            _ => natural.max(1.0),
-        };
-
-        let shadows = borderfx::parse_shadows(c, size, bd, st.color);
-        let radii = borderfx::radius_spec(c).resolve(box_w, box_h, size);
-        let outline = borderfx::outline(c, size, bd, st.color);
-        let clip = borderfx::clips_overflow(c);
-        let mut out: Vec<DisplayItem> = Vec::new();
-        let layers = if self.canvas_bg_node != Some(node) {
-            bgimg::parse_box(
-                c,
-                [pt, pr, pb, pl],
-                [bw_t, bw_r, bw_b, bw_l],
-                size,
-                self.viewport_h,
-                self.viewport_w,
-                st.color,
-            )
-            .map(|bgl| {
-                bgimg::items_for(
-                    &bgl,
-                    0.0,
-                    0.0,
-                    box_w,
-                    box_h,
-                    (self.viewport_w, self.viewport_h),
-                )
-            })
-            .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        borderfx::emit_box(
-            &mut out,
-            0.0,
-            0.0,
-            box_w,
-            box_h,
-            bg,
-            border.as_ref(),
-            &radii,
-            &shadows,
-            clip,
-            outline.as_ref(),
-            layers,
-            items,
-        );
-        let nhits: Vec<_> = if clip {
-            let bw = border.map(|b| b.w).unwrap_or([0.0; 4]);
-            let (cx, cy, cw, chh) = borderfx::padding_box(0.0, 0.0, box_w, box_h, bw);
-            let mut v = nhits;
-            clip_hits(&mut v, 0, cx, cy, cw, chh);
-            v
-        } else {
-            nhits
-        };
-        // filter/clip/blend/backdrop group bg+border+content of this box
-        let fx = colorfx::element_fx(c, size, st.color, Some([0.0, 0.0, box_w, box_h]));
-        if !fx.is_empty() && !out.is_empty() {
-            colorfx::wrap_vec(&mut out, 0, fx);
-        }
-        // translate/transform: visual-only — the box's line word carries
-        // the spec and wraps at flush_line (translate-only too: applying
-        // translate_xy here AND a translate marker would double-shift).
-        let ib_xf = xform::spec(c, size);
-        let (tx, ty) = if ib_xf.is_some() {
-            (0.0, 0.0)
-        } else {
-            translate_xy(c, box_w, box_h, size)
-        };
-
-        let nhits: Vec<_> = if tx != 0.0 || ty != 0.0 {
-            out = out.into_iter().map(|it| offset_item(it, tx, ty)).collect();
-            nhits
-                .into_iter()
-                .map(|h| xform::off_hit(h, tx, ty))
-                .collect()
-        } else {
-            nhits
-        };
+        // shared box builder (`flexbox.rs`): same bg/border/padding/nest
+        // geometry, plus deco info the flex path uses for height restretches
+        let b = self.item_box(node, c, st.clone(), hint, None);
+        // baseline: the first line's baseline inside the box; empty boxes
+        // align on the bottom margin edge (≈ border bottom here)
+        let ascent = b.baseline.unwrap_or(b.h);
 
         // a pending inter-word space becomes a gap before the box
         if self.pending_space && !self.line.is_empty() {
@@ -3851,21 +3576,22 @@ impl<'a> Layouter<'a> {
         }
         // the box's own transform spec tags its line word — the word run's
         // marker applies it (translate or full matrix alike)
-        let saved_xf = if ib_xf.is_some() {
-            Some(std::mem::replace(&mut self.cur_xf, ib_xf.clone()))
+        let saved_xf = if b.xf.is_some() {
+            Some(std::mem::replace(&mut self.cur_xf, b.xf.clone()))
         } else {
             None
         };
         self.push_box(
-            box_w,
-            box_h,
-            out,
-            nhits,
+            b.w,
+            b.h,
+            b.items,
+            b.hits,
             mb.max(0.0),
             self.rel_offset(c, size),
+            ascent,
         );
-        if let Some(s) = saved_xf {
-            self.cur_xf = s;
+        if let Some(sv) = saved_xf {
+            self.cur_xf = sv;
         }
 
         if mr > 0.0 {
@@ -4280,383 +4006,17 @@ impl<'a> Layouter<'a> {
 
     /// Lay out `node`'s children off-screen into a private item list.
     /// Content box: origin (x0, y0), `avail` wide. Returns (items, bottom y).
-    /// `display:flex` — element children laid as inline-block items on a
-    /// row with `gap` spacing.
+    /// `display:flex` — order-aware, wrapping-capable line layout.
+    /// Implementation lives in `flexbox.rs` (`flex_layout`): items are
+    /// sorted by `order`, packed into lines (`flex-wrap`), sized per line
+    /// (grow/shrink/clamps/auto margins), aligned (`justify-content`,
+    /// `align-items`/`align-self`, `align-content`) and emitted at explicit
+    /// coordinates.
     fn flex_children(&mut self, node: NodeId, c: &Props, st: Style) {
         // flex items are atomic boxes, not part of an enclosing inline's
-        // transform run — their own specs tag their line words
+        // transform run — their own specs wrap their emitted spans
         let saved_xf = self.cur_xf.take();
-        // `gap` shorthand then axis longhands (Tailwind emits gap-x/gap-y)
-        let base_gap = c
-            .get("gap")
-            .and_then(|v| parse_len(v, self.avail_w, st.size))
-            .unwrap_or(0.0);
-        let col_dir = c.get("flex-direction").map(String::as_str) == Some("column");
-        let gap = c
-            .get(if col_dir { "row-gap" } else { "column-gap" })
-            .and_then(|v| parse_len(v, self.avail_w, st.size))
-            .unwrap_or(base_gap);
-        // column direction: children stack as blocks, vertical gap.
-        // `flex-1`/`grow-*` children share the container's definite height.
-        if c.get("flex-direction").map(String::as_str) == Some("column") {
-            let mut st = st;
-            if c.get("align-items").map(String::as_str) == Some("center") {
-                st.align = Align::Center;
-            }
-            // container's own definite content height → grow target. pct_h is
-            // this box's target when its own props set a height, else an
-            // ancestor's (must not stretch to that).
-            let hrel = self.pct_h.unwrap_or(self.viewport_h);
-            let own_def = dim(c, "height", hrel, st.size).is_some()
-                || c.get("min-height").is_some()
-                || self.inset_h.is_some();
-            let target = if own_def { self.pct_h } else { None };
-            let start_y = self.y;
-            // per-child item/hit ranges so grown slots can shift content down
-            let mut segs: Vec<(usize, usize, usize, usize, f32)> = Vec::new();
-            let mut first = true;
-            for &ch in self.doc.children(node) {
-                if !matches!(
-                    self.doc.kind(ch),
-                    NodeKind::Element { .. } | NodeKind::Text(_)
-                ) {
-                    continue;
-                }
-                if !first && gap > 0.0 {
-                    self.y += gap;
-                }
-                let (i0, h0) = (self.items.len(), self.hits.len());
-                let grow = if matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
-                    let cc = self.style(ch);
-                    cc.get("flex")
-                        .and_then(|v| v.split_whitespace().next().and_then(|t| t.parse().ok()))
-                        .or_else(|| cc.get("flex-grow").and_then(|v| v.trim().parse().ok()))
-                        .unwrap_or(0.0f32)
-                } else {
-                    0.0
-                };
-                self.walk(ch, &st);
-                segs.push((i0, self.items.len(), h0, self.hits.len(), grow));
-                first = false;
-            }
-            if let Some(t) = target {
-                let free = t - (self.y - start_y);
-                let n_grow: f32 = segs.iter().map(|s| s.4).sum();
-                if free > 0.0 && n_grow > 0.0 {
-                    // each grow child's slot gains `share`; its content sits
-                    // centered in the slot (flex items-center labels)
-                    let share = free / n_grow;
-                    let mut consumed = 0.0;
-                    for (i0, i1, h0, h1, g) in segs {
-                        let shift = if g > 0.0 {
-                            let s = consumed + share * g / 2.0;
-                            consumed += share * g;
-                            s
-                        } else {
-                            consumed
-                        };
-                        if shift != 0.0 {
-                            for i in i0..i1 {
-                                let it = std::mem::replace(
-                                    &mut self.items[i],
-                                    DisplayItem::FillRect {
-                                        x: 0.0,
-                                        y: 0.0,
-                                        w: 0.0,
-                                        h: 0.0,
-                                        color: 0,
-                                    },
-                                );
-                                self.items[i] = offset_item(it, 0.0, shift);
-                            }
-                            for h in self.hits.iter_mut().skip(h0).take(h1 - h0) {
-                                h.1 += shift;
-                                h.5 = h.5.conjugated(0.0, shift);
-                            }
-                        }
-                    }
-                }
-                self.y = start_y + t.max(self.y - start_y);
-            }
-            self.cur_xf = saved_xf;
-            return;
-        }
-        // justify-content on the main axis: pre-measure total child width.
-        // Each element child's base size is its `width`, flex-basis (grow
-        // items), or max-content — never min-content, which would wrap
-        // `flex:1` labels to one word per line. `margin-left:auto` items share
-        // the leftover space before it (pushed to the row's far edge).
-        let mut base_w: FxHashMap<NodeId, f32> = FxHashMap::default();
-        let mut grow_meta: FxHashMap<NodeId, (f32, f32)> = FxHashMap::default();
-        let mut min_w: FxHashMap<NodeId, f32> = FxHashMap::default();
-        let mut shrink_f: FxHashMap<NodeId, f32> = FxHashMap::default();
-        let mut oof: Vec<NodeId> = Vec::new();
-        let mut sum_grow = 0.0f32;
-        let mut shrink_w = 0.0f32;
-        let mut n_auto_ml = 0usize;
-        let mut total = 0.0f32; // flex-item bases only
-        let mut text_w = 0.0f32;
-        let mut margins = 0.0f32; // positive outer margins (excluded from shrink)
-        let mut n_vis = 0usize;
-        for &ch in self.doc.children(node) {
-            match self.doc.kind(ch) {
-                NodeKind::Text(t) => {
-                    if let Some(fi) = self.resolve_font(&st) {
-                        if let Some(f) = self.fonts.font(fi) {
-                            let tw = f.measure(
-                                &t.split_whitespace().collect::<Vec<_>>().join(" "),
-                                st.size,
-                            );
-                            text_w += tw;
-                            total += tw;
-                        }
-                    }
-                }
-                NodeKind::Element { .. } => {
-                    let cc = self.style(ch);
-                    if cc.get("display").map(String::as_str) == Some("none") {
-                        continue;
-                    }
-                    // out-of-flow children aren't flex items — they still
-                    // paint, laid out after the row (below)
-                    if matches!(
-                        cc.get("position").map(String::as_str),
-                        Some("absolute") | Some("fixed")
-                    ) {
-                        oof.push(ch);
-                        continue;
-                    }
-                    let mut cst = st.clone();
-                    self.apply_computed(&cc, &mut cst);
-                    let [_t, pr, _b, pl] =
-                        box_sides(&cc, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
-                    let [_t, mr, _b, ml] = box_sides(&cc, "margin", self.avail_w, cst.size);
-                    let (g, basis) = flex_grow_basis(&cc, self.avail_w, cst.size);
-                    let w = if g > 0.0 {
-                        grow_meta.insert(ch, (g, basis.unwrap_or(0.0)));
-                        sum_grow += g;
-                        basis.unwrap_or(0.0)
-                    } else {
-                        dim(&cc, "width", self.avail_w, cst.size)
-                            .map(|w| if border_box(&cc) { w - pl - pr } else { w })
-                            .unwrap_or_else(|| self.max_content_width(ch, &cst))
-                    };
-                    base_w.insert(ch, w + pl + pr);
-                    total += w + pl + pr;
-                    margins += ml.max(0.0) + mr.max(0.0);
-                    // flex-shrink + min-content floor: an overflowing row
-                    // shrinks items ∝ shrink×base, floored at min-width
-                    // (auto → min-content, like real flexbox)
-                    let floor = dim(&cc, "min-width", self.avail_w, cst.size)
-                        .unwrap_or_else(|| self.shrink_width(ch, &cst) + pl + pr);
-                    min_w.insert(ch, floor.max(1.0));
-                    let sh = flex_shrink_factor(&cc);
-                    if sh > 0.0 {
-                        shrink_w += sh * (w + pl + pr);
-                        shrink_f.insert(ch, sh);
-                    }
-                    if has_auto_ml(&cc) {
-                        n_auto_ml += 1;
-                    }
-                    n_vis += 1;
-                }
-                _ => {}
-            }
-        }
-        let gaps = gap * n_vis.saturating_sub(1) as f32;
-        let cw = self.content_width();
-        let overflow = total + margins + gaps - cw;
-        if overflow > 0.0 && shrink_w > 0.0 {
-            // negative free space → shrink bases ∝ shrink×base, floored at
-            // min-width (one pass; floors can leave residual overflow)
-            for (ch, sh) in &shrink_f {
-                if let Some(b) = base_w.get_mut(ch) {
-                    // floor never exceeds the pre-shrink base: a min-content
-                    // estimate larger than the base would grow, not shrink
-                    let floor = min_w.get(ch).copied().unwrap_or(1.0).min(*b);
-                    *b = (*b - overflow * sh * *b / shrink_w).max(floor);
-                }
-            }
-            total = text_w + base_w.values().sum::<f32>();
-        }
-        let free = (cw - total - margins - gaps).max(0.0);
-        // grow items absorb all leftover space; auto margins only split what
-        // grow leaves (spec: auto margins are 0 when any item grows)
-        let auto_share = if sum_grow > 0.0 || n_auto_ml == 0 {
-            0.0
-        } else {
-            free / n_auto_ml as f32
-        };
-        let extra = if sum_grow > 0.0 || n_auto_ml > 0 {
-            0.0
-        } else {
-            free
-        };
-        let n_children = self
-            .doc
-            .children(node)
-            .iter()
-            .filter(|&&ch| matches!(self.doc.kind(ch), NodeKind::Element { .. }))
-            .count();
-        let mut effective_gap = gap;
-        match c.get("justify-content").map(String::as_str) {
-            Some("center") => self.spacer(extra / 2.0),
-            Some("flex-end") | Some("right") | Some("end") => self.spacer(extra),
-            Some("space-between") if n_children > 1 => {
-                effective_gap = gap + extra / (n_children - 1) as f32;
-            }
-            _ => {}
-        }
-        let mut first = true;
-        for &ch in self.doc.children(node) {
-            match self.doc.kind(ch) {
-                NodeKind::Element { .. } => {
-                    let cc = self.style(ch);
-                    if cc.get("display").map(String::as_str) == Some("none") {
-                        continue;
-                    }
-                    if matches!(
-                        cc.get("position").map(String::as_str),
-                        Some("absolute") | Some("fixed")
-                    ) {
-                        continue; // in `oof` — painted after the row
-                    }
-                    if !first && effective_gap > 0.0 {
-                        self.spacer(effective_gap);
-                    }
-                    if has_auto_ml(&cc) && auto_share > 0.0 {
-                        self.spacer(auto_share);
-                    }
-                    let mut cst = st.clone();
-                    self.apply_computed(&cc, &mut cst);
-                    // img/svg become a word on the flex line — they share in
-                    // justify-content spacing and align/justify centering
-                    match self.doc.tag(ch) {
-                        Some(t @ ("img" | "svg")) => {
-                            if let Some((w, h, items, hits)) =
-                                self.replaced_payload(ch, t, &cc, &cst)
-                            {
-                                let mut items = items;
-                                let fx = colorfx::element_fx(
-                                    &cc,
-                                    cst.size,
-                                    cst.color,
-                                    Some([0.0, 0.0, w, h]),
-                                );
-                                if !fx.is_empty() && !items.is_empty() {
-                                    colorfx::wrap_vec(&mut items, 0, fx);
-                                }
-                                let xf = xform::spec(&cc, cst.size);
-                                let wrapping = xf.as_ref().is_some_and(|s| s.wrap);
-                                let (tx, ty) = if wrapping {
-                                    (0.0, 0.0)
-                                } else {
-                                    translate_xy(&cc, w, h, cst.size)
-                                };
-
-                                let items = if tx != 0.0 || ty != 0.0 {
-                                    items
-                                        .into_iter()
-                                        .map(|it| offset_item(it, tx, ty))
-                                        .collect()
-                                } else {
-                                    items
-                                };
-                                let hits = if tx != 0.0 || ty != 0.0 {
-                                    hits.into_iter()
-                                        .map(|h| xform::off_hit(h, tx, ty))
-                                        .collect()
-                                } else {
-                                    hits
-                                };
-                                let mb =
-                                    box_sides(&cc, "margin", self.avail_w, cst.size)[2].max(0.0);
-                                let saved = if wrapping {
-                                    Some(std::mem::replace(&mut self.cur_xf, xf.clone()))
-                                } else {
-                                    None
-                                };
-                                self.push_box(
-                                    w,
-                                    h,
-                                    items,
-                                    hits,
-                                    mb,
-                                    self.rel_offset(&cc, cst.size),
-                                );
-                                if let Some(s) = saved {
-                                    self.cur_xf = s;
-                                }
-                            }
-                        }
-                        Some(
-                            t @ ("input" | "select" | "textarea" | "video" | "canvas" | "iframe"
-                            | "object" | "embed" | "br" | "hr"),
-                        ) => {
-                            let fx = xform::spec(&cc, cst.size);
-                            let saved = if fx.is_some() {
-                                Some(std::mem::replace(&mut self.cur_xf, fx.clone()))
-                            } else {
-                                None
-                            };
-                            self.inline(ch, t, &cc, cst);
-                            if let Some(s) = saved {
-                                self.cur_xf = s;
-                            }
-                        }
-                        _ => {
-                            // flex item main size: grow → basis + share of the
-                            // leftover; otherwise its measured base (explicit
-                            // `width` still wins via the `dim` branch inside).
-                            // `min-width:auto` floors at min-content.
-                            let mut hint = if let Some(&(g, bpx)) = grow_meta.get(&ch) {
-                                Some(bpx + free * g / sum_grow)
-                            } else if dim(&cc, "width", self.avail_w, cst.size).is_none() {
-                                base_w.get(&ch).copied()
-                            } else {
-                                None
-                            };
-                            // min-content floor — capped at the item's own base
-                            // size: a floor above base inflates the item past
-                            // what the free-space math budgeted → phantom wrap
-                            if let (Some(h), Some(&fl)) = (hint, min_w.get(&ch)) {
-                                let cap = base_w.get(&ch).copied().unwrap_or(h);
-                                hint = Some(h.max(fl.min(cap)));
-                            }
-                            self.inline_block_w(ch, &cc, cst, hint)
-                        }
-                    }
-                    first = false;
-                }
-                NodeKind::Text(t) => {
-                    // whitespace between flex items collapses in real flexbox;
-                    // a pending_space here would add a phantom gap that can
-                    // wrap an edge-aligned item past the row's end
-                    if !t.trim().is_empty() {
-                        self.text(t, &st)
-                    }
-                }
-                _ => {}
-            }
-        }
-        // out-of-flow children paint last, as plain blocks (position
-        // offsets resolve against the nearest positioned ancestor's cb),
-        // in z-index order
-        if !oof.is_empty() {
-            self.flush_line();
-            oof.sort_by_key(|&ch| stacking::item_layer(&self.style(ch)));
-            for ch in oof {
-                let cc = self.style(ch);
-                let mut cst = st.clone();
-                self.apply_computed(&cc, &mut cst);
-                let (i0, h0) = (self.items.len(), self.hits.len());
-                let sp = xform::spec(&cc, cst.size);
-                self.block(ch, self.doc.tag(ch).unwrap_or("div"), &cc, cst);
-                if let Some(sp) = sp {
-                    self.wrap_span(&sp, ch, i0, h0);
-                }
-            }
-        }
+        self.flex_layout(node, c, st);
         self.cur_xf = saved_xf;
     }
 
@@ -5695,7 +5055,10 @@ impl<'a> Layouter<'a> {
         } else {
             match c.get("display").map(String::as_str) {
                 Some("flex") | Some("inline-flex") => {
-                    if c.get("flex-direction").map(String::as_str) == Some("column") {
+                    if matches!(
+                        c.get("flex-direction").map(String::as_str),
+                        Some("column") | Some("column-reverse")
+                    ) {
                         // column: widest child's contribution
                         for &ch in self.doc.children(node) {
                             if matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
@@ -5776,22 +5139,36 @@ impl<'a> Layouter<'a> {
     /// gaps/padding/margins — `flex_shrink_width` is the *min*-content sum
     /// and would under-measure `a > span + icon` links.
     fn flex_maxc_width(&mut self, node: NodeId, c: &Props, st: &Style) -> f32 {
-        let gap = c
-            .get("column-gap")
-            .and_then(|v| parse_len(v, self.avail_w, st.size))
-            .or_else(|| {
-                c.get("gap")
-                    .and_then(|v| parse_len(v, self.avail_w, st.size))
-            })
-            .unwrap_or(0.0);
-        let mut w = 0.0;
+        // column direction: max-content width is the widest item, and the
+        // main-axis gap runs vertically — neither contributes to width
+        let col_dir = matches!(
+            c.get("flex-direction").map(String::as_str),
+            Some("column") | Some("column-reverse")
+        );
+        let gap = if col_dir {
+            0.0
+        } else {
+            c.get("column-gap")
+                .and_then(|v| parse_len(v, self.avail_w, st.size))
+                .or_else(|| {
+                    c.get("gap")
+                        .and_then(|v| parse_len(v, self.avail_w, st.size))
+                })
+                .unwrap_or(0.0)
+        };
+        let mut w = 0.0f32;
         let mut n = 0usize;
         for &ch in self.doc.children(node) {
             if let NodeKind::Text(t) = self.doc.kind(ch) {
                 if let Some(fi) = self.resolve_font(st) {
                     if let Some(f) = self.fonts.font(fi) {
-                        w +=
+                        let tw =
                             f.measure(&t.split_whitespace().collect::<Vec<_>>().join(" "), st.size);
+                        if col_dir {
+                            w = w.max(tw);
+                        } else {
+                            w += tw;
+                        }
                     }
                 }
                 continue;
@@ -5821,7 +5198,12 @@ impl<'a> Layouter<'a> {
                     }
                 })
                 .unwrap_or_else(|| self.max_content_width(ch, &cst));
-            w += cw + pl.max(0.0) + pr.max(0.0) + ml + mr;
+            let item = cw + pl.max(0.0) + pr.max(0.0) + ml + mr;
+            if col_dir {
+                w = w.max(item);
+            } else {
+                w += item;
+            }
             n += 1;
         }
         (w + gap * n.saturating_sub(1) as f32).max(st.size)
@@ -5911,20 +5293,30 @@ impl<'a> Layouter<'a> {
     /// Intrinsic width of a flex container: children's widths + gaps + their
     /// own padding/margins — a max-content approximation.
     fn flex_shrink_width(&mut self, node: NodeId, c: &Props, st: &Style) -> f32 {
-        let gap = c
-            .get("column-gap")
-            .and_then(|v| parse_len(v, self.avail_w, st.size))
-            .or_else(|| {
-                c.get("gap")
-                    .and_then(|v| parse_len(v, self.avail_w, st.size))
-            })
-            .unwrap_or(0.0);
+        // column direction: items stack vertically — the cross-size
+        // contribution is the widest item, no horizontal gaps
+        let col_dir = matches!(
+            c.get("flex-direction").map(String::as_str),
+            Some("column") | Some("column-reverse")
+        );
+        let gap = if col_dir {
+            0.0
+        } else {
+            c.get("column-gap")
+                .and_then(|v| parse_len(v, self.avail_w, st.size))
+                .or_else(|| {
+                    c.get("gap")
+                        .and_then(|v| parse_len(v, self.avail_w, st.size))
+                })
+                .unwrap_or(0.0)
+        };
         // flex-wrap:wrap rows can break between items — the min-content
         // contribution is the widest single item, not the whole line
-        let wrap = matches!(
-            c.get("flex-wrap").map(String::as_str),
-            Some("wrap") | Some("wrap-reverse")
-        );
+        let wrap = col_dir
+            || matches!(
+                c.get("flex-wrap").map(String::as_str),
+                Some("wrap") | Some("wrap-reverse")
+            );
         let mut w = 0.0f32;
         let mut n = 0usize;
         for &ch in self.doc.children(node) {
@@ -6028,6 +5420,8 @@ impl<'a> Layouter<'a> {
     }
 
     /// Push an inline-block box (pre-rendered items) onto the line like a word.
+    /// `ascent` = the box's first-baseline offset below its border-box top —
+    /// the baseline the box shares with the line's other words.
     fn push_box(
         &mut self,
         w: f32,
@@ -6036,6 +5430,7 @@ impl<'a> Layouter<'a> {
         hits: Vec<Hit>,
         mb: f32,
         rel: (f32, f32),
+        ascent: f32,
     ) {
         if self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line();
@@ -6049,7 +5444,7 @@ impl<'a> Layouter<'a> {
             strike: false,
             shift: 0.0,
             width: w,
-            ascent: h, // box bottom sits on the baseline
+            ascent: ascent.min(h),
             line_h: h + mb,
             href: None,
             bg: None,
@@ -7118,6 +6513,215 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// first bg rect painted at `color`, as (x, y, w, h)
+    fn fill_rect(items: &[DisplayItem], color: u32) -> (f32, f32, f32, f32) {
+        for i in items {
+            if let DisplayItem::FillRect {
+                x,
+                y,
+                w,
+                h,
+                color: c,
+            } = i
+            {
+                if *c == color {
+                    return (*x, *y, *w, *h);
+                }
+            }
+        }
+        panic!("no FillRect of color {color:#x}");
+    }
+
+    #[test]
+    fn flex_order_reorders_items() {
+        // `order` sorts items before placement: -1 first, 0 middle, 1 last
+        let (items, _, _) = lay(
+            "<style>.f{display:flex}.b{order:1}.a{order:-1}</style>\
+             <div class=f><span class=b>one</span><span class=a>two</span><span>three</span></div>",
+        );
+        let (xa, _) = text_pos(&items, "one");
+        let (xb, _) = text_pos(&items, "two");
+        let (xc, _) = text_pos(&items, "three");
+        assert!(
+            xb < xc && xc < xa,
+            "order -1,0,1 → two < three < one: {xb} {xc} {xa}"
+        );
+    }
+
+    #[test]
+    fn flex_shorthand_grows_item() {
+        // `flex:1` → grow 1, basis 0% → the item absorbs all leftover width
+        let (items, _, _) = lay("<style>.f{display:flex}.a{flex:1;background:#ff0000}\
+             .b{width:100px}</style>\
+             <div class=f><div class=b>side</div><div class=a></div></div>");
+        let (x, _, w, _) = fill_rect(&items, bgra(255, 0, 0));
+        assert!(
+            (x - 8.0 - 100.0).abs() < 1.0,
+            "grow item starts after 100px sibling, x={x}"
+        );
+        assert!(
+            (w - 684.0).abs() < 2.0,
+            "grow item fills remaining 784-100, w={w}"
+        );
+    }
+
+    #[test]
+    fn flex_wrap_makes_two_lines() {
+        // 3×300px items in a 784px container wrap to two lines
+        let (items, _, _) = lay(
+            "<style>.f{display:flex;flex-wrap:wrap}.i{width:300px}</style>\
+             <div class=f><div class=i>aa</div><div class=i>bb</div><div class=i>cc</div></div>",
+        );
+        let (_, ya) = text_pos(&items, "aa");
+        let (_, yb) = text_pos(&items, "bb");
+        let (_, yc) = text_pos(&items, "cc");
+        assert!(
+            (yb - ya).abs() < 0.5,
+            "aa and bb share line 1: {ya} vs {yb}"
+        );
+        assert!(yc > ya + 10.0, "cc wraps to line 2: {ya} -> {yc}");
+    }
+
+    #[test]
+    fn flex_align_content_space_between() {
+        // two wrapped lines in a 200px container spread to the cross edges
+        let (items, _, _) = lay("<style>.f{display:flex;flex-wrap:wrap;height:200px;\
+             align-content:space-between}.i{width:300px}</style>\
+             <div class=f><div class=i>aa</div><div class=i>bb</div><div class=i>cc</div></div>");
+        let (_, ya) = text_pos(&items, "aa");
+        let (_, yc) = text_pos(&items, "cc");
+        assert!(
+            yc - ya > 150.0,
+            "lines spread to container edges: {ya} -> {yc}"
+        );
+    }
+
+    #[test]
+    fn flex_align_items_stretch_fills_line() {
+        // auto-height item stretches to the line's cross size (80px)
+        let (items, _, _) = lay("<style>.f{display:flex}.a{background:#ff0000}</style>\
+             <div class=f><div class=a></div><div style='height:80px'>tall</div></div>");
+        let (_, _, _, h) = fill_rect(&items, bgra(255, 0, 0));
+        assert!((h - 80.0).abs() < 1.0, "stretched item height {h}");
+    }
+
+    #[test]
+    fn flex_column_justify_content_center() {
+        // column direction: justify-content centers along the vertical axis
+        let (items, _, _) = lay("<style>.f{display:flex;flex-direction:column;height:200px;\
+             justify-content:center}.i{height:20px}</style>\
+             <div class=f><div class=i>mid</div></div>");
+        let (_, yb) = text_pos(&items, "mid");
+        // box top ≈ 8 + (200-20)/2 = 98; baseline a bit below the top
+        assert!(
+            yb > 8.0 + 95.0 && yb < 8.0 + 125.0,
+            "vertically centered baseline {yb}"
+        );
+    }
+
+    #[test]
+    fn flex_min_width_floors_shrink() {
+        // two 600px-basis items overflow 784px; min-width:550 stops b's
+        // shrink while a shrinks to its share (an explicit `width` is its
+        // own min-content, so the test uses flex-basis for the base size)
+        let (items, _, _) = lay(
+            "<style>.f{display:flex}.a{flex-basis:600px;background:#ff0000}\
+             .b{flex-basis:600px;min-width:550px;background:#00ff00}</style>\
+             <div class=f><div class=a></div><div class=b></div></div>",
+        );
+        let (_, _, wa, _) = fill_rect(&items, bgra(255, 0, 0));
+        let (_, _, wb, _) = fill_rect(&items, bgra(0, 255, 0));
+        assert!(wa < 500.0, "a shrank below its 600px base, w={wa}");
+        assert!(
+            (wb - 550.0).abs() < 1.0,
+            "b floored at min-width 550, w={wb}"
+        );
+    }
+
+    #[test]
+    fn flex_basis_sizes_item() {
+        // flex-basis:120px (no grow) sets the item's main size
+        let (items, _, _) = lay(
+            "<style>.f{display:flex}.a{flex-basis:120px;background:#ff0000}</style>\
+             <div class=f><div class=a></div></div>",
+        );
+        let (_, _, w, _) = fill_rect(&items, bgra(255, 0, 0));
+        assert!((w - 120.0).abs() < 1.0, "flex-basis width {w}");
+    }
+
+    #[test]
+    fn flex_row_reverse_packs_from_right() {
+        // row-reverse mirrors the pack direction: DOM order a,b → a on the right
+        let (items, _, _) = lay(
+            "<style>.f{display:flex;flex-direction:row-reverse}.i{width:100px}</style>\
+             <div class=f><div class=i>aa</div><div class=i>bb</div></div>",
+        );
+        let (xa, _) = text_pos(&items, "aa");
+        let (xb, _) = text_pos(&items, "bb");
+        assert!(
+            xa > xb,
+            "row-reverse puts first item last: aa {xa}, bb {xb}"
+        );
+        assert!(
+            (xa - 8.0 - 684.0).abs() < 1.5,
+            "aa hugs the right edge, x={xa}"
+        );
+    }
+
+    #[test]
+    fn flex_space_between_spreads_items() {
+        let (items, _, _) = lay(
+            "<style>.f{display:flex;justify-content:space-between}.i{width:100px}</style>\
+             <div class=f><div class=i>aa</div><div class=i>bb</div></div>",
+        );
+        let (xa, _) = text_pos(&items, "aa");
+        let (xb, _) = text_pos(&items, "bb");
+        assert!(
+            (xa - 8.0).abs() < 1.5,
+            "first item at the start edge, x={xa}"
+        );
+        assert!(
+            (xb - 8.0 - 684.0).abs() < 1.5,
+            "last item at the end edge, x={xb}"
+        );
+    }
+
+    #[test]
+    fn flex_auto_margin_pushes_item() {
+        // margin-left:auto absorbs the leftover main space
+        let (items, _, _) = lay(
+            "<style>.f{display:flex}.i{width:100px}.b{margin-left:auto}</style>\
+             <div class=f><div class=i>aa</div><div class='i b'>bb</div></div>",
+        );
+        let (xb, _) = text_pos(&items, "bb");
+        assert!(
+            (xb - 8.0 - 684.0).abs() < 1.5,
+            "auto margin pushes bb to the right edge, x={xb}"
+        );
+    }
+
+    #[test]
+    fn flex_gap_separates_items() {
+        let (items, _, _) = lay("<style>.f{display:flex;gap:20px}.i{width:100px}</style>\
+             <div class=f><div class=i>aa</div><div class=i>bb</div></div>");
+        let (xb, _) = text_pos(&items, "bb");
+        assert!(
+            (xb - 8.0 - 120.0).abs() < 1.5,
+            "gap:20 → bb at x=128, x={xb}"
+        );
+    }
+
+    #[test]
+    fn flex_baseline_aligns_first_lines() {
+        // different font sizes align on their first text baselines
+        let (items, _, _) = lay("<style>.f{display:flex;align-items:baseline}\
+             .a{font-size:32px}.b{font-size:12px}</style>\
+             <div class=f><div class=a>big</div><div class=b>small</div></div>");
+        let (_, ya) = text_pos(&items, "big");
+        let (_, yb) = text_pos(&items, "small");
+        assert!((yb - ya).abs() < 1.0, "shared first baseline: {ya} vs {yb}");
     }
 
     // ---------- @font-face / family fallback ----------
