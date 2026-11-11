@@ -143,6 +143,8 @@ head,title,meta,link,style,script,template,noscript,base{display:none}
 html,body,div,p,blockquote,pre,listing,h1,h2,h3,h4,h5,h6,ul,ol,menu,dir,dl,dd,dt,li,
 section,article,nav,header,footer,main,aside,form,fieldset,figcaption,figure,
 address,table,tr,tbody,thead,tfoot,caption,hr,center{display:block}
+center{text-align:center}
+table{text-align:left}
 p{margin-top:1em;margin-bottom:1em}
 h1{font-size:2em;font-weight:bold;margin-top:.67em;margin-bottom:.67em}
 h2{font-size:1.5em;font-weight:bold;margin-top:.83em;margin-bottom:.83em}
@@ -605,6 +607,14 @@ pub fn parse_color(v: &str) -> Option<Color> {
         }
     }
     named_color(&v)
+}
+
+impl Layouter<'_> {
+    /// `background-color`/`background` or the legacy `bgcolor` attribute.
+    fn bg_of(&self, node: NodeId, c: &Props) -> Option<Color> {
+        bg_color(c)
+            .or_else(|| self.doc.attr(node, "bgcolor").and_then(|v| parse_color(v)))
+    }
 }
 
 /// `background-color` or a color inside the `background` shorthand.
@@ -2076,7 +2086,7 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let bd = self.backdrop;
         let bb = border_box(c);
-        let bg = bg_color(c).map(|col| over(col, bd));
+        let bg = self.bg_of(node, c).map(|col| over(col, bd));
         let border = border_sides(c, size)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         // the block's own background paints behind the whole box, not per word
@@ -2168,6 +2178,16 @@ impl<'a> Layouter<'a> {
         } else {
             (self.avail_w - ml - mr - pl - pr - bw_h).max(1.0)
         };
+        // a definite-width block in a text-align:center context (<center>)
+        // or with margin-inline:auto gets centered
+        if w_prop.is_some() {
+            let outer = inner_w + pl + pr + bw_h;
+            let centered = saved_align == Align::Center
+                || (margin_auto(c, true) && margin_auto(c, false));
+            if centered && outer < self.avail_w {
+                self.margin_x += ((self.avail_w - outer) / 2.0).max(0.0);
+            }
+        }
         self.margin_x += ml.max(0.0) + pl + bw_l;
         self.avail_w = inner_w;
         self.align = st.align;
@@ -2401,7 +2421,7 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
-        let bg = bg_color(c).map(|col| over(col, bd));
+        let bg = self.bg_of(node, c).map(|col| over(col, bd));
         let border = border_sides(c, size)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         st.inline_bg = None;
@@ -2505,7 +2525,7 @@ impl<'a> Layouter<'a> {
         let [_t, mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
         let bb = border_box(c);
-        let bg = bg_color(c).map(|col| over(col, bd));
+        let bg = self.bg_of(node, c).map(|col| over(col, bd));
         let border = border_sides(c, size)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         st.inline_bg = None; // the box paints its own bg
@@ -2535,7 +2555,9 @@ impl<'a> Layouter<'a> {
         ) {
             self.flex_maxc_width(node, c, &st)
         } else {
-            self.shrink_width(node, &st)
+            // shrink-to-fit ≈ max-content — capped by the remaining line room
+            // in `box_w` below (spec: min(max-content, available))
+            self.max_content_width(node, &st)
         };
         let room = self.content_width();
         let box_w = (inner + pl + pr + bw_h).min(room);
@@ -2642,7 +2664,7 @@ impl<'a> Layouter<'a> {
         let size = st.size;
         let [mt, _mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
-        let bg = bg_color(c).map(|col| over(col, bd));
+        let bg = self.bg_of(node, c).map(|col| over(col, bd));
         let border = border_sides(c, size)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         st.inline_bg = None;
@@ -2685,11 +2707,27 @@ impl<'a> Layouter<'a> {
             }
         }
 
-        // column widths: max min-content width per column
-        let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        // column widths: per-column min-content (col_w) and max-content
+        // (col_pref); colspan>1 cells share their width across the spanned
+        // columns (deficit split evenly)
+        let colspan = |cell| {
+            self.doc
+                .attr(cell, "colspan")
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1)
+        };
+        let ncols = rows
+            .iter()
+            .map(|r| r.iter().map(|&c| colspan(c)).sum())
+            .max()
+            .unwrap_or(0);
         let mut col_w = vec![0.0f32; ncols];
+        let mut col_pref = vec![0.0f32; ncols];
         for row in &rows {
-            for (i, &cell) in row.iter().enumerate() {
+            let mut i = 0usize;
+            for &cell in row {
+                let span = colspan(cell).min(ncols - i.min(ncols));
                 let cs = self.style(cell);
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
@@ -2700,11 +2738,28 @@ impl<'a> Layouter<'a> {
                     .unwrap_or([0.0; 4]);
                 let cbw_h = cbw_l + cbw_r;
                 let mut w = self.shrink_width(cell, &cst) + pl + pr + cbw_h;
+                let mut pw = self.max_content_width(cell, &cst) + pl + pr + cbw_h;
                 if let Some(wp) = dim(&cs, "width", self.avail_w, cst.size) {
                     let wp = if border_box(&cs) { wp } else { wp + pl + pr + cbw_h };
                     w = w.max(wp);
+                    pw = pw.max(wp);
                 }
-                col_w[i] = col_w[i].max(w);
+                if span <= 1 {
+                    col_w[i] = col_w[i].max(w);
+                    col_pref[i] = col_pref[i].max(pw);
+                } else {
+                    // min-content only: a colspan cell's intrinsic width must
+                    // still fit somewhere, but its max-content shouldn't
+                    // inflate every spanned column's growth need
+                    let cur: f32 = col_w[i..i + span].iter().sum();
+                    if w > cur {
+                        let add = (w - cur) / span as f32;
+                        for cw in col_w[i..i + span].iter_mut() {
+                            *cw += add;
+                        }
+                    }
+                }
+                i += span;
             }
         }
 
@@ -2714,15 +2769,58 @@ impl<'a> Layouter<'a> {
         self.avail_w -= ml.max(0.0);
         self.align = st.align;
 
-        // scale columns down to fit the available width
+        // scale columns to fit the available width; `width` (attribute px/%
+        // or CSS) sizes the table box itself — columns scale up to fill it
         let avail = self.avail_w.max(1.0);
+        let spec_w = self
+            .doc
+            .attr(node, "width")
+            .and_then(|v| {
+                let v = v.trim();
+                if let Some(p) = v.strip_suffix('%') {
+                    p.parse::<f32>().ok().map(|n| avail * n / 100.0)
+                } else {
+                    v.parse::<f32>().ok()
+                }
+            })
+            .or_else(|| dim(c, "width", self.avail_w, st.size));
+        // auto layout: width = min(max-content, available) unless specified;
+        // grow columns toward their max-content need, then any leftover
+        // proportionally; shrink proportionally when over budget
         let total: f32 = col_w.iter().sum();
-        if total > avail && total > 0.0 {
+        let pref: f32 = col_pref.iter().sum();
+        let auto = pref.max(total).min(avail);
+        let target = spec_w.unwrap_or(auto).min(avail).max(total.min(avail));
+        let deficit = target - total;
+        if deficit > 0.01 && total > 0.0 {
+            // grow toward each column's max-content share, floored at its
+            // min-content; renormalize any leftover proportionally
+            let pref_sum: f32 = col_pref.iter().sum::<f32>().max(total);
+            for (w, &p) in col_w.iter_mut().zip(&col_pref) {
+                *w = w.max(target * p / pref_sum);
+            }
+            let cur: f32 = col_w.iter().sum();
+            if target - cur > 0.01 && cur > 0.0 {
+                for w in col_w.iter_mut() {
+                    *w *= target / cur;
+                }
+            }
+        } else if deficit < -0.01 && total > 0.0 {
             for w in col_w.iter_mut() {
-                *w *= avail / total;
+                *w *= target / total;
             }
         }
         let table_w: f32 = col_w.iter().sum();
+        // align="center"|"right" attribute, margin:auto, or a parent
+        // text-align:center (<center> / -webkit-center behavior) centers it
+        let center = self.doc.attr(node, "align") == Some("center")
+            || (margin_auto(c, true) && margin_auto(c, false))
+            || saved.2 == Align::Center;
+        if center && table_w < avail {
+            self.margin_x += (avail - table_w) / 2.0;
+        } else if self.doc.attr(node, "align") == Some("right") && table_w < avail {
+            self.margin_x += avail - table_w;
+        }
 
         let shadow = parse_shadow(c, size, bd, st.color);
         let patch = if bg.is_some() || border.is_some() || shadow.is_some() {
@@ -2763,12 +2861,20 @@ impl<'a> Layouter<'a> {
             )> = Vec::new();
             let mut x = self.margin_x;
             let mut row_h = 0.0f32;
-            for (i, &cell) in row.iter().enumerate() {
-                let cw = col_w[i];
+            let mut ci = 0usize;
+            for &cell in row {
+                let span = colspan(cell).min(ncols - ci.min(ncols));
+                let cw: f32 = col_w[ci..(ci + span).min(ncols)].iter().sum();
+                ci += span;
                 let cs = self.style(cell);
                 let mut cst = st.clone();
                 self.apply_computed(&cs, &mut cst);
                 cst.inline_bg = None; // cell bg paints the whole cell
+                match self.doc.attr(cell, "align") {
+                    Some("right") => cst.align = Align::Right,
+                    Some("center") => cst.align = Align::Center,
+                    _ => {}
+                }
                 let [pt, pr, pb, pl] = box_sides(&cs, "padding", self.avail_w, cst.size).map(|v| v.max(0.0));
                 let cborder = border_sides(&cs, cst.size)
                     .or(attr_border)
@@ -2778,6 +2884,9 @@ impl<'a> Layouter<'a> {
                 let cbg = cs
                     .get("background-color")
                     .and_then(|v| parse_color(v))
+                    .or_else(|| {
+                        self.doc.attr(cell, "bgcolor").and_then(|v| parse_color(v))
+                    })
                     .map(|col| over(col, bg.unwrap_or(bd)));
                 let inner = (cw - pl - pr - bw_l - bw_r).max(1.0);
                 let (items, y_end, nhits) =
@@ -3462,7 +3571,7 @@ impl<'a> Layouter<'a> {
             let p = box_sides(&cc, "padding", avail, cst.size).map(|v| v.max(0.0));
             let bd = self.backdrop;
             let bb = border_box(&cc);
-            let bg = bg_color(&cc).map(|col| over(col, bd));
+            let bg = self.bg_of(ch, &cc).map(|col| over(col, bd));
             let border = border_sides(&cc, cst.size)
                 .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
             let bw = border.map(|b| b.0).unwrap_or([0.0; 4]);
@@ -3941,18 +4050,38 @@ impl<'a> Layouter<'a> {
         (items, bottom, hits)
     }
 
+    /// Invoke `f` on each descendant text node's raw text (node boundaries
+    /// matter — `</li><li>` with no whitespace still breaks between items
+    /// once a generated separator or list box splits them)
+    fn each_text(doc: &Document, node: NodeId, f: &mut impl FnMut(&str)) {
+        if let Some(t) = doc.text(node) {
+            f(t);
+        }
+        for &c in doc.children(node) {
+            if matches!(
+                doc.tag(c),
+                Some("style") | Some("script") | Some("noscript") | Some("template")
+            ) {
+                continue;
+            }
+            Self::each_text(doc, c, f);
+        }
+    }
+
     /// min-content width approximation: the longest word inside `node`
     /// measured in the current font (or a default for textless content).
     /// Explicit `width`, nested flex rows, and fixed-track grids contribute
     /// their own geometry rather than text width.
     fn shrink_width(&mut self, node: NodeId, st: &Style) -> f32 {
-        let text = self.doc.text_content(node);
         let mut w = 0.0f32;
+        let doc = self.doc;
         if let Some(fi) = self.resolve_font(st) {
             if let Some(f) = self.fonts.font(fi) {
-                for word in text.split_whitespace() {
-                    w = w.max(f.measure(word, st.size));
-                }
+                Self::each_text(doc, node, &mut |t| {
+                    for word in t.split_whitespace() {
+                        w = w.max(f.measure(word, st.size));
+                    }
+                });
             }
         }
         // layout-aware: nested containers out-measure their text
@@ -4175,13 +4304,27 @@ impl<'a> Layouter<'a> {
             .and_then(|v| parse_len(v, self.avail_w, st.size))
             .or_else(|| c.get("gap").and_then(|v| parse_len(v, self.avail_w, st.size)))
             .unwrap_or(0.0);
-        let mut w = 0.0;
+        // flex-wrap:wrap rows can break between items — the min-content
+        // contribution is the widest single item, not the whole line
+        let wrap = matches!(
+            c.get("flex-wrap").map(String::as_str),
+            Some("wrap") | Some("wrap-reverse")
+        );
+        let mut w = 0.0f32;
         let mut n = 0usize;
         for &ch in self.doc.children(node) {
             if let NodeKind::Text(t) = self.doc.kind(ch) {
                 if let Some(fi) = self.resolve_font(st) {
                     if let Some(f) = self.fonts.font(fi) {
-                        w += f.measure(&t.split_whitespace().collect::<Vec<_>>().join(" "), st.size);
+                        let tw = f.measure(
+                            &t.split_whitespace().collect::<Vec<_>>().join(" "),
+                            st.size,
+                        );
+                        if wrap {
+                            w = w.max(tw);
+                        } else {
+                            w += tw;
+                        }
                     }
                 }
                 continue;
@@ -4215,10 +4358,16 @@ impl<'a> Layouter<'a> {
                     }
                 })
                 .unwrap_or_else(|| self.shrink_width(ch, &cst));
-            w += cw + pl.max(0.0) + pr.max(0.0) + ml + mr;
+            let item = cw + pl.max(0.0) + pr.max(0.0) + ml + mr;
+            if wrap {
+                w = w.max(item);
+            } else {
+                w += item;
+            }
             n += 1;
         }
-        (w + gap * n.saturating_sub(1) as f32).max(st.size)
+        let gaps = if wrap { 0.0 } else { gap * n.saturating_sub(1) as f32 };
+        (w + gaps).max(st.size)
     }
 
     /// Effective line height for a style: line-height override else font metric.
