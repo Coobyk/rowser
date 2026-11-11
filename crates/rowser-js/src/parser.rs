@@ -7,14 +7,22 @@ use std::rc::Rc;
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        no_in: false,
+    };
     p.program()
 }
 
 /// Parse a single expression from source (used for template interpolations).
 fn parse_expr_src(src: &str) -> Result<Expr, Error> {
     let toks = lex(src)?;
-    let mut p = Parser { toks, pos: 0 };
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        no_in: false,
+    };
     let e = p.expression()?;
     if !matches!(p.peek().tok, Tok::Eof) {
         return Err(p.err("trailing tokens in expression"));
@@ -25,6 +33,10 @@ fn parse_expr_src(src: &str) -> Result<Expr, Error> {
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// when set, `in` is NOT treated as a binary operator — used while
+    /// parsing for-head init expressions so `for (x in y)` and the common
+    /// minified `for (a in b&&c, d)` forms parse correctly
+    no_in: bool,
 }
 
 impl Parser {
@@ -93,6 +105,7 @@ impl Parser {
             Tok::Num(n) => format!("`{n}`"),
             Tok::Str(s) => format!("`\"{s}\"`"),
             Tok::Template(_) => "template literal".into(),
+            Tok::Regex { pattern, flags } => format!("`/{pattern}/{flags}`"),
         }
     }
     /// Automatic semicolon insertion: consume `;`, or allow newline/`}`/EOF.
@@ -114,21 +127,7 @@ impl Parser {
                 Ok(s)
             }
             // contextual keywords usable as identifiers/property names
-            Tok::Kw(k)
-                if matches!(
-                    k,
-                    Kw::Let
-                        | Kw::Get
-                        | Kw::Set
-                        | Kw::Static
-                        | Kw::Async
-                        | Kw::Of
-                        | Kw::From
-                        | Kw::As
-                        | Kw::Await
-                        | Kw::Yield
-                ) =>
-            {
+            Tok::Kw(k) if is_contextual_ident_kw(&k) => {
                 self.next();
                 Ok(k.name().to_string())
             }
@@ -194,7 +193,7 @@ impl Parser {
                 // `let` can be an identifier: `let = 5`, `let.x`, `let(x)` or
                 // a declaration `let x ...`. Disambiguate by lookahead.
                 if matches!(self.peek2().tok, Tok::Ident(_) | Tok::Punct("[") | Tok::Punct("{"))
-                    || matches!(&self.peek2().tok, Tok::Kw(k) if matches!(k, Kw::Get|Kw::Set|Kw::Async|Kw::Of|Kw::Await|Kw::Yield))
+                    || matches!(&self.peek2().tok, Tok::Kw(k) if is_contextual_ident_kw(k))
                 {
                     let (kind, decls) = self.var_decl()?;
                     self.semi()?;
@@ -371,12 +370,7 @@ impl Parser {
                 self.next();
                 Ok(Pattern::Ident(s))
             }
-            Tok::Kw(k)
-                if matches!(
-                    k,
-                    Kw::Let | Kw::Get | Kw::Set | Kw::Async | Kw::Of | Kw::Await | Kw::Yield
-                ) =>
-            {
+            Tok::Kw(k) if is_contextual_ident_kw(&k) => {
                 self.next();
                 Ok(Pattern::Ident(k.name().to_string()))
             }
@@ -474,13 +468,14 @@ impl Parser {
 
     fn for_stmt(&mut self) -> Result<Stmt, Error> {
         self.expect_kw(Kw::For)?;
+        self.eat_kw(Kw::Await); // `for await (x of y)` — sync iteration
         self.expect_punct("(")?;
 
         // for-in / for-of heads
         let init_is_decl = matches!(self.peek().tok, Tok::Kw(Kw::Var) | Tok::Kw(Kw::Const))
             || (matches!(self.peek().tok, Tok::Kw(Kw::Let))
                 && matches!(self.peek2().tok, Tok::Ident(_) | Tok::Punct("[") | Tok::Punct("{")))
-            || matches!(&self.peek().tok, Tok::Kw(Kw::Let) if matches!(&self.peek2().tok, Tok::Kw(k) if matches!(k, Kw::Get|Kw::Set|Kw::Async|Kw::Of|Kw::Await|Kw::Yield)));
+            || matches!(&self.peek().tok, Tok::Kw(Kw::Let) if matches!(&self.peek2().tok, Tok::Kw(k) if is_contextual_ident_kw(k)));
 
         if init_is_decl {
             let kind = match self.peek().tok {
@@ -574,7 +569,11 @@ impl Parser {
             });
         }
 
+        // parse the head expression with `in` disabled so `for (x in y)`
+        // and `for (a in b&&c, d)` see the keyword as the for-in marker
+        self.no_in = true;
         let first = self.expression()?;
+        self.no_in = false;
         if self.at_kw(Kw::Of) {
             self.next();
             let right = self.expression()?;
@@ -830,6 +829,10 @@ impl Parser {
             self.semi()?;
             ExportRec::Names(names, from)
         } else if self.eat_punct("*") {
+            // `export * as ns from "x"` or `export * from "x"`
+            if self.eat_kw(Kw::As) {
+                let _ = self.ident_name()?;
+            }
             self.expect_kw(Kw::From)?;
             match self.peek().tok.clone() {
                 Tok::Str(s) => {
@@ -855,12 +858,7 @@ impl Parser {
                 self.next();
                 Some(s)
             }
-            Tok::Kw(k)
-                if matches!(
-                    k,
-                    Kw::Let | Kw::Get | Kw::Set | Kw::Async | Kw::Of | Kw::Await | Kw::Yield
-                ) =>
-            {
+            Tok::Kw(k) if is_contextual_ident_kw(&k) => {
                 self.next();
                 Some(k.name().to_string())
             }
@@ -937,6 +935,12 @@ impl Parser {
             if self.at_kw(Kw::Static) && !matches!(self.peek2().tok, Tok::Punct("(") | Tok::Punct("=")) {
                 self.next();
                 is_static = true;
+            }
+            // static initialization block `static { ... }` — parse + skip
+            if is_static && self.at_punct("{") {
+                self.next();
+                let _ = self.block_body()?;
+                continue;
             }
             if self.at_kw(Kw::Async) && !matches!(self.peek2().tok, Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(":")) && !self.peek2().newline_before {
                 self.next();
@@ -1196,7 +1200,7 @@ impl Parser {
             Tok::Punct(">") => (8, BinKind::B(Gt)),
             Tok::Punct(">=") => (8, BinKind::B(Ge)),
             Tok::Kw(Kw::Instanceof) => (8, BinKind::B(Instanceof)),
-            Tok::Kw(Kw::In) => (8, BinKind::B(In)),
+            Tok::Kw(Kw::In) if !self.no_in => (8, BinKind::B(In)),
             Tok::Punct("<<") => (9, BinKind::B(Shl)),
             Tok::Punct(">>") => (9, BinKind::B(Shr)),
             Tok::Punct(">>>") => (9, BinKind::B(Ushr)),
@@ -1482,6 +1486,10 @@ impl Parser {
                 self.next();
                 Ok(Expr::Null)
             }
+            Tok::Regex { pattern, flags } => {
+                self.next();
+                Ok(Expr::Regex { pattern, flags })
+            }
             Tok::Kw(Kw::This) => {
                 self.next();
                 Ok(Expr::This)
@@ -1494,6 +1502,15 @@ impl Parser {
                 self.next();
                 self.eat_punct("*");
                 let f = self.fn_tail(false)?;
+                Ok(Expr::Fn(Rc::new(f)))
+            }
+            Tok::Kw(Kw::Async) if matches!(self.peek2().tok, Tok::Kw(Kw::Function)) => {
+                // `async function [name](...) {}` in expression position
+                self.next();
+                self.next();
+                self.eat_punct("*");
+                let mut f = self.fn_tail(false)?;
+                f.is_async = true;
                 Ok(Expr::Fn(Rc::new(f)))
             }
             Tok::Kw(Kw::Import) => {
@@ -1726,6 +1743,24 @@ impl Parser {
             _ => Err(self.err(format!("unexpected {}", self.describe()))),
         }
     }
+}
+
+/// Contextual keywords that are legal as plain identifiers (`as`, `from`,
+/// `let`, `of`, `get`, `set`, `static`, `async`, `await`, `yield`).
+fn is_contextual_ident_kw(k: &Kw) -> bool {
+    matches!(
+        k,
+        Kw::Let
+            | Kw::Get
+            | Kw::Set
+            | Kw::Static
+            | Kw::Async
+            | Kw::Of
+            | Kw::From
+            | Kw::As
+            | Kw::Await
+            | Kw::Yield
+    )
 }
 
 fn prop_key_name(k: &PropKey) -> Option<String> {

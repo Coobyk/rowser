@@ -12,6 +12,7 @@ pub mod dom_bridge;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
+pub mod regexp;
 
 use interp::{Interp, Value};
 
@@ -773,6 +774,338 @@ mod tests {
             Value::Num(n) => n,
             _ => panic!("expected number"),
         }
+    }
+
+    // ============================ regex ============================
+
+    #[test]
+    fn regex_literal_lexing_contexts() {
+        // after `=` — regex
+        assert!(b("var r = /a+/; r.test('baa')"));
+        // at statement start / after `;` — regex
+        assert!(b("var x = 0; /a/.test('a')"));
+        // after `(` — regex
+        assert!(b("var x = 'a'; if (/a/.test(x)) { x = 1; } x === 1"));
+        // after `return` — regex
+        assert!(b("function f() { return /\\d/.test('7'); } f()"));
+        // after `,` — regex
+        assert!(b("var a = 1, r = /x/; r.test('x')"));
+        // after `:` and `?` — regex
+        assert!(b("var o = {re: /z/}; o.re.test('z')"));
+        assert!(b("var v = true ? /y/.test('y') : false; v"));
+        // after operator — regex
+        assert!(b("var t = !/q/.test('a'); t"));
+        assert!(b("var t = /a/.test('a') && /b/.test('b'); t"));
+        // after `=>` — regex
+        assert!(b("var f = () => /w/.test('w'); f()"));
+        // division still works in operand contexts
+        assert_eq!(num("var a = 10; a / 2"), 5.0);
+        assert_eq!(num("var a = 20, b = 4; a / b / 2"), 2.5);
+        assert_eq!(num("var x = 8, y = 2, z = x / y; z / 2"), 2.0);
+        assert_eq!(num("(10 + 2) / 3"), 4.0);
+        assert_eq!(num("var r = /x/; 8 / 4"), 2.0);
+        // `/=` division-assign vs regex starting with `=`
+        assert_eq!(num("var a = 10; a /= 2; a"), 5.0);
+        assert!(b("var r = /=x+/; r.test('=xx')"));
+        // regex after `)` of a call stays division
+        assert_eq!(num("function t(){return 9} var q = t() / 3; q"), 3.0);
+    }
+
+    #[test]
+    fn regex_basics() {
+        assert!(b("/abc/.test('xxabcxx')"));
+        assert!(!b("/abc/.test('ab')"));
+        assert!(b("/a.c/.test('axc')"));
+        assert!(!b("/a.c/.test('a\\nc')")); // . excludes newline
+        assert!(b("/a.c/s.test('a\\nc')")); // dotAll
+        assert!(b("/^[a-z]+$/.test('hello')"));
+        assert!(!b("/^[a-z]+$/.test('hello9')"));
+        assert!(b("/^b/m.test('a\\nb')"));
+        assert!(b("/d$/m.test('c\\nd')"));
+    }
+
+    #[test]
+    fn regex_classes_and_escapes() {
+        assert!(b("/[aeiou]/.test('bad')"));
+        assert!(!b("/[aeiou]/.test('bcdfg')"));
+        assert!(b("/[^aeiou]/.test('bcd')"));
+        assert!(b("/[a-z]+/.test('HELLOabc')"));
+        assert!(b("/\\d{3}-\\d{4}/.test('call 555-1234')"));
+        assert!(b("/\\w+/.test('  hi_9 ')"));
+        assert!(b("/\\s/.test('a b')"));
+        assert!(b("/\\S+/.test('  x  ')"));
+        assert!(b("/[=:]/.test('a=b')"));
+        assert!(b("/\\/+/.test('a//b')"));
+        assert!(b("/\\bword\\b/.test('a word here')"));
+        assert!(!b("/\\bword\\b/.test('swordfish')"));
+        assert!(b("/\\x41\\u0042/.test('AB')"));
+    }
+
+    #[test]
+    fn regex_quantifiers() {
+        assert!(b("/ab*c/.test('abbbbc')"));
+        assert!(b("/ab+c/.test('abc')"));
+        assert!(!b("/ab+c/.test('ac')"));
+        assert!(b("/ab?c/.test('ac')"));
+        assert!(b("/a{2,3}b/.test('aab')"));
+        assert!(!b("/a{2,3}b/.test('ab')"));
+        assert!(!b("/^a{2,3}b$/.test('aaaab')"));
+        assert!(b("/a{2,3}b/.test('aaaab')")); // 'aaab' contains a{3}+b
+        assert!(b("/a{2,}b/.test('aaaab')"));
+        assert!(b("/a{2}b/.test('aab')"));
+        // lazy
+        assert_eq!(s("'<ab>'.match(/<(.+?)>/)[1]"), "ab");
+        assert_eq!(s("'<<a>>'.match(/<(.+?)>/)[1]"), "<a");
+        assert_eq!(s("'aaa'.match(/a+?/)[0]"), "a");
+        assert_eq!(s("'aaa'.match(/a+?a/)[0]"), "aa");
+        assert_eq!(s("'<x><y>'.match(/<.*>/)[0]"), "<x><y>");
+        assert_eq!(s("'<x><y>'.match(/<.*?>/)[0]"), "<x>");
+        // alternation + groups
+        assert!(b("/cat|dog/.test('i have a dog')"));
+        assert_eq!(s("'abab'.match(/(ab|cd)+/)[0]"), "abab");
+        assert!(b("/(ab)+/.test('ababab')"));
+    }
+
+    #[test]
+    fn regex_groups_and_backrefs() {
+        assert_eq!(s("var m = /(\\d+)-(\\d+)/.exec('12-34'); m[1] + '/' + m[2]"), "12/34");
+        assert_eq!(num("var m = /b(c)/.exec('abc'); m.index"), 1.0);
+        assert_eq!(s("var m = /b(c)/.exec('abc'); m.input"), "abc");
+        assert!(b("/(a|b)\\1/.test('aa')"));
+        assert!(!b("/(a|b)\\1/.test('ab')"));
+        assert!(b("/(\\w+)\\s+\\1/.test('hello hello')"));
+        // non-capture group isn't counted
+        assert_eq!(s("var m = /(?:a)(b)/.exec('ab'); m.length + ':' + m[1]"), "2:b");
+        // named groups
+        assert_eq!(
+            s("var m = /(?<yr>\\d{4})-(?<mo>\\d{2})/.exec('2024-05'); m.groups.yr + '/' + m.groups.mo"),
+            "2024/05"
+        );
+        assert_eq!(num("var m = /(?<x>a)/.exec('a'); m.index"), 0.0);
+        // lookahead
+        assert!(b("/a(?=b)/.test('ab')"));
+        assert!(!b("/a(?=b)/.test('ac')"));
+        assert!(b("/a(?!b)/.test('ac')"));
+        assert_eq!(s("'a1b2'.match(/[a-z](?=\\d)/)[0]"), "a");
+    }
+
+    #[test]
+    fn regex_case_insensitive() {
+        assert!(b("/AbC/i.test('xxaBcxx')"));
+        assert!(b("/[a-z]+/i.test('HELLO')"));
+        assert!(b("new RegExp('x', 'i').test('X')"));
+    }
+
+    #[test]
+    fn regex_exec_result_and_lastindex() {
+        assert!(b("var m = /x/.exec('nope'); m === null"));
+        assert_eq!(s("var m = /b/.exec('abc'); m[0]"), "b");
+        assert_eq!(num("var m = /b/.exec('abc'); m.length"), 1.0);
+        // global exec advances lastIndex
+        assert_eq!(
+            num("var re = /a/g; re.exec('aa'); re.lastIndex"),
+            1.0
+        );
+        assert_eq!(
+            num("var re = /a/g; re.exec('aa'); re.exec('aa'); re.lastIndex"),
+            2.0
+        );
+        // exhausted → null + lastIndex reset to 0
+        assert_eq!(
+            num("var re = /a/g; re.exec('aa'); re.exec('aa'); re.exec('aa'); re.lastIndex"),
+            0.0
+        );
+        // test() also advances
+        assert_eq!(
+            num("var re = /b/g; re.test('ab'); re.test('ab'); re.lastIndex"),
+            0.0
+        );
+        // lastIndex honored as start
+        assert_eq!(
+            num("var re = /a/g; re.lastIndex = 2; var m = re.exec('aaxa'); m.index"),
+            3.0
+        );
+        // non-global ignores lastIndex
+        assert_eq!(num("var re = /a/; re.lastIndex = 5; var m = re.exec('a'); m.index"), 0.0);
+    }
+
+    #[test]
+    fn regex_object_props() {
+        assert_eq!(s("/a+/gi.source"), "a+");
+        assert_eq!(s("/a+/gi.flags"), "gi");
+        assert_eq!(s("/a+/yims.toString()"), "/a+/imsy");
+        assert!(b("/x/g.global"));
+        assert!(!b("/x/.global"));
+        assert!(b("/x/i.ignoreCase"));
+        assert!(b("typeof /x/.test === 'function'"));
+        assert_eq!(s("var r = new RegExp('\\\\d+', 'g'); r.source"), "\\d+");
+        assert_eq!(s("var r = RegExp('a+'); r.test('aaa') ? 'y' : 'n'"), "y");
+        // literal evaluates to RegExp instance
+        assert!(b("/x/ instanceof RegExp"));
+        assert_eq!(s("/x/.toString()"), "/x/");
+    }
+
+    #[test]
+    fn string_match_regex() {
+        // non-global → exec result
+        assert_eq!(s("var m = 'a1b2'.match(/\\d/); m[0] + '@' + m.index"), "1@1");
+        // global → all match strings
+        assert_eq!(s("'a1b2c3'.match(/\\d/g).join(',')"), "1,2,3");
+        assert_eq!(num("'hello'.match(/z/g) === null ? 1 : 0"), 1.0);
+        assert_eq!(num("'aXbXc'.match(/X/g).length"), 2.0);
+        // match with groups+global gives whole matches only
+        assert_eq!(s("'a1b2'.match(/(\\w)(\\d)/g).join(',')"), "a1,b2");
+        // matchAll → iterator of exec results
+        assert_eq!(
+            s("var out = []; for (var m of 'a1b2'.matchAll(/(\\w)(\\d)/g)) out.push(m[2]); out.join(',')"),
+            "1,2"
+        );
+        // matchAll requires global
+        assert!(eval("'x'.matchAll(/x/)").is_err());
+        // string arg is a pattern
+        assert_eq!(s("'abc'.match('b')[0]"), "b");
+        // Symbol.match plumbing: non-g → exec result, g → all matches
+        assert_eq!(s("/\\d+/[Symbol.match]('a12b34')[0]"), "12");
+        assert_eq!(s("/\\d+/g[Symbol.match]('a12b34').join('-')"), "12-34");
+    }
+
+    #[test]
+    fn string_search_regex() {
+        assert_eq!(num("'hello'.search(/l+/)"), 2.0);
+        assert_eq!(num("'hello'.search(/z/)"), -1.0);
+        assert_eq!(num("'aXb'.search(/x/i)"), 1.0);
+        assert_eq!(num("'hello'.search('l+')"), 2.0); // string arg as pattern
+    }
+
+    #[test]
+    fn string_replace_regex() {
+        // basic non-global: first only
+        assert_eq!(s("'aaa'.replace(/a/, 'b')"), "baa");
+        // global: all
+        assert_eq!(s("'aaa'.replace(/a/g, 'b')"), "bbb");
+        // the blocker pattern
+        assert_eq!(s("'k=v:x'.replace(/[=:]/g, '-')"), "k-v-x");
+        // capture groups in replacement
+        assert_eq!(s("'2024-05'.replace(/(\\d+)-(\\d+)/, '$2/$1')"), "05/2024");
+        // $& = whole match, $` = before, $' = after
+        assert_eq!(s("'abc'.replace(/b/, '[$&]')"), "a[b]c");
+        assert_eq!(s("'abc'.replace(/b/, '<$`>')"), "a<a>c");
+        assert_eq!(s("'abc'.replace(/b/, '<$\\'>')"), "a<c>c");
+        assert_eq!(s("'abc'.replace(/b/, '$$x')"), "a$xc");
+        // function replacer (match, p1..pn, offset, string)
+        assert_eq!(
+            s("'a=1'.replace(/([a-z])=(\\d)/g, function(m, k, v) { return k + ':' + (v * 2); })"),
+            "a:2"
+        );
+        assert_eq!(
+            s("'x1y2'.replace(/\\d/g, function(m, off) { return '(' + m + '@' + off + ')'; })"),
+            "x(1@1)y(2@3)"
+        );
+        // named group $<name>
+        assert_eq!(
+            s("'a5'.replace(/(?<d>\\d)/, '#$<d>#')"),
+            "a#5#"
+        );
+        // replaceAll with regex needs /g
+        assert_eq!(s("'a1b2'.replaceAll(/\\d/g, '_')"), "a_b_");
+        assert!(eval("'x'.replaceAll(/x/, 'y')").is_err());
+        // replace with no match → same string
+        assert_eq!(s("'abc'.replace(/z/, 'x')"), "abc");
+        // empty-match replace
+        assert_eq!(s("'ab'.replace(/x*/g, '-')"), "-a-b-");
+    }
+
+    #[test]
+    fn string_split_regex() {
+        assert_eq!(s("'a1b2c'.split(/\\d/).join('|')"), "a|b|c");
+        assert_eq!(s("'a  b   c'.split(/\\s+/).join('|')"), "a|b|c");
+        // captures are spliced in per spec
+        assert_eq!(s("'a1b2'.split(/(\\d)/).join('|')"), "a|1|b|2|");
+        // limit
+        assert_eq!(num("'a1b2c3'.split(/\\d/, 2).length"), 2.0);
+        // no match → whole string
+        assert_eq!(s("'abc'.split(/z/).join('|')"), "abc");
+        // string sep still works
+        assert_eq!(num("'a,b,c'.split(',').length"), 3.0);
+        assert_eq!(s("'aXbXc'.split('X').join('-')"), "a-b-c");
+    }
+
+    #[test]
+    fn regex_sticky_and_more() {
+        // sticky: anchored at lastIndex
+        assert_eq!(num("var re = /b/y; re.lastIndex = 1; var m = re.exec('abc'); m === null ? -1 : m.index"), 1.0);
+        assert!(b("var re = /b/y; re.lastIndex = 0; re.exec('abc') === null"));
+        // unicode + d flags tolerated
+        assert!(b("/a/u.test('a')"));
+        assert!(b("/a/d.test('a')"));
+        // dot-all + multiline combo
+        assert!(b("/a.b/s.test('a\\nb')"));
+        // toPrimitive/toString concat
+        assert_eq!(s("'' + /x/g"), "/x/g");
+    }
+
+    #[test]
+    fn regex_catastrophic_backtrack_guard() {
+        // classic exponential pattern — must return quickly (step cap), not hang
+        let t = std::time::Instant::now();
+        let r = eval("var re = /(a+)+$/; re.test('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaX')");
+        assert!(r.is_ok());
+        assert!(matches!(r.unwrap(), Value::Bool(false)));
+        assert!(t.elapsed().as_secs() < 20);
+        // another: nested quantifier over long-ish input
+        let r = eval("var re = /(.*)*b/; re.test('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')");
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn regex_edge_patterns() {
+        // empty pattern → char split (per spec sticky-exec algorithm)
+        assert_eq!(num("'ab'.split(/(?:)/).length"), 2.0);
+        assert_eq!(s("'ab'.split(/(?:)/).join('|')"), "a|b");
+        assert_eq!(s("'ab'.split(/b?/).join('|')"), "a|");
+        assert_eq!(s("'axb'.split(/x*/).join('|')"), "a|b");
+        assert_eq!(s("'aXbX'.split(/X/).join('|')"), "a|b|");
+        // empty class matches nothing
+        assert!(!b("/[]/.test('a')"));
+        assert!(b("/[^]/.test('a')"));
+        // alternation with empty arm
+        assert!(b("/a|/.test('zzz')"));
+        // regex in template / call args / arrays / objects
+        assert!(b("var f = (r) => r.test('a'); f(/a/)"));
+        assert!(b("var arr = [/a/, /b/]; arr[0].test('a') && arr[1].test('b')"));
+        // regex literal inside class method body
+        assert_eq!(
+            num("class C { ok() { return /\\d/.test('5') ? 1 : 0; } } new C().ok()"),
+            1.0
+        );
+        // case keyword
+        assert_eq!(
+            num("var r = 0; switch (true) { case /a/.test('a'): r = 1; break; } r"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn regex_from_bundle_patterns() {
+        // patterns actually seen in minified bundles
+        assert!(b("var j = /\\/+/g; j.test('a//b')"));
+        assert_eq!(s("'a=b:c'.replace(/[=:]/g, function(m) { return m === '=' ? '1' : '2'; })"), "a1b2c");
+        assert!(b("/^https?:\\/\\//.test('https://x.com')"));
+        assert!(b("/[\\w-]+/.test('some-thing_9')"));
+        assert_eq!(s("'fooBar'.replace(/([A-Z])/g, '-$1').toLowerCase()"), "foo-bar");
+        assert!(b("/function\\s*\\(/.test('function (x)')"));
+        assert_eq!(num("'color: rgb(1, 2, 3)'.match(/rgb\\((\\d+), (\\d+), (\\d+)\\)/).length"), 4.0);
+        assert_eq!(
+            s("'a\\nb\\nc'.split(/\\n/).join(';')"),
+            "a;b;c"
+        );
+        // common idiom: strip trailing slash
+        assert_eq!(s("'path/'.replace(/\\/+$/, '')"), "path");
+        // camelCase → kebab via function
+        assert_eq!(
+            s("'backgroundColor'.replace(/[A-Z]/g, function(c) { return '-' + c.toLowerCase(); })"),
+            "background-color"
+        );
     }
 
     #[test]

@@ -9,6 +9,12 @@ use std::rc::Rc;
 pub const SYM_ITERATOR: u64 = 1;
 pub const SYM_TOPRIMITIVE: u64 = 2;
 pub const SYM_TOSTRINGTAG: u64 = 3;
+pub const SYM_HASINSTANCE: u64 = 4;
+pub const SYM_MATCH: u64 = 5;
+pub const SYM_REPLACE: u64 = 6;
+pub const SYM_SPLIT: u64 = 7;
+pub const SYM_SEARCH: u64 = 8;
+pub const SYM_MATCHALL: u64 = 9;
 const REST_PAT_KEY: &str = "\u{0}rest";
 
 // ---------------------------------------------------------------------------
@@ -193,6 +199,8 @@ pub enum ObjKind {
     Host(Rc<str>),
     Map(Vec<(Value, Value)>),
     Set(Vec<Value>),
+    /// compiled regular expression
+    Regex(Rc<crate::regexp::Regex>),
 }
 
 #[derive(Clone)]
@@ -290,6 +298,7 @@ pub struct Protos {
     pub ref_error: ObjRef,
     pub promise: ObjRef,
     pub iterator: ObjRef,
+    pub regexp: ObjRef,
     pub global: ObjRef,
 }
 
@@ -337,6 +346,7 @@ impl Interp {
                 ref_error: mk(Some(obj.clone())),
                 promise: mk(Some(obj.clone())),
                 iterator: mk(Some(obj.clone())),
+                regexp: mk(Some(obj.clone())),
                 global: mk(Some(obj.clone())),
                 obj,
                 func,
@@ -522,6 +532,25 @@ impl Interp {
             Some(self.p.array.clone()),
             ObjKind::Arr(items),
         )))
+    }
+    /// Compile `pattern`/`flags` and build a RegExp object.
+    pub fn make_regexp(&mut self, pattern: &str, flags: &str) -> ERes {
+        match crate::regexp::Regex::compile(pattern, flags) {
+            Ok(re) => {
+                let o = Rc::new(RefCell::new(Obj::new(
+                    Some(self.p.regexp.clone()),
+                    ObjKind::Regex(re),
+                )));
+                o.borrow_mut().props.insert(
+                    PropKey::from_str("lastIndex"),
+                    Prop::builtin(Value::Num(0.0)),
+                );
+                Ok(Value::Obj(o))
+            }
+            Err(e) => Err(
+                self.syntax_err(format!("Invalid regular expression: /{pattern}/: {e}"))
+            ),
+        }
     }
     pub fn set_data(&self, o: &ObjRef, key: &str, v: Value) {
         o.borrow_mut()
@@ -1091,6 +1120,14 @@ impl Interp {
                         PromiseState::Fulfilled(_) => "Promise { <fulfilled> }".into(),
                         PromiseState::Rejected(_) => "Promise { <rejected> }".into(),
                     },
+                    ObjKind::Regex(re) => {
+                        let src = if re.source.is_empty() {
+                            "(?:)".to_string()
+                        } else {
+                            re.source.clone()
+                        };
+                        format!("/{src}/{}", re.flags)
+                    }
                     ObjKind::Iter { .. } => "[Iterator]".into(),
                     ObjKind::Map(m) => format!("Map({})", m.len()),
                     ObjKind::Set(s) => format!("Set({})", s.len()),
@@ -2287,6 +2324,7 @@ impl Interp {
                 Ok(v)
             }
             Expr::Super => Err(self.syntax_err("'super' keyword unexpected here")),
+            Expr::Regex { pattern, flags } => self.make_regexp(pattern, flags),
             Expr::Template(parts) => {
                 let mut s = String::new();
                 for p in parts {

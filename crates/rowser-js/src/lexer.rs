@@ -11,6 +11,9 @@ pub enum Tok {
     Ident(String),
     Kw(Kw),
     Punct(&'static str),
+    /// regex literal `/pattern/flags` — produced when a `/` appears where an
+    /// expression cannot continue (see `slash_is_regex`)
+    Regex { pattern: String, flags: String },
     Eof,
 }
 
@@ -309,6 +312,18 @@ impl Lexer {
                 match keyword(&name) {
                     Some(kw) => Tok::Kw(kw),
                     None => Tok::Ident(name),
+                }
+            } else if c == '#' {
+                // `#name` — private class member / brand check (`#x in obj`)
+                self.bump();
+                let name = self.ident();
+                Tok::Ident(format!("#{name}"))
+            } else if c == '/' && slash_is_regex(out.last()) {
+                // regex-literal context; if the scan fails (e.g. it was
+                // actually division), fall back to punct tokenization
+                match self.try_regex() {
+                    Some(t) => t,
+                    None => self.punct()?,
                 }
             } else {
                 self.punct()?
@@ -679,6 +694,77 @@ impl Lexer {
         }
     }
 
+    /// Try to scan `/pattern/flags` starting at the current `/`.
+    /// Returns None (and rewinds) if no unescaped, in-line `/` is found —
+    /// the caller then treats the `/` as division.
+    fn try_regex(&mut self) -> Option<Tok> {
+        let (si, sl, sc, sn) = (self.i, self.line, self.col, self.newline);
+        self.bump(); // leading /
+        let mut pattern = String::new();
+        let mut in_class = false;
+        loop {
+            match self.peek() {
+                None => {
+                    self.rewind(si, sl, sc, sn);
+                    return None;
+                }
+                Some('\n') | Some('\r') => {
+                    self.rewind(si, sl, sc, sn);
+                    return None;
+                }
+                Some('\\') => {
+                    self.bump();
+                    match self.peek() {
+                        Some('\n') | Some('\r') | None => {
+                            self.rewind(si, sl, sc, sn);
+                            return None;
+                        }
+                        Some(e) => {
+                            pattern.push('\\');
+                            pattern.push(e);
+                            self.bump();
+                        }
+                    }
+                }
+                Some('[') => {
+                    in_class = true;
+                    pattern.push('[');
+                    self.bump();
+                }
+                Some(']') => {
+                    in_class = false;
+                    pattern.push(']');
+                    self.bump();
+                }
+                Some('/') if !in_class => {
+                    self.bump();
+                    break;
+                }
+                Some(c) => {
+                    pattern.push(c);
+                    self.bump();
+                }
+            }
+        }
+        let mut flags = String::new();
+        while let Some(c) = self.peek() {
+            if is_ident_part(c) {
+                flags.push(c);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        Some(Tok::Regex { pattern, flags })
+    }
+
+    fn rewind(&mut self, i: usize, line: u32, col: u32, newline: bool) {
+        self.i = i;
+        self.line = line;
+        self.col = col;
+        self.newline = newline;
+    }
+
     fn punct(&mut self) -> Result<Tok, Error> {
         let rest: String = self.chars[self.i..].iter().take(4).collect();
         for p in PUNCTS {
@@ -694,6 +780,61 @@ impl Lexer {
             }
         }
         Err(self.err(format!("unexpected character `{}`", self.peek().unwrap_or('?'))))
+    }
+}
+
+/// Does a `/` after `prev` begin a regex literal? A `/` starts a regex when
+/// the previous significant token CANNOT end an expression: operators,
+/// `(` `[` `{` `,` `;` `:`, the `=` family, `=>`, or keywords like
+/// `return`/`throw`/`case`/`typeof` etc., or at file start.
+fn slash_is_regex(prev: Option<&Token>) -> bool {
+    use Kw::*;
+    match prev.map(|t| &t.tok) {
+        None => true,
+        // literals / identifiers / `)` `]` `}` `++` `--` end expressions → division
+        Some(Tok::Num(_))
+        | Some(Tok::Str(_))
+        | Some(Tok::Template(_))
+        | Some(Tok::Ident(_))
+        | Some(Tok::Regex { .. }) => false,
+        Some(Tok::Eof) => false,
+        Some(Tok::Punct(p)) => !matches!(*p, ")" | "]" | "}" | "++" | "--"),
+        Some(Tok::Kw(k)) => matches!(
+            k,
+            Return
+                | Throw
+                | Case
+                | Delete
+                | Void
+                | Typeof
+                | Instanceof
+                | In
+                | New
+                | Do
+                | Else
+                | Yield
+                | Await
+                | Break
+                | Continue
+                | Var
+                | Const
+                | Function
+                | If
+                | For
+                | While
+                | Switch
+                | Try
+                | Catch
+                | Finally
+                | Class
+                | Extends
+                | Import
+                | Export
+                | Debugger
+        ),
+        // keywords NOT listed can end an expression (`this`, literals) or act
+        // as contextual identifiers (`let`, `of`, `as`, `get`, `set`,
+        // `static`, `async`, `from`) → division
     }
 }
 
