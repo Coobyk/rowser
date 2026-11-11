@@ -246,7 +246,8 @@ pub fn paint_into(
             | DisplayItem::RoundedRect2 { y, h, .. }
             | DisplayItem::BorderSide { y, h, .. }
             | DisplayItem::Raster { y, h, .. }
-            | DisplayItem::Image { y, h, .. } => (*y, *y + *h),
+            | DisplayItem::Image { y, h, .. }
+            | DisplayItem::BgImage { y, h, .. } => (*y, *y + *h),
             DisplayItem::Text { baseline, size, .. } => {
                 (baseline - size * 4.0, baseline + size * 4.0)
             }
@@ -279,6 +280,18 @@ pub fn paint_into(
                         0xffe8e8e8,
                     );
                 }
+            }
+            DisplayItem::BgImage {
+                x, y, w, h, px, py, pw, ph, mode, sw, sh, fx, ax, fy, ay, rx, ry, src,
+            } => {
+                if let Some(img) = images.get(src) {
+                    canvas.blit_tiled(
+                        img, *x, *y, *w, *h, *px, *py, *pw, *ph, *mode, *sw, *sh,
+                        *fx, *ax, *fy, *ay, *rx, *ry,
+                    );
+                }
+                // undecoded/failed image: paint nothing — the element's
+                // background-color still shows through
             }
             DisplayItem::FillRect { x, y, w, h, color } => {
                 canvas.fill_rect(*x as i32, *y as i32, *w as u32, *h as u32, *color);
@@ -575,6 +588,179 @@ impl Canvas {
                 } else if a > 0 {
                     let inv = 255 - a;
                     self.pixels[di] = ((b as u32 * a + self.pixels[di] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 1] =
+                        ((g as u32 * a + self.pixels[di + 1] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 2] =
+                        ((r as u32 * a + self.pixels[di + 2] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 3] = 255;
+                }
+            }
+        }
+    }
+
+    /// Tiled `background-image`/object-fit blit. `img` scales to a (tw,th)
+    /// tile resolved here from the natural size, then tiles grid over the
+    /// positioning area and clip to (x,y,w,h). See `DisplayItem::BgImage`
+    /// for the field semantics; `space` approximates as `repeat`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_tiled(
+        &mut self,
+        img: &Image,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        px: f32,
+        py: f32,
+        pw: f32,
+        ph: f32,
+        mode: u8,
+        sw: f32,
+        sh: f32,
+        fx: f32,
+        ax: f32,
+        fy: f32,
+        ay: f32,
+        rx: u8,
+        ry: u8,
+    ) {
+        let (nw, nh) = (img.width as f32, img.height as f32);
+        if nw <= 0.0 || nh <= 0.0 || w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        // tile size: explicit axes fall back to natural size / aspect ratio
+        let (mut tw, mut th) = match mode {
+            1 => {
+                let s = (pw / nw).max(ph / nh);
+                (nw * s, nh * s)
+            }
+            2 => {
+                let s = (pw / nw).min(ph / nh);
+                (nw * s, nh * s)
+            }
+            3 => {
+                let s = (pw / nw).min(ph / nh).min(1.0);
+                (nw * s, nh * s)
+            }
+            _ => {
+                let tw = if sw >= 0.0 {
+                    sw
+                } else if sh >= 0.0 {
+                    nw * sh / nh
+                } else {
+                    nw
+                };
+                let th = if sh >= 0.0 {
+                    sh
+                } else if sw >= 0.0 {
+                    nh * tw / nw
+                } else {
+                    nh
+                };
+                (tw, th)
+            }
+        };
+        if tw <= 0.0 || th <= 0.0 {
+            return;
+        }
+        // `round`: the tile stretches so a whole number fits the area
+        if rx == 3 {
+            tw = pw / (pw / tw).round().max(1.0);
+        }
+        if ry == 3 {
+            th = ph / (ph / th).round().max(1.0);
+        }
+        let ox = px + fx * (pw - tw) + ax;
+        let oy = py + fy * (ph - th) + ay;
+        let (cx0, cy0) = (x as i32, y as i32);
+        let (cx1, cy1) = ((x + w).ceil() as i32, (y + h).ceil() as i32);
+        // first tile index that can intersect the clip rect
+        let kx0 = if rx != 0 { ((x - ox) / tw).floor() as i32 } else { 0 };
+        let ky0 = if ry != 0 { ((y - oy) / th).floor() as i32 } else { 0 };
+        let mut ti = ky0;
+        loop {
+            let ty = oy + ti as f32 * th;
+            if ty >= y + h {
+                break;
+            }
+            if ry != 0 || ti == 0 {
+                let mut tj = kx0;
+                loop {
+                    let tx = ox + tj as f32 * tw;
+                    if tx >= x + w {
+                        break;
+                    }
+                    if tx + tw > x && ty + th > y {
+                        self.blit_clip(
+                            img,
+                            tx as i32,
+                            ty as i32,
+                            tw.ceil() as i32,
+                            th.ceil() as i32,
+                            cx0,
+                            cy0,
+                            cx1,
+                            cy1,
+                        );
+                    }
+                    if rx == 0 {
+                        break;
+                    }
+                    tj += 1;
+                }
+            }
+            if ry == 0 {
+                break;
+            }
+            ti += 1;
+        }
+    }
+
+    /// `blit` clipped to a destination rect — used for `background-clip`.
+    #[allow(clippy::too_many_arguments)]
+    fn blit_clip(
+        &mut self,
+        img: &Image,
+        dx: i32,
+        dy: i32,
+        dw: i32,
+        dh: i32,
+        cx0: i32,
+        cy0: i32,
+        cx1: i32,
+        cy1: i32,
+    ) {
+        if img.width == 0 || img.height == 0 || dw <= 0 || dh <= 0 {
+            return;
+        }
+        let (cw, ch) = (self.width as i32, self.height as i32);
+        let x_lo = dx.max(cx0).max(0);
+        let x_hi = (dx + dw).min(cx1).min(cw);
+        let y_lo = dy.max(cy0).max(0);
+        let y_hi = (dy + dh).min(cy1).min(ch);
+        for yy in y_lo..y_hi {
+            let sy =
+                ((yy - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
+            for xx in x_lo..x_hi {
+                let sx =
+                    ((xx - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
+                let si = ((sy * img.width + sx) * 4) as usize;
+                let di = ((yy * cw + xx) * 4) as usize;
+                let (b, g, r, a) = (
+                    img.pixels[si],
+                    img.pixels[si + 1],
+                    img.pixels[si + 2],
+                    img.pixels[si + 3] as u32,
+                );
+                if a == 255 {
+                    self.pixels[di] = b;
+                    self.pixels[di + 1] = g;
+                    self.pixels[di + 2] = r;
+                    self.pixels[di + 3] = 255;
+                } else if a > 0 {
+                    let inv = 255 - a;
+                    self.pixels[di] =
+                        ((b as u32 * a + self.pixels[di] as u32 * inv) / 255) as u8;
                     self.pixels[di + 1] =
                         ((g as u32 * a + self.pixels[di + 1] as u32 * inv) / 255) as u8;
                     self.pixels[di + 2] =

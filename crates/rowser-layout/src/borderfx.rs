@@ -615,9 +615,10 @@ pub fn emit_outline(out: &mut Vec<DisplayItem>, x: f32, y: f32, w: f32, h: f32, 
 }
 
 /// Full box chrome in one pass: outer shadows (reversed — the first CSS
-/// shadow is topmost) → bg → inset shadows → borders → [clip →] `inner`
-/// [→ pop] → outline. `inner` holds the box's laid children in the same
-/// coordinate space (grid/table/inline-block payloads).
+/// shadow is topmost) → bg → `layers` (bg-image/gradient items) → inset
+/// shadows → borders → [clip →] `inner` [→ pop] → outline. `inner` holds
+/// the box's laid children in the same coordinate space (grid/table/
+/// inline-block payloads).
 #[allow(clippy::too_many_arguments)]
 pub fn emit_box(
     out: &mut Vec<DisplayItem>,
@@ -631,6 +632,7 @@ pub fn emit_box(
     shadows: &[BoxShadow],
     clip: bool,
     outline: Option<&Outline>,
+    layers: Vec<DisplayItem>,
     inner: Vec<DisplayItem>,
 ) {
     for s in shadows.iter().filter(|s| !s.inset).rev() {
@@ -639,6 +641,7 @@ pub fn emit_box(
     if let Some(col) = bg {
         out.push(bg_item(x, y, w, h, col, radii));
     }
+    out.extend(layers);
     for s in shadows.iter().filter(|s| s.inset).rev() {
         out.push(shadow_item(s, x, y, w, h, radii));
     }

@@ -640,13 +640,16 @@ fn decode_svg(body: &[u8]) -> Option<rowser_image::Image> {
     fn missing_srcs(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for it in &self.items {
-            if let rowser_layout::DisplayItem::Image { src, .. } = it {
-                if !self.images.contains_key(src)
-                    && !self.img_failed.contains(src)
-                    && !out.contains(src)
-                {
-                    out.push(src.clone());
-                }
+            let src = match it {
+                rowser_layout::DisplayItem::Image { src, .. }
+                | rowser_layout::DisplayItem::BgImage { src, .. } => src,
+                _ => continue,
+            };
+            if !self.images.contains_key(src)
+                && !self.img_failed.contains(src)
+                && !out.contains(src)
+            {
+                out.push(src.clone());
             }
         }
         out
@@ -1129,9 +1132,18 @@ fn compute_selection(
 fn sheet_pins_scroll(sheet: &rowser_css::StyleSheet) -> bool {
     sheet.rules.iter().any(|r| {
         r.decls.iter().any(|d| {
-            d.prop.trim().eq_ignore_ascii_case("position") && {
-                let v = d.value.trim().to_ascii_lowercase();
-                matches!(v.as_str(), "fixed" | "sticky") || v.contains("var(")
+            let p = d.prop.trim().to_ascii_lowercase();
+            let v = d.value.trim().to_ascii_lowercase();
+            match p.as_str() {
+                "position" => {
+                    matches!(v.as_str(), "fixed" | "sticky") || v.contains("var(")
+                }
+                // background-attachment:fixed pins the same way — the page
+                // must relayout on scroll for the fixed positioning area
+                "background" | "background-attachment" => v
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                    .any(|t| t == "fixed"),
+                _ => false,
             }
         })
     })
@@ -1141,11 +1153,15 @@ fn sheet_pins_scroll(sheet: &rowser_css::StyleSheet) -> bool {
 fn style_attr_pins(style: &str) -> bool {
     style.split(';').any(|d| {
         let Some((k, v)) = d.split_once(':') else { return false };
-        if !k.trim().eq_ignore_ascii_case("position") {
-            return false;
-        }
+        let k = k.trim().to_ascii_lowercase();
         let v = v.trim().to_ascii_lowercase();
-        matches!(v.as_str(), "fixed" | "sticky") || v.contains("var(")
+        match k.as_str() {
+            "position" => matches!(v.as_str(), "fixed" | "sticky") || v.contains("var("),
+            "background" | "background-attachment" => v
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .any(|t| t == "fixed"),
+            _ => false,
+        }
     })
 }
 
@@ -1162,6 +1178,10 @@ fn shift_item_y(it: &mut rowser_layout::DisplayItem, dy: f32) {
         | D::PushClip { y, .. }
         | D::Raster { y, .. }
         | D::Image { y, .. } => *y += dy,
+        D::BgImage { y, py, .. } => {
+            *y += dy;
+            *py += dy;
+        }
         D::PopClip => {}
     }
 }

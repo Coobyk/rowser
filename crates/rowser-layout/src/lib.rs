@@ -13,6 +13,7 @@
 use rowser_css as css;
 mod borderfx;
 pub mod svg;
+mod bgimg;
 
 use borderfx::{Borders, BoxShadow, Outline, RadiusSpec};
 
@@ -151,6 +152,34 @@ pub enum DisplayItem {
     },
     /// End the most recent `PushClip`.
     PopClip,
+    /// `background-image` layer / `object-fit` image: the decoded bitmap
+    /// `src` is tiled over the clip rect (x,y,w,h). Tile geometry resolves
+    /// in paint once the natural size is known:
+    ///  - (px,py,pw,ph): positioning area (background-origin/object box)
+    ///  - mode: 0 = tile size (sw,sh; <0 = auto/natural), 1 = cover,
+    ///    2 = contain, 3 = scale-down
+    ///  - tile origin per axis = pa + f*(pa - tile) + a
+    ///  - rx/ry: 0 no-repeat, 1 repeat, 2 space(≈repeat), 3 round
+    BgImage {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        px: f32,
+        py: f32,
+        pw: f32,
+        ph: f32,
+        mode: u8,
+        sw: f32,
+        sh: f32,
+        fx: f32,
+        ax: f32,
+        fy: f32,
+        ay: f32,
+        rx: u8,
+        ry: u8,
+        src: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1793,6 +1822,28 @@ fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             radii,
         },
         DisplayItem::PopClip => DisplayItem::PopClip,
+        DisplayItem::BgImage {
+            x, y, w, h, px, py, pw, ph, mode, sw, sh, fx, ax, fy, ay, rx, ry, src,
+        } => DisplayItem::BgImage {
+            x: x + dx,
+            y: y + dy,
+            w,
+            h,
+            px: px + dx,
+            py: py + dy,
+            pw,
+            ph,
+            mode,
+            sw,
+            sh,
+            fx,
+            ax,
+            fy,
+            ay,
+            rx,
+            ry,
+            src,
+        },
     }
 }
 
@@ -1832,6 +1883,9 @@ struct BlockPatch {
     /// overflow clip — last slot is a PushClip on the padding box
     clip: bool,
     outline: Option<Outline>,
+    /// parsed `background-*` layers + box metrics, emitted at
+    /// `finish_patch` once the box height is known
+    bgl: Option<bgimg::BoxBgs>,
 }
 
 pub struct Layouter<'a> {
@@ -1887,6 +1941,12 @@ pub struct Layouter<'a> {
     /// cells) resolve against it; propagated to auto-height children so a
     /// `h-full` chain still finds the nearest definite ancestor
     pct_h: Option<f32>,
+    /// viewport width (the width passed to `layout`) for vw units and
+    /// `background-attachment:fixed` positioning areas
+    viewport_w: f32,
+    /// element whose background propagated to the canvas (its own bg-image
+    /// layers are skipped — they're already painted viewport-wide)
+    canvas_bg_node: Option<NodeId>,
 }
 
 impl<'a> Layouter<'a> {
@@ -1940,6 +2000,8 @@ impl<'a> Layouter<'a> {
             hits: Vec::new(),
             backdrop: WHITE,
             pct_h: None,
+            viewport_w: width,
+            canvas_bg_node: None,
         };
         l.preresolve_styles();
         // css-backgrounds §2.11: the canvas takes the root element's
@@ -1947,25 +2009,55 @@ impl<'a> Layouter<'a> {
         // edge-to-edge so the body margin doesn't show a white frame
         for &el in l.doc.children(l.doc.root) {
             if l.doc.tag(el) == Some("html") {
-                let p = l.style(el);
+                let mut p = l.style(el);
                 let mut canvas_bg = l.bg_of(el, &p);
-                if canvas_bg.is_none() {
+                let mut src_el: Option<NodeId> = None;
+                if canvas_bg.is_some() || bgimg::has_layers(&p) {
+                    src_el = Some(el);
+                } else {
                     for &b in l.doc.children(el) {
                         if l.doc.tag(b) == Some("body") {
                             let pb = l.style(b);
-                            canvas_bg = l.bg_of(b, &pb);
+                            if l.bg_of(b, &pb).is_some() || bgimg::has_layers(&pb) {
+                                canvas_bg = l.bg_of(b, &pb);
+                                p = pb;
+                                src_el = Some(b);
+                            }
                         }
                     }
                 }
-                if let Some(col) = canvas_bg {
-                    l.backdrop = col;
-                    l.items.push(DisplayItem::FillRect {
-                        x: 0.0,
-                        y: 0.0,
-                        w: width,
-                        h: viewport_h,
-                        color: col,
-                    });
+                if let Some(se) = src_el {
+                    l.canvas_bg_node = Some(se);
+                    if let Some(col) = canvas_bg {
+                        l.backdrop = col;
+                        l.items.push(DisplayItem::FillRect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: width,
+                            h: viewport_h,
+                            color: col,
+                        });
+                    }
+                    let em = p
+                        .get("font-size")
+                        .map(|v| parse_font_size(v, BASE_SIZE))
+                        .unwrap_or(BASE_SIZE);
+                    let cur = p
+                        .get("color")
+                        .and_then(|v| parse_color(v))
+                        .unwrap_or(BLACK);
+                    if let Some(bgl) =
+                        bgimg::parse_box(&p, [0.0; 4], [0.0; 4], em, viewport_h, width, cur)
+                    {
+                        l.items.extend(bgimg::items_for(
+                            &bgl,
+                            0.0,
+                            0.0,
+                            width,
+                            viewport_h,
+                            (width, viewport_h),
+                        ));
+                    }
                 }
             }
         }
@@ -2151,6 +2243,7 @@ impl<'a> Layouter<'a> {
                                 }
                             }
                             DisplayItem::Image { .. }
+                            | DisplayItem::BgImage { .. }
                             | DisplayItem::PushClip { .. }
                             | DisplayItem::PopClip => {}
                         }
@@ -2319,6 +2412,22 @@ impl<'a> Layouter<'a> {
         let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let bw_h = bw_l + bw_r; // horizontal border total
         let bw_v = bw_t + bw_b; // vertical border total
+        // `background-image` layers resolve to display items at finish_patch
+        // (the final box height isn't known yet). Skip a node whose
+        // background already propagated to the canvas.
+        let bgl = if self.canvas_bg_node == Some(node) {
+            None
+        } else {
+            bgimg::parse_box(
+                c,
+                [pt, pr, pb, pl],
+                [bw_t, bw_r, bw_b, bw_l],
+                size,
+                self.viewport_h,
+                self.viewport_w,
+                st.color,
+            )
+        };
 
         if matches!(c.get("float").map(String::as_str), Some("left") | Some("right")) {
             return self.float_block(node, c, st, mt, mb);
@@ -2419,12 +2528,13 @@ impl<'a> Layouter<'a> {
         let outline = borderfx::outline(c, size, bd, st.color);
         let clip = borderfx::clips_overflow(c);
         let radii = borderfx::radius_spec(c);
-        let patch = if bg.is_some()
+        let mut patch = if bg.is_some()
             || border.is_some()
             || !shadows.is_empty()
             || outline.is_some()
             || clip
             || !radii.none()
+            || bgl.is_some()
         {
             let idx = self.items.len();
             let n_out = shadows.iter().filter(|s| !s.inset).count();
@@ -2451,6 +2561,7 @@ impl<'a> Layouter<'a> {
                 shadows,
                 clip,
                 outline,
+                bgl,
             })
         } else {
             None
@@ -2459,7 +2570,7 @@ impl<'a> Layouter<'a> {
         // padding-top + border push content down inside the painted box
         self.y += pt + bw_t;
         let content_top = self.y;
-        let children_items_start = self.items.len();
+        let mut children_items_start = self.items.len();
         let children_hits_start = self.hits.len();
         // descendants composite translucent paints over this box's bg
         let saved_bd = self.backdrop;
@@ -2581,8 +2692,8 @@ impl<'a> Layouter<'a> {
         // padding-bottom + border extend the painted box below content
         self.y += pb + bw_b;
 
-        if let Some(p) = patch.as_ref() {
-            self.finish_patch(p);
+        if let Some(p) = patch.as_mut() {
+            children_items_start += self.finish_patch(p);
             if p.clip {
                 // descendant hits outside the padding box are dropped
                 let h = self.y - p.y;
@@ -2674,6 +2785,19 @@ impl<'a> Layouter<'a> {
         let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let bw_h = bw_l + bw_r;
         let right = c.get("float").is_some_and(|v| v.trim() == "right");
+        let bgl = if self.canvas_bg_node == Some(node) {
+            None
+        } else {
+            bgimg::parse_box(
+                c,
+                [pt, pr, pb, pl],
+                [bw_t, bw_r, bw_b, bw_l],
+                size,
+                self.viewport_h,
+                self.viewport_w,
+                st.color,
+            )
+        };
 
         let inner = if let Some(w) = dim(c, "width", self.avail_w, size) {
             let w = if border_box(c) { w - pl - pr - bw_h } else { w };
@@ -2708,6 +2832,7 @@ impl<'a> Layouter<'a> {
             || outline.is_some()
             || clip
             || !radii.none()
+            || bgl.is_some()
         {
             let idx = self.items.len();
             let n_out = shadows.iter().filter(|s| !s.inset).count();
@@ -2734,6 +2859,7 @@ impl<'a> Layouter<'a> {
                 shadows,
                 clip,
                 outline,
+                bgl,
             })
         } else {
             None
@@ -2751,8 +2877,8 @@ impl<'a> Layouter<'a> {
         self.flush_line();
         self.backdrop = saved_bd;
         self.y += pb + bw_b;
-        if let Some(p) = patch {
-            self.finish_patch(&p);
+        if let Some(mut p) = patch {
+            self.finish_patch(&mut p);
             if p.clip {
                 let h = self.y - p.y;
                 let bw = p.border.map(|b| b.w).unwrap_or([0.0; 4]);
@@ -2883,6 +3009,23 @@ impl<'a> Layouter<'a> {
         let outline = borderfx::outline(c, size, bd, st.color);
         let clip = borderfx::clips_overflow(c);
         let mut out: Vec<DisplayItem> = Vec::new();
+        let layers = if self.canvas_bg_node != Some(node) {
+            bgimg::parse_box(
+                c,
+                [pt, pr, pb, pl],
+                [bw_t, bw_r, bw_b, bw_l],
+                size,
+                self.viewport_h,
+                self.viewport_w,
+                st.color,
+            )
+            .map(|bgl| {
+                bgimg::items_for(&bgl, 0.0, 0.0, box_w, box_h, (self.viewport_w, self.viewport_h))
+            })
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         borderfx::emit_box(
             &mut out,
             0.0,
@@ -2895,6 +3038,7 @@ impl<'a> Layouter<'a> {
             &shadows,
             clip,
             outline.as_ref(),
+            layers,
             items,
         );
         let nhits: Vec<_> = if clip {
@@ -2963,6 +3107,20 @@ impl<'a> Layouter<'a> {
                 st.color = over(col, b);
             }
         }
+        let tpad = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
+        let tbgl = if self.canvas_bg_node == Some(node) {
+            None
+        } else {
+            bgimg::parse_box(
+                c,
+                tpad,
+                border.map(|b| b.w).unwrap_or([0.0; 4]),
+                size,
+                self.viewport_h,
+                self.viewport_w,
+                st.color,
+            )
+        };
         // <table border=N> fallback cell borders (border="0" = none)
         let attr_border = self
             .doc
@@ -3126,6 +3284,7 @@ impl<'a> Layouter<'a> {
             || outline.is_some()
             || clip
             || !radii.none()
+            || tbgl.is_some()
         {
             let idx = self.items.len();
             let n_out = shadows.iter().filter(|s| !s.inset).count();
@@ -3152,6 +3311,7 @@ impl<'a> Layouter<'a> {
                 shadows,
                 clip,
                 outline,
+                bgl: tbgl,
             })
         } else {
             None
@@ -3173,6 +3333,7 @@ impl<'a> Layouter<'a> {
             let mut x = self.margin_x;
             let mut row_h = 0.0f32;
             let mut ci = 0usize;
+            let mut cell_bgs: Vec<Option<bgimg::BoxBgs>> = Vec::new();
             for &cell in row {
                 let span = colspan(cell).min(ncols - ci.min(ncols));
                 let cw: f32 = col_w[ci..(ci + span).min(ncols)].iter().sum();
@@ -3205,6 +3366,19 @@ impl<'a> Layouter<'a> {
                     })
                     .map(|col| over(col, bg.unwrap_or(bd)));
                 let inner = (cw - pl - pr - bw_l - bw_r).max(1.0);
+                cell_bgs.push(if self.canvas_bg_node == Some(cell) {
+                    None
+                } else {
+                    bgimg::parse_box(
+                        &cs,
+                        [pt, pr, pb, pl],
+                        [bw_t, bw_r, bw_b, bw_l],
+                        cst.size,
+                        self.viewport_h,
+                        self.viewport_w,
+                        cst.color,
+                    )
+                });
                 let (items, y_end, nhits) =
                     self.nest(cell, &cst, pl + bw_l, pt + bw_t, inner, &cs);
                 let min_h = self.eff_line_h(&cst);
@@ -3215,7 +3389,9 @@ impl<'a> Layouter<'a> {
                 row_h = row_h.max(cell_h);
             }
             // second pass: stretch cell bg/borders to row height, place content
-            for (cx, cw, _ch, cbg, cborder, cell_clip, items, mut nhits) in boxes {
+            for (i, (cx, cw, _ch, cbg, cborder, cell_clip, items, mut nhits)) in
+                boxes.into_iter().enumerate()
+            {
                 if let Some(col) = cbg {
                     self.items.push(DisplayItem::FillRect {
                         x: cx,
@@ -3224,6 +3400,16 @@ impl<'a> Layouter<'a> {
                         h: row_h,
                         color: col,
                     });
+                }
+                if let Some(bgl) = &cell_bgs[i] {
+                    self.items.extend(bgimg::items_for(
+                        bgl,
+                        cx,
+                        self.y,
+                        cw,
+                        row_h,
+                        (self.viewport_w, self.viewport_h),
+                    ));
                 }
                 if let Some(b2) = cborder {
                     borderfx::emit_borders(&mut self.items, cx, self.y, cw, row_h, &b2);
@@ -3253,8 +3439,8 @@ impl<'a> Layouter<'a> {
             self.y += row_h;
         }
 
-        if let Some(p) = patch {
-            self.finish_patch(&p);
+        if let Some(mut p) = patch {
+            self.finish_patch(&mut p);
             if p.clip {
                 let h = self.y - p.y;
                 let bw = p.border.map(|b| b.w).unwrap_or([0.0; 4]);
@@ -3632,6 +3818,7 @@ impl<'a> Layouter<'a> {
             ratio: Option<f32>,
             just: GAlign,
             al: GAlign,
+            bgl: Option<bgimg::BoxBgs>,
             laid: Vec<DisplayItem>,
             /// child element boxes laid relative to the item's content box —
             /// offset to (ix, iy+dy) at emit for click hit-testing
@@ -3980,6 +4167,19 @@ impl<'a> Layouter<'a> {
                 .and_then(|v| parse_len_vp(v, ihrel, cst.size, self.viewport_h, avail))
                 .map(hconv);
             let ratio = aspect_ratio(&cc);
+            let bgl = if self.canvas_bg_node == Some(ch) {
+                None
+            } else {
+                bgimg::parse_box(
+                    &cc,
+                    p,
+                    bw,
+                    cst.size,
+                    self.viewport_h,
+                    self.viewport_w,
+                    cst.color,
+                )
+            };
             items.push(GItem {
                 id: ch,
                 r,
@@ -4006,6 +4206,7 @@ impl<'a> Layouter<'a> {
                 ratio,
                 just,
                 al,
+                bgl,
                 laid: Vec::new(),
                 hits: Vec::new(),
                 box_h_intr: 0.0,
@@ -4286,6 +4487,13 @@ impl<'a> Layouter<'a> {
             let (tx, ty) = translate_xy(&it.cc, box_w, box_h, it.st.size);
             let (ix, iy) = (ix + tx, iy + ty);
             let radii = it.radius.resolve(box_w, box_h, it.st.size);
+            let layers = it
+                .bgl
+                .as_ref()
+                .map(|bgl| {
+                    bgimg::items_for(bgl, ix, iy, box_w, box_h, (self.viewport_w, self.viewport_h))
+                })
+                .unwrap_or_default();
             // `align-items:center` on the item centers its content inside the
             // (possibly stretched) box
             let dy = if matches!(
@@ -4313,6 +4521,7 @@ impl<'a> Layouter<'a> {
                 &it.shadows,
                 it.clip,
                 it.outline.as_ref(),
+                layers,
                 laid,
             );
             self.hits.push((ix, iy, box_w, box_h, it.id));
@@ -4784,7 +4993,7 @@ impl<'a> Layouter<'a> {
         self.line_x += w;
     }
 
-    fn finish_patch(&mut self, p: &BlockPatch) {
+    fn finish_patch(&mut self, p: &mut BlockPatch) -> usize {
         let h = self.y - p.y;
         let radii = p.radii.resolve(p.w, h, p.em);
         let mut slot = p.idx;
@@ -4798,6 +5007,16 @@ impl<'a> Layouter<'a> {
         if let Some(bg) = p.bg {
             self.items[slot] = borderfx::bg_item(p.x, p.y, p.w, h, bg, &radii);
             slot += 1;
+        }
+        // bg-image/gradient layers paint between the bg color and the
+        // inset shadows/borders — spliced items shift the slots after.
+        let mut n = 0usize;
+        if let Some(bgl) = &p.bgl {
+            let vp = (self.viewport_w, self.viewport_h);
+            let items = bgimg::items_for(bgl, p.x, p.y, p.w, h, vp);
+            n = items.len();
+            self.items.splice(slot..slot, items);
+            slot += n;
         }
         for s in p.shadows.iter().filter(|s| s.inset).rev() {
             self.items[slot] = borderfx::shadow_item(s, p.x, p.y, p.w, h, &radii);
@@ -4819,7 +5038,7 @@ impl<'a> Layouter<'a> {
             let bw = p.border.map(|b| b.w).unwrap_or([0.0; 4]);
             let (cx, cy, cw, ch) = borderfx::padding_box(p.x, p.y, p.w, h, bw);
             let pr = radii.inset(bw);
-            self.items[p.idx + p.nslots - 1] = DisplayItem::PushClip {
+            self.items[p.idx + p.nslots + n - 1] = DisplayItem::PushClip {
                 x: cx,
                 y: cy,
                 w: cw,
@@ -4831,6 +5050,8 @@ impl<'a> Layouter<'a> {
         if let Some(o) = &p.outline {
             borderfx::emit_outline(&mut self.items, p.x, p.y, p.w, h, o);
         }
+        p.nslots += n;
+        n
     }
 
     /// Replaced-element payload: box size + items in box-local coords +
@@ -4846,6 +5067,25 @@ impl<'a> Layouter<'a> {
         // % heights resolve against the definite containing height
         let hrel = self.pct_h.unwrap_or(self.avail_w);
         match tag {
+            "video" => {
+                // <video> lays out at its box size; its `poster` bitmap is
+                // the painted payload (object-fit applies like <img>)
+                let w = dim(c, "width", self.avail_w, st.size)
+                    .or_else(|| self.doc.attr(node, "width")
+                        .and_then(|v| v.trim_end_matches("px").parse().ok()))
+                    .unwrap_or(300.0f32);
+                let h = dim(c, "height", hrel, st.size)
+                    .or_else(|| self.doc.attr(node, "height")
+                        .and_then(|v| v.trim_end_matches("px").parse().ok()))
+                    .or_else(|| aspect_ratio(c).map(|r| w / r))
+                    .unwrap_or(150.0f32);
+                let items = self
+                    .doc
+                    .attr(node, "poster")
+                    .map(|src| vec![self.fit_image_item(c, st.size, w, h, src)])
+                    .unwrap_or_default();
+                Some((w, h, items, vec![(0.0, 0.0, w, h, node)]))
+            }
             "svg" => {
                 let w = dim(c, "width", self.avail_w, st.size)
                     .or_else(|| dim(c, "height", hrel, st.size))
@@ -4881,19 +5121,46 @@ impl<'a> Layouter<'a> {
                 let items = self
                     .doc
                     .attr(node, "src")
-                    .map(|src| {
-                        vec![DisplayItem::Image {
-                            x: 0.0,
-                            y: 0.0,
-                            w,
-                            h,
-                            src: src.to_string(),
-                        }]
-                    })
+                    .map(|src| vec![self.fit_image_item(c, st.size, w, h, src)])
                     .unwrap_or_default();
                 Some((w, h, items, vec![(0.0, 0.0, w, h, node)]))
             }
             _ => None,
+        }
+    }
+
+    /// `object-fit`-aware image item for a replaced element in box-local
+    /// coords: `fill` (default) keeps the plain stretch `Image`; any other
+    /// fit emits a `BgImage` whose tile resolves against the decoded size.
+    fn fit_image_item(&self, c: &Props, size: f32, w: f32, h: f32, src: &str) -> DisplayItem {
+        match bgimg::object_fit(c, size, self.viewport_h, self.viewport_w) {
+            Some((mode, xx, yy)) => DisplayItem::BgImage {
+                x: 0.0,
+                y: 0.0,
+                w,
+                h,
+                px: 0.0,
+                py: 0.0,
+                pw: w,
+                ph: h,
+                mode,
+                sw: -1.0,
+                sh: -1.0,
+                fx: xx.0,
+                ax: xx.1,
+                fy: yy.0,
+                ay: yy.1,
+                rx: 0,
+                ry: 0,
+                src: src.to_string(),
+            },
+            None => DisplayItem::Image {
+                x: 0.0,
+                y: 0.0,
+                w,
+                h,
+                src: src.to_string(),
+            },
         }
     }
 
@@ -4908,7 +5175,7 @@ impl<'a> Layouter<'a> {
         }
         match tag {
             "br" => self.flush_line(),
-            "svg" | "img" => {
+            "svg" | "img" | "video" => {
                 self.flush_line();
                 if let Some((w, h, items, hits)) = self.replaced_payload(node, tag, c, &st) {
                     let (tx, ty) = translate_xy(c, w, h, st.size);
@@ -5828,5 +6095,97 @@ mod tests {
             .count();
         assert!(reds >= 4, "four outline edges");
     }
-}
 
+    #[test]
+    fn gradient_background_emits_raster() {
+        let (items, _, _) = lay(
+            "<style>div{height:40px;background:linear-gradient(90deg,#ff0000,#0000ff)}</style><div></div>",
+        );
+        let r = items
+            .iter()
+            .find_map(|it| match it {
+                DisplayItem::Raster { x, y, w, h, pixels } => Some((*x, *y, *w, *h, pixels)),
+                _ => None,
+            })
+            .expect("gradient raster item");
+        assert_eq!(r.0, 8.0);
+        assert_eq!(r.2, 784.0); // body-margin edge to edge
+        assert_eq!(r.3, 40.0);
+        let px = r.4;
+        assert!(px[2] > 240 && px[0] < 20, "left pixel ~red: {:?}", &px[0..4]);
+        let ri = 783 * 4;
+        assert!(px[ri] > 240 && px[ri + 2] < 20, "right pixel ~blue: {:?}", &px[ri..ri + 4]);
+    }
+
+    #[test]
+    fn background_image_emits_bgimage() {
+        let (items, _, _) = lay(
+            "<style>div{height:50px;background-image:url(a.png);background-repeat:no-repeat}</style><div></div>",
+        );
+        match items.iter().find(|it| matches!(it, DisplayItem::BgImage { .. })) {
+            Some(DisplayItem::BgImage { x, y, w, h, rx, ry, src, .. }) => {
+                assert_eq!((*x, *y, *w, *h), (8.0, 8.0, 784.0, 50.0));
+                assert_eq!((*rx, *ry), (0, 0));
+                assert_eq!(src, "a.png");
+            }
+            _ => panic!("BgImage missing"),
+        }
+    }
+
+    #[test]
+    fn background_cover_contain_modes() {
+        let (items, _, _) = lay(
+            "<style>div{height:50px;background:url(a) center/cover no-repeat}</style><div></div>",
+        );
+        assert!(
+            items.iter().any(|it| matches!(it, DisplayItem::BgImage { mode: 1, .. })),
+            "cover BgImage missing"
+        );
+        let (items, _, _) = lay(
+            "<style>div{height:50px;background-image:url(a);background-size:contain}</style><div></div>",
+        );
+        assert!(
+            items.iter().any(|it| matches!(it, DisplayItem::BgImage { mode: 2, .. })),
+            "contain BgImage missing"
+        );
+    }
+
+    #[test]
+    fn background_position_four_value() {
+        let (items, _, _) = lay(
+            "<style>div{height:50px;background:url(a) right 10px bottom 20px no-repeat}</style><div></div>",
+        );
+        match items.iter().find_map(|it| match it {
+            DisplayItem::BgImage { fx, ax, fy, ay, .. } => Some((*fx, *ax, *fy, *ay)),
+            _ => None,
+        }) {
+            Some(v) => assert_eq!(v, (1.0, -10.0, 1.0, -20.0)),
+            None => panic!("BgImage missing"),
+        }
+    }
+
+    #[test]
+    fn object_fit_cover_uses_bgimage() {
+        let (items, _, _) =
+            lay("<img src=p.png width=100 height=50 style='object-fit:cover'>");
+        match items.iter().find(|it| matches!(it, DisplayItem::BgImage { .. })) {
+            Some(DisplayItem::BgImage { mode, w, h, src, .. }) => {
+                assert_eq!(*mode, 1);
+                assert_eq!((*w, *h), (100.0, 50.0));
+                assert_eq!(src, "p.png");
+            }
+            _ => panic!("object-fit BgImage missing"),
+        }
+    }
+
+    #[test]
+    fn body_background_image_paints_canvas() {
+        let (items, _, _) = lay("<style>body{background:url(bg.png) no-repeat}</style>");
+        match items.iter().find(|it| matches!(it, DisplayItem::BgImage { .. })) {
+            Some(DisplayItem::BgImage { x, y, w, .. }) => {
+                assert_eq!((*x, *y, *w), (0.0, 0.0, 800.0)); // viewport-wide canvas rect
+            }
+            _ => panic!("canvas BgImage missing"),
+        }
+    }
+}
