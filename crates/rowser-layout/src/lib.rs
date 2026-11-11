@@ -1517,6 +1517,18 @@ enum GTrack {
     Fr(f32, f32),
     /// Content-sized track clamped to [min, max] (auto, minmax, fit-content).
     Auto(f32, f32),
+    /// Intrinsic-breadth track (auto / minmax / fit-content / min-content /
+    /// max-content). `min`/`max` are breadth kinds — 0 none, 1 min-content,
+    /// 2 max-content; `cap` clamps growth (fit-content limit, minmax max);
+    /// `stretch` marks an `auto` max — it shares container free space when
+    /// *-content is normal|stretch.
+    C {
+        floor: f32,
+        min: u8,
+        max: u8,
+        cap: f32,
+        stretch: bool,
+    },
 }
 
 /// Whitespace-split `s` into tokens, keeping `fn(...)` groups together.
@@ -1563,6 +1575,26 @@ fn track_floor(t: &GTrack) -> f32 {
         GTrack::Fixed(x) => x,
         GTrack::Fr(_, m) => m,
         GTrack::Auto(m, _) => m,
+        GTrack::C { floor, .. } => floor,
+    }
+}
+
+/// Normalize a track into sizing semantics: (base floor, min-breadth kind,
+/// growth kind, growth cap, stretchable). Kinds: 0 none, 1 min-content,
+/// 2 max-content contribution. `Auto` is the legacy [min,max] clamp — an
+/// uncapped max reads as an `auto` max (stretchable).
+fn track_sem(t: &GTrack) -> (f32, u8, u8, f32, bool) {
+    match *t {
+        GTrack::Fixed(x) => (x, 0, 0, f32::MAX, false),
+        GTrack::Fr(_, m) => (m, 0, 0, f32::MAX, false),
+        GTrack::Auto(m, mx) => (m, 0, 2, mx, mx >= f32::MAX),
+        GTrack::C {
+            floor,
+            min,
+            max,
+            cap,
+            stretch,
+        } => (floor, min, max, cap, stretch),
     }
 }
 
@@ -1572,41 +1604,113 @@ fn track_spec(t: &str, rel: f32, em: f32, vh: f32, vw: f32) -> GTrack {
     if let Some(f) = t.strip_suffix("fr") {
         return GTrack::Fr(f.trim().parse::<f32>().unwrap_or(1.0).max(0.0), 0.0);
     }
-    if t == "auto" || t == "min-content" || t == "max-content" {
-        return GTrack::Auto(0.0, f32::MAX);
+    match t.as_str() {
+        // auto ≡ minmax(auto, auto): ~min-content floor, max-content max,
+        // and it stretches to share container free space
+        "auto" | "masonry" => {
+            return GTrack::C {
+                floor: 0.0,
+                min: 1,
+                max: 2,
+                cap: f32::MAX,
+                stretch: true,
+            };
+        }
+        "min-content" => {
+            return GTrack::C {
+                floor: 0.0,
+                min: 1,
+                max: 1,
+                cap: f32::MAX,
+                stretch: false,
+            };
+        }
+        "max-content" => {
+            return GTrack::C {
+                floor: 0.0,
+                min: 2,
+                max: 2,
+                cap: f32::MAX,
+                stretch: false,
+            };
+        }
+        _ => {}
     }
     if let Some(inner) = t.strip_prefix("minmax(").and_then(|x| x.strip_suffix(')')) {
         let (a, b) = top_comma(inner).unwrap_or((inner, "auto"));
-        let min = if a.trim() == "auto" {
-            0.0
-        } else {
-            parse_len_vp(a.trim(), rel, em, vh, vw).unwrap_or(0.0)
+        let (floor, min) = match a.trim() {
+            "auto" | "min-content" => (0.0, 1),
+            "max-content" => (0.0, 2),
+            a => (parse_len_vp(a, rel, em, vh, vw).unwrap_or(0.0), 0),
         };
         let b = b.trim();
         if let Some(f) = b.strip_suffix("fr") {
-            return GTrack::Fr(f.trim().parse::<f32>().unwrap_or(1.0).max(0.0), min);
+            return GTrack::Fr(f.trim().parse::<f32>().unwrap_or(1.0).max(0.0), floor);
         }
-        if b == "auto" || b == "min-content" || b == "max-content" {
-            return GTrack::Auto(min, f32::MAX);
-        }
-        return GTrack::Auto(min, parse_len_vp(b, rel, em, vh, vw).unwrap_or(f32::MAX));
+        return match b {
+            "auto" => GTrack::C {
+                floor,
+                min,
+                max: 2,
+                cap: f32::MAX,
+                stretch: true,
+            },
+            "min-content" => GTrack::C {
+                floor,
+                min,
+                max: 1,
+                cap: f32::MAX,
+                stretch: false,
+            },
+            "max-content" => GTrack::C {
+                floor,
+                min,
+                max: 2,
+                cap: f32::MAX,
+                stretch: false,
+            },
+            _ => {
+                let cap = if let Some(x) = b
+                    .strip_prefix("fit-content(")
+                    .and_then(|x| x.strip_suffix(')'))
+                {
+                    parse_len_vp(x.trim(), rel, em, vh, vw).unwrap_or(f32::MAX)
+                } else {
+                    parse_len_vp(b, rel, em, vh, vw).unwrap_or(f32::MAX)
+                };
+                GTrack::C {
+                    floor,
+                    min,
+                    max: 2,
+                    cap,
+                    stretch: false,
+                }
+            }
+        };
     }
     if let Some(inner) = t
         .strip_prefix("fit-content(")
         .and_then(|x| x.strip_suffix(')'))
     {
-        return GTrack::Auto(
-            0.0,
-            parse_len_vp(inner.trim(), rel, em, vh, vw).unwrap_or(f32::MAX),
-        );
+        // max(min-content, min(max-content, limit))
+        return GTrack::C {
+            floor: 0.0,
+            min: 1,
+            max: 2,
+            cap: parse_len_vp(inner.trim(), rel, em, vh, vw).unwrap_or(f32::MAX),
+            stretch: false,
+        };
     }
     GTrack::Fixed(parse_len_vp(&t, rel, em, vh, vw).unwrap_or(0.0))
 }
 
 /// `grid-template-*`/`grid-auto-*` value → expanded track list plus named
 /// lines: `names[i]` holds the names of the line *before* track i (len =
-/// tracks+1). `none`/empty → ([], []). repeat() expands; auto-fill/auto-fit
-/// size against `avail` using the repeat unit's floor width.
+/// tracks+1); `fit[i]` marks a track produced by repeat(auto-fit) — empty
+/// ones collapse to 0 after placement. `none`/`subgrid`/`masonry`/empty →
+/// empty (masonry ≈ auto rows; subgrid resolves to the parent's spanned
+/// tracks at the call site). repeat() expands; auto-fill/auto-fit size
+/// against `avail` using the repeat unit's floor width.
 fn grid_track_list(
     v: Option<&String>,
     rel: f32,
@@ -1615,17 +1719,18 @@ fn grid_track_list(
     vw: f32,
     avail: f32,
     gap: f32,
-) -> (Vec<GTrack>, Vec<Vec<String>>) {
+) -> (Vec<GTrack>, Vec<Vec<String>>, Vec<bool>) {
     let Some(v) = v else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
-    let v = v.trim();
-    if v.is_empty() || v == "none" {
-        return (Vec::new(), Vec::new());
+    let v = v.trim().to_lowercase();
+    if v.is_empty() || v == "none" || v == "subgrid" || v == "masonry" {
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let mut out: Vec<GTrack> = Vec::new();
+    let mut fit: Vec<bool> = Vec::new();
     let mut names: Vec<Vec<String>> = vec![Vec::new()];
-    for tok in track_tokens(v) {
+    for tok in track_tokens(&v) {
         let t = tok.trim().to_lowercase();
         if t.starts_with('[') {
             // [name ...] — names for the line at the current track boundary
@@ -1635,16 +1740,13 @@ fn grid_track_list(
         }
         if let Some(inner) = t.strip_prefix("repeat(").and_then(|x| x.strip_suffix(')')) {
             let (cnt, rest) = top_comma(inner).unwrap_or((inner, ""));
-            let sub: Vec<GTrack> = track_tokens(rest)
-                .iter()
-                .filter(|s| !s.trim().starts_with('['))
-                .map(|s| track_spec(s, rel, em, vh, vw))
-                .collect();
+            let sub = expand_track_tokens(&track_tokens(rest), rel, em, vh, vw);
             if sub.is_empty() {
                 continue;
             }
             let cnt = cnt.trim();
-            let n = if cnt == "auto-fill" || cnt == "auto-fit" {
+            let auto_fit = cnt == "auto-fit";
+            let n = if cnt == "auto-fill" || auto_fit {
                 let unit: f32 =
                     sub.iter().map(track_floor).sum::<f32>() + gap * (sub.len() - 1) as f32;
                 (((avail + gap) / (unit + gap).max(1.0)).floor() as usize).max(1)
@@ -1653,41 +1755,90 @@ fn grid_track_list(
             };
             for _ in 0..n.min(1000) {
                 out.extend_from_slice(&sub);
+                fit.resize(out.len(), auto_fit);
             }
         } else {
             out.push(track_spec(&t, rel, em, vh, vw));
+            fit.push(false);
         }
         while names.len() <= out.len() {
             names.push(Vec::new());
         }
     }
-    (out, names)
+    (out, names, fit)
 }
 
-/// A grid line placement term: `auto`, an integer line, `span N`, or a
-/// named line (`content`/`content-start`/`extended-full-end`).
+/// Expand a repeat() body (or any token list) into tracks: a numeric
+/// `repeat(n, ...)` recurses — `repeat(auto-fill, 1fr repeat(2, 30px))`
+/// and mixed minmax/fixed lists work. `[names]` inside repeats are
+/// dropped, matching the flat list's behavior.
+fn expand_track_tokens(toks: &[String], rel: f32, em: f32, vh: f32, vw: f32) -> Vec<GTrack> {
+    fn go(toks: &[String], rel: f32, em: f32, vh: f32, vw: f32, depth: u8) -> Vec<GTrack> {
+        let mut out = Vec::new();
+        for tok in toks {
+            let t = tok.trim().to_lowercase();
+            if t.starts_with('[') {
+                continue;
+            }
+            if depth < 8 {
+                if let Some(inner) = t.strip_prefix("repeat(").and_then(|x| x.strip_suffix(')')) {
+                    let (cnt, rest) = top_comma(inner).unwrap_or((inner, ""));
+                    if let Ok(n) = cnt.trim().parse::<usize>() {
+                        let sub = go(&track_tokens(rest), rel, em, vh, vw, depth + 1);
+                        for _ in 0..n.min(1000) {
+                            out.extend_from_slice(&sub);
+                        }
+                        continue;
+                    }
+                }
+            }
+            out.push(track_spec(&t, rel, em, vh, vw));
+        }
+        out
+    }
+    go(toks, rel, em, vh, vw, 0)
+}
+
+/// A grid line placement term: `auto`, an integer line, `span N`, a named
+/// line (`content`/`content-start`), `<num> <name>` (the nth line carrying
+/// the name), or `span [N] <name>` (to the Nth next/previous named line).
 #[derive(Clone, PartialEq)]
 enum GLine {
     Auto,
     Line(i32),
     Span(i32),
     Named(String),
+    NamedLine(i32, String),
+    NamedSpan(i32, String),
 }
 
 fn grid_line_val(t: &str) -> GLine {
     let t = t.trim().to_lowercase();
-    if let Some(rest) = t.strip_prefix("span") {
-        return GLine::Span(rest.trim().parse::<i32>().unwrap_or(1));
+    let (mut span, mut num, mut name) = (false, None::<i32>, None::<String>);
+    for tok in t.split_whitespace() {
+        if tok == "span" {
+            span = true;
+        } else if let Ok(i) = tok.parse::<i32>() {
+            if i != 0 && num.is_none() {
+                num = Some(i);
+            }
+        } else if name.is_none() {
+            name = Some(tok.to_string());
+        }
     }
-    match t.parse::<i32>() {
-        Ok(0) | Err(_) => {
-            if t.is_empty() || t == "auto" {
+    match (span, num, name) {
+        (true, _, Some(nm)) => GLine::NamedSpan(num.unwrap_or(1).max(1), nm),
+        (true, n, None) => GLine::Span(n.unwrap_or(1)),
+        (false, Some(i), Some(nm)) => GLine::NamedLine(i, nm),
+        (false, Some(i), None) => GLine::Line(i),
+        (false, None, Some(nm)) => {
+            if nm == "auto" {
                 GLine::Auto
             } else {
-                GLine::Named(t.to_string())
+                GLine::Named(nm)
             }
         }
-        Ok(n) => GLine::Line(n),
+        (false, None, None) => GLine::Auto,
     }
 }
 
@@ -1729,15 +1880,34 @@ fn resolve_axis(
     ntracks: usize,
     names: &[Vec<String>],
 ) -> (Option<usize>, usize) {
+    // Named/NamedLine → numeric line. A bare `x` start prefers `x-start`
+    // then `x`; `<ord> x` takes the ord-th line matching `x` or the
+    // suffixed variant. Names exist only on explicit tracks.
     let named = |g: &GLine, is_start: bool| -> GLine {
-        let GLine::Named(n) = g else { return g.clone() };
         let suffix = if is_start { "-start" } else { "-end" };
-        for w in [format!("{n}{suffix}"), n.clone()] {
-            if let Some(i) = names.iter().position(|ns| ns.iter().any(|x| x == &w)) {
-                return GLine::Line(i as i32 + 1);
+        match g {
+            GLine::NamedLine(ord, n) => {
+                let mut count = 0i32;
+                for (i, ns) in names.iter().enumerate() {
+                    if ns.iter().any(|x| x == n || x == &format!("{n}{suffix}")) {
+                        count += 1;
+                        if count == *ord {
+                            return GLine::Line(i as i32 + 1);
+                        }
+                    }
+                }
+                GLine::Auto
             }
+            GLine::Named(n) => {
+                for w in [format!("{n}{suffix}"), n.clone()] {
+                    if let Some(i) = names.iter().position(|ns| ns.iter().any(|x| x == &w)) {
+                        return GLine::Line(i as i32 + 1);
+                    }
+                }
+                GLine::Auto
+            }
+            _ => g.clone(),
         }
-        GLine::Auto
     };
     let (s, e) = (named(&s, true), named(&e, false));
     // line k>0 → track index k-1; line k<0 → ntracks+1+k (so -1 → ntracks)
@@ -1761,7 +1931,43 @@ fn resolve_axis(
             let end = idx(b);
             (Some((end - n as i64).max(0) as usize), n.max(1) as usize)
         }
+        // `span <name>` end: the k-th `name`/`name-end` line past the
+        // resolved start; fewer than k → span `k` tracks as a fallback.
+        (GLine::Line(a), GLine::NamedSpan(k, ref nm)) => {
+            let a_idx = idx(a).max(0) as usize;
+            let span = ((a_idx + 1)..names.len())
+                .filter(|&j| {
+                    names[j]
+                        .iter()
+                        .any(|x| x == nm || x == &format!("{nm}-end"))
+                })
+                .nth(k.max(1) as usize - 1)
+                .map(|j| j - a_idx)
+                .unwrap_or(k.max(1) as usize);
+            (Some(a_idx), span.max(1))
+        }
+        // `span <name>` start: the k-th `name`/`name-start` line before the
+        // resolved end, walking backwards.
+        (GLine::NamedSpan(k, ref nm), GLine::Line(b)) => {
+            let e_idx = idx(b).max(0) as usize;
+            let start = names
+                .iter()
+                .enumerate()
+                .take(e_idx)
+                .rev()
+                .filter(|(_, ns)| ns.iter().any(|x| x == nm || x == &format!("{nm}-start")))
+                .nth(k.max(1) as usize - 1)
+                .map(|(j, _)| j);
+            match start {
+                Some(j) => (Some(j), (e_idx - j).max(1)),
+                None => (
+                    Some((e_idx as i64 - k as i64).max(0) as usize),
+                    k.max(1) as usize,
+                ),
+            }
+        }
         (GLine::Span(n), _) | (GLine::Auto, GLine::Span(n)) => (None, n.max(1) as usize),
+        (GLine::NamedSpan(k, _), _) | (_, GLine::NamedSpan(k, _)) => (None, k.max(1) as usize),
         (GLine::Auto, GLine::Auto) => (None, 1),
         _ => (None, 1),
     }
@@ -2154,6 +2360,12 @@ pub struct Layouter<'a> {
     /// words queued on `line` pick it up (see flush_line). Reset inside
     /// nested boxes (nest/flex/grid) whose content isn't part of the run.
     cur_xf: Option<Rc<xform::Spec>>,
+    /// `grid-template-columns:subgrid` children inherit the parent grid's
+    /// spanned track sizes — recorded as a px track list while laying out
+    /// the parent item, read by the child's own grid pass
+    subgrid_cols: FxHashMap<NodeId, String>,
+    /// same for `grid-template-rows:subgrid` (explicit row floors only)
+    subgrid_rows: FxHashMap<NodeId, String>,
 }
 
 impl<'a> Layouter<'a> {
@@ -2212,6 +2424,8 @@ impl<'a> Layouter<'a> {
             cb_stack: Vec::new(),
             stickies: Vec::new(),
             cur_xf: None,
+            subgrid_cols: FxHashMap::default(),
+            subgrid_rows: FxHashMap::default(),
         };
         l.preresolve_styles();
         // css-backgrounds §2.11: the canvas takes the root element's
@@ -4064,6 +4278,14 @@ impl<'a> Layouter<'a> {
             hits: Vec<Hit>,
             /// border-box height of the laid content (pre-stretch)
             box_h_intr: f32,
+            /// min-content content width — contribution to min-content /
+            /// fit-content / auto-min tracks
+            min_w: f32,
+            /// content-box width floor: explicit min-width, else the
+            /// min-width:auto min-content minimum (0 when overflow clips)
+            min_wc: f32,
+            /// content-box width ceiling from max-width
+            max_wc: Option<f32>,
         }
         let avail = self.avail_w.max(1.0);
         let x0 = self.margin_x;
@@ -4134,13 +4356,30 @@ impl<'a> Layouter<'a> {
             .get("grid-template-columns")
             .map(String::as_str)
             .or(t_cols.as_deref())
-            .map(String::from);
+            .map(String::from)
+            .and_then(|v| {
+                // `subgrid` adopts the parent grid's spanned tracks —
+                // recorded on self by the parent's sizing pass; a non-grid
+                // parent leaves it templateless (all auto)
+                if v.trim() == "subgrid" {
+                    self.subgrid_cols.get(&node).cloned()
+                } else {
+                    Some(v)
+                }
+            });
         let row_src = c
             .get("grid-template-rows")
             .map(String::as_str)
             .or(t_rows.as_deref())
-            .map(String::from);
-        let (col_specs, col_names) = grid_track_list(
+            .map(String::from)
+            .and_then(|v| {
+                if v.trim() == "subgrid" {
+                    self.subgrid_rows.get(&node).cloned()
+                } else {
+                    Some(v)
+                }
+            });
+        let (col_specs, col_names, col_fit) = grid_track_list(
             col_src.as_ref(),
             avail,
             st.size,
@@ -4149,7 +4388,7 @@ impl<'a> Layouter<'a> {
             avail,
             col_gap,
         );
-        let (row_specs, row_names) = grid_track_list(
+        let (row_specs, row_names, row_fit) = grid_track_list(
             row_src.as_ref(),
             row_rel,
             st.size,
@@ -4183,7 +4422,7 @@ impl<'a> Layouter<'a> {
                 e.3 = e.3.max(ci);
             }
         }
-        let (auto_cols, _) = grid_track_list(
+        let (auto_cols, _, _) = grid_track_list(
             c.get("grid-auto-columns"),
             avail,
             st.size,
@@ -4192,7 +4431,7 @@ impl<'a> Layouter<'a> {
             avail,
             col_gap,
         );
-        let (auto_rows, _) = grid_track_list(
+        let (auto_rows, _, _) = grid_track_list(
             c.get("grid-auto-rows"),
             row_rel,
             st.size,
@@ -4211,6 +4450,33 @@ impl<'a> Layouter<'a> {
                 auto[(i - specs.len()) % auto.len()]
             }
         };
+
+        // container content distribution — resolved early: `stretch` (and
+        // `normal`) inflates `auto`-max tracks during column/row sizing,
+        // the other keywords shift/gap the finished track block at emit
+        let (pc_a, pc_j) = c
+            .get("place-content")
+            .map(|v| {
+                let mut it = v.split_whitespace();
+                let a = it.next().unwrap_or("start").to_string();
+                let j = it.next().map(String::from).unwrap_or_else(|| a.clone());
+                (a, j)
+            })
+            .unwrap_or_default();
+        let jc = c
+            .get("justify-content")
+            .or(if pc_j.is_empty() { None } else { Some(&pc_j) });
+        let ac = c
+            .get("align-content")
+            .or(if pc_a.is_empty() { None } else { Some(&pc_a) });
+        let stretch_cols = matches!(
+            jc.map(|s| s.split_whitespace().last().unwrap_or("normal")),
+            None | Some("normal") | Some("stretch") | Some("auto")
+        );
+        let stretch_rows = matches!(
+            ac.map(|s| s.split_whitespace().last().unwrap_or("normal")),
+            None | Some("normal") | Some("stretch") | Some("auto")
+        );
 
         // container-level item alignment defaults
         let (pi_a, pi_j) = c
@@ -4270,9 +4536,9 @@ impl<'a> Layouter<'a> {
             req.push((ch, ecol, cs, erow, rs));
         }
 
-        let col_flow = c
-            .get("grid-auto-flow")
-            .is_some_and(|v| v.contains("column"));
+        let flow = c.get("grid-auto-flow").map(String::as_str).unwrap_or("");
+        let col_flow = flow.contains("column");
+        let dense = flow.contains("dense");
         let mut occ: Vec<Vec<bool>> = Vec::new();
         let mut placed: Vec<(NodeId, usize, usize, usize, usize)> = Vec::with_capacity(req.len());
         let (mut cur_r, mut cur_c) = (0usize, 0usize);
@@ -4299,26 +4565,58 @@ impl<'a> Layouter<'a> {
                 }
                 (None, None) => {
                     if col_flow {
-                        loop {
-                            if cur_r + rs > row_bound {
-                                cur_r = 0;
-                                cur_c += 1;
-                                continue;
+                        if dense {
+                            // dense column flow: every column is rescanned
+                            // from its first row — earlier holes backfill
+                            let mut cix = 0usize;
+                            'scan: loop {
+                                if cix + cs > ncols {
+                                    ncols = cix + cs; // implicit columns
+                                    for row in occ.iter_mut() {
+                                        row.resize(ncols, false);
+                                    }
+                                }
+                                for r in 0..row_bound.saturating_sub(rs) + 1 {
+                                    if grid_free(&occ, ncols, r, cix, rs, cs) {
+                                        break 'scan (r, cix);
+                                    }
+                                }
+                                cix += 1;
                             }
-                            if cur_c + cs > ncols {
-                                ncols = cur_c + cs; // implicit columns
-                                for row in occ.iter_mut() {
-                                    row.resize(ncols, false);
+                        } else {
+                            loop {
+                                if cur_r + rs > row_bound {
+                                    cur_r = 0;
+                                    cur_c += 1;
+                                    continue;
+                                }
+                                if cur_c + cs > ncols {
+                                    ncols = cur_c + cs; // implicit columns
+                                    for row in occ.iter_mut() {
+                                        row.resize(ncols, false);
+                                    }
+                                }
+                                if grid_free(&occ, ncols, cur_r, cur_c, rs, cs) {
+                                    break;
+                                }
+                                cur_r += 1;
+                            }
+                            let p = (cur_r, cur_c);
+                            cur_r += rs;
+                            p
+                        }
+                    } else if dense {
+                        // dense row flow: a row-major scan from the top
+                        // backfills holes sparse flow leaves behind
+                        let mut r = 0usize;
+                        'scan: loop {
+                            for cix in 0..ncols {
+                                if cix + cs <= ncols && grid_free(&occ, ncols, r, cix, rs, cs) {
+                                    break 'scan (r, cix);
                                 }
                             }
-                            if grid_free(&occ, ncols, cur_r, cur_c, rs, cs) {
-                                break;
-                            }
-                            cur_r += 1;
+                            r += 1;
                         }
-                        let p = (cur_r, cur_c);
-                        cur_r += rs;
-                        p
                     } else {
                         loop {
                             if cur_c + cs > ncols {
@@ -4348,6 +4646,22 @@ impl<'a> Layouter<'a> {
             placed.push((ch, r, cix, rs, cs));
         }
         let nrows = occ.len().max(exp_rows).max(1);
+
+        // repeat(auto-fit): expanded tracks no item lands in collapse to
+        // 0px — auto-fill's stay (same count, only collapse differs);
+        // their adjacent gutters fold away at emit time
+        let mut col_collapsed = vec![false; ncols];
+        for (i, f) in col_fit.iter().enumerate().take(ncols) {
+            if *f && !placed.iter().any(|p| (p.2..p.2 + p.4).contains(&i)) {
+                col_collapsed[i] = true;
+            }
+        }
+        let mut row_collapsed = vec![false; nrows];
+        for (i, f) in row_fit.iter().enumerate().take(nrows) {
+            if *f && !placed.iter().any(|p| (p.1..p.1 + p.3).contains(&i)) {
+                row_collapsed[i] = true;
+            }
+        }
 
         // ---- column track sizes ----
         let col_spec: Vec<GTrack> = (0..ncols)
@@ -4405,6 +4719,32 @@ impl<'a> Layouter<'a> {
             let intrinsic_w = w_prop
                 .unwrap_or_else(|| self.max_content_width(ch, &cst).min(avail))
                 .max(0.0);
+            // min-content contribution: floors min-content / fit-content /
+            // auto-min tracks and the `min-width:auto` item minimum
+            let min_w = self.min_content_w(ch, &cst);
+            let wconv = |v: f32| {
+                if bb {
+                    v - p[1] - p[3] - bw[1] - bw[3]
+                } else {
+                    v
+                }
+            };
+            let overflow_clips = matches!(
+                cc.get("overflow-x")
+                    .or_else(|| cc.get("overflow"))
+                    .map(String::as_str),
+                Some("hidden") | Some("scroll") | Some("auto") | Some("clip")
+            );
+            let min_wc = cc
+                .get("min-width")
+                .and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail))
+                .map(wconv)
+                .unwrap_or(if overflow_clips { 0.0 } else { min_w })
+                .max(0.0);
+            let max_wc = cc
+                .get("max-width")
+                .and_then(|v| parse_len_vp(v, avail, cst.size, self.viewport_h, avail))
+                .map(wconv);
             let ps = cc.get("place-self").map(|v| {
                 let mut it = v.split_whitespace();
                 let a = it.next().unwrap_or("auto").to_string();
@@ -4479,16 +4819,32 @@ impl<'a> Layouter<'a> {
                 laid: Vec::new(),
                 hits: Vec::new(),
                 box_h_intr: 0.0,
+                min_w,
+                min_wc,
+                max_wc,
             });
         }
 
-        // auto columns take the widest single-span item's margin-box width
+        // tracks grow to fit items: a single-span item contributes its
+        // min-content and max-content margin-box sizes at the track's min
+        // and max breadths (growth capped — fit-content limits, minmax max)
         for it in &items {
-            let need = it.intrinsic_w + it.p[1] + it.p[3] + it.bw[1] + it.bw[3] + it.m[1] + it.m[3];
             if it.cs == 1 {
-                if let GTrack::Auto(_, mx) = col_spec[it.c] {
-                    cw[it.c] = cw[it.c].max(need.min(mx));
-                }
+                let sides = it.p[1] + it.p[3] + it.bw[1] + it.bw[3] + it.m[1] + it.m[3];
+                let c_min = it.min_w + sides;
+                let c_max = it.intrinsic_w + sides;
+                let (_, mn, mxk, cap, _) = track_sem(&col_spec[it.c]);
+                let lo = match mn {
+                    1 => c_min,
+                    2 => c_max,
+                    _ => 0.0,
+                };
+                let grow = match mxk {
+                    1 => c_min,
+                    2 => c_max,
+                    _ => 0.0,
+                };
+                cw[it.c] = cw[it.c].max(lo).max(grow.min(cap));
             }
         }
         for it in &items {
@@ -4498,17 +4854,40 @@ impl<'a> Layouter<'a> {
                 let have: f32 =
                     cw[it.c..it.c + it.cs].iter().sum::<f32>() + col_gap * (it.cs - 1) as f32;
                 if need > have {
-                    let add = (need - have) / it.cs as f32;
-                    for w in cw.iter_mut().skip(it.c).take(it.cs) {
-                        *w += add;
+                    // growable (intrinsic) tracks absorb the deficit first;
+                    // only if none span does the whole span share it
+                    let mut targets: Vec<usize> = (it.c..it.c + it.cs)
+                        .filter(|&i| matches!(col_spec[i], GTrack::Auto(..) | GTrack::C { .. }))
+                        .collect();
+                    if targets.is_empty() {
+                        targets = (it.c..it.c + it.cs).collect();
+                    }
+                    let add = (need - have) / targets.len() as f32;
+                    for i in targets {
+                        cw[i] += add;
                     }
                 }
+            }
+        }
+        // collapsed auto-fit tracks are inert — 0px, no fr share, no stretch
+        for (i, col) in col_collapsed.iter().enumerate() {
+            if *col {
+                cw[i] = 0.0;
             }
         }
         // fr columns share the leftover space
         let total_fr: f32 = col_spec
             .iter()
-            .map(|t| if let GTrack::Fr(f, _) = t { *f } else { 0.0 })
+            .enumerate()
+            .map(|(i, t)| {
+                if col_collapsed[i] {
+                    0.0
+                } else if let GTrack::Fr(f, _) = t {
+                    *f
+                } else {
+                    0.0
+                }
+            })
             .sum();
         if total_fr > 0.0 {
             let non_fr: f32 = cw
@@ -4519,7 +4898,57 @@ impl<'a> Layouter<'a> {
             let leftover = (avail - col_gap * ncols.saturating_sub(1) as f32 - non_fr).max(0.0);
             for (i, t) in col_spec.iter().enumerate() {
                 if let GTrack::Fr(f, m) = t {
-                    cw[i] = (*m).max(leftover * *f / total_fr);
+                    if !col_collapsed[i] {
+                        cw[i] = (*m).max(leftover * *f / total_fr);
+                    }
+                }
+            }
+        }
+        // justify-content normal|stretch: leftover space inflates
+        // `auto`-max columns evenly (fr already ate what it wanted)
+        if stretch_cols {
+            let stretchable: Vec<usize> = (0..ncols)
+                .filter(|&i| track_sem(&col_spec[i]).4 && !col_collapsed[i])
+                .collect();
+            if !stretchable.is_empty() {
+                let used: f32 = cw.iter().sum::<f32>() + col_gap * ncols.saturating_sub(1) as f32;
+                let extra = (avail - used).max(0.0);
+                if extra > 0.0 {
+                    let add = extra / stretchable.len() as f32;
+                    for i in stretchable {
+                        cw[i] += add;
+                    }
+                }
+            }
+        }
+        // `subgrid` children adopt the sizes of the parent tracks their
+        // cell spans — rows only get explicit floors here (content-sized
+        // row heights aren't known until items are measured)
+        for it in &items {
+            if matches!(
+                it.cc.get("display").map(String::as_str),
+                Some("grid") | Some("inline-grid")
+            ) {
+                if it
+                    .cc
+                    .get("grid-template-columns")
+                    .is_some_and(|v| v.trim() == "subgrid")
+                {
+                    let s: Vec<String> = cw[it.c..it.c + it.cs]
+                        .iter()
+                        .map(|w| format!("{w}px"))
+                        .collect();
+                    self.subgrid_cols.insert(it.id, s.join(" "));
+                }
+                if it
+                    .cc
+                    .get("grid-template-rows")
+                    .is_some_and(|v| v.trim() == "subgrid")
+                {
+                    let s: Vec<String> = (it.r..it.r + it.rs)
+                        .map(|i| format!("{}px", track_floor(&spec_at(&row_specs, &auto_rows, i))))
+                        .collect();
+                    self.subgrid_rows.insert(it.id, s.join(" "));
                 }
             }
         }
@@ -4536,6 +4965,8 @@ impl<'a> Layouter<'a> {
                     GAlign::Stretch => inner_w,
                     _ => it.intrinsic_w.min(inner_w),
                 })
+                .min(it.max_wc.unwrap_or(f32::MAX))
+                .max(it.min_wc)
                 .max(1.0);
             let box_w = content_w + it.p[1] + it.p[3] + it.bw[1] + it.bw[3];
             let saved_bd = self.backdrop;
@@ -4596,29 +5027,29 @@ impl<'a> Layouter<'a> {
         let row_spec: Vec<GTrack> = (0..nrows)
             .map(|i| spec_at(&row_specs, &auto_rows, i))
             .collect();
-        // fr rows with an indefinite container height behave as auto
+        // fr rows with an indefinite container height behave as auto —
+        // they floor at 0 and grow to content below
         let mut rh: Vec<f32> = row_spec
             .iter()
             .map(|t| match *t {
-                GTrack::Fixed(x) => x,
-                GTrack::Fr(_, m) if cont_h.is_some() => m,
-                _ => track_floor(&GTrack::Auto(track_floor(t), f32::MAX)),
+                GTrack::Fr(..) if cont_h.is_none() => 0.0,
+                _ => track_floor(t),
             })
             .collect();
         for it in &items {
             let need = it.box_h_intr + it.m[0] + it.m[2];
             if it.rs == 1 {
-                let autoish = match row_spec[it.r] {
-                    GTrack::Auto(..) => true,
-                    GTrack::Fr(..) => cont_h.is_none(),
-                    GTrack::Fixed(_) => false,
+                // row min/max breadths share one content height — either
+                // kind contributes `need` (growth still honors the cap)
+                let (mn, mxk, cap) = match row_spec[it.r] {
+                    GTrack::Auto(_, mx) => (0u8, 2u8, mx),
+                    GTrack::C { min, max, cap, .. } => (min, max, cap),
+                    GTrack::Fr(..) if cont_h.is_none() => (0, 2, f32::MAX),
+                    _ => (0, 0, f32::MAX),
                 };
-                if autoish {
-                    if let GTrack::Auto(_, mx) | GTrack::Fr(_, mx) = row_spec[it.r] {
-                        let cap = if cont_h.is_none() { f32::MAX } else { mx };
-                        rh[it.r] = rh[it.r].max(need.min(cap));
-                    }
-                }
+                let lo = if mn > 0 { need } else { 0.0 };
+                let grow = if mxk > 0 { need.min(cap) } else { 0.0 };
+                rh[it.r] = rh[it.r].max(lo).max(grow);
             }
         }
         for it in &items {
@@ -4627,17 +5058,42 @@ impl<'a> Layouter<'a> {
                 let have: f32 =
                     rh[it.r..it.r + it.rs].iter().sum::<f32>() + row_gap * (it.rs - 1) as f32;
                 if need > have {
-                    let add = (need - have) / it.rs as f32;
-                    for h in rh.iter_mut().skip(it.r).take(it.rs) {
-                        *h += add;
+                    let mut targets: Vec<usize> = (it.r..it.r + it.rs)
+                        .filter(|&i| match row_spec[i] {
+                            GTrack::Auto(..) | GTrack::C { .. } => true,
+                            GTrack::Fr(..) => cont_h.is_none(),
+                            GTrack::Fixed(_) => false,
+                        })
+                        .collect();
+                    if targets.is_empty() {
+                        targets = (it.r..it.r + it.rs).collect();
+                    }
+                    let add = (need - have) / targets.len() as f32;
+                    for i in targets {
+                        rh[i] += add;
                     }
                 }
+            }
+        }
+        // collapsed auto-fit rows are inert — 0px, no fr share, no stretch
+        for (i, col) in row_collapsed.iter().enumerate() {
+            if *col {
+                rh[i] = 0.0;
             }
         }
         if let Some(ch) = cont_h {
             let total_fr: f32 = row_spec
                 .iter()
-                .map(|t| if let GTrack::Fr(f, _) = t { *f } else { 0.0 })
+                .enumerate()
+                .map(|(i, t)| {
+                    if row_collapsed[i] {
+                        0.0
+                    } else if let GTrack::Fr(f, _) = t {
+                        *f
+                    } else {
+                        0.0
+                    }
+                })
                 .sum();
             if total_fr > 0.0 {
                 let non_fr: f32 = rh
@@ -4648,42 +5104,75 @@ impl<'a> Layouter<'a> {
                 let leftover = (ch - row_gap * nrows.saturating_sub(1) as f32 - non_fr).max(0.0);
                 for (i, t) in row_spec.iter().enumerate() {
                     if let GTrack::Fr(f, m) = t {
-                        rh[i] = (*m).max(leftover * *f / total_fr);
+                        if !row_collapsed[i] {
+                            rh[i] = (*m).max(leftover * *f / total_fr);
+                        }
+                    }
+                }
+            }
+            // align-content normal|stretch inflates `auto`-max rows —
+            // implicit (auto) rows included
+            if stretch_rows {
+                let stretchable: Vec<usize> = (0..nrows)
+                    .filter(|&i| track_sem(&row_spec[i]).4 && !row_collapsed[i])
+                    .collect();
+                if !stretchable.is_empty() {
+                    let used: f32 =
+                        rh.iter().sum::<f32>() + row_gap * nrows.saturating_sub(1) as f32;
+                    let extra = (ch - used).max(0.0);
+                    if extra > 0.0 {
+                        let add = extra / stretchable.len() as f32;
+                        for i in stretchable {
+                            rh[i] += add;
+                        }
                     }
                 }
             }
         }
 
         // ---- emit ----
-        let tracks_w = cw.iter().sum::<f32>() + col_gap * ncols.saturating_sub(1) as f32;
-        let tracks_h = rh.iter().sum::<f32>() + row_gap * nrows.saturating_sub(1) as f32;
-        let (pc_a, pc_j) = c
-            .get("place-content")
-            .map(|v| {
-                let mut it = v.split_whitespace();
-                let a = it.next().unwrap_or("start").to_string();
-                let j = it.next().map(String::from).unwrap_or_else(|| a.clone());
-                (a, j)
-            })
-            .unwrap_or_default();
-        let jc = c
-            .get("justify-content")
-            .or(if pc_j.is_empty() { None } else { Some(&pc_j) });
-        let ac = c
-            .get("align-content")
-            .or(if pc_a.is_empty() { None } else { Some(&pc_a) });
+        // the gutter after track i folds to 0 when either adjacent track
+        // is a collapsed auto-fit track
+        let gapx = |i: usize| -> f32 {
+            if i + 1 < ncols && (col_collapsed[i] || col_collapsed[i + 1]) {
+                0.0
+            } else {
+                col_gap
+            }
+        };
+        let gapy = |i: usize| -> f32 {
+            if i + 1 < nrows && (row_collapsed[i] || row_collapsed[i + 1]) {
+                0.0
+            } else {
+                row_gap
+            }
+        };
+        let gaps_w: f32 = (0..ncols.saturating_sub(1)).map(|i| gapx(i)).sum();
+        let gaps_h: f32 = (0..nrows.saturating_sub(1)).map(|i| gapy(i)).sum();
+        let tracks_w = cw.iter().sum::<f32>() + gaps_w;
+        let tracks_h = rh.iter().sum::<f32>() + gaps_h;
         let (egap_x, off_x) = content_offset(jc, (avail - tracks_w).max(0.0), ncols);
         let (egap_y, off_y) =
             content_offset(ac, (cont_h.unwrap_or(tracks_h) - tracks_h).max(0.0), nrows);
-        let egx = col_gap + egap_x;
-        let egy = row_gap + egap_y;
         let mut col_x = vec![0.0f32; ncols + 1];
         for i in 0..ncols {
-            col_x[i + 1] = col_x[i] + cw[i] + egx;
+            col_x[i + 1] = col_x[i]
+                + cw[i]
+                + if i + 1 < ncols {
+                    gapx(i) + egap_x
+                } else {
+                    col_gap + egap_x
+                };
         }
         let mut row_y = vec![0.0f32; nrows + 1];
         for i in 0..nrows {
-            row_y[i + 1] = row_y[i] + rh[i] + egy;
+            row_y[i + 1] = row_y[i]
+                + rh[i]
+                + if i + 1 < nrows {
+                    gapy(i) + egap_y
+                } else {
+                    row_gap + egap_y
+                };
         }
 
         // each item emits a sibling paint-order segment for the post-pass
@@ -4695,9 +5184,15 @@ impl<'a> Layouter<'a> {
                 stacking::item_layer(&it.cc),
             ));
             let cell_x = x0 + off_x + col_x[it.c];
-            let cell_w = cw[it.c..it.c + it.cs].iter().sum::<f32>() + egx * (it.cs - 1) as f32;
+            let cell_w: f32 = cw[it.c..it.c + it.cs].iter().sum::<f32>()
+                + (it.c..it.c + it.cs - 1)
+                    .map(|i| gapx(i) + egap_x)
+                    .sum::<f32>();
             let cell_y = y0 + off_y + row_y[it.r];
-            let cell_h = rh[it.r..it.r + it.rs].iter().sum::<f32>() + egy * (it.rs - 1) as f32;
+            let cell_h: f32 = rh[it.r..it.r + it.rs].iter().sum::<f32>()
+                + (it.r..it.r + it.rs - 1)
+                    .map(|i| gapy(i) + egap_y)
+                    .sum::<f32>();
             let inner_w =
                 (cell_w - it.m[1] - it.m[3] - it.p[1] - it.p[3] - it.bw[1] - it.bw[3]).max(1.0);
             let content_w = it
@@ -4706,7 +5201,10 @@ impl<'a> Layouter<'a> {
                 .unwrap_or(match it.just {
                     GAlign::Stretch => inner_w,
                     _ => it.intrinsic_w.min(inner_w).max(1.0),
-                });
+                })
+                .min(it.max_wc.unwrap_or(f32::MAX))
+                .max(it.min_wc)
+                .max(1.0);
             let box_w = content_w + it.p[1] + it.p[3] + it.bw[1] + it.bw[3];
             let mut box_h = if let Some(h) = it.h_prop {
                 h + it.p[0] + it.p[2] + it.bw[0] + it.bw[2]
@@ -5077,7 +5575,7 @@ impl<'a> Layouter<'a> {
                 }
                 Some("grid") | Some("inline-grid") => {
                     // fixed track sum beats text (repeat(8,64px) → 512)
-                    let (tracks, _) = grid_track_list(
+                    let (tracks, _, _) = grid_track_list(
                         c.get("grid-template-columns"),
                         self.avail_w,
                         st.size,
@@ -5090,6 +5588,7 @@ impl<'a> Layouter<'a> {
                         .iter()
                         .map(|t| match t {
                             GTrack::Fixed(p) => *p,
+                            GTrack::C { floor, .. } => *floor,
                             GTrack::Fr(_, floor) | GTrack::Auto(_, floor) => *floor,
                         })
                         .sum();
@@ -5102,6 +5601,57 @@ impl<'a> Layouter<'a> {
         }
         if w <= 0.0 {
             w = st.size * 4.0; // default for empty/image-ish content
+        }
+        w
+    }
+
+    /// min-content width approximation: the longest unbreakable word, or a
+    /// descendant's own minimum (explicit width, nested track sums).
+    /// Unlike `shrink_width` an empty subtree contributes 0 — it feeds
+    /// `min-width:auto` floors and min-content/fit-content tracks where
+    /// the 4em empty-content default would be wrong.
+    fn min_content_w(&mut self, node: NodeId, st: &Style) -> f32 {
+        let mut w = 0.0f32;
+        let doc = self.doc;
+        if let Some(fi) = self.resolve_font(st) {
+            if let Some(f) = self.fonts.font(fi) {
+                Self::each_text(doc, node, &mut |t| {
+                    for word in t.split_whitespace() {
+                        w = w.max(f.measure(word, st.size));
+                    }
+                });
+            }
+        }
+        let c = self.style(node);
+        if let Some(ew) = dim_intrinsic(&c, "width", self.avail_w, st.size) {
+            let ew = if border_box(&c) {
+                let [_t, pr, _b, pl] =
+                    box_sides(&c, "padding", self.avail_w, st.size).map(|v| v.max(0.0));
+                ew - pl - pr
+            } else {
+                ew
+            };
+            w = w.max(ew);
+        }
+        // a child's own minimum can out-measure our words
+        for &ch in self.doc.children(node) {
+            if !matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
+                continue;
+            }
+            let cc = self.style(ch);
+            if cc.get("display").map(String::as_str) == Some("none")
+                || matches!(
+                    cc.get("position").map(String::as_str),
+                    Some("absolute") | Some("fixed")
+                )
+            {
+                continue; // hidden or out-of-flow: no contribution
+            }
+            let mut cst = st.clone();
+            self.apply_computed(&cc, &mut cst);
+            let cw = dim_intrinsic(&cc, "width", self.avail_w, cst.size)
+                .unwrap_or_else(|| self.min_content_w(ch, &cst));
+            w = w.max(cw);
         }
         w
     }
@@ -6513,6 +7063,189 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn grid_auto_fill_expands_tracks() {
+        // repeat(auto-fill,100px) in ~784px avail → 7 explicit tracks;
+        // `grid-column:-1` = the last explicit line → track 7 → x = 8+700
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:repeat(auto-fill,100px)}\
+             .x{grid-column:-1}</style>\
+             <div class=g><div>a</div><div class=x>b</div></div>",
+        );
+        let (xa, _) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        assert!(
+            (xb - xa - 700.0).abs() < 2.0,
+            "auto-fill expands 7 tracks, b in the implicit 8th: {xa} -> {xb}"
+        );
+    }
+
+    #[test]
+    fn grid_auto_fit_collapses_empty() {
+        // repeat(auto-fit,100px) → same 7 tracks, but the 5 empty ones
+        // collapse to 0: an item pinned at track 7 lands at +100 not +600
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:repeat(auto-fit,100px)}\
+             .x{grid-column:7}</style>\
+             <div class=g><div>a</div><div class=x>b</div></div>",
+        );
+        let (xa, _) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        assert!(
+            (xb - xa - 100.0).abs() < 2.0,
+            "empty auto-fit tracks collapse: {xa} -> {xb}"
+        );
+    }
+
+    #[test]
+    fn grid_auto_flow_dense_backfills() {
+        // a,b span 2 of 3 columns → b wraps to row 1 leaving r0c2 free;
+        // dense puts c in the hole instead of after b
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:repeat(3,100px);\
+             grid-auto-flow:dense}.w{grid-column:span 2}</style>\
+             <div class=g><div class=w>a</div><div class=w>b</div><div>c</div><div>d</div></div>",
+        );
+        let (_xa, ya) = text_pos(&items, "a");
+        let (_xb, yb) = text_pos(&items, "b");
+        let (_xc, yc) = text_pos(&items, "c");
+        let (_xd, yd) = text_pos(&items, "d");
+        assert!(
+            (yc - ya).abs() < 1.0,
+            "dense c backfills row 0: ya={ya} yc={yc}"
+        );
+        assert!(yb > ya, "b lands on row 1");
+        assert!((yd - yb).abs() < 1.0, "d backfills r1c2 beside b");
+    }
+
+    #[test]
+    fn grid_auto_flow_column() {
+        // 2 explicit rows + column flow → implicit 60px columns
+        let (items, _, _) = lay("<style>.g{display:grid;grid-template-rows:20px 20px;\
+             grid-auto-flow:column;grid-template-columns:100px;\
+             grid-auto-columns:60px}</style>\
+             <div class=g><div>a</div><div>b</div><div>c</div><div>d</div><div>e</div></div>");
+        let (xa, ya) = text_pos(&items, "a");
+        let (_xb, yb) = text_pos(&items, "b");
+        let (xc, yc) = text_pos(&items, "c");
+        let (xe, _ye) = text_pos(&items, "e");
+        assert!(yb > ya, "column flow fills rows first");
+        assert!((yc - ya).abs() < 1.0, "c wraps to the next column's top");
+        assert!(
+            (xc - xa - 100.0).abs() < 2.0,
+            "explicit col 100px: {xa} -> {xc}"
+        );
+        assert!(
+            (xe - xc - 60.0).abs() < 2.0,
+            "implicit col 60px: {xc} -> {xe}"
+        );
+    }
+
+    #[test]
+    fn grid_fit_content_clamps() {
+        // fit-content(80px): a ~200px max-content contribution clamps at 80
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:fit-content(80px)}\
+             .i{background:#ff0000}</style>\
+             <div class=g><div class=i>aaa bbb ccc ddd eee fff ggg hhh iii</div></div>",
+        );
+        let r = items.iter().find(
+            |i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)),
+        );
+        let Some(DisplayItem::FillRect { w, .. }) = r else {
+            panic!("item bg not found")
+        };
+        assert!((*w - 80.0).abs() < 2.0, "fit-content clamps at 80px: w={w}");
+    }
+
+    #[test]
+    fn grid_justify_content_center() {
+        // 200px of tracks inside ~784 avail → the block centers: off ~292
+        let (items, _, _) = lay("<style>.g{display:grid;grid-template-columns:100px 100px;\
+             justify-content:center}</style>\
+             <div class=g><div>a</div><div>b</div></div>");
+        let (xa, _) = text_pos(&items, "a");
+        let want = 8.0 + (784.0 - 200.0) / 2.0;
+        assert!(
+            (xa - want).abs() < 3.0,
+            "track block centered: x={xa} want {want}"
+        );
+    }
+
+    #[test]
+    fn grid_named_numeric_lines() {
+        // [a]100px[b]100px[a]100px[b] — `2 a` = the 2nd `a` line = line 3
+        let (items, _, _) = lay("<style>.g{display:grid;\
+             grid-template-columns:[a] 100px [b] 100px [a] 100px [b]}\
+             .x{grid-column:2 a}</style>\
+             <div class=g><div class=x>bb</div></div>");
+        let (xb, _) = text_pos(&items, "bb");
+        assert!(
+            (xb - 8.0 - 200.0).abs() < 2.0,
+            "line '2 a' → column 3: x={xb}"
+        );
+    }
+
+    #[test]
+    fn grid_span_to_named_line() {
+        // `1 / span a` spans to the next `a` line (line 3) → 2 columns wide
+        let (items, _, _) = lay("<style>.g{display:grid;\
+             grid-template-columns:[a] 100px [b] 100px [a] 100px [b]}\
+             .x{grid-column:1 / span a;background:#ff0000}</style>\
+             <div class=g><div class=x></div></div>");
+        let r = items.iter().find(
+            |i| matches!(i, DisplayItem::FillRect { color, .. } if *color == bgra(255, 0, 0)),
+        );
+        let Some(DisplayItem::FillRect { w, .. }) = r else {
+            panic!("item bg not found")
+        };
+        assert!((*w - 200.0).abs() < 2.0, "span a → 2 tracks: w={w}");
+    }
+
+    #[test]
+    fn grid_shorthand_template_and_autoflow() {
+        // `grid: 40px / 100px 100px` → template rows + columns
+        let (items, _, _) = lay("<style>.g{display:grid;grid:40px / 100px 100px}</style>\
+             <div class=g><div>a</div><div>b</div><div>c</div></div>");
+        let (xa, ya) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        let (xc, yc) = text_pos(&items, "c");
+        assert!(
+            (xb - xa - 100.0).abs() < 1.0,
+            "shorthand cols: {xa} -> {xb}"
+        );
+        assert!(
+            (yc - ya - 40.0).abs() < 2.0,
+            "shorthand row 40px: {ya} -> {yc}"
+        );
+        assert!((xc - xa).abs() < 1.0, "c wraps to column 1");
+        // `grid: auto-flow 40px / 100px 100px` → row flow, 40px auto rows
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid:auto-flow 40px / 100px 100px}</style>\
+             <div class=g><div>a</div><div>b</div><div>c</div></div>",
+        );
+        let (_, ya) = text_pos(&items, "a");
+        let (_, yc) = text_pos(&items, "c");
+        assert!((yc - ya - 40.0).abs() < 2.0, "auto row 40px: {ya} -> {yc}");
+    }
+
+    #[test]
+    fn grid_auto_tracks_stretch() {
+        // justify-content:normal → the two auto columns stretch evenly to
+        // fill the ~784px container (col 1 starts ~halfway, not at ~16px
+        // of content-sized tracks)
+        let (items, _, _) = lay(
+            "<style>.g{display:grid;grid-template-columns:auto auto}</style>\
+             <div class=g><div>a</div><div>b</div></div>",
+        );
+        let (xa, _) = text_pos(&items, "a");
+        let (xb, _) = text_pos(&items, "b");
+        assert!(
+            xb - xa > 300.0,
+            "auto columns stretch to fill: {xa} -> {xb}"
+        );
     }
 
     /// first bg rect painted at `color`, as (x, y, w, h)

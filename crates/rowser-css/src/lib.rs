@@ -2009,8 +2009,171 @@ fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
             f("overflow-x", value);
             f("overflow-y", value);
         }
+        "gap" => {
+            f("gap", value);
+            let mut it = value.split_whitespace();
+            let rg = it.next().unwrap_or("normal");
+            let cg = it.next().unwrap_or(rg);
+            f("row-gap", rg);
+            f("column-gap", cg);
+        }
+        "place-items" => {
+            f("place-items", value);
+            let mut it = value.split_whitespace();
+            let av = it.next().unwrap_or("normal");
+            let j = it.next().unwrap_or(av);
+            f("align-items", av);
+            f("justify-items", j);
+        }
+        "place-content" => {
+            f("place-content", value);
+            let mut it = value.split_whitespace();
+            let av = it.next().unwrap_or("normal");
+            let j = it.next().unwrap_or(av);
+            f("align-content", av);
+            f("justify-content", j);
+        }
+        "place-self" => {
+            f("place-self", value);
+            let mut it = value.split_whitespace();
+            let av = it.next().unwrap_or("auto");
+            let j = it.next().unwrap_or(av);
+            f("align-self", av);
+            f("justify-self", j);
+        }
+        "grid-template" => {
+            f("grid-template", value);
+            let (rows, cols, areas) = grid_template_parts(value);
+            f("grid-template-rows", &rows);
+            f("grid-template-columns", &cols);
+            f("grid-template-areas", &areas);
+        }
+        "grid" => {
+            f("grid", value);
+            for (p, v) in expand_grid(value) {
+                f(p, &v);
+            }
+        }
         _ => f(prop, value),
     }
+}
+
+/// `grid-template: <rows> [/ <cols>]` → (row track list, col track list,
+/// areas). Row segments interleave `'name'` area strings with track sizes;
+/// the names are re-quoted into a `grid-template-areas` value. Missing
+/// sides report `none` — a shorthand resets them.
+fn grid_template_parts(value: &str) -> (String, String, String) {
+    let (rows, cols) = value.split_once('/').unwrap_or((value, ""));
+    let mut tracks = String::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut seg = String::new();
+    let mut in_q = false;
+    for ch in rows.chars() {
+        match ch {
+            '\'' | '"' => {
+                if in_q {
+                    names.push(seg.trim().to_string());
+                    seg.clear();
+                }
+                in_q = !in_q;
+            }
+            _ if in_q => seg.push(ch),
+            _ => tracks.push(ch),
+        }
+    }
+    let tracks = tracks.trim();
+    let rows = if tracks.is_empty() { "none" } else { tracks }.to_string();
+    let cols = cols.trim();
+    let cols = if cols.is_empty() { "none" } else { cols }.to_string();
+    let areas = if names.is_empty() {
+        "none".to_string()
+    } else {
+        names
+            .iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    (rows, cols, areas)
+}
+
+/// `grid` shorthand → longhand pairs. Forms: `none`, the `grid-template`
+/// form (rows [/ cols], area strings interleaved in rows), and the
+/// auto-flow forms — `grid: <rows> / auto-flow <cols>` sets column flow
+/// and `grid: auto-flow <rows> / <cols>` sets row flow — `dense` may sit
+/// on either side of `auto-flow`.
+fn expand_grid(value: &str) -> Vec<(&'static str, String)> {
+    let v = value.trim();
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    if v.is_empty() || v == "none" {
+        out.push(("grid-template-rows", "none".to_string()));
+        out.push(("grid-template-columns", "none".to_string()));
+        out.push(("grid-template-areas", "none".to_string()));
+        return out;
+    }
+    if !v.contains("auto-flow") {
+        let (rows, cols, areas) = grid_template_parts(v);
+        out.push(("grid-template-rows", rows));
+        out.push(("grid-template-columns", cols));
+        out.push(("grid-template-areas", areas));
+        return out;
+    }
+    // auto-flow forms: the side of `/` carrying `auto-flow` becomes the
+    // flow axis' auto track list; the other side is the explicit template
+    let (left, right) = v.split_once('/').unwrap_or((v, ""));
+    for (i, side) in [left, right].into_iter().enumerate() {
+        let toks: Vec<&str> = side.split_whitespace().collect();
+        if toks.iter().any(|t| *t == "auto-flow") {
+            let dense = toks.iter().any(|t| *t == "dense");
+            let tracks = toks
+                .iter()
+                .copied()
+                .filter(|t| *t != "auto-flow" && *t != "dense")
+                .collect::<Vec<_>>()
+                .join(" ");
+            let dir = if i == 0 { "row" } else { "column" };
+            out.push((
+                "grid-auto-flow",
+                if dense {
+                    format!("{dir} dense")
+                } else {
+                    dir.to_string()
+                },
+            ));
+            out.push((
+                if i == 0 {
+                    "grid-auto-rows"
+                } else {
+                    "grid-auto-columns"
+                },
+                tracks,
+            ));
+            // the template on the flow axis is empty
+            out.push((
+                if i == 0 {
+                    "grid-template-rows"
+                } else {
+                    "grid-template-columns"
+                },
+                "none".to_string(),
+            ));
+        } else if i == 0 {
+            // row template may interleave 'area' strings with track sizes
+            let (rows, _, areas) = grid_template_parts(&format!("{side} /"));
+            out.push(("grid-template-rows", rows));
+            out.push(("grid-template-areas", areas));
+        } else {
+            out.push((
+                "grid-template-columns",
+                if side.trim().is_empty() {
+                    "none".to_string()
+                } else {
+                    side.trim().to_string()
+                },
+            ));
+        }
+    }
+    out
 }
 
 /// Custom-property declarations (--x) matching this element.
@@ -2543,6 +2706,33 @@ fn supports_leaf(inner: &str) -> bool {
         "background-origin",
         "background-clip",
         "background-attachment",
+        "grid",
+        "grid-template",
+        "grid-template-areas",
+        "grid-area",
+        "grid-template-columns",
+        "grid-template-rows",
+        "grid-column",
+        "grid-row",
+        "grid-column-start",
+        "grid-column-end",
+        "grid-row-start",
+        "grid-row-end",
+        "grid-auto-flow",
+        "grid-auto-rows",
+        "grid-auto-columns",
+        "row-gap",
+        "column-gap",
+        "place-items",
+        "place-content",
+        "place-self",
+        "align-items",
+        "justify-items",
+        "align-content",
+        "justify-content",
+        "align-self",
+        "justify-self",
+        "aspect-ratio",
     ];
     match inner.trim().split_once(':') {
         Some((prop, _)) => {
