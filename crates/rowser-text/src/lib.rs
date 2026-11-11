@@ -19,6 +19,17 @@ pub struct FontFace {
     pub bold: bool,
     pub italic: bool,
     pub path: PathBuf,
+    /// CSS weight 100–900 (scanned faces: 400, or 700 when `bold`).
+    pub weight: u16,
+    /// font-stretch percentage; 100 = normal width.
+    pub stretch: u16,
+    /// unicode-range restriction (@font-face faces); empty = unrestricted.
+    pub unicode_ranges: Vec<(u32, u32)>,
+    /// registered from a web font / local() alias — outranks a fuzzy
+    /// substring hit on a scanned system face.
+    pub registered: bool,
+    /// deactivated by `clear_registered` (navigation) — never selected.
+    pub disabled: bool,
 }
 
 /// Scan a directory (non-recursively) for .ttf/.otf files and read their
@@ -86,6 +97,11 @@ fn inspect(path: &Path) -> Option<FontFace> {
         bold,
         italic,
         path: path.to_path_buf(),
+        weight: if bold { 700 } else { 400 },
+        stretch: 100,
+        unicode_ranges: Vec::new(),
+        registered: false,
+        disabled: false,
     })
 }
 
@@ -830,43 +846,55 @@ impl FontCache {
     /// candidate substring-matches face families; generic keywords expand to
     /// preferred concrete families.
     pub fn resolve(&mut self, family: &str, bold: bool, italic: bool) -> Option<usize> {
+        self.resolve_face(family, if bold { 700 } else { 400 }, 100, italic, None)
+    }
+
+    /// Full-strength resolution: numeric CSS `weight` (100–900), `stretch`
+    /// percent, and an optional first char of the run — faces restricted by
+    /// unicode-range (@font-face) only match when they cover that char.
+    /// Each comma-separated name in `family` is tried in order; generic
+    /// keywords expand to preferred concrete families.
+    pub fn resolve_face(
+        &mut self,
+        family: &str,
+        weight: u16,
+        stretch: u16,
+        italic: bool,
+        ch: Option<char>,
+    ) -> Option<usize> {
         let generics = |g: &str| -> &[&str] {
             match g {
-                "monospace" | "ui-monospace" | "mono" => {
+                "monospace" | "ui-monospace" | "mono" | "fixed" | "fixed-width"
+                | "consolas" | "menlo" | "sfmono" | "sf mono" => {
                     &["geist mono", "jetbrains", "noto sans mono", "dejavu sans mono", "mono"]
                 }
-                "sans-serif" | "sans" | "system-ui" => {
+                "sans-serif" | "sans" | "system-ui" | "ui-sans-serif" | "-apple-system"
+                | "blinkmacsystemfont" | "-webkit-standard" => {
                     &["liberation sans", "noto sans", "dejavu sans", "geist"]
                 }
                 "serif" | "ui-serif" => &["liberation serif", "noto serif", "dejavu serif"],
                 "cursive" | "fantasy" => &["comic", "liberation sans"],
+                "emoji" => &["noto color emoji", "emoji", "symbola", "sans"],
+                "math" => &["noto sans math", "stix", "dejavu sans"],
                 _ => &[],
             }
         };
         for cand in family.split(',') {
-            let want = cand.trim().to_lowercase();
+            let want = cand
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_lowercase();
+            if want.is_empty() {
+                continue;
+            }
             let wants: Vec<String> = {
                 let g = generics(want.as_str());
                 if g.is_empty() { vec![want] } else { g.iter().map(|s| s.to_string()).collect() }
             };
             for want in wants {
-                let mut best: Option<(usize, u32)> = None;
-                for (i, f) in self.faces.iter().enumerate() {
-                    if !f.family.to_lowercase().contains(&want) {
-                        continue;
-                    }
-                    let mut score = 1u32;
-                    if f.bold == bold {
-                        score += 4;
-                    }
-                    if f.italic == italic {
-                        score += 2;
-                    }
-                    if best.is_none_or(|(_, s)| score > s) {
-                        best = Some((i, score));
-                    }
-                }
-                if let Some((idx, _)) = best {
+                if let Some(idx) = self.best_face(&want, weight, stretch, italic, ch) {
                     if !self.fonts.contains_key(&idx) {
                         if let Some(font) = Font::load(&self.faces[idx].path) {
                             self.fonts.insert(idx, font);
@@ -877,6 +905,55 @@ impl FontCache {
             }
         }
         None
+    }
+
+    /// Best face substring-matching `want` for (weight, stretch, italic,
+    /// optional first-char). Registered (@font-face / local-alias) faces
+    /// outrank fuzzy system matches; unicode-range restricted faces need
+    /// coverage of `ch` (unrestricted when `ch` is None).
+    fn best_face(
+        &self,
+        want: &str,
+        weight: u16,
+        stretch: u16,
+        italic: bool,
+        ch: Option<char>,
+    ) -> Option<usize> {
+        let cp = ch.map(|c| c as u32);
+        let mut best: Option<(usize, u32)> = None;
+        for (i, f) in self.faces.iter().enumerate() {
+            if f.disabled || !f.family.to_lowercase().contains(want) {
+                continue;
+            }
+            if !f.unicode_ranges.is_empty() {
+                if let Some(cp) = cp {
+                    if !f.unicode_ranges.iter().any(|&(a, b)| cp >= a && cp <= b) {
+                        continue;
+                    }
+                }
+            }
+            let mut score = 1u32;
+            if f.italic == italic {
+                score += 4;
+            }
+            // nearest weight wins: ±50 gets 2, within 150 gets 1
+            let wd = (f.weight as i32 - weight as i32).unsigned_abs();
+            score += match wd {
+                0..=50 => 2,
+                51..=150 => 1,
+                _ => 0,
+            };
+            if (f.stretch as i32 - stretch as i32).unsigned_abs() <= 10 {
+                score += 1;
+            }
+            if f.registered {
+                score += 8;
+            }
+            if best.is_none_or(|(_, s)| score > s) {
+                best = Some((i, score));
+            }
+        }
+        best.map(|(i, _)| i)
     }
 
     pub fn font(&mut self, idx: usize) -> Option<&mut Font> {
@@ -905,6 +982,78 @@ impl FontCache {
             self.glyphs.insert(key, r);
         }
         self.glyphs.get(&key)?.as_ref()
+    }
+
+    /// Register a downloaded @font-face font under its declared `family`,
+    /// so `font-family: <family>` resolves to it ahead of fuzzy system
+    /// matches. Returns the face index, or None when `bytes` isn't a
+    /// decodable (TrueType-outline) font.
+    pub fn register_bytes(
+        &mut self,
+        family: &str,
+        bytes: &[u8],
+        weight: u16,
+        italic: bool,
+        unicode_ranges: Vec<(u32, u32)>,
+    ) -> Option<usize> {
+        let font = Font::parse(bytes)?;
+        let idx = self.faces.len();
+        self.faces.push(FontFace {
+            family: family.to_string(),
+            bold: weight >= 600,
+            italic,
+            path: PathBuf::new(),
+            weight,
+            stretch: 100,
+            unicode_ranges,
+            registered: true,
+            disabled: false,
+        });
+        self.fonts.insert(idx, font);
+        Some(idx)
+    }
+
+    /// `local("Name")` source: alias an already-installed face under the
+    /// @font-face `family`. Returns the new index when a face matched.
+    pub fn register_local(
+        &mut self,
+        family: &str,
+        local_name: &str,
+        weight: u16,
+        italic: bool,
+        unicode_ranges: Vec<(u32, u32)>,
+    ) -> Option<usize> {
+        let want = local_name.trim().to_lowercase();
+        if want.is_empty() {
+            return None;
+        }
+        let src = self.faces.iter().position(|f| {
+            !f.registered && !f.disabled && f.family.to_lowercase().contains(&want)
+        })?;
+        let mut face = self.faces[src].clone();
+        face.family = family.to_string();
+        face.weight = weight;
+        face.bold = weight >= 600;
+        face.italic = italic;
+        face.unicode_ranges = unicode_ranges;
+        face.registered = true;
+        let idx = self.faces.len();
+        self.faces.push(face);
+        Some(idx)
+    }
+
+    /// Deactivate every web-registered face — the @font-face set is per
+    /// page, so navigation calls this before registering the next batch.
+    /// Indices stay stable; display lists built from a stale page still
+    /// hold valid (if disabled) indices.
+    pub fn clear_registered(&mut self) {
+        for (i, f) in self.faces.iter_mut().enumerate() {
+            if f.registered && !f.disabled {
+                f.disabled = true;
+                self.fonts.remove(&i);
+                self.glyphs.retain(|&(gi, _, _), _| gi != i);
+            }
+        }
     }
 }
 
@@ -1017,6 +1166,55 @@ mod tests {
         assert!(faces.len() >= 12);
         let sans = select(&faces, "sans", true, false).unwrap();
         assert!(sans.bold);
+    }
+
+    fn font_bytes() -> Vec<u8> {
+        std::fs::read("/usr/share/fonts/liberation/LiberationSans-Regular.ttf").unwrap()
+    }
+
+    #[test]
+    fn registers_bytes_as_family() {
+        let mut c = FontCache::new();
+        let idx = c
+            .register_bytes("Totally Custom", &font_bytes(), 400, false, vec![])
+            .expect("register");
+        assert_eq!(c.resolve("totally custom", false, false), Some(idx));
+        assert!(c.font(idx).is_some());
+    }
+
+    #[test]
+    fn registered_weight_and_range_gate() {
+        let mut c = FontCache::new();
+        let up = c
+            .register_bytes("Ranged", &font_bytes(), 400, false, vec![(0x41, 0x5a)])
+            .unwrap();
+        let lo = c
+            .register_bytes("Ranged", &font_bytes(), 400, false, vec![(0x61, 0x7a)])
+            .unwrap();
+        // first char of the run picks the covering face
+        assert_eq!(c.resolve_face("ranged", 400, 100, false, Some('H')), Some(up));
+        assert_eq!(c.resolve_face("ranged", 400, 100, false, Some('h')), Some(lo));
+        // no char context → unrestricted resolution still works
+        assert!(c.resolve_face("ranged", 400, 100, false, None).is_some());
+    }
+
+    #[test]
+    fn register_local_aliases_system_face() {
+        let mut c = FontCache::new();
+        let idx = c
+            .register_local("Alias Fam", "liberation sans", 700, false, vec![])
+            .expect("local match");
+        assert_eq!(c.resolve_face("alias fam", 700, 100, false, None), Some(idx));
+        assert!(c.font(idx).is_some());
+    }
+
+    #[test]
+    fn clear_registered_disables_web_faces() {
+        let mut c = FontCache::new();
+        c.register_bytes("Gone Fam", &font_bytes(), 400, false, vec![])
+            .unwrap();
+        c.clear_registered();
+        assert!(c.resolve("gone fam", false, false).is_none());
     }
 }
 

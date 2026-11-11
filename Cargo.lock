@@ -4432,6 +4432,7 @@ name = "rowser-renderer"
 version = "0.0.0"
 dependencies = [
  "rowser-css",
+ "rowser-deflate",
  "rowser-dom",
  "rowser-html",
  "rowser-image",

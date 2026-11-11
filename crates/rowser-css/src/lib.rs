@@ -20,6 +20,9 @@ use rustc_hash::FxHashMap;
 /// small and lookups/inserts dominate the cascade).
 pub type StrMap<V> = FxHashMap<String, V>;
 
+mod fontface;
+pub use fontface::{FontFace, FontFaceStyle, FontSrc};
+
 #[derive(Debug, Clone)]
 pub struct Decl {
     pub prop: String,
@@ -133,6 +136,9 @@ pub struct StyleSheet {
     /// `@keyframes` name → declarations of its end (`to`/`100%`/last)
     /// frame, used to emulate animation-fill-mode resting state.
     pub keyframes: FxHashMap<String, Vec<Decl>>,
+    /// `@font-face` blocks collected while parsing — consumed by the
+    /// renderer's font loader, never by the cascade.
+    pub fonts: Vec<FontFace>,
 }
 
 pub fn parse(css: &str) -> StyleSheet {
@@ -152,6 +158,7 @@ pub fn parse_selector(s: &str) -> Option<Selector> {
         layer_map: FxHashMap::default(),
         layer_count: 0,
         keyframes: Vec::new(),
+        font_faces: Vec::new(),
     };
     p.skip_ws_comments();
     let sel = p.selector()?;
@@ -173,6 +180,7 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         layer_map: FxHashMap::default(),
         layer_count: 0,
         keyframes: Vec::new(),
+        font_faces: Vec::new(),
     };
     let mut pairs: Vec<(u32, Rule)> = Vec::new();
     p.skip_ws_comments();
@@ -196,6 +204,7 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         by_id: FxHashMap::default(),
         plain: Vec::new(),
         keyframes: p.keyframes.into_iter().collect(),
+        fonts: p.font_faces,
     };
     sheet.reindex();
     sheet
@@ -302,6 +311,8 @@ struct CssParser<'a> {
     /// `@keyframes` name → decls of the end (`to`/`100%`) frame, captured
     /// for animation end-state emulation (non-animating engine).
     keyframes: Vec<(String, Vec<Decl>)>,
+    /// `@font-face` descriptors collected for `StyleSheet::fonts`.
+    font_faces: Vec<FontFace>,
 }
 
 impl<'a> CssParser<'a> {
@@ -386,6 +397,15 @@ impl<'a> CssParser<'a> {
             }
             if !kf_name.is_empty() {
                 self.keyframes.push((kf_name, end_decls));
+            }
+            return Some(Vec::new());
+        }
+        // `@font-face { ... }` is a descriptor block — parse it into the
+        // sheet's font list instead of rule-parsing it or skipping it.
+        if name == "font-face" && has_block {
+            let decls = self.decl_block();
+            if let Some(ff) = fontface::font_face_from_decls(&decls) {
+                self.font_faces.push(ff);
             }
             return Some(Vec::new());
         }

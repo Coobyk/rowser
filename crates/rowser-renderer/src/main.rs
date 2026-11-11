@@ -9,6 +9,8 @@ use rowser_layout::{bgra, Layouter};
 use rowser_text::FontCache;
 use std::io::{self, Write};
 
+mod fontface;
+
 const WELCOME: &str = include_str!("../../../assets/welcome.html");
 
 /// Stage timing + event trace → shared log the browser owner can read.
@@ -125,6 +127,7 @@ fn main() {
                     .unwrap_or_else(|| effective.clone());
                 page.load(doc, effective, title.clone());
                 page.js = js;
+                load_web_fonts(&page, &mut fonts);
                 page.repaint(&mut fonts);
                 if !frag.is_empty() {
                     if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
@@ -1167,6 +1170,33 @@ fn frame_msg(page: &Page) -> ToBrowser {
 }
 
 /// Resolve a URL to HTML text + the effective URL (after fallback).
+/// Gather @font-face rules from the page's sheets (linked + inline
+/// <style>), fetch usable sources, and register them in the FontCache so
+/// `font-family` resolves to web fonts. Web faces from the previous page
+/// are deactivated first — the set is per-document.
+fn load_web_fonts(page: &Page, fonts: &mut FontCache) {
+    fonts.clear_registered();
+    let mut faces: Vec<rowser_css::FontFace> = Vec::new();
+    for s in &page.sheets {
+        faces.extend(s.fonts.iter().cloned());
+    }
+    if let Some(doc) = &page.doc {
+        for s in rowser_css::document_sheets_vw(doc, page.viewport.0 as f32) {
+            faces.extend(s.fonts);
+        }
+    }
+    if faces.is_empty() {
+        return;
+    }
+    let t = std::time::Instant::now();
+    fontface::register_font_faces(&faces, &page.url_base, fonts);
+    pt!(
+        "[prof] webfonts {} declared faces in {:?}",
+        faces.len(),
+        t.elapsed()
+    );
+}
+
 fn load_url(url: &str) -> (String, String) {
     if let Some(rest) = url.strip_prefix("file://") {
         let path = rowser_net::percent_decode(rest).unwrap_or_else(|_| rest.to_string());
