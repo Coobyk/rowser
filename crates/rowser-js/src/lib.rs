@@ -1045,6 +1045,158 @@ mod tests {
     }
 
     #[test]
+    fn regex_replace_fn_args() {
+        // fn replacer receives (match, p1..pn, offset, string[, groups])
+        assert_eq!(
+            s("'ab'.replace(/(a)(b)/, function(m, p1, p2, off, str) { return p1 + off + p2 + str.length; })"),
+            "a0b2"
+        );
+        // named groups → 5th arg is the groups object
+        assert_eq!(
+            s("'a1'.replace(/(?<d>\\d)/, function(m, g, off, s, gr) { return gr.d; })"),
+            "a1"
+        );
+        // unmatched group → undefined
+        assert_eq!(
+            s("'ab'.replace(/(x)?b/, function(m, g) { return g === undefined ? 'U' : g; })"),
+            "aU"
+        );
+    }
+
+    #[test]
+    fn regex_more_lexer_contexts() {
+        // `in`/`instanceof`/`typeof`/`void`/`delete`/`new`/`throw` → regex
+        assert_eq!(s("var x = typeof /a/; x"), "object");
+        assert_eq!(s("typeof /a/"), "object");
+        assert!(b("var x = void /a/; x === undefined"));
+        assert!(b("var o = {a:1}; delete /x/.test('x') && delete o.a; !('a' in o)"));
+        // after `case`, `do`, `else`
+        assert_eq!(num("var r = 0; if (false) {} else /a/.test('a') ? r = 5 : 0; r"), 5.0);
+        assert!(b("do { } while (false); /z/.test('z')"));
+        // division vs regex after number/paren/bracket
+        assert_eq!(num("var a = [10]; a[0] / 2"), 5.0);
+        assert_eq!(num("var n = 9; n / 3"), 3.0);
+        // regex at start of file
+        assert!(b("/fi/.test('first')"));
+    }
+
+    #[test]
+    fn regex_named_groups_detail() {
+        // groups prop is undefined for unnamed regexes
+        assert!(b("var m = /a/.exec('a'); m.groups === undefined"));
+        // named group missing → undefined value
+        assert_eq!(
+            s("var m = /(?<a>x)|(?<b>y)/.exec('y'); String(m.groups.a) + String(m.groups.b)"),
+            "undefinedy"
+        );
+        // named backref \\k<name>
+        assert!(b("/(?<w>ab)\\k<w>/.test('abab')"));
+    }
+
+    #[test]
+    fn regex_char_classes_detail() {
+        assert!(b("/[\\d]/.test('5')"));
+        assert!(!b("/[\\D]/.test('5')"));
+        assert!(b("/[a-]/.test('-')"));      // trailing dash literal
+        assert!(b("/[-a]/.test('-')"));      // leading dash literal
+        assert!(b("/[\\]]/.test(']')"));
+        assert!(b("/[a-cx-z]/.test('y')"));
+        assert!(!b("/[a-cx-z]/.test('w')"));
+        assert!(b("/[\\x41-\\x43]/.test('B')")); // hex range
+    }
+
+    #[test]
+    fn regex_anchors_and_wordb() {
+        assert!(b("/^ab$/.test('ab')"));
+        assert!(!b("/^ab$/.test('xab')"));
+        assert!(b("/^b/m.test('a\\nb')"));
+        assert!(b("/a$/m.test('a\\nb')"));
+        assert_eq!(s("'foo bar'.replace(/\\bbar\\b/, 'B')"), "foo B");
+        assert_eq!(num("'the cat'.search(/\\bcat\\b/)"), 4.0);
+        assert!(b("/\\Bcat/.test('scat')"));
+    }
+
+    #[test]
+    fn regex_group_capture_detail() {
+        // nested groups numbered left-to-right by open paren
+        assert_eq!(
+            s("var m = /((a)(b))/.exec('ab'); m[1] + ',' + m[2] + ',' + m[3]"),
+            "ab,a,b"
+        );
+        // unmatched group → undefined
+        assert!(b("var m = /(x)?b/.exec('b'); m[1] === undefined"));
+        // lastIndex advances to match end
+        assert_eq!(num("var re = /\\d/g; re.exec('12'); re.lastIndex"), 1.0);
+        // sticky exec at exact position
+        assert_eq!(num("var re = /\\d/y; re.lastIndex = 2; var m = re.exec('ab3'); m === null ? -9 : m.index"), 2.0);
+    }
+
+    #[test]
+    fn regex_split_with_captures() {
+        assert_eq!(s("'a1b2c'.split(/(\\d)/).join('|')"), "a|1|b|2|c");
+        assert_eq!(num("'a1b2'.split(/\\d/).length"), 3.0);
+        // multiple capture groups spliced
+        assert_eq!(s("'k=1'.split(/(\\w)(=)/).join('|')"), "|k|=|1");
+        // trailing separator → trailing empty string
+        assert_eq!(s("'aXbX'.split(/X/).join('|')"), "a|b|");
+        assert_eq!(s("'XaXb'.split(/X/).join('|')"), "|a|b");
+    }
+
+    #[test]
+    fn regex_compile_errors() {
+        // invalid flag → SyntaxError thrown
+        assert!(eval("var r = /x/q;").is_err());
+        assert!(eval("new RegExp('a', 'zz')").is_err());
+        assert!(eval("new RegExp('(')").is_err());
+        // unknown named backref
+        assert!(eval("new RegExp('\\\\k<nope>')").is_err());
+    }
+
+    #[test]
+    fn regex_lookaround() {
+        assert!(b("/foo(?=bar)/.test('foobar')"));
+        assert!(!b("/foo(?=bar)/.test('foobaz')"));
+        assert!(b("/foo(?!bar)/.test('foobaz')"));
+        // lookbehind
+        assert!(b("/(?<=x)y/.test('xy')"));
+        assert!(!b("/(?<=x)y/.test('zy')"));
+        assert!(b("/(?<!x)y/.test('zy')"));
+        // captures inside lookahead are usable
+        assert_eq!(s("'ab'.match(/a(?=(b))/)[1]"), "b");
+    }
+
+    #[test]
+    fn regex_matchall_iterator() {
+        assert_eq!(
+            s("var out = ''; for (var m of 'a1b2'.matchAll(/[a-z]\\d/g)) out += m[0]; out"),
+            "a1b2"
+        );
+        // matchAll on regex with named groups
+        assert_eq!(
+            s("var out = []; for (var m of 'x=1;y=2'.matchAll(/(?<k>\\w)=(?<v>\\d)/g)) out.push(m.groups.k + m.groups.v); out.join(',')"),
+            "x1,y2"
+        );
+    }
+
+    #[test]
+    fn regex_misc_semantics() {
+        // toString on empty pattern → /(?:)/
+        assert_eq!(s("new RegExp().toString()"), "/(?:)/");
+        // regex from regex: new RegExp(re, flags)
+        assert_eq!(s("var r = new RegExp(/ab/, 'i'); r.flags + r.source"), "iab");
+        // lastIndex writable
+        assert_eq!(num("var re = /a/g; re.lastIndex = 99; re.exec('a'); re.lastIndex"), 0.0);
+        // replace $1 with unmatched group → empty
+        assert_eq!(s("'ab'.replace(/(x)?b/, '[$1]')"), "a[]");
+        // $n where n > groups → literal
+        assert_eq!(s("'ab'.replace(/b/, '$9')"), "a$9");
+        // str.match with null result
+        assert!(b("'x'.match(/z/) === null"));
+        // charCode-driven: \\0 escape
+        assert!(b("/\\0x/.test('\\u0000x')"));
+    }
+
+    #[test]
     fn regex_catastrophic_backtrack_guard() {
         // classic exponential pattern — must return quickly (step cap), not hang
         let t = std::time::Instant::now();

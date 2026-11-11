@@ -2176,9 +2176,10 @@ fn str_iter(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 fn string_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let s = match arg(args, 0) {
-        Value::Und => String::new(),
-        v => i.to_str(&v)?,
+    let s = if args.is_empty() {
+        String::new()
+    } else {
+        i.to_str(&arg(args, 0))?
     };
     if matches!(this, Value::Obj(_)) {
         // `new String(x)` → boxed
