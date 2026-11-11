@@ -40,7 +40,7 @@ fn with_arr(this: &Value, f: impl FnOnce(&mut Vec<Value>)) {
 }
 
 /// read array-like elements: real arrays + objects with numeric props/length
-fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
+pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
     match v {
         Value::Obj(o) => {
             if let ObjKind::Arr(items) = &o.borrow().kind {
@@ -61,7 +61,7 @@ fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
     }
 }
 
-fn clamp_index(n: f64, len: usize) -> usize {
+pub(crate) fn clamp_index(n: f64, len: usize) -> usize {
     if n.is_nan() {
         0
     } else if n < 0.0 {
@@ -326,7 +326,7 @@ fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Obj(r))
 }
 
-fn make_iter(i: &mut Interp, items: Vec<Value>) -> Value {
+pub(crate) fn make_iter(i: &mut Interp, items: Vec<Value>) -> Value {
     let o = Rc::new(RefCell::new(Obj::new(
         Some(i.p.iterator.clone()),
         ObjKind::Iter { items, idx: 0 },
@@ -683,6 +683,9 @@ fn install_globals(i: &mut Interp) {
         method(i, &r, "construct", reflect_construct);
         define_global(i, "Reflect", Value::Obj(r));
     }
+
+    // binary views + web-platform surface (TextEncoder, URL, Blob, …)
+    crate::binary::install(i);
 }
 
 fn make_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: ObjRef) -> Value {
@@ -776,6 +779,9 @@ fn obj_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             ObjKind::Promise(_) => "Promise",
             ObjKind::Map(_) => "Map",
             ObjKind::Set(_) => "Set",
+            ObjKind::Bytes(_) => "ArrayBuffer",
+            ObjKind::Typed { kind, .. } => kind.type_name(),
+            ObjKind::View { .. } => "DataView",
             _ => "Object",
         },
     };
@@ -1675,7 +1681,7 @@ fn arr_sort(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(this.clone())
 }
 
-fn merge_sort(items: &mut [Value], work: &mut Vec<Value>, cmp: &mut dyn FnMut(&Value, &Value) -> std::cmp::Ordering) {
+pub(crate) fn merge_sort(items: &mut [Value], work: &mut Vec<Value>, cmp: &mut dyn FnMut(&Value, &Value) -> std::cmp::Ordering) {
     let n = items.len();
     if n <= 1 {
         return;

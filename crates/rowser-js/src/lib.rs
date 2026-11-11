@@ -7,6 +7,7 @@
 //! ```
 
 pub mod ast;
+pub mod binary;
 pub mod builtins;
 pub mod dom_bridge;
 pub mod interp;
@@ -1336,5 +1337,301 @@ mod tests {
             bundle.require(0).answer
         "#;
         assert_eq!(num(src), 42.0);
+    }
+
+    // --- binary: ArrayBuffer / TypedArray / DataView ---
+    #[test]
+    fn typed_array_basics() {
+        assert_eq!(num("new Uint8Array(4).length"), 4.0);
+        assert_eq!(num("new Uint8Array(4).byteLength"), 4.0);
+        assert_eq!(num("new Uint16Array(4).byteLength"), 8.0);
+        assert_eq!(num("new Uint8Array([1,2,3])[1]"), 2.0);
+        assert_eq!(num("let a = new Uint8Array(3); a[0] = 7; a[0]"), 7.0);
+        assert_eq!(num("let a = new Uint8Array(3); a.length = 9; a.length"), 3.0);
+        assert!(b("let a = new Uint8Array(2); a instanceof Uint8Array"));
+        assert!(b("new Uint8Array(1) instanceof Object"));
+        assert_eq!(num("Uint8Array.BYTES_PER_ELEMENT + Float64Array.BYTES_PER_ELEMENT"), 9.0);
+    }
+
+    #[test]
+    fn typed_array_wrap_clamp() {
+        // ints wrap mod 2^bits
+        assert_eq!(num("let a = new Uint8Array(1); a[0] = 300; a[0]"), 44.0);
+        assert_eq!(num("let a = new Uint8Array(1); a[0] = -1; a[0]"), 255.0);
+        assert_eq!(num("let a = new Int8Array(1); a[0] = 200; a[0]"), -56.0);
+        assert_eq!(num("let a = new Int8Array(1); a[0] = -1; a[0]"), -1.0);
+        assert_eq!(num("let a = new Uint32Array(1); a[0] = -1; a[0]"), 4294967295.0);
+        assert_eq!(num("let a = new Int32Array(1); a[0] = 4294967295; a[0]"), -1.0);
+        // clamped rounds + clamps
+        assert_eq!(num("let a = new Uint8ClampedArray(2); a[0] = 300; a[1] = -5; a[0] + a[1]"), 255.0);
+        assert_eq!(num("let a = new Uint8ClampedArray(1); a[0] = 2.6; a[0]"), 3.0);
+    }
+
+    #[test]
+    fn typed_array_views_share() {
+        assert_eq!(num("let b = new ArrayBuffer(8); let v = new Uint8Array(b, 2, 4); v.byteOffset"), 2.0);
+        assert_eq!(num("let b = new ArrayBuffer(8); let v = new Uint8Array(b, 2, 4); v.byteLength"), 4.0);
+        assert!(b("let b = new ArrayBuffer(8); let v = new Uint8Array(b); v.buffer === b"));
+        assert_eq!(
+            num("let b = new ArrayBuffer(4); let v = new Uint8Array(b); v[1] = 9; new Uint8Array(b)[1]"),
+            9.0
+        );
+        // subarray shares the buffer
+        assert_eq!(
+            num("let a = new Uint8Array([1,2,3,4]); let s = a.subarray(1,3); s[0] = 9; a[1]"),
+            9.0
+        );
+        assert_eq!(
+            s("let a = new Uint8Array([1,2,3,4]); a.subarray(1,3).join(',')"),
+            "2,3"
+        );
+        assert_eq!(
+            s("let a = new Uint8Array([1,2,3,4]); a.slice(1,3).join(',')"),
+            "2,3"
+        );
+        // slice copies
+        assert_eq!(
+            num("let a = new Uint8Array([1,2,3]); let s = a.slice(0,2); s[0] = 9; a[0]"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn typed_array_methods() {
+        assert_eq!(s("let a = new Uint8Array([0,0,0]); a.set([9,8], 1); a.join(',')"), "0,9,8");
+        assert_eq!(s("new Uint8Array([1,2,3,4]).fill(0, 1, 3).join(',')"), "1,0,0,4");
+        assert_eq!(s("new Uint8Array([1,2,3,4]).copyWithin(1, 0, 2).join(',')"), "1,1,2,4");
+        assert_eq!(s("new Uint8Array([1,2,3]).reverse().join(',')"), "3,2,1");
+        // sort is numeric, not lexicographic
+        assert_eq!(s("new Uint8Array([3,10,1]).sort().join(',')"), "1,3,10");
+        assert_eq!(s("new Uint8Array([3,10,1]).sort((a,b)=>b-a).join(',')"), "10,3,1");
+        assert_eq!(num("new Uint8Array([1,2,3]).indexOf(2)"), 1.0);
+        assert!(b("new Uint8Array([1,2,3]).includes(3)"));
+        assert_eq!(num("new Uint8Array([1,2,3]).at(-1)"), 3.0);
+        assert_eq!(s("new Uint8Array([1,2,3]).map(x => x * 2).join(',')"), "2,4,6");
+        assert_eq!(num("new Uint8Array([1,2,3,4]).filter(x => x % 2).length"), 2.0);
+        assert_eq!(num("new Uint8Array([1,2,3,4]).reduce((s,v) => s + v, 0)"), 10.0);
+        assert!(b("new Uint8Array([1,2,3]).some(x => x > 2)"));
+        assert!(!b("new Uint8Array([1,2,3]).every(x => x > 2)"));
+        assert_eq!(num("new Uint8Array([1,2,3]).find(x => x > 1)"), 2.0);
+        assert_eq!(num("let t = 0; new Uint8Array([1,2,3]).forEach(x => t += x); t"), 6.0);
+        assert_eq!(s("String(new Uint8Array([1,2,3]))"), "1,2,3");
+    }
+
+    #[test]
+    fn typed_array_iteration() {
+        assert_eq!(num("let s = 0; for (let v of new Uint8Array([1,2,3])) s += v; s"), 6.0);
+        assert_eq!(num("[...new Uint8Array([1,2,3])].length"), 3.0);
+        assert_eq!(
+            num("let n = 0; for (let e of new Uint8Array([5,6]).entries()) n += e[0] + e[1]; n"),
+            12.0
+        );
+        assert_eq!(num("let a = new Float64Array(2); a[0] = 1.5; a[0]"), 1.5);
+        assert_eq!(num("Array.from(new Uint8Array([1,2,3])).length"), 3.0);
+        assert_eq!(s("Object.keys(new Uint8Array([7,8])).join(',')"), "0,1");
+    }
+
+    #[test]
+    fn array_buffer_api() {
+        assert_eq!(num("new ArrayBuffer(8).byteLength"), 8.0);
+        assert_eq!(num("new ArrayBuffer(8).slice(2, 5).byteLength"), 3.0);
+        assert!(b("ArrayBuffer.isView(new Uint8Array(1))"));
+        assert!(b("ArrayBuffer.isView(new DataView(new ArrayBuffer(2)))"));
+        assert!(!b("ArrayBuffer.isView(new ArrayBuffer(2))"));
+        assert!(!b("ArrayBuffer.isView([])"));
+        assert!(eval("new Uint8Array(new ArrayBuffer(3), 1, 1)").is_ok());
+        assert!(eval("new Uint8Array(new ArrayBuffer(3), 1, 3)").is_err());
+    }
+
+    #[test]
+    fn data_view_endian() {
+        assert_eq!(
+            num("let b = new ArrayBuffer(4); let d = new DataView(b); d.setUint16(0, 0x1234, true); d.getUint16(0, false)"),
+            0x3412 as f64
+        );
+        assert_eq!(
+            num("let b = new ArrayBuffer(4); let d = new DataView(b); d.setUint32(0, 0xdeadbeef); d.getUint8(0)"),
+            0xde as f64
+        );
+        // DataView defaults to big-endian
+        assert_eq!(
+            num("let b = new ArrayBuffer(4); let d = new DataView(b); d.setInt32(0, -2); d.getUint8(0)"),
+            0xff as f64
+        );
+        assert_eq!(
+            num("let b = new ArrayBuffer(8); let d = new DataView(b); d.setFloat64(0, 1.5); d.getFloat64(0)"),
+            1.5
+        );
+        assert_eq!(
+            num("let b = new ArrayBuffer(8); let d = new DataView(b, 2, 4); d.byteOffset + d.byteLength"),
+            6.0
+        );
+        assert!(eval("let d = new DataView(new ArrayBuffer(2)); d.getUint32(0)").is_err());
+    }
+
+    #[test]
+    fn text_encoder_decoder() {
+        assert_eq!(s("new TextDecoder().decode(new TextEncoder().encode('héllo'))"), "héllo");
+        assert_eq!(num("new TextEncoder().encode('héllo').length"), 6.0);
+        assert_eq!(s("new TextDecoder().decode(new Uint8Array([104,105]))"), "hi");
+        assert_eq!(num("new TextEncoder().encode('').length"), 0.0);
+        assert_eq!(s("new TextDecoder('utf-8').decode()"), "");
+        assert_eq!(
+            s("let e = new TextEncoder().encode('ab'); new TextDecoder().decode(new Uint8Array(e.buffer))"),
+            "ab"
+        );
+        assert_eq!(
+            s("let b = new ArrayBuffer(8); new Uint8Array(b).set([104,105], 2); new TextDecoder().decode(new Uint8Array(b, 2, 2))"),
+            "hi"
+        );
+        assert_eq!(
+            num("let d = new Uint8Array(4); new TextEncoder().encodeInto('hello', d).written"),
+            4.0
+        );
+    }
+
+    #[test]
+    fn url_parse_fields() {
+        assert_eq!(
+            s("let u = new URL('https://u:p@ex.com:8080/a/b?x=1#f'); u.protocol + '|' + u.host + '|' + u.pathname + '|' + u.search + '|' + u.hash"),
+            "https:|ex.com:8080|/a/b|?x=1|#f"
+        );
+        assert_eq!(s("new URL('https://ex.com/a').hostname"), "ex.com");
+        assert_eq!(s("new URL('https://ex.com:443/a').host"), "ex.com");
+        assert_eq!(s("new URL('https://u:p@ex.com/').username + ':' + new URL('https://u:p@ex.com/').password"), "u:p");
+        assert_eq!(s("new URL('https://ex.com/a').origin"), "https://ex.com");
+        assert_eq!(s("new URL('https://ex.com/a').href"), "https://ex.com/a");
+        assert_eq!(s("String(new URL('https://ex.com/a?b=1'))"), "https://ex.com/a?b=1");
+    }
+
+    #[test]
+    fn url_relative_resolution() {
+        assert_eq!(
+            s("new URL('../d?y=2', 'https://ex.com/a/b/c').href"),
+            "https://ex.com/a/d?y=2"
+        );
+        assert_eq!(
+            s("new URL('/x', 'https://ex.com/a/b').href"),
+            "https://ex.com/x"
+        );
+        assert_eq!(
+            s("new URL('?z=1', 'https://ex.com/a/b').href"),
+            "https://ex.com/a/b?z=1"
+        );
+        assert_eq!(
+            s("new URL('#f', 'https://ex.com/a?x=1').href"),
+            "https://ex.com/a?x=1#f"
+        );
+        assert_eq!(
+            s("new URL('g', 'https://ex.com/a/b/').href"),
+            "https://ex.com/a/b/g"
+        );
+        assert!(b("URL.canParse('https://ex.com')"));
+        assert!(!b("URL.canParse('/rel')"));
+        assert!(eval("new URL('not a url')").is_err());
+    }
+
+    #[test]
+    fn url_search_params() {
+        assert_eq!(
+            s("let u = new URL('https://ex.com/p?a=1&b=2'); u.searchParams.get('a')"),
+            "1"
+        );
+        assert!(b("new URL('https://x/?a=1').searchParams.has('a')"));
+        assert_eq!(
+            s("let sp = new URLSearchParams('a=1&b=2'); sp.append('c', '3'); sp.toString()"),
+            "a=1&b=2&c=3"
+        );
+        assert_eq!(
+            s("let sp = new URLSearchParams('a=1&a=2'); sp.set('a', '9'); sp.getAll('a').join(',')"),
+            "9"
+        );
+        assert_eq!(
+            s("let sp = new URLSearchParams('a=1&b=2'); sp.delete('a'); sp.toString()"),
+            "b=2"
+        );
+        // mutating searchParams syncs url.search
+        assert_eq!(
+            s("let u = new URL('https://ex.com/'); u.searchParams.set('q', 'x y'); u.search"),
+            "?q=x+y"
+        );
+        assert_eq!(
+            num("let n = 0; new URLSearchParams('a=1&b=2').forEach(() => n++); n"),
+            2.0
+        );
+        assert_eq!(num("new URLSearchParams('a=1&b=2').size"), 2.0);
+    }
+
+    #[test]
+    fn form_data_api() {
+        assert_eq!(
+            s("let f = new FormData(); f.append('a', '1'); f.append('a', '2'); f.get('a')"),
+            "1"
+        );
+        assert_eq!(
+            num("let f = new FormData(); f.append('a', '1'); f.append('a', '2'); f.getAll('a').length"),
+            2.0
+        );
+        assert!(b("let f = new FormData(); f.append('a', 1); f.has('a')"));
+        assert_eq!(
+            num("let f = new FormData(); f.set('a', 1); f.set('a', 2); f.getAll('a').length"),
+            1.0
+        );
+        assert!(b("let f = new FormData(); f.append('a', 1); f.delete('a'); !f.has('a')"));
+        assert_eq!(
+            num("let n = 0; let f = new FormData(); f.append('x', 1); f.append('y', 2); for (let e of f) n++; n"),
+            2.0
+        );
+    }
+
+    #[test]
+    fn blob_api() {
+        assert_eq!(num("new Blob(['hi', ' there']).size"), 8.0);
+        assert_eq!(s("new Blob([], {type: 'Text/HTML'}).type"), "text/html");
+        assert_eq!(num("new Blob([new Uint8Array([1,2,3])]).size"), 3.0);
+        assert_eq!(
+            s("let out; new Blob(['hi']).text().then(t => out = t); out"),
+            "hi"
+        );
+        assert_eq!(
+            num("let out; new Blob(['abc']).arrayBuffer().then(b => out = b.byteLength); out"),
+            3.0
+        );
+        assert_eq!(num("new Blob(['abcdef']).slice(1, 3).size"), 2.0);
+    }
+
+    #[test]
+    fn web_stubs() {
+        assert!(b("typeof Worker === 'function'"));
+        assert!(b("typeof Image === 'function'"));
+        assert!(b("typeof XMLHttpRequest === 'function'"));
+        assert!(b("typeof crypto === 'object'"));
+        assert_eq!(num("let w = new Worker('x.js'); w.postMessage({}); w.terminate(); w.onmessage === null ? 1 : 0"), 1.0);
+        assert_eq!(num("let im = new Image(10, 20); im.width + im.height"), 30.0);
+        assert_eq!(num("let x = new XMLHttpRequest(); x.open('GET', '/'); x.send(); x.readyState"), 0.0);
+        assert_eq!(num("typeof BigInt64Array === 'function' ? 1 : 0"), 1.0);
+        assert!(eval("new BigInt64Array(1)").is_err());
+        assert!(b("typeof queueMicrotask === 'function'"));
+        assert_eq!(num("typeof URL.createObjectURL(new Blob()) === 'string' ? 1 : 0"), 1.0);
+    }
+
+    #[test]
+    fn crypto_api() {
+        assert_eq!(
+            num("let a = new Uint8Array(16); crypto.getRandomValues(a) === a ? (a.every(x => x === 0) ? 0 : 1) : -1"),
+            1.0
+        );
+        assert_eq!(num("crypto.randomUUID().length"), 36.0);
+        assert!(b("/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID())"));
+    }
+
+    #[test]
+    fn reflect_surface() {
+        assert_eq!(num("Reflect.get({a: 5}, 'a')"), 5.0);
+        assert!(b("Reflect.set({}, 'x', 1)"));
+        assert!(b("Reflect.has({a: 1}, 'a')"));
+        assert!(b("Reflect.ownKeys({a:1,b:2}).length === 2"));
+        assert!(b("Reflect.getPrototypeOf([]) === Array.prototype"));
+        assert_eq!(num("Reflect.apply((a, b) => a + b, null, [3, 4])"), 7.0);
     }
 }

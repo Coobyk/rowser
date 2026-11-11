@@ -201,6 +201,167 @@ pub enum ObjKind {
     Set(Vec<Value>),
     /// compiled regular expression
     Regex(Rc<crate::regexp::Regex>),
+    /// ArrayBuffer — shared byte store (Rc so views alias it)
+    Bytes(Rc<RefCell<Vec<u8>>>),
+    /// TypedArray view: buffer object (kind `Bytes`), byte offset,
+    /// element count, element kind
+    Typed {
+        buf: ObjRef,
+        off: usize,
+        len: usize,
+        kind: TAK,
+    },
+    /// DataView: buffer object, byte offset, byte length
+    View {
+        buf: ObjRef,
+        off: usize,
+        len: usize,
+    },
+}
+
+/// TypedArray element kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TAK {
+    U8,
+    U8C,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    F32,
+    F64,
+}
+
+impl TAK {
+    pub fn size(self) -> usize {
+        match self {
+            TAK::U8 | TAK::U8C | TAK::I8 => 1,
+            TAK::U16 | TAK::I16 => 2,
+            TAK::U32 | TAK::I32 | TAK::F32 => 4,
+            TAK::F64 => 8,
+        }
+    }
+    pub fn type_name(self) -> &'static str {
+        match self {
+            TAK::U8 => "Uint8Array",
+            TAK::U8C => "Uint8ClampedArray",
+            TAK::I8 => "Int8Array",
+            TAK::U16 => "Uint16Array",
+            TAK::I16 => "Int16Array",
+            TAK::U32 => "Uint32Array",
+            TAK::I32 => "Int32Array",
+            TAK::F32 => "Float32Array",
+            TAK::F64 => "Float64Array",
+        }
+    }
+    /// read one element (little-endian) at byte offset `boff`
+    pub fn read(self, b: &[u8], boff: usize) -> f64 {
+        match self {
+            TAK::U8 | TAK::U8C => b[boff] as f64,
+            TAK::I8 => b[boff] as i8 as f64,
+            TAK::U16 => u16::from_le_bytes(b[boff..boff + 2].try_into().unwrap()) as f64,
+            TAK::I16 => i16::from_le_bytes(b[boff..boff + 2].try_into().unwrap()) as f64,
+            TAK::U32 => u32::from_le_bytes(b[boff..boff + 4].try_into().unwrap()) as f64,
+            TAK::I32 => i32::from_le_bytes(b[boff..boff + 4].try_into().unwrap()) as f64,
+            TAK::F32 => f32::from_le_bytes(b[boff..boff + 4].try_into().unwrap()) as f64,
+            TAK::F64 => f64::from_le_bytes(b[boff..boff + 8].try_into().unwrap()),
+        }
+    }
+    /// write one element (little-endian) with JS conversion semantics:
+    /// ints wrap mod 2^bits, Uint8Clamped rounds+clamps, floats truncate.
+    pub fn write(self, b: &mut [u8], boff: usize, v: f64) {
+        match self {
+            TAK::U8 => b[boff] = to_u32(v) as u8,
+            TAK::U8C => {
+                b[boff] = if v.is_nan() || v <= 0.0 {
+                    0
+                } else if v >= 255.0 {
+                    255
+                } else {
+                    v.round() as u8
+                };
+            }
+            TAK::I8 => b[boff] = to_i32(v) as i8 as u8,
+            TAK::U16 => b[boff..boff + 2].copy_from_slice(&(to_u32(v) as u16).to_le_bytes()),
+            TAK::I16 => b[boff..boff + 2].copy_from_slice(&(to_i32(v) as i16).to_le_bytes()),
+            TAK::U32 => b[boff..boff + 4].copy_from_slice(&to_u32(v).to_le_bytes()),
+            TAK::I32 => b[boff..boff + 4].copy_from_slice(&to_i32(v).to_le_bytes()),
+            TAK::F32 => b[boff..boff + 4].copy_from_slice(&(v as f32).to_le_bytes()),
+            TAK::F64 => b[boff..boff + 8].copy_from_slice(&v.to_le_bytes()),
+        }
+    }
+}
+
+/// If `o` is an ArrayBuffer (`ObjKind::Bytes`), its shared byte store.
+pub fn buffer_bytes(o: &ObjRef) -> Option<Rc<RefCell<Vec<u8>>>> {
+    if let ObjKind::Bytes(b) = &o.borrow().kind {
+        Some(b.clone())
+    } else {
+        None
+    }
+}
+
+/// Virtual own-props for array/binary kinds: `length`/`byteLength`/
+/// `byteOffset`/`buffer` and integer-indexed reads. Returns `Some` when
+/// `key` resolves on the object kind itself (before stored props).
+fn view_own_prop(o: &ObjRef, key: &PropKey) -> Option<Value> {
+    let b = o.borrow();
+    match &b.kind {
+        ObjKind::Arr(items) => {
+            if let PropKey::S(s) = key {
+                if s.as_ref() == "length" {
+                    return Some(Value::Num(items.len() as f64));
+                }
+                if let Some(i) = arr_index(s) {
+                    return Some(items.get(i).cloned().unwrap_or(Value::Und));
+                }
+            }
+            None
+        }
+        ObjKind::Typed { buf, off, len, kind } => {
+            if let PropKey::S(s) = key {
+                match s.as_ref() {
+                    "length" => return Some(Value::Num(*len as f64)),
+                    "byteLength" => return Some(Value::Num((*len * kind.size()) as f64)),
+                    "byteOffset" => return Some(Value::Num(*off as f64)),
+                    "buffer" => return Some(Value::Obj(buf.clone())),
+                    _ => {}
+                }
+                if let Some(idx) = arr_index(s) {
+                    if idx >= *len {
+                        return Some(Value::Und);
+                    }
+                    if let Some(bytes) = buffer_bytes(buf) {
+                        let bb = bytes.borrow();
+                        return Some(Value::Num(kind.read(&bb, *off + idx * kind.size())));
+                    }
+                    return Some(Value::Und);
+                }
+            }
+            None
+        }
+        ObjKind::Bytes(bytes) => {
+            if let PropKey::S(s) = key {
+                if s.as_ref() == "byteLength" {
+                    return Some(Value::Num(bytes.borrow().len() as f64));
+                }
+            }
+            None
+        }
+        ObjKind::View { buf, off, len } => {
+            if let PropKey::S(s) = key {
+                match s.as_ref() {
+                    "byteLength" => return Some(Value::Num(*len as f64)),
+                    "byteOffset" => return Some(Value::Num(*off as f64)),
+                    "buffer" => return Some(Value::Obj(buf.clone())),
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -237,6 +398,10 @@ pub struct Scope {
     pub parent: Option<EnvRef>,
     /// function scope: `this`/arguments/new.target/super boundary
     pub is_fn: bool,
+    /// `var` declarations stop here — true for every function body scope
+    /// INCLUDING arrows (arrows only inherit this/arguments/new.target,
+    /// never their parent's var bindings).
+    pub var_boundary: std::cell::Cell<bool>,
     pub thisv: RefCell<Value>,
     pub new_target: RefCell<Value>,
     /// set on method scopes for `super.prop`
@@ -253,6 +418,7 @@ impl Scope {
             vars: RefCell::new(HashMap::new()),
             parent,
             is_fn,
+            var_boundary: std::cell::Cell::new(is_fn),
             thisv: RefCell::new(Value::Und),
             new_target: RefCell::new(Value::Und),
             home: RefCell::new(None),
@@ -299,6 +465,7 @@ pub struct Protos {
     pub promise: ObjRef,
     pub iterator: ObjRef,
     pub regexp: ObjRef,
+    pub arraybuffer: ObjRef,
     pub global: ObjRef,
 }
 
@@ -317,6 +484,8 @@ pub struct Interp {
     /// functions receive `&mut Interp`, so host bindings stash their world
     /// here and downcast. Not touched by the interpreter itself.
     pub ext: Option<Box<dyn std::any::Any>>,
+    /// ring buffer of recent call sites (debug aid for bundle triage)
+    pub call_trace: std::collections::VecDeque<String>,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -347,6 +516,7 @@ impl Interp {
                 promise: mk(Some(obj.clone())),
                 iterator: mk(Some(obj.clone())),
                 regexp: mk(Some(obj.clone())),
+                arraybuffer: mk(Some(obj.clone())),
                 global: mk(Some(obj.clone())),
                 obj,
                 func,
@@ -364,6 +534,7 @@ impl Interp {
                 n ^ 0x9e3779b97f4a7c15
             },
             ext: None,
+            call_trace: std::collections::VecDeque::new(),
         }
     }
 
@@ -472,7 +643,7 @@ impl Interp {
     pub fn declare_var(&mut self, env: &EnvRef, name: &str, v: Value) {
         let mut cur = env.clone();
         loop {
-            if cur.is_fn || cur.parent.is_none() {
+            if cur.var_boundary.get() || cur.parent.is_none() {
                 break;
             }
             let next = cur.parent.clone().unwrap();
@@ -577,15 +748,8 @@ impl Interp {
 
     /// raw own-prop lookup (no proto walk, no getters)
     pub fn obj_get_raw(&self, o: &ObjRef, key: &PropKey) -> Option<Value> {
-        if let ObjKind::Arr(items) = &o.borrow().kind {
-            if let PropKey::S(s) = key {
-                if s.as_ref() == "length" {
-                    return Some(Value::Num(items.len() as f64));
-                }
-                if let Some(i) = arr_index(s) {
-                    return Some(items.get(i).cloned().unwrap_or(Value::Und));
-                }
-            }
+        if let Some(v) = view_own_prop(o, key) {
+            return Some(v);
         }
         o.borrow().props.get(key).map(|p| p.val.clone())
     }
@@ -641,17 +805,10 @@ impl Interp {
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
             {
-                let b = c.borrow();
-                if let ObjKind::Arr(items) = &b.kind {
-                    if let PropKey::S(s) = key {
-                        if s.as_ref() == "length" {
-                            return Ok(Value::Num(items.len() as f64));
-                        }
-                        if let Some(i) = arr_index(s) {
-                            return Ok(items.get(i).cloned().unwrap_or(Value::Und));
-                        }
-                    }
+                if let Some(v) = view_own_prop(&c, key) {
+                    return Ok(v);
                 }
+                let b = c.borrow();
                 if let Some(p) = b.props.get(key) {
                     if p.is_accessor() {
                         match &p.get {
@@ -708,6 +865,46 @@ impl Interp {
     }
 
     fn obj_set(&mut self, o: &ObjRef, key: PropKey, v: Value, receiver: &Value) -> Result<(), Value> {
+        // integer-indexed writes + read-only virtuals on binary views
+        {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Typed { buf, off, len, kind } => {
+                    if let PropKey::S(s) = &key {
+                        if let Some(idx) = arr_index(s) {
+                            let (buf, off, len, kind) = (buf.clone(), *off, *len, *kind);
+                            drop(b);
+                            if idx >= len {
+                                return Ok(()); // OOB write: silently ignored
+                            }
+                            let n = self.to_num(&v)?;
+                            if let Some(bytes) = buffer_bytes(&buf) {
+                                kind.write(&mut bytes.borrow_mut(), off + idx * kind.size(), n);
+                            }
+                            return Ok(());
+                        }
+                        if matches!(s.as_ref(), "length" | "byteLength" | "byteOffset" | "buffer") {
+                            return Ok(()); // accessor-only props: sloppy no-op
+                        }
+                    }
+                }
+                ObjKind::Bytes(_) => {
+                    if let PropKey::S(s) = &key {
+                        if s.as_ref() == "byteLength" {
+                            return Ok(());
+                        }
+                    }
+                }
+                ObjKind::View { .. } => {
+                    if let PropKey::S(s) = &key {
+                        if matches!(s.as_ref(), "byteLength" | "byteOffset" | "buffer") {
+                            return Ok(());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // walk chain looking for existing prop (setter or data)
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
@@ -776,17 +973,46 @@ impl Interp {
         while let Some(c) = cur {
             {
                 let b = c.borrow();
-                if let ObjKind::Arr(items) = &b.kind {
-                    if let PropKey::S(s) = key {
-                        if s.as_ref() == "length" {
-                            return true;
+                match &b.kind {
+                    ObjKind::Arr(items) => {
+                        if let PropKey::S(s) = key {
+                            if s.as_ref() == "length" {
+                                return true;
+                            }
+                            if let Some(i) = arr_index(s) {
+                                if i < items.len() {
+                                    return true;
+                                }
+                            }
                         }
-                        if let Some(i) = arr_index(s) {
-                            if i < items.len() {
+                    }
+                    ObjKind::Typed { len, .. } => {
+                        if let PropKey::S(s) = key {
+                            if matches!(s.as_ref(), "length" | "byteLength" | "byteOffset" | "buffer") {
+                                return true;
+                            }
+                            if let Some(i) = arr_index(s) {
+                                if i < *len {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    ObjKind::Bytes(_) => {
+                        if let PropKey::S(s) = key {
+                            if s.as_ref() == "byteLength" {
                                 return true;
                             }
                         }
                     }
+                    ObjKind::View { .. } => {
+                        if let PropKey::S(s) = key {
+                            if matches!(s.as_ref(), "byteLength" | "byteOffset" | "buffer") {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 if b.props.contains_key(key) {
                     return true;
@@ -833,13 +1059,24 @@ impl Interp {
         while let Some(c) = cur {
             {
                 let b = c.borrow();
-                if let ObjKind::Arr(items) = &b.kind {
-                    for i in 0..items.len() {
-                        let k = i.to_string();
-                        if seen.insert(k.clone()) {
-                            out.push(k);
+                match &b.kind {
+                    ObjKind::Arr(items) => {
+                        for i in 0..items.len() {
+                            let k = i.to_string();
+                            if seen.insert(k.clone()) {
+                                out.push(k);
+                            }
                         }
                     }
+                    ObjKind::Typed { len, .. } => {
+                        for i in 0..*len {
+                            let k = i.to_string();
+                            if seen.insert(k.clone()) {
+                                out.push(k);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 for (k, p) in b.props.iter() {
                     if !p.enumerable {
@@ -864,10 +1101,18 @@ impl Interp {
             return out;
         };
         let b = o.borrow();
-        if let ObjKind::Arr(items) = &b.kind {
-            for i in 0..items.len() {
-                out.push(i.to_string());
+        match &b.kind {
+            ObjKind::Arr(items) => {
+                for i in 0..items.len() {
+                    out.push(i.to_string());
+                }
             }
+            ObjKind::Typed { len, .. } => {
+                for i in 0..*len {
+                    out.push(i.to_string());
+                }
+            }
+            _ => {}
         }
         for (k, p) in b.props.iter() {
             if !p.enumerable {
@@ -1132,6 +1377,11 @@ impl Interp {
                     ObjKind::Map(m) => format!("Map({})", m.len()),
                     ObjKind::Set(s) => format!("Set({})", s.len()),
                     ObjKind::Host(tag) => format!("[{tag}]"),
+                    ObjKind::Bytes(b) => format!("ArrayBuffer({})", b.borrow().len()),
+                    ObjKind::Typed { kind, len, .. } => {
+                        format!("{}({len})", kind.type_name())
+                    }
+                    ObjKind::View { .. } => "DataView {}".into(),
                     ObjKind::Ord => {
                         if depth > 3 {
                             return "{…}".into();
@@ -1167,7 +1417,8 @@ impl Interp {
         }
         let Value::Obj(o) = f else {
             let tn = self.type_name(f);
-            return Err(self.type_err(format!("{tn} is not a function")));
+            let iv = self.inspect(f, 0);
+            return Err(self.type_err(format!("{tn} is not a function (callee {iv})")));
         };
         let kind = o.borrow().kind.clone();
         match kind {
@@ -1185,6 +1436,7 @@ impl Interp {
                 ctor: _,
             }) => {
                 let scope = Scope::new(Some(env), !def.is_arrow);
+                scope.var_boundary.set(true);
                 if !def.is_arrow {
                     *scope.thisv.borrow_mut() = this;
                     *scope.home.borrow_mut() = home;
@@ -1606,7 +1858,7 @@ impl Interp {
     }
 
     // -- hoisting ----------------------------------------------------------------
-    fn hoist_body(&mut self, stmts: &[Stmt], scope: &EnvRef) -> Result<(), Value> {
+    pub fn hoist_body(&mut self, stmts: &[Stmt], scope: &EnvRef) -> Result<(), Value> {
         let mut fns: Vec<&Rc<FnDef>> = Vec::new();
         let mut vars: Vec<&str> = Vec::new();
         collect_hoisted(stmts, &mut fns, &mut vars);
@@ -1669,7 +1921,7 @@ impl Interp {
         })
     }
 
-    fn exec_stmt(&mut self, s: &Stmt, env: &EnvRef) -> SRes {
+    pub fn exec_stmt(&mut self, s: &Stmt, env: &EnvRef) -> SRes {
         match s {
             Stmt::Empty => Ok(Completion::Empty),
             Stmt::Expr(e) => Ok(Completion::Normal(self.eval_expr(e, env)?)),
@@ -2573,6 +2825,11 @@ impl Interp {
     }
 
     fn eval_call(&mut self, callee: &Expr, args: &[Arg], env: &EnvRef) -> ERes {
+        if self.call_trace.len() >= 64 {
+            self.call_trace.pop_front();
+        }
+        self.call_trace
+            .push_back(format!("{:.160}", format!("{callee:?}")));
         // super(args) — derived-class parent ctor call
         if matches!(callee, Expr::Super) {
             let fscope = self.find_fn_scope(env);
@@ -2621,7 +2878,8 @@ impl Interp {
                 let f = self.get_prop(&ov, &key)?;
                 if !self.is_callable(&f) {
                     let ks = self.key_str(&key);
-                    return Err(self.type_err(format!("{ks} is not a function")));
+                    let iv = self.inspect(&f, 0);
+                    return Err(self.type_err(format!("{ks} is not a function (got {iv})")));
                 }
                 let argv = self.eval_args(args, env)?;
                 self.call(&f, ov, argv)
