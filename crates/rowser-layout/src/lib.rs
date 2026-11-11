@@ -111,6 +111,12 @@ struct Style {
     /// background-color of the nearest inline ancestor; painted per-word.
     /// Cleared when a block/inline-box paints its own background rect.
     inline_bg: Option<Color>,
+    /// deepest inline element producing the current words — stamped onto
+    /// each word so hit-testing sees inline elements, not just blocks.
+    hit_owner: Option<NodeId>,
+    /// `pointer-events:none` in effect (inherited) — the element and its
+    /// descendants contribute no hit rects; `pointer-events:auto` resets it.
+    pe_none: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -139,6 +145,8 @@ fn base_style() -> Style {
         href: None,
         line_h: None,
         inline_bg: None,
+        hit_owner: None,
+        pe_none: false,
     }
 }
 
@@ -165,6 +173,8 @@ b,strong{font-weight:bold}
 i,em,dfn,var,cite,address{font-style:italic}
 code,kbd,samp,tt{font-family:monospace}
 a{color:#0000ee;text-decoration:underline}
+a[href],area[href]{cursor:pointer}
+input,textarea{cursor:text}
 u,ins{text-decoration:underline}
 s,strike,del{text-decoration:line-through}
 small{font-size:.83em}
@@ -1729,6 +1739,9 @@ struct Word {
     hits: Vec<(f32, f32, f32, f32, NodeId)>,
     /// inline-block height (baseline alignment: box bottom sits on baseline)
     box_h: f32,
+    /// inline element that produced this word — flushed into `hits` so
+    /// links/spans are hoverable/clickable (`None` = block-owned).
+    owner: Option<NodeId>,
 }
 
 /// A floated box occupying [x .. x+w] horizontally until `bottom`.
@@ -1884,6 +1897,12 @@ pub struct Layouter<'a> {
     /// cells) resolve against it; propagated to auto-height children so a
     /// `h-full` chain still finds the nearest definite ancestor
     pct_h: Option<f32>,
+    /// interaction state `:hover`/`:focus`/... selectors match against —
+    /// cloned into each pre-resolve worker's StyleCtx
+    pstate: css::PseudoState,
+    /// `pointer-events:none` is in effect on the current walk path — hit
+    /// pushes are dropped while set (an `auto` descendant re-enables).
+    pe_blocked: bool,
 }
 
 impl<'a> Layouter<'a> {
@@ -1907,6 +1926,28 @@ impl<'a> Layouter<'a> {
         scroll: f32,
         viewport_h: f32,
         external: &[css::StyleSheet],
+    ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<(f32, f32, f32, f32, NodeId)>) {
+        Self::layout_vh_st(
+            doc,
+            fonts,
+            width,
+            scroll,
+            viewport_h,
+            external,
+            &css::PseudoState::default(),
+        )
+    }
+
+    /// `layout_vh` + an interaction state — `:hover`/`:focus`/`:active`/
+    /// `:target` selectors match against `pstate` for this pass.
+    pub fn layout_vh_st(
+        doc: &'a Document,
+        fonts: &'a mut FontCache,
+        width: f32,
+        scroll: f32,
+        viewport_h: f32,
+        external: &[css::StyleSheet],
+        pstate: &css::PseudoState,
     ) -> (Vec<DisplayItem>, f32, Vec<(String, f32)>, Vec<(f32, f32, f32, f32, NodeId)>) {
         let author = css::document_sheets_vw(doc, width);
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
@@ -1937,7 +1978,10 @@ impl<'a> Layouter<'a> {
             hits: Vec::new(),
             backdrop: WHITE,
             pct_h: None,
+            pstate: pstate.clone(),
+            pe_blocked: false,
         };
+        l.ctx.set_state(pstate.clone());
         l.preresolve_styles();
         // css-backgrounds §2.11: the canvas takes the root element's
         // background (body's when html's is transparent) — painted
@@ -2028,10 +2072,12 @@ impl<'a> Layouter<'a> {
             std::iter::repeat_with(|| None).take(elems.len()).collect();
         let doc = self.doc;
         let sheets = &self.sheets[..];
+        let pstate = &self.pstate;
         std::thread::scope(|s| {
             for (work, oc) in elems.chunks(chunk).zip(out.chunks_mut(chunk)) {
                 s.spawn(move || {
                     let mut ctx = css::StyleCtx::new(doc, sheets);
+                    ctx.set_state(pstate.clone());
                     for (i, &id) in work.iter().enumerate() {
                         oc[i] = Some(ctx.computed(id));
                     }
@@ -2102,9 +2148,20 @@ impl<'a> Layouter<'a> {
                     c.get("visibility").map(String::as_str),
                     Some("hidden") | Some("collapse")
                 );
+                // pointer-events:none: suppress hits for the element and
+                // its subtree — an `auto` descendant re-enables (st.pe_none
+                // already folds inheritance into this element's flag)
+                let pe_save = self.pe_blocked;
+                self.pe_blocked = st.pe_none;
                 match c.get("display").map(String::as_str) {
-                    _ if visually_hidden => return,
-                    Some("none") => return,
+                    _ if visually_hidden => {
+                        self.pe_blocked = pe_save;
+                        return;
+                    }
+                    Some("none") => {
+                        self.pe_blocked = pe_save;
+                        return;
+                    }
                     // CSS 2.1 §9.7: absolute/fixed blockify AND leave normal
                     // flow — an <input> overlay (Vector's dropdown checkbox)
                     // or an <a> must not contribute line box size either
@@ -2124,6 +2181,7 @@ impl<'a> Layouter<'a> {
                     }
                     _ => self.inline(node, tag, &c, st),
                 }
+                self.pe_blocked = pe_save;
                 if op <= 0.0 || hidden {
                     // fully transparent/hidden: nothing painted, nothing clickable
                     self.items.truncate(i0);
@@ -2149,6 +2207,13 @@ impl<'a> Layouter<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Record a hit rect unless `pointer-events:none` is in effect.
+    fn push_hit(&mut self, h: (f32, f32, f32, f32, NodeId)) {
+        if !self.pe_blocked {
+            self.hits.push(h);
         }
     }
 
@@ -2231,6 +2296,9 @@ impl<'a> Layouter<'a> {
         }
         if let Some(col) = bg_color(c) {
             st.inline_bg = Some(over(col, self.backdrop));
+        }
+        if let Some(v) = c.get("pointer-events") {
+            st.pe_none = matches!(v.trim(), "none");
         }
     }
 
@@ -2561,7 +2629,7 @@ impl<'a> Layouter<'a> {
             self.finish_patch(p);
         }
         // element border box → click hit-test map
-        self.hits.push((
+        self.push_hit((
             self.margin_x - pl - bw_l,
             content_top - pt - bw_t,
             inner_w + pl + pr + bw_h,
@@ -2740,6 +2808,7 @@ impl<'a> Layouter<'a> {
         let border = border_sides(c, size)
             .map(|(w, col)| (w, over(col, bg.unwrap_or(bd))));
         st.inline_bg = None; // the box paints its own bg
+        st.hit_owner = Some(node);
         if let Some(b) = bg {
             if let Some(col) = c.get("color").and_then(|v| parse_color(v)) {
                 st.color = over(col, b);
@@ -2860,7 +2929,7 @@ impl<'a> Layouter<'a> {
         if ml > 0.0 {
             self.spacer(ml);
         }
-        self.push_box(box_w, box_h, out, nhits, mb.max(0.0));
+        self.push_box(box_w, box_h, out, nhits, mb.max(0.0), Some(node));
         if mr > 0.0 {
             self.spacer(mr);
         }
@@ -3126,7 +3195,7 @@ impl<'a> Layouter<'a> {
                     self.items.push(offset_item(it, cx, self.y));
                 }
                 for h in nhits {
-                    self.hits.push((h.0 + cx, h.1 + self.y, h.2, h.3, h.4));
+                    self.push_hit((h.0 + cx, h.1 + self.y, h.2, h.3, h.4));
                 }
             }
             self.y += row_h;
@@ -3417,7 +3486,7 @@ impl<'a> Layouter<'a> {
                                 };
                                 let mb =
                                     box_sides(&cc, "margin", self.avail_w, cst.size)[2].max(0.0);
-                                self.push_box(w, h, items, hits, mb);
+                                self.push_box(w, h, items, hits, mb, Some(ch));
                             }
                         }
                         Some(t @ ("input" | "select" | "textarea" | "video" | "canvas" | "iframe" | "object" | "embed" | "br" | "hr")) => {
@@ -4205,9 +4274,9 @@ impl<'a> Layouter<'a> {
             for di in it.laid.drain(..) {
                 self.items.push(offset_item(di, ix, iy + dy));
             }
-            self.hits.push((ix, iy, box_w, box_h, it.id));
+            self.push_hit((ix, iy, box_w, box_h, it.id));
             for h in it.hits.drain(..) {
-                self.hits.push((h.0 + ix, h.1 + iy + dy, h.2, h.3, h.4));
+                self.push_hit((h.0 + ix, h.1 + iy + dy, h.2, h.3, h.4));
             }
         }
 
@@ -4630,6 +4699,7 @@ impl<'a> Layouter<'a> {
             items: None,
             hits: Vec::new(),
             box_h: 0.0,
+            owner: None,
         });
         self.line_x += w;
     }
@@ -4642,6 +4712,7 @@ impl<'a> Layouter<'a> {
         items: Vec<DisplayItem>,
         hits: Vec<(f32, f32, f32, f32, NodeId)>,
         mb: f32,
+        owner: Option<NodeId>,
     ) {
         if self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line();
@@ -4662,6 +4733,7 @@ impl<'a> Layouter<'a> {
             items: Some(items),
             hits,
             box_h: h,
+            owner,
         });
         self.line_x += w;
     }
@@ -4774,6 +4846,9 @@ impl<'a> Layouter<'a> {
         if tag == "a" {
             st.href = self.doc.attr(node, "href").map(String::from);
         }
+        // this element owns the words it emits — hit rects let links and
+        // other inline elements be hovered/clicked over their text
+        st.hit_owner = Some(node);
         // inline margins become spacing around the element's runs
         let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, st.size);
         if ml > 0.0 {
@@ -4791,8 +4866,7 @@ impl<'a> Layouter<'a> {
                         self.items.push(offset_item(it, x + tx, y + ty));
                     }
                     for hd in hits {
-                        self.hits
-                            .push((hd.0 + x + tx, hd.1 + y + ty, hd.2, hd.3, hd.4));
+                        self.push_hit((hd.0 + x + tx, hd.1 + y + ty, hd.2, hd.3, hd.4));
                     }
                     let lh = self.eff_line_h(&st);
                     self.y += h.max(lh);
@@ -4980,6 +5054,7 @@ impl<'a> Layouter<'a> {
                         items: None,
             hits: Vec::new(),
                         box_h: 0.0,
+                        owner: st.hit_owner,
                     });
                     self.flush_line();
                     chunk.clear();
@@ -5005,6 +5080,7 @@ impl<'a> Layouter<'a> {
                     items: None,
             hits: Vec::new(),
                     box_h: 0.0,
+                    owner: st.hit_owner,
                 });
                 self.line_x += cw;
             }
@@ -5026,6 +5102,7 @@ impl<'a> Layouter<'a> {
             items: None,
             hits: Vec::new(),
             box_h: 0.0,
+            owner: st.hit_owner,
         });
         self.line_x += w;
     }
@@ -5054,6 +5131,7 @@ impl<'a> Layouter<'a> {
                 Align::Center => ((self.content_width() - used) / 2.0).max(0.0),
                 Align::Right => (self.content_width() - used).max(0.0),
             };
+        let pe_blocked = self.pe_blocked;
         for w in self.line.drain(..) {
             if let Some(items) = w.items {
                 // inline-block: box bottom sits on the baseline
@@ -5062,7 +5140,9 @@ impl<'a> Layouter<'a> {
                     self.items.push(offset_item(it, x, dy));
                 }
                 for h in w.hits {
-                    self.hits.push((h.0 + x, h.1 + dy, h.2, h.3, h.4));
+                    if !pe_blocked {
+                        self.hits.push((h.0 + x, h.1 + dy, h.2, h.3, h.4));
+                    }
                 }
             } else if !w.text.is_empty() {
                 if let Some(bg) = w.bg {
@@ -5087,6 +5167,12 @@ impl<'a> Layouter<'a> {
                     href: w.href,
                 });
             }
+            // hit for the owning inline element (e.g. <a> over its text)
+            if !pe_blocked {
+                if let Some(o) = w.owner {
+                    self.hits.push((x, self.y, w.width, line_h, o));
+                }
+            }
             // empty words (inline-margin spacers) just advance x
             x += w.width;
         }
@@ -5094,6 +5180,36 @@ impl<'a> Layouter<'a> {
         self.line_x = 0.0;
         self.pending_space = false;
     }
+}
+
+/// Computed `cursor` keyword for `node` under `pstate`, resolved with the
+/// same sheet stack as layout (UA + external + author). `cursor` is
+/// inherited — ancestors are climbed until one declares it. "auto"/""
+/// means the default pointer.
+pub fn cursor_for(
+    doc: &Document,
+    width: f32,
+    external: &[css::StyleSheet],
+    node: NodeId,
+    pstate: &css::PseudoState,
+) -> String {
+    let author = css::document_sheets_vw(doc, width);
+    let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
+    sheets.extend(external.iter());
+    sheets.extend(author.iter());
+    let mut ctx = css::StyleCtx::new(doc, &sheets);
+    ctx.set_state(pstate.clone());
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if doc.tag(n).is_none() {
+            break;
+        }
+        if let Some(v) = ctx.computed(n).get("cursor") {
+            return v.trim().to_string();
+        }
+        cur = doc.parent(n);
+    }
+    "auto".to_string()
 }
 
 #[cfg(test)]

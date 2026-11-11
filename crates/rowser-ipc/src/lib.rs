@@ -131,6 +131,12 @@ pub enum ToRenderer {
     /// left button is held; the renderer re-paints with the selected text
     /// highlighted and replies with `ToBrowser::SelText`.
     Select { x0: f32, y0: f32, x1: f32, y1: f32 },
+    /// Pointer moved at document-space device px; `down` = any button held
+    /// (release clears :active and the drag state).
+    MouseMove { x: f32, y: f32, down: bool },
+    /// Primary button pressed at document-space device px — starts :active
+    /// on the hit node and primes focus on the matching release (`Click`).
+    MouseDown { x: f32, y: f32 },
     /// Request a text dump of the DOM tree (inspector).
     DomDump,
     Shutdown,
@@ -159,6 +165,9 @@ pub enum ToBrowser {
     /// Currently selected page text ("" when the selection is empty) —
     /// sent after each `Select` so the browser can copy on Ctrl+C.
     SelText(String),
+    /// CSS `cursor` keyword for the hovered element ("auto"/"" = default).
+    /// Sent only when the resolved value changes.
+    Cursor(String),
 }
 
 const TAG_PING: u8 = 0;
@@ -168,6 +177,8 @@ const TAG_SCROLL: u8 = 3;
 const TAG_CLICK: u8 = 5;
 const TAG_DOMDUMP: u8 = 6;
 const TAG_SELECT: u8 = 8;
+const TAG_MOUSEMOVE: u8 = 9;
+const TAG_MOUSEDOWN: u8 = 10;
 const TAG_SHUTDOWN: u8 = 4;
 
 const TAG_PONG: u8 = 0;
@@ -179,6 +190,7 @@ const TAG_LOG: u8 = 5;
 const TAG_NAV_REQUEST: u8 = 6;
 const TAG_BDOMDUMP: u8 = 7;
 const TAG_SELTEXT: u8 = 8;
+const TAG_CURSOR: u8 = 9;
 
 impl ToRenderer {
     pub fn encode(&self) -> Vec<u8> {
@@ -213,6 +225,17 @@ impl ToRenderer {
                 w.u32(x1.to_bits());
                 w.u32(y1.to_bits());
             }
+            Self::MouseMove { x, y, down } => {
+                w.u8(TAG_MOUSEMOVE);
+                w.u32(x.to_bits());
+                w.u32(y.to_bits());
+                w.u8(*down as u8);
+            }
+            Self::MouseDown { x, y } => {
+                w.u8(TAG_MOUSEDOWN);
+                w.u32(x.to_bits());
+                w.u32(y.to_bits());
+            }
             Self::DomDump => w.u8(TAG_DOMDUMP),
             Self::Shutdown => w.u8(TAG_SHUTDOWN),
         }
@@ -240,6 +263,15 @@ impl ToRenderer {
                 y0: f32::from_bits(r.u32()?),
                 x1: f32::from_bits(r.u32()?),
                 y1: f32::from_bits(r.u32()?),
+            },
+            TAG_MOUSEMOVE => Self::MouseMove {
+                x: f32::from_bits(r.u32()?),
+                y: f32::from_bits(r.u32()?),
+                down: r.u8()? != 0,
+            },
+            TAG_MOUSEDOWN => Self::MouseDown {
+                x: f32::from_bits(r.u32()?),
+                y: f32::from_bits(r.u32()?),
             },
             TAG_DOMDUMP => Self::DomDump,
             TAG_SHUTDOWN => Self::Shutdown,
@@ -293,6 +325,10 @@ impl ToBrowser {
                 w.u8(TAG_SELTEXT);
                 w.string(text);
             }
+            Self::Cursor(css) => {
+                w.u8(TAG_CURSOR);
+                w.string(css);
+            }
         }
         w.into_payload()
     }
@@ -313,6 +349,7 @@ impl ToBrowser {
             TAG_NAV_REQUEST => Self::NavigationRequest(r.string()?),
             TAG_BDOMDUMP => Self::DomDump(r.string()?),
             TAG_SELTEXT => Self::SelText(r.string()?),
+            TAG_CURSOR => Self::Cursor(r.string()?),
             tag => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -345,6 +382,12 @@ mod tests {
                 x1: 30.5,
                 y1: 40.5,
             },
+            ToRenderer::MouseMove {
+                x: 5.5,
+                y: 7.25,
+                down: true,
+            },
+            ToRenderer::MouseDown { x: 1.0, y: 2.0 },
             ToRenderer::DomDump,
             ToRenderer::Shutdown,
         ];
@@ -369,6 +412,7 @@ mod tests {
             ToBrowser::NavigationRequest("https://example.com".into()),
             ToBrowser::DomDump("<html>".into()),
             ToBrowser::SelText("selected words".into()),
+            ToBrowser::Cursor("pointer".into()),
         ];
         for msg in msgs {
             assert_eq!(ToBrowser::decode(&msg.encode()).unwrap(), msg);
