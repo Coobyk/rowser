@@ -70,12 +70,20 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 mix(&(pixels.len() as u64).to_le_bytes());
                 mix(&pixels[..pixels.len().min(64)]);
             }
-            DisplayItem::Image { x, y, w, h, src } => {
+            DisplayItem::Image {
+                x,
+                y,
+                w,
+                h,
+                src,
+                near,
+            } => {
                 mix(&[5]);
                 for v in [x, y, w, h] {
                     mix(&v.to_bits().to_le_bytes());
                 }
                 mix(src.as_bytes());
+                mix(&[*near as u8]);
             }
             DisplayItem::BorderSide {
                 x,

@@ -55,6 +55,8 @@ pub(crate) struct BoxBgs {
     pad: [f32; 4],
     /// border widths [t,r,b,l]
     brd: [f32; 4],
+    /// image-rendering: pixelated → nearest-neighbor sampling
+    near: bool,
 }
 
 /// Does the computed style carry a paintable background image layer?
@@ -88,7 +90,18 @@ pub(crate) fn parse_box(
     if layers.is_empty() {
         return None;
     }
-    Some(BoxBgs { layers, pad, brd })
+    Some(BoxBgs {
+        layers,
+        pad,
+        brd,
+        near: matches!(
+            c.get("image-rendering").map(String::as_str),
+            Some("pixelated")
+                | Some("crisp-edges")
+                | Some("-moz-crisp-edges")
+                | Some("optimizeSpeed")
+        ),
+    })
 }
 
 /// Emit display items for the layers, painted back-to-front (last layer
@@ -144,6 +157,7 @@ pub(crate) fn items_for(
                     rx: l.rep.0,
                     ry: l.rep.1,
                     src: src.clone(),
+                    near: b.near,
                 });
             }
             Img::Grad(g) => emit_gradient(&mut out, g, l, clip, pa, &mut budget),

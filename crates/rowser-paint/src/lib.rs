@@ -335,9 +335,16 @@ fn paint_span(
             DisplayItem::Raster { x, y, w, h, pixels } => {
                 canvas.blit_pixels(pixels, *x as i32, *y as i32, *w as i32, *h as i32);
             }
-            DisplayItem::Image { x, y, w, h, src } => {
+            DisplayItem::Image {
+                x,
+                y,
+                w,
+                h,
+                src,
+                near,
+            } => {
                 if let Some(img) = images.get(src) {
-                    canvas.blit(img, *x as i32, *y as i32, *w as i32, *h as i32);
+                    canvas.blit(img, *x as i32, *y as i32, *w as i32, *h as i32, *near);
                 } else {
                     canvas.fill_rect(
                         *x as i32,
@@ -367,11 +374,12 @@ fn paint_span(
                 rx,
                 ry,
                 src,
+                near,
             } => {
                 if let Some(img) = images.get(src) {
                     canvas.blit_tiled(
                         img, *x, *y, *w, *h, *px, *py, *pw, *ph, *mode, *sw, *sh, *fx, *ax, *fy,
-                        *ay, *rx, *ry,
+                        *ay, *rx, *ry, *near,
                     );
                 }
                 // undecoded/failed image: paint nothing — the element's
@@ -621,6 +629,7 @@ mod tests {
                 w: 10.0,
                 h: 10.0,
                 src: "missing.png".into(),
+                near: false,
             },
             DisplayItem::FillRect {
                 x: 0.0,
@@ -897,10 +906,13 @@ impl Canvas {
             height: dh.max(0) as u32,
             pixels: pixels.to_vec(),
         };
-        self.blit(&img, dx, dy, dw, dh);
+        // raw rasters are 1:1 content — nearest keeps them crisp
+        self.blit(&img, dx, dy, dw, dh, true);
     }
 
-    fn blit(&mut self, img: &Image, dx: i32, dy: i32, dw: i32, dh: i32) {
+    /// `image-rendering`: `near` = pixelated nearest-neighbor, else the
+    /// pixel center is bilinear-sampled.
+    fn blit(&mut self, img: &Image, dx: i32, dy: i32, dw: i32, dh: i32, near: bool) {
         if img.width == 0 || img.height == 0 {
             return;
         }
@@ -908,7 +920,6 @@ impl Canvas {
         let (sx0, sy0, sx1, sy1) = fx::scissor(&self.clips, cw, ch);
         let clipped = !self.clips.is_empty();
         for y in dy.max(0).max(sy0)..(dy + dh).min(ch).min(sy1) {
-            let sy = ((y - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
             for x in dx.max(0).max(sx0)..(dx + dw).min(cw).min(sx1) {
                 if clipped
                     && !self
@@ -918,27 +929,32 @@ impl Canvas {
                 {
                     continue;
                 }
-                let sx = ((x - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
-                let si = ((sy * img.width + sx) * 4) as usize;
                 let di = ((y * cw + x) * 4) as usize;
-                let (b, g, r, a) = (
-                    img.pixels[si],
-                    img.pixels[si + 1],
-                    img.pixels[si + 2],
-                    img.pixels[si + 3] as u32,
-                );
+                let (b, g, r, a) = if near {
+                    let sy = ((y - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
+                    let sx = ((x - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
+                    let si = ((sy * img.width + sx) * 4) as usize;
+                    (
+                        img.pixels[si] as u32,
+                        img.pixels[si + 1] as u32,
+                        img.pixels[si + 2] as u32,
+                        img.pixels[si + 3] as u32,
+                    )
+                } else {
+                    let sy = (y - dy) as f32 / dh.max(1) as f32 * img.height as f32;
+                    let sx = (x - dx) as f32 / dw.max(1) as f32 * img.width as f32;
+                    bilinear(&img.pixels, img.width, img.height, sx + 0.5, sy + 0.5)
+                };
                 if a == 255 {
-                    self.pixels[di] = b;
-                    self.pixels[di + 1] = g;
-                    self.pixels[di + 2] = r;
+                    self.pixels[di] = b as u8;
+                    self.pixels[di + 1] = g as u8;
+                    self.pixels[di + 2] = r as u8;
                     self.pixels[di + 3] = 255;
                 } else if a > 0 {
                     let inv = 255 - a;
-                    self.pixels[di] = ((b as u32 * a + self.pixels[di] as u32 * inv) / 255) as u8;
-                    self.pixels[di + 1] =
-                        ((g as u32 * a + self.pixels[di + 1] as u32 * inv) / 255) as u8;
-                    self.pixels[di + 2] =
-                        ((r as u32 * a + self.pixels[di + 2] as u32 * inv) / 255) as u8;
+                    self.pixels[di] = ((b * a + self.pixels[di] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 1] = ((g * a + self.pixels[di + 1] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 2] = ((r * a + self.pixels[di + 2] as u32 * inv) / 255) as u8;
                     self.pixels[di + 3] = 255;
                 }
             }
@@ -970,6 +986,7 @@ impl Canvas {
         ay: f32,
         rx: u8,
         ry: u8,
+        near: bool,
     ) {
         let (nw, nh) = (img.width as f32, img.height as f32);
         if nw <= 0.0 || nh <= 0.0 || w <= 0.0 || h <= 0.0 {
@@ -1056,6 +1073,7 @@ impl Canvas {
                             cy0,
                             cx1,
                             cy1,
+                            near,
                         );
                     }
                     if rx == 0 {
@@ -1084,6 +1102,7 @@ impl Canvas {
         cy0: i32,
         cx1: i32,
         cy1: i32,
+        near: bool,
     ) {
         if img.width == 0 || img.height == 0 || dw <= 0 || dh <= 0 {
             return;
@@ -1094,29 +1113,33 @@ impl Canvas {
         let y_lo = dy.max(cy0).max(0);
         let y_hi = (dy + dh).min(cy1).min(ch);
         for yy in y_lo..y_hi {
-            let sy = ((yy - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
             for xx in x_lo..x_hi {
-                let sx = ((xx - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
-                let si = ((sy * img.width + sx) * 4) as usize;
                 let di = ((yy * cw + xx) * 4) as usize;
-                let (b, g, r, a) = (
-                    img.pixels[si],
-                    img.pixels[si + 1],
-                    img.pixels[si + 2],
-                    img.pixels[si + 3] as u32,
-                );
+                let (b, g, r, a) = if near {
+                    let sy = ((yy - dy) as u32 * img.height / dh.max(1) as u32).min(img.height - 1);
+                    let sx = ((xx - dx) as u32 * img.width / dw.max(1) as u32).min(img.width - 1);
+                    let si = ((sy * img.width + sx) * 4) as usize;
+                    (
+                        img.pixels[si] as u32,
+                        img.pixels[si + 1] as u32,
+                        img.pixels[si + 2] as u32,
+                        img.pixels[si + 3] as u32,
+                    )
+                } else {
+                    let sy = (yy - dy) as f32 / dh.max(1) as f32 * img.height as f32;
+                    let sx = (xx - dx) as f32 / dw.max(1) as f32 * img.width as f32;
+                    bilinear(&img.pixels, img.width, img.height, sx + 0.5, sy + 0.5)
+                };
                 if a == 255 {
-                    self.pixels[di] = b;
-                    self.pixels[di + 1] = g;
-                    self.pixels[di + 2] = r;
+                    self.pixels[di] = b as u8;
+                    self.pixels[di + 1] = g as u8;
+                    self.pixels[di + 2] = r as u8;
                     self.pixels[di + 3] = 255;
                 } else if a > 0 {
                     let inv = 255 - a;
-                    self.pixels[di] = ((b as u32 * a + self.pixels[di] as u32 * inv) / 255) as u8;
-                    self.pixels[di + 1] =
-                        ((g as u32 * a + self.pixels[di + 1] as u32 * inv) / 255) as u8;
-                    self.pixels[di + 2] =
-                        ((r as u32 * a + self.pixels[di + 2] as u32 * inv) / 255) as u8;
+                    self.pixels[di] = ((b * a + self.pixels[di] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 1] = ((g * a + self.pixels[di + 1] as u32 * inv) / 255) as u8;
+                    self.pixels[di + 2] = ((r * a + self.pixels[di + 2] as u32 * inv) / 255) as u8;
                     self.pixels[di + 3] = 255;
                 }
             }

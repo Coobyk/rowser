@@ -153,6 +153,8 @@ pub enum DisplayItem {
         w: f32,
         h: f32,
         src: String,
+        /// image-rendering: pixelated → nearest-neighbor sampling
+        near: bool,
     },
     /// Begin an effect group (filter/clip/blend/backdrop): items until the
     /// matching `PopEffect` form this element's painted subtree.
@@ -234,6 +236,8 @@ pub enum DisplayItem {
         rx: u8,
         ry: u8,
         src: String,
+        /// image-rendering: pixelated → nearest-neighbor sampling
+        near: bool,
     },
     /// Begin a 2D affine transform (xform::Mat) over the items up to the
     /// matching PopTransform. Nests; matrices compose in paint order.
@@ -2486,12 +2490,20 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             h,
             color,
         },
-        DisplayItem::Image { x, y, w, h, src } => DisplayItem::Image {
+        DisplayItem::Image {
+            x,
+            y,
+            w,
+            h,
+            src,
+            near,
+        } => DisplayItem::Image {
             x: x + dx,
             y: y + dy,
             w,
             h,
             src,
+            near,
         },
         DisplayItem::BorderSide {
             x,
@@ -2577,6 +2589,7 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             rx,
             ry,
             src,
+            near,
         } => DisplayItem::BgImage {
             x: x + dx,
             y: y + dy,
@@ -2596,6 +2609,7 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             rx,
             ry,
             src,
+            near,
         },
         DisplayItem::PushEffect(e) => DisplayItem::PushEffect(e.offset(dx, dy)),
         DisplayItem::PopEffect => DisplayItem::PopEffect, // moving stored points by (dx,dy) conjugates the authored matrix
@@ -7583,6 +7597,13 @@ impl<'a> Layouter<'a> {
     /// coords: `fill` (default) keeps the plain stretch `Image`; any other
     /// fit emits a `BgImage` whose tile resolves against the decoded size.
     fn fit_image_item(&self, c: &Props, size: f32, w: f32, h: f32, src: &str) -> DisplayItem {
+        let near = matches!(
+            c.get("image-rendering").map(String::as_str),
+            Some("pixelated")
+                | Some("crisp-edges")
+                | Some("-moz-crisp-edges")
+                | Some("optimizeSpeed")
+        );
         match bgimg::object_fit(c, size, self.viewport_h, self.viewport_w) {
             Some((mode, xx, yy)) => DisplayItem::BgImage {
                 x: 0.0,
@@ -7603,6 +7624,7 @@ impl<'a> Layouter<'a> {
                 rx: 0,
                 ry: 0,
                 src: src.to_string(),
+                near,
             },
             None => DisplayItem::Image {
                 x: 0.0,
@@ -7610,6 +7632,7 @@ impl<'a> Layouter<'a> {
                 w,
                 h,
                 src: src.to_string(),
+                near,
             },
         }
     }
@@ -10828,5 +10851,23 @@ mod tests {
             .collect();
         assert_eq!(xs.len(), 2);
         assert!((xs[1] - xs[0] - 20.0).abs() < 1.0, "flex row: {xs:?}");
+    }
+
+    #[test]
+    fn image_rendering_pixelated_flags_item() {
+        let (items, _, _) = lay(
+            r#"<style>img{image-rendering:pixelated;width:32px;height:32px}</style>             <img src="a.png">"#,
+        );
+        let near = items.iter().find_map(|i| match i {
+            DisplayItem::Image { near, .. } => Some(*near),
+            _ => None,
+        });
+        assert_eq!(near, Some(true));
+        let (items2, _, _) = lay(r#"<img src="a.png" width="32" height="32">"#);
+        let near2 = items2.iter().find_map(|i| match i {
+            DisplayItem::Image { near, .. } => Some(*near),
+            _ => None,
+        });
+        assert_eq!(near2, Some(false), "auto must smooth");
     }
 }
