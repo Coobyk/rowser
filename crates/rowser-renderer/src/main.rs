@@ -614,12 +614,18 @@ impl Page {
             resolved.len(),
             t.elapsed()
         );
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for u in &resolved {
             if let Some(b) = bodies.get(u) {
-                self.sheets.push(rowser_css::parse_vw(
-                    &String::from_utf8_lossy(b),
+                let sh = rowser_css::parse_vw(&String::from_utf8_lossy(b), self.viewport.0 as f32);
+                expand_imports(
+                    sh,
+                    u,
                     self.viewport.0 as f32,
-                ));
+                    &mut self.sheets,
+                    0,
+                    &mut seen,
+                );
             }
         }
     }
@@ -1782,6 +1788,39 @@ fn fetch_pool(
         }
     }
     out
+}
+
+/// `@import` expansion: each import's fetched sheet (and its own
+/// imports, recursively, depth ≤ 4) splices in before the importing
+/// sheet's rules — matching the spec's in-place insertion for imports
+/// at the top of the sheet. `seen` dedupes/cycle-guards across sheets.
+fn expand_imports(
+    sheet: rowser_css::StyleSheet,
+    base: &str,
+    vw: f32,
+    out: &mut Vec<rowser_css::StyleSheet>,
+    depth: u8,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if depth < 4 {
+        let urls: Vec<String> = sheet
+            .imports
+            .iter()
+            .filter(|i| rowser_css::media_query(&i.media, vw))
+            .filter_map(|i| resolve_url(base, &i.url))
+            .filter(|u| seen.insert(u.clone()))
+            .collect();
+        if !urls.is_empty() {
+            let bodies = fetch_pool(&urls, CSS_FETCH_DEADLINE);
+            for u in &urls {
+                if let Some(b) = bodies.get(u) {
+                    let sh = rowser_css::parse_vw(&String::from_utf8_lossy(b), vw);
+                    expand_imports(sh, u, vw, out, depth + 1, seen);
+                }
+            }
+        }
+    }
+    out.push(sheet);
 }
 
 /// Resolve `resource` against `base` (absolute URLs pass through).

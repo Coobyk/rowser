@@ -37,6 +37,31 @@ fn fetch(url: &str) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Fetch + splice `@import`ed sheets ahead of `sheet` (depth-capped).
+fn expand_imports(
+    sheet: rowser_css::StyleSheet,
+    base: &str,
+    vw: f32,
+    out: &mut Vec<rowser_css::StyleSheet>,
+    depth: u8,
+) {
+    if depth < 4 {
+        for imp in &sheet.imports {
+            if !rowser_css::media_query(&imp.media, vw) {
+                continue;
+            }
+            let Some(u) = resolve(base, &imp.url) else {
+                continue;
+            };
+            if let Ok(b) = fetch(&u) {
+                let sh = rowser_css::parse_vw(&String::from_utf8_lossy(&b), vw);
+                expand_imports(sh, &u, vw, out, depth + 1);
+            }
+        }
+    }
+    out.push(sheet);
+}
+
 fn resolve(base: &str, r: &str) -> Option<String> {
     let r = r.trim();
     if r.starts_with("data:") {
@@ -140,7 +165,8 @@ fn main() {
         {
             if let Some(h) = doc.attr(id, "href").and_then(|h| resolve(&url, h)) {
                 if let Ok(b) = fetch(&h) {
-                    sheets.push(rowser_css::parse_vw(&String::from_utf8_lossy(&b), w));
+                    let sh = rowser_css::parse_vw(&String::from_utf8_lossy(&b), w);
+                    expand_imports(sh, &h, w, &mut sheets, 0);
                 }
             }
         }

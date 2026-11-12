@@ -176,8 +176,20 @@ pub struct PseudoState {
     pub target_frag: Option<String>,
 }
 
+/// One `@import` statement: target url + the media list it applies
+/// under (empty = unconditional).
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub url: String,
+    pub media: String,
+}
+
 pub struct StyleSheet {
     pub rules: Vec<Rule>,
+    /// `@import` statements in document order — the loader splices the
+    /// imported sheets' rules before this sheet's (spec position rules
+    /// mean imports precede everything but @charset/@layer).
+    pub imports: Vec<Import>,
     /// Cascade-layer index per rule (parallel to `rules`); `u32::MAX` =
     /// unlayered, which beats every layered rule of the same importance.
     layers: Vec<u32>,
@@ -217,6 +229,7 @@ pub fn parse_selector(s: &str) -> Option<Selector> {
         layer_count: 0,
         keyframes: Vec::new(),
         properties: Vec::new(),
+        imports: Vec::new(),
         font_faces: Vec::new(),
     };
     p.skip_ws_comments();
@@ -240,6 +253,7 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         layer_count: 0,
         keyframes: Vec::new(),
         properties: Vec::new(),
+        imports: Vec::new(),
         font_faces: Vec::new(),
     };
     let mut pairs: Vec<(u32, Rule)> = Vec::new();
@@ -257,6 +271,7 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
     let (rules, layers): (Vec<Rule>, Vec<u32>) = pairs.into_iter().map(|(l, r)| (r, l)).unzip();
     let mut sheet = StyleSheet {
         rules,
+        imports: p.imports,
         layers,
         by_tag: FxHashMap::default(),
         by_class: FxHashMap::default(),
@@ -380,6 +395,7 @@ struct CssParser<'a> {
     keyframes: Vec<(String, Vec<Decl>)>,
     /// `@property` registrations collected while parsing.
     properties: Vec<cascade::PropertyDef>,
+    imports: Vec<Import>,
     /// `@font-face` descriptors collected for `StyleSheet::fonts`.
     font_faces: Vec<FontFace>,
 }
@@ -498,6 +514,36 @@ impl<'a> CssParser<'a> {
             let decls = self.decl_block();
             if let Some(ff) = fontface::font_face_from_decls(&decls) {
                 self.font_faces.push(ff);
+            }
+            return Some(Vec::new());
+        }
+        // `@import url(...) [media list];` — statement form only; the
+        // loader fetches + splices. url can be url() or a bare string.
+        if name == "import" && !has_block {
+            let p = raw_prelude.trim();
+            let (u, media) = if let Some(inner) = p
+                .strip_prefix("url(")
+                .and_then(|r| r.find(')').map(|i| r[..i].to_string()))
+            {
+                let media = p[inner.len() + 5..].trim().to_string();
+                (
+                    inner
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .trim()
+                        .to_string(),
+                    media,
+                )
+            } else {
+                let mut it = p.splitn(2, char::is_whitespace);
+                let first = it.next().unwrap_or("");
+                (
+                    first.trim_matches('"').trim_matches('\'').to_string(),
+                    it.next().unwrap_or("").trim().to_string(),
+                )
+            };
+            if !u.is_empty() {
+                self.imports.push(Import { url: u, media });
             }
             return Some(Vec::new());
         }
@@ -2461,6 +2507,21 @@ mod tests {
         assert_eq!(s.rules.len(), 2);
         assert_eq!(s.rules[0].decls[0].prop, "color");
         assert_eq!(s.rules[0].decls[0].value, "red");
+    }
+
+    #[test]
+    fn import_recorded() {
+        let s = parse(
+            r#"@import url('a.css'); @import "b.css" screen and (min-width:600px);
+             @import "c.css" print; p { color: red }"#,
+        );
+        assert_eq!(s.imports.len(), 3);
+        assert_eq!(s.imports[0].url, "a.css");
+        assert_eq!(s.imports[0].media, "");
+        assert_eq!(s.imports[1].url, "b.css");
+        assert!(s.imports[1].media.contains("min-width"));
+        assert_eq!(s.imports[2].media, "print");
+        assert_eq!(s.rules.len(), 1);
     }
 
     #[test]
