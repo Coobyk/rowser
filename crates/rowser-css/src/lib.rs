@@ -1679,6 +1679,18 @@ fn each_physical(prop: &str, mut f: impl FnMut(&str)) {
         "inset-inline-end" => f("right"),
         "inset-block-start" => f("top"),
         "inset-block-end" => f("bottom"),
+        // logical size aliases (horizontal LTR only — no writing-mode)
+        "inline-size" => f("width"),
+        "block-size" => f("height"),
+        "min-inline-size" => f("min-width"),
+        "max-inline-size" => f("max-width"),
+        "min-block-size" => f("min-height"),
+        "max-block-size" => f("max-height"),
+        // logical border-radius corners
+        "border-start-start-radius" => f("border-top-left-radius"),
+        "border-start-end-radius" => f("border-top-right-radius"),
+        "border-end-start-radius" => f("border-bottom-left-radius"),
+        "border-end-end-radius" => f("border-bottom-right-radius"),
         p => f(p),
     }
 }

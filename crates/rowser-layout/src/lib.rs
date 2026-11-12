@@ -289,6 +289,8 @@ struct Style {
     align_last: Option<Align>,
     /// text-shadow list: (dx, dy, blur, color)
     shadow: Vec<(f32, f32, f32, Color)>,
+    /// direction:rtl — flips start/end alignment and word order
+    rtl: bool,
     /// overflow-wrap:break-word|anywhere, word-break:break-all — overwide
     /// words may split mid-word; otherwise they overflow
     break_word: bool,
@@ -358,6 +360,7 @@ fn base_style() -> Style {
         indent: 0.0,
         align_last: None,
         shadow: Vec::new(),
+        rtl: false,
         break_word: false,
         align: Align::Left,
         href: None,
@@ -2650,6 +2653,8 @@ pub struct Layouter<'a> {
     align: Align,
     /// text-align-last for forced line breaks; follows `align` saves
     align_last: Option<Align>,
+    /// direction:rtl — flush_line emits words right-to-left
+    rtl: bool,
     line: Vec<Word>,
     line_x: f32,
     pending_space: bool,
@@ -2789,6 +2794,7 @@ impl<'a> Layouter<'a> {
             avail_w: width,
             align: Align::Left,
             align_last: None,
+            rtl: false,
             line: Vec::new(),
             line_x: 0.0,
             pending_space: false,
@@ -3447,10 +3453,13 @@ impl<'a> Layouter<'a> {
         }
         st.deco = deco;
         if let Some(v) = c.get("text-align") {
-            st.align = match v.trim() {
-                "center" | "-webkit-center" | "match-parent" => Align::Center,
-                "right" | "-webkit-right" | "end" => Align::Right,
-                "justify" | "justify-all" => Align::Justify,
+            let rtl = st.rtl || c.get("direction").map(String::as_str) == Some("rtl");
+            st.align = match (v.trim(), rtl) {
+                ("center", _) | ("-webkit-center", _) | ("match-parent", _) => Align::Center,
+                ("right", _) | ("-webkit-right", _) => Align::Right,
+                ("start", true) | ("end", false) => Align::Right,
+                ("end", true) => Align::Left,
+                ("justify", _) | ("justify-all", _) => Align::Justify,
                 _ => Align::Left,
             };
         }
@@ -3505,6 +3514,13 @@ impl<'a> Layouter<'a> {
         }
         if let Some(v) = c.get("hyphens") {
             st.hyphens_none = v.trim() == "none";
+        }
+        st.rtl = c.get("direction").map(String::as_str) == Some("rtl");
+        if st.rtl && c.get("text-align").is_none() {
+            st.align = Align::Right;
+        }
+        if let Some(v) = c.get("text-wrap") {
+            st.nowrap |= v.trim() == "nowrap";
         }
         if let Some(v) = c.get("white-space") {
             let v = v.trim();
@@ -3783,6 +3799,7 @@ impl<'a> Layouter<'a> {
         let saved_avail = self.avail_w;
         let saved_align = self.align;
         let saved_align_last = self.align_last;
+        let saved_rtl = self.rtl;
         let saved_ellip = self.ellipsis_clip;
         let inner_w = if let Some(w) = w_prop {
             if w_is_outer {
@@ -3808,6 +3825,7 @@ impl<'a> Layouter<'a> {
         self.avail_w = inner_w;
         self.align = st.align;
         self.align_last = st.align_last;
+        self.rtl = st.rtl;
         // text-indent shifts the first line only — it rides into
         // flush_line as a pending offset (wrap checks get it via line_x)
         if st.indent != 0.0 {
@@ -4167,6 +4185,7 @@ impl<'a> Layouter<'a> {
         self.avail_w = saved_avail;
         self.align = saved_align;
         self.align_last = saved_align_last;
+        self.rtl = saved_rtl;
         self.ellipsis_clip = saved_ellip;
         // out-of-flow boxes reserve no flow space
         if let Some((fy, fmx, favail)) = flow {
@@ -4304,7 +4323,13 @@ impl<'a> Layouter<'a> {
 
         let top = self.y;
         let f0 = self.floats.len();
-        let saved = (self.margin_x, self.avail_w, self.align, self.align_last);
+        let saved = (
+            self.margin_x,
+            self.avail_w,
+            self.align,
+            self.align_last,
+            self.rtl,
+        );
         let outer_x = if right {
             self.margin_x + self.avail_w - ri - box_w - mr.max(0.0)
         } else {
@@ -4314,6 +4339,7 @@ impl<'a> Layouter<'a> {
         self.avail_w = inner;
         self.align = st.align;
         self.align_last = st.align_last;
+        self.rtl = st.rtl;
         if st.indent != 0.0 {
             self.indent_pending = st.indent;
             self.line_x += st.indent;
@@ -4458,6 +4484,7 @@ impl<'a> Layouter<'a> {
         self.avail_w = saved.1;
         self.align = saved.2;
         self.align_last = saved.3;
+        self.rtl = saved.4;
         // floats take no vertical space in normal flow
         self.y = top;
         self.floats.push(Float {
@@ -4575,13 +4602,20 @@ impl<'a> Layouter<'a> {
             self.y += mt.max(0.0);
         }
 
-        let saved = (self.margin_x, self.avail_w, self.align, self.align_last);
+        let saved = (
+            self.margin_x,
+            self.avail_w,
+            self.align,
+            self.align_last,
+            self.rtl,
+        );
         if !nested {
             self.margin_x += ml.max(0.0);
             self.avail_w -= ml.max(0.0);
         }
         self.align = st.align;
         self.align_last = st.align_last;
+        self.rtl = st.rtl;
         let avail = self.avail_w.max(1.0);
 
         // `width` attribute (px/%) or CSS `width` sizes the table box
@@ -4906,6 +4940,7 @@ impl<'a> Layouter<'a> {
         self.avail_w = saved.1;
         self.align = saved.2;
         self.align_last = saved.3;
+        self.rtl = saved.4;
         if !nested {
             self.y += mb.max(0.0);
         }
@@ -6517,6 +6552,7 @@ impl<'a> Layouter<'a> {
             self.align_last,
             self.ellipsis_clip,
             self.indent_pending,
+            self.rtl,
         );
         let saved_lx = self.line_x;
         let saved_ps = self.pending_space;
@@ -6526,6 +6562,7 @@ impl<'a> Layouter<'a> {
         self.avail_w = avail.max(1.0);
         self.align = st.align;
         self.align_last = st.align_last;
+        self.rtl = st.rtl;
         self.ellipsis_clip = if c.get("text-overflow").map(String::as_str) == Some("ellipsis")
             && borderfx::clips_overflow(c)
         {
@@ -6617,6 +6654,7 @@ impl<'a> Layouter<'a> {
         self.align_last = saved.4;
         self.ellipsis_clip = saved.5;
         self.indent_pending = saved.6;
+        self.rtl = saved.7;
         self.line = saved_line;
         self.line_x = saved_lx;
         self.pending_space = saved_ps;
@@ -8201,15 +8239,23 @@ impl<'a> Layouter<'a> {
         // per-word x positions on this line — gap_before lands *before*
         // the word, widened by justify_extra
         let n = self.line.len();
-        let mut xs = Vec::with_capacity(n);
-        for w in &self.line {
+        let mut xs = vec![0.0; n];
+        // direction:rtl emits words right-to-left — the first word lands
+        // at the line's right edge
+        let emit_order: Vec<usize> = if self.rtl {
+            (0..n).rev().collect()
+        } else {
+            (0..n).collect()
+        };
+        for &k in &emit_order {
+            let w = &self.line[k];
             x += w.gap_before
                 + if w.gap_before > 0.0 {
                     justify_extra
                 } else {
                     0.0
                 };
-            xs.push(x);
+            xs[k] = x;
             x += w.width;
         }
         // a consecutive run of words sharing one transform spec wraps in
@@ -10552,5 +10598,44 @@ mod tests {
             strs.iter().any(|s| s.ends_with('-')),
             "a shy break shows a hyphen: {strs:?}"
         );
+    }
+
+    #[test]
+    fn rtl_direction_reverses_word_order() {
+        let (items, _, _) = lay(r#"<style>p{direction:rtl}</style><p>AA BB CC DD EE FF GG HH</p>"#);
+        let xs: Vec<f32> = texts(&items).iter().map(|i| tinfo(i).0).collect();
+        let (items2, _, _) = lay(r#"<p>AA BB CC DD EE FF GG HH</p>"#);
+        let xs2: Vec<f32> = texts(&items2).iter().map(|i| tinfo(i).0).collect();
+        assert!(xs2.windows(2).all(|w| w[0] < w[1]), "ltr ascends: {xs2:?}");
+        assert!(xs.windows(2).all(|w| w[0] > w[1]), "rtl descends: {xs:?}");
+    }
+
+    #[test]
+    fn logical_sizes_map_to_physical() {
+        let (items, _, _) = lay(
+            r#"<style>div{inline-size:120px;block-size:40px;background:#f00}</style>             <div><span>x</span></div>"#,
+        );
+        let b = items
+            .iter()
+            .find_map(|i| match i {
+                DisplayItem::FillRect { w, h, color, .. }
+                    if *w > 100.0 && *color == bgra(255, 0, 0) =>
+                {
+                    Some((*w, *h))
+                }
+                _ => None,
+            })
+            .expect("div bg rect");
+        assert_eq!(b, (120.0, 40.0));
+    }
+
+    #[test]
+    fn text_wrap_nowrap_maps_to_nowrap() {
+        let (items, _, _) = lay(
+            r#"<style>p{text-wrap:nowrap}</style><p>one two three four five six seven eight</p>"#,
+        );
+        let t = texts(&items);
+        let y0 = tinfo(t[0]).1;
+        assert!(t.iter().all(|i| tinfo(i).1 == y0), "nowrap single line");
     }
 }
