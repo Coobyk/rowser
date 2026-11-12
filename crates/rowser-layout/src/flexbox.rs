@@ -853,8 +853,9 @@ impl<'a> Layouter<'a> {
                     it.shrink = s;
                     it.align = align;
                     it.cross_auto = fixed_cross.is_none() && (col || aspect_ratio(&cc).is_none());
+                    // css spec: min wins over max when they invert
                     it.min_cross = min_cross;
-                    it.max_cross = max_cross;
+                    it.max_cross = max_cross.max(min_cross);
                     it.order = order;
                     match kind {
                         FKind::Replaced => {
@@ -973,7 +974,7 @@ impl<'a> Layouter<'a> {
                                 it.ceil = dim(&cc, "max-height", hrel, size)
                                     .map(|v| if bb { v } else { v + main_pad })
                                     .unwrap_or(f32::MAX);
-                                it.base = it.base.clamp(it.floor, it.ceil);
+                                it.base = it.base.clamp(it.floor, it.ceil.max(it.floor));
                             } else {
                                 it.base = match basis {
                                     FBasis::Px(v) => {
@@ -1005,7 +1006,7 @@ impl<'a> Layouter<'a> {
                                 it.ceil = dim(&cc, "max-width", self.avail_w, size)
                                     .map(|v| if bb { v } else { v + main_pad })
                                     .unwrap_or(f32::MAX);
-                                it.base = it.base.clamp(it.floor, it.ceil);
+                                it.base = it.base.clamp(it.floor, it.ceil.max(it.floor));
                             }
                         }
                     }
