@@ -441,6 +441,7 @@ fn paint_span(
                 deco,
                 ls,
                 href: _,
+                sel: _,
             } => {
                 let mut pen = *x;
                 let mut prev = 0u16;
@@ -612,6 +613,7 @@ mod tests {
                 deco: rowser_layout::TextDeco::NONE,
                 ls: 0.0,
                 href: None,
+                sel: true,
             },
             DisplayItem::Image {
                 x: 0.0,

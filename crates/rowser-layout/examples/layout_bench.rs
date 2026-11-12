@@ -28,6 +28,7 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 deco,
                 ls,
                 href,
+                sel,
             } => {
                 mix(&[1]);
                 mix(&x.to_bits().to_le_bytes());
@@ -38,6 +39,7 @@ fn fingerprint(items: &[DisplayItem]) -> u64 {
                 mix(&color.to_le_bytes());
                 mix(&[deco.lines, *ls as u8]);
                 mix(href.as_deref().unwrap_or("").as_bytes());
+                mix(&[*sel as u8]);
             }
             DisplayItem::FillRect { x, y, w, h, color } => {
                 mix(&[2]);

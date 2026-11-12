@@ -1180,12 +1180,13 @@ fn text_boxes<'a>(
             text,
             font,
             size,
+            sel,
             ..
         } = it
         else {
             continue;
         };
-        if text.is_empty() {
+        if text.is_empty() || !sel {
             continue;
         }
         let (starts, top, bot) = match fonts.font(*font) {

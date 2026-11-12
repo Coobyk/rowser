@@ -116,6 +116,8 @@ pub enum DisplayItem {
         size: f32,
         color: Color,
         deco: TextDeco,
+        /// user-select — false suppresses selection rects for this word
+        sel: bool,
         /// letter-spacing — extra advance after every glyph
         ls: f32,
         href: Option<String>,
@@ -291,6 +293,8 @@ struct Style {
     shadow: Vec<(f32, f32, f32, Color)>,
     /// direction:rtl — flips start/end alignment and word order
     rtl: bool,
+    /// user-select:none — words from this element can't be selected
+    no_select: bool,
     /// overflow-wrap:break-word|anywhere, word-break:break-all — overwide
     /// words may split mid-word; otherwise they overflow
     break_word: bool,
@@ -361,6 +365,7 @@ fn base_style() -> Style {
         align_last: None,
         shadow: Vec::new(),
         rtl: false,
+        no_select: false,
         break_word: false,
         align: Align::Left,
         href: None,
@@ -2355,6 +2360,8 @@ struct Word {
     color: Color,
     deco: TextDeco,
     va: Va,
+    /// user-select:none on the owning element
+    sel: bool,
     /// whitespace gap before this word (word-spacing + letter-spacing
     /// folded in) — kept separate from `width` so `text-align:justify`
     /// can stretch it
@@ -2456,6 +2463,7 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             deco,
             ls,
             href,
+            sel,
         } => DisplayItem::Text {
             x: x + dx,
             baseline: baseline + dy,
@@ -2466,6 +2474,7 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             deco,
             ls,
             href,
+            sel,
         },
         DisplayItem::FillRect { x, y, w, h, color } => DisplayItem::FillRect {
             x: x + dx,
@@ -3521,6 +3530,18 @@ impl<'a> Layouter<'a> {
         }
         if let Some(v) = c.get("text-wrap") {
             st.nowrap |= v.trim() == "nowrap";
+        }
+        if let Some(v) = c
+            .get("user-select")
+            .or_else(|| c.get("-webkit-user-select"))
+            .or_else(|| c.get("-moz-user-select"))
+        {
+            st.no_select = matches!(v.trim(), "none" | "-moz-none");
+        }
+        if let Some(v) = c.get("unicode-bidi") {
+            // bidi-override forces rtl reorder; isolate/plaintext keep
+            // the direction's natural behavior (our approximation)
+            st.rtl |= matches!(v.trim(), "bidi-override" | "isolate-override");
         }
         if let Some(v) = c.get("white-space") {
             let v = v.trim();
@@ -6780,6 +6801,7 @@ impl<'a> Layouter<'a> {
                     deco: TextDeco::NONE,
                     ls: w.ls,
                     href: None,
+                    sel: w.sel,
                 });
                 if blur > 0.5 {
                     self.items.push(DisplayItem::PopEffect);
@@ -6795,6 +6817,7 @@ impl<'a> Layouter<'a> {
                 deco: w.deco,
                 ls: w.ls,
                 href: w.href,
+                sel: w.sel,
             });
         }
         // empty words (inline-margin spacers) just advance x
@@ -7260,6 +7283,7 @@ impl<'a> Layouter<'a> {
             color: 0,
             deco: TextDeco::NONE,
             va: Va::Baseline,
+            sel: true,
             gap_before: gap,
             ls: 0.0,
             shadow: Vec::new(),
@@ -7304,6 +7328,7 @@ impl<'a> Layouter<'a> {
             color: 0,
             deco: TextDeco::NONE,
             va: Va::Baseline,
+            sel: true,
             gap_before: gap,
             ls: 0.0,
             shadow: Vec::new(),
@@ -7782,6 +7807,7 @@ impl<'a> Layouter<'a> {
             color: st.color,
             deco: st.deco.clone(),
             va: st.va,
+            sel: !st.no_select,
             gap_before: gap,
             ls: st.ls,
             shadow: st.shadow.clone(),
@@ -7871,6 +7897,7 @@ impl<'a> Layouter<'a> {
                             color: fst.color,
                             deco: fst.deco.clone(),
                             va: fst.va,
+                            sel: !fst.no_select,
                             gap_before: gap,
                             ls: fst.ls,
                             shadow: fst.shadow.clone(),
@@ -8018,6 +8045,7 @@ impl<'a> Layouter<'a> {
                         color: st.color,
                         deco: st.deco.clone(),
                         va: st.va,
+                        sel: !st.no_select,
                         gap_before: gap,
                         ls: st.ls,
                         shadow: st.shadow.clone(),
@@ -8050,6 +8078,7 @@ impl<'a> Layouter<'a> {
                     color: st.color,
                     deco: st.deco.clone(),
                     va: st.va,
+                    sel: !st.no_select,
                     gap_before: gap,
                     ls: st.ls,
                     shadow: st.shadow.clone(),
@@ -8078,6 +8107,7 @@ impl<'a> Layouter<'a> {
             color: st.color,
             deco: st.deco.clone(),
             va: st.va,
+            sel: !st.no_select,
             gap_before: gap,
             ls: st.ls,
             shadow: st.shadow.clone(),
@@ -8554,6 +8584,7 @@ impl<'a> Layouter<'a> {
             deco: mst.deco.clone(),
             ls: mst.ls,
             href: None,
+            sel: true,
         });
     }
 
@@ -10637,5 +10668,27 @@ mod tests {
         let t = texts(&items);
         let y0 = tinfo(t[0]).1;
         assert!(t.iter().all(|i| tinfo(i).1 == y0), "nowrap single line");
+    }
+
+    #[test]
+    fn user_select_none_marks_words() {
+        let (items, _, _) = lay(
+            r#"<style>.nope{user-select:none;-webkit-user-select:none}</style>             <p>yes <span class=nope>hidden</span> tail</p>"#,
+        );
+        let mut saw_yes = false;
+        let mut saw_hidden = false;
+        for i in texts(&items) {
+            if let DisplayItem::Text { text, sel, .. } = i {
+                if text.trim() == "yes" {
+                    assert!(*sel);
+                    saw_yes = true;
+                }
+                if text.trim() == "hidden" {
+                    assert!(!*sel, "user-select:none word");
+                    saw_hidden = true;
+                }
+            }
+        }
+        assert!(saw_yes && saw_hidden);
     }
 }
