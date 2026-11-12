@@ -7559,7 +7559,43 @@ impl<'a> Layouter<'a> {
     /// element's layout width, `x` against 1 dpr — prefer the smallest
     /// candidate that covers `want`, else the largest available.
     fn img_src(&self, node: NodeId, want: f32) -> Option<String> {
+        // <picture>: first preceding <source> sibling whose `media` matches
+        // supplies its srcset (spec: sources are evaluated in document order)
+        if let Some(par) = self.doc.parent(node) {
+            if self.doc.tag(par) == Some("picture") {
+                for &sib in self.doc.children(par) {
+                    if sib == node {
+                        break;
+                    }
+                    if self.doc.tag(sib) != Some("source") {
+                        continue;
+                    }
+                    let ok = self
+                        .doc
+                        .attr(sib, "media")
+                        .map(|m| css::media_query(m, self.viewport_w))
+                        .unwrap_or(true);
+                    if ok {
+                        if let Some(ss) = self.doc.attr(sib, "srcset") {
+                            if let Some(u) = self.pick_srcset(ss, want) {
+                                return Some(u);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Some(ss) = self.doc.attr(node, "srcset") {
+            if let Some(u) = self.pick_srcset(ss, want) {
+                return Some(u);
+            }
+        }
+        self.doc.attr(node, "src").map(String::from)
+    }
+
+    /// Pick the best candidate out of a `srcset` list for `want` css px.
+    fn pick_srcset(&self, ss: &str, want: f32) -> Option<String> {
+        {
             let mut best: Option<(f32, String)> = None;
             for cand in ss.split(',') {
                 let mut it = cand.trim().split_whitespace();
@@ -7586,11 +7622,8 @@ impl<'a> Layouter<'a> {
                     best = Some((score, url.to_string()));
                 }
             }
-            if let Some((_, u)) = best {
-                return Some(u);
-            }
+            best.map(|(_, u)| u)
         }
-        self.doc.attr(node, "src").map(String::from)
     }
 
     /// `object-fit`-aware image item for a replaced element in box-local
@@ -10869,5 +10902,19 @@ mod tests {
             _ => None,
         });
         assert_eq!(near2, Some(false), "auto must smooth");
+    }
+
+    #[test]
+    fn mask_image_emits_effect() {
+        let (items, _, _) = lay(
+            r#"<style>d{-webkit-mask-image:url(m.png);width:20px;height:20px;             background:#000}</style><d></d>"#,
+        );
+        assert!(
+            items.iter().any(|i| matches!(
+                i,
+                DisplayItem::PushEffect(colorfx::Effect::Mask { src }) if src == "m.png"
+            )),
+            "mask effect missing"
+        );
     }
 }

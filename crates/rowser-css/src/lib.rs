@@ -2029,6 +2029,11 @@ fn each_decl(prop: &str, value: &str, mut f: impl FnMut(&str, &str)) {
 
 /// Physical-property expansion shared by `each_decl` — see its docs.
 fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
+    // `mask: url(...)` shorthand → mask-image (layers/keywords beyond a
+    // plain url are rare; keep the value on the longhand for parsing)
+    if prop == "mask" && value.contains("url(") {
+        f("mask-image", value);
+    }
     // `-webkit-box` is the legacy flex display (line-clamp idiom) —
     // normalize so every display consumer sees `flex`
     if prop == "display" {
@@ -2739,6 +2744,12 @@ fn media_atom(a: &str, vw: f32, dark: bool) -> bool {
 }
 
 /// Full media query list: `not`/`only` prefixes, `,` = or.
+/// Public media-query check for attribute consumers (`<source media>`,
+/// `<link media>`): light scheme assumed — `dark` follows the env default.
+pub fn media_query(q: &str, vw: f32) -> bool {
+    media_matches(q, vw, dark_mode())
+}
+
 fn media_matches(q: &str, vw: f32, dark: bool) -> bool {
     let q = q.trim().to_lowercase();
     if q.is_empty() {

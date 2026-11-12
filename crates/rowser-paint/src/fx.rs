@@ -482,6 +482,11 @@ pub fn process(
                             apply_op(&mut tile, op);
                         }
                     }
+                    Effect::Mask { src } => {
+                        if let Some(m) = images.get(src) {
+                            mask_tile(&mut tile, m);
+                        }
+                    }
                     _ => {}
                 }
                 match eff {
@@ -899,6 +904,25 @@ fn clip_tile(tile: &mut Tile, abs: &ClipAbs) {
             if !clip_covers(abs, cx, cy) {
                 tile.px[(y * tile.w + x) * 4 + 3] = 0;
             }
+        }
+    }
+}
+
+/// `mask-mode:alpha` — each tile pixel's alpha is scaled by the mask
+/// image's alpha at the corresponding point (mask stretched to tile).
+fn mask_tile(tile: &mut Tile, m: &Image) {
+    if m.width == 0 || m.height == 0 {
+        return;
+    }
+    for y in 0..tile.h {
+        let sy =
+            (y as u64 * m.height as u64 / tile.h.max(1) as u64).min(m.height as u64 - 1) as usize;
+        for x in 0..tile.w {
+            let sx =
+                (x as u64 * m.width as u64 / tile.w.max(1) as u64).min(m.width as u64 - 1) as usize;
+            let ma = m.pixels[(sy * m.width as usize + sx) * 4 + 3] as u32;
+            let i = (y * tile.w + x) * 4;
+            tile.px[i + 3] = (tile.px[i + 3] as u32 * ma / 255) as u8;
         }
     }
 }

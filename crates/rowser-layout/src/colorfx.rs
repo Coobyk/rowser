@@ -145,6 +145,9 @@ pub enum Effect {
     },
     /// `mix-blend-mode:` subtree blended over the backdrop.
     Blend(BlendMode),
+    /// `mask-image:` url() — the painted subtree is alpha-masked by the
+    /// image (scaled to the subtree's painted bbox).
+    Mask { src: String },
 }
 
 impl Effect {
@@ -199,7 +202,21 @@ pub fn element_fx(c: &Props, size: f32, cur: Color, rect: Option<[f32; 4]>) -> V
             out.push(Effect::Clip { shape, rect });
         }
     }
+    // url() masks only this pass — gradient masks need a rasterizer
+    if let Some(v) = c.get("mask-image").or_else(|| c.get("-webkit-mask-image")) {
+        if let Some(src) = mask_url(v) {
+            out.push(Effect::Mask { src });
+        }
+    }
     out
+}
+
+/// `url(...)` → the inner address for mask-image; `none`/gradients → None.
+fn mask_url(v: &str) -> Option<String> {
+    let v = v.trim();
+    let inner = v.strip_prefix("url(")?.strip_suffix(')')?;
+    let inner = inner.trim_matches('"').trim_matches('\'').trim();
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
 /// Splice Push/Pop markers around `items[start..]`, outermost first.
