@@ -66,6 +66,46 @@ pub enum BorderStyle {
     Outset,
 }
 
+/// `text-decoration-line` rendering style.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DecoStyle {
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
+/// Resolved `text-decoration` for a text run (line bits + paint params).
+#[derive(Debug, Clone)]
+pub struct TextDeco {
+    /// bit0 underline, bit1 overline, bit2 line-through
+    pub lines: u8,
+    pub style: DecoStyle,
+    /// explicit text-decoration-color; None → the run's own color
+    pub color: Option<Color>,
+    /// text-decoration-thickness in px; None → derived from size
+    pub thick: Option<f32>,
+    /// text-underline-offset — extra px below the auto position
+    pub offset: Option<f32>,
+}
+
+impl TextDeco {
+    pub const NONE: TextDeco = TextDeco {
+        lines: 0,
+        style: DecoStyle::Solid,
+        color: None,
+        thick: None,
+        offset: None,
+    };
+    pub fn underline(&self) -> bool {
+        self.lines & 1 != 0
+    }
+    pub fn strike(&self) -> bool {
+        self.lines & 4 != 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DisplayItem {
     Text {
@@ -75,8 +115,9 @@ pub enum DisplayItem {
         font: usize,
         size: f32,
         color: Color,
-        underline: bool,
-        strike: bool,
+        deco: TextDeco,
+        /// letter-spacing — extra advance after every glyph
+        ls: f32,
         href: Option<String>,
     },
     FillRect {
@@ -211,6 +252,8 @@ pub enum Align {
     Left,
     Center,
     Right,
+    /// inter-word space stretched so the line fills the block
+    Justify,
 }
 
 #[derive(Clone)]
@@ -223,12 +266,29 @@ struct Style {
     /// text-transform applied per word
     transform: u8, // 0 none, 1 upper, 2 lower, 3 capitalize
     color: Color,
-    underline: bool,
-    strike: bool,
-    shift: f32,
+    deco: TextDeco,
+    /// vertical-align
+    va: Va,
+    /// letter-spacing / word-spacing additions in px
+    ls: f32,
+    ws: f32,
     pre: bool,
+    /// white-space:pre-line — whitespace collapses but \n breaks
+    pre_line: bool,
     /// white-space:nowrap (and pre) — lines never break; text overflows
     nowrap: bool,
+    /// tab-size in space widths (pre text)
+    tab: f32,
+    /// font-variant:small-caps — lowercase runs render as scaled caps
+    small_caps: bool,
+    /// hyphens:none — disables &shy; break opportunities
+    hyphens_none: bool,
+    /// text-indent (inherited) applied to a block's first line
+    indent: f32,
+    /// text-align-last (inherited); None → same as text-align
+    align_last: Option<Align>,
+    /// text-shadow list: (dx, dy, blur, color)
+    shadow: Vec<(f32, f32, f32, Color)>,
     /// overflow-wrap:break-word|anywhere, word-break:break-all — overwide
     /// words may split mid-word; otherwise they overflow
     break_word: bool,
@@ -262,6 +322,19 @@ enum LineH {
     Px(f32),
 }
 
+/// `vertical-align` beyond the plain baseline: `Shift` is a baseline
+/// offset as a fraction of font-size (sub/super/length/percent fold in);
+/// the rest are line-box alignments, applied at emit where line metrics
+/// exist. Top/Bottom double as text-top/text-bottom approximations.
+#[derive(Clone, Copy)]
+enum Va {
+    Baseline,
+    Shift(f32),
+    Top,
+    Middle,
+    Bottom,
+}
+
 const BASE_SIZE: f32 = 16.0;
 
 fn base_style() -> Style {
@@ -272,11 +345,19 @@ fn base_style() -> Style {
         family: "liberation sans".to_string(),
         transform: 0,
         color: BLACK,
-        underline: false,
-        strike: false,
-        shift: 0.0,
+        deco: TextDeco::NONE,
+        va: Va::Baseline,
+        ls: 0.0,
+        ws: 0.0,
         pre: false,
+        pre_line: false,
         nowrap: false,
+        tab: 8.0,
+        small_caps: false,
+        hyphens_none: false,
+        indent: 0.0,
+        align_last: None,
+        shadow: Vec::new(),
         break_word: false,
         align: Align::Left,
         href: None,
@@ -1264,6 +1345,37 @@ fn parse_len_vp(v: &str, rel: f32, em: f32, vh: f32, vw: f32) -> Option<f32> {
     parse_len(&v, rel, em)
 }
 
+/// `text-shadow: dx dy [blur] [color] [, ...]` → (dx, dy, blur, color)
+/// tuples. `none` yields an empty list; an absent color inherits the
+/// run's `color` at parse time (close enough — currentColor is the rule).
+fn parse_text_shadow(v: &str, size: f32, cur: Color) -> Vec<(f32, f32, f32, Color)> {
+    if v.trim() == "none" {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for part in v.split(',') {
+        let (mut dx, mut dy, mut blur) = (0.0f32, 0.0f32, 0.0f32);
+        let mut color = cur;
+        let mut n_len = 0;
+        for tok in part.trim().split_whitespace() {
+            if let Some(px) = parse_len(tok, size, size) {
+                match n_len {
+                    0 => dx = px,
+                    1 => dy = px,
+                    _ => blur = px,
+                }
+                n_len += 1;
+            } else if let Some(c) = parse_color_ctx(tok, Some(cur)) {
+                color = c;
+            }
+        }
+        if n_len >= 2 {
+            out.push((dx, dy, blur.max(0.0), color));
+        }
+    }
+    out
+}
+
 fn parse_len(v: &str, rel: f32, em: f32) -> Option<f32> {
     let v = v.trim().to_lowercase();
     if let Some(inner) = v.strip_prefix("calc(").and_then(|x| x.strip_suffix(')')) {
@@ -2238,9 +2350,16 @@ struct Word {
     font: usize,
     size: f32,
     color: Color,
-    underline: bool,
-    strike: bool,
-    shift: f32,
+    deco: TextDeco,
+    va: Va,
+    /// whitespace gap before this word (word-spacing + letter-spacing
+    /// folded in) — kept separate from `width` so `text-align:justify`
+    /// can stretch it
+    gap_before: f32,
+    /// letter-spacing painted per glyph
+    ls: f32,
+    /// text-shadow copies to emit under the run
+    shadow: Vec<(f32, f32, f32, Color)>,
     width: f32,
     ascent: f32,
     line_h: f32,
@@ -2331,8 +2450,8 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             font,
             size,
             color,
-            underline,
-            strike,
+            deco,
+            ls,
             href,
         } => DisplayItem::Text {
             x: x + dx,
@@ -2341,8 +2460,8 @@ pub fn offset_item(it: DisplayItem, dx: f32, dy: f32) -> DisplayItem {
             font,
             size,
             color,
-            underline,
-            strike,
+            deco,
+            ls,
             href,
         },
         DisplayItem::FillRect { x, y, w, h, color } => DisplayItem::FillRect {
@@ -2529,9 +2648,20 @@ pub struct Layouter<'a> {
     /// width available to the current content box (before float insets)
     avail_w: f32,
     align: Align,
+    /// text-align-last for forced line breaks; follows `align` saves
+    align_last: Option<Align>,
     line: Vec<Word>,
     line_x: f32,
     pending_space: bool,
+    /// measured whitespace gap awaiting the next word (word-spacing and
+    /// letter-spacing folded in by word_with_space)
+    pending_gap: f32,
+    /// Some(clip x) while laying a `text-overflow:ellipsis` +
+    /// `overflow` clipped block — flush_line truncates + appends "…"
+    ellipsis_clip: Option<f32>,
+    /// text-indent for the *next* flushed line — consumed at emit so the
+    /// first line shifts right while later lines return to the edge
+    indent_pending: f32,
     /// open ul/ol/menu/dir contexts — drives ::marker type + numbering
     list_stack: Vec<generated::ListCtx>,
     /// active floats; inset following lines until `y` passes `bottom`
@@ -2658,9 +2788,13 @@ impl<'a> Layouter<'a> {
             margin_x: 0.0,
             avail_w: width,
             align: Align::Left,
+            align_last: None,
             line: Vec::new(),
             line_x: 0.0,
             pending_space: false,
+            pending_gap: 0.0,
+            ellipsis_clip: None,
+            indent_pending: 0.0,
             list_stack: Vec::new(),
             floats: Vec::new(),
             scroll,
@@ -3229,21 +3363,154 @@ impl<'a> Layouter<'a> {
                 st.color = over(col, self.backdrop);
             }
         }
+        // text-decoration shorthand + longhands → one spec. The shorthand
+        // resets everything it omits; the longhands patch individual bits.
+        let mut deco = st.deco.clone();
         if let Some(v) = c.get("text-decoration") {
-            st.underline = v.contains("underline");
-            st.strike = v.contains("line-through");
+            let v = v.trim().to_lowercase();
+            if v == "none" {
+                deco.lines = 0;
+            } else {
+                deco.lines = 0;
+                for t in v.split_whitespace() {
+                    match t {
+                        "underline" => deco.lines |= 1,
+                        "overline" => deco.lines |= 2,
+                        "line-through" => deco.lines |= 4,
+                        "solid" => deco.style = DecoStyle::Solid,
+                        "double" => deco.style = DecoStyle::Double,
+                        "dotted" => deco.style = DecoStyle::Dotted,
+                        "dashed" => deco.style = DecoStyle::Dashed,
+                        "wavy" => deco.style = DecoStyle::Wavy,
+                        _ => {
+                            if let Some(col) = parse_color_ctx(t, Some(st.color)) {
+                                deco.color = Some(col);
+                            } else if let Some(px) = parse_len(t, st.size, st.size) {
+                                deco.thick = Some(px);
+                            }
+                        }
+                    }
+                }
+            }
         }
+        if let Some(v) = c.get("text-decoration-line") {
+            let mut lines = 0;
+            for t in v.split_whitespace() {
+                match t {
+                    "underline" => lines |= 1,
+                    "overline" => lines |= 2,
+                    "line-through" => lines |= 4,
+                    _ => {}
+                }
+            }
+            deco.lines = lines;
+        }
+        if let Some(v) = c.get("text-decoration-style") {
+            deco.style = match v.trim() {
+                "double" => DecoStyle::Double,
+                "dotted" => DecoStyle::Dotted,
+                "dashed" => DecoStyle::Dashed,
+                "wavy" => DecoStyle::Wavy,
+                _ => DecoStyle::Solid,
+            };
+        }
+        if let Some(v) = c.get("text-decoration-color") {
+            deco.color = parse_color_ctx(v, Some(st.color));
+        }
+        if let Some(v) = c.get("text-decoration-thickness") {
+            let v = v.trim();
+            deco.thick = if v == "auto" || v == "from-font" {
+                None
+            } else if let Some(px) = parse_len(v, st.size, st.size) {
+                Some(px)
+            } else {
+                v.strip_suffix('%')
+                    .and_then(|p| p.parse::<f32>().ok())
+                    .map(|p| st.size * p / 100.0)
+            };
+        }
+        if let Some(v) = c.get("text-underline-offset") {
+            let v = v.trim();
+            deco.offset = if v == "auto" {
+                None
+            } else if let Some(px) = parse_len(v, st.size, st.size) {
+                Some(px)
+            } else {
+                v.strip_suffix('%')
+                    .and_then(|p| p.parse::<f32>().ok())
+                    .map(|p| st.size * p / 100.0)
+            };
+        }
+        // text-underline-position: under ≈ larger offset from baseline
+        if c.get("text-underline-position").map(String::as_str) == Some("under") {
+            deco.offset = Some(deco.offset.unwrap_or(0.0) + st.size * 0.18);
+        }
+        st.deco = deco;
         if let Some(v) = c.get("text-align") {
-            st.align = match v.as_str() {
-                "center" => Align::Center,
-                "right" => Align::Right,
+            st.align = match v.trim() {
+                "center" | "-webkit-center" | "match-parent" => Align::Center,
+                "right" | "-webkit-right" | "end" => Align::Right,
+                "justify" | "justify-all" => Align::Justify,
                 _ => Align::Left,
             };
         }
+        if let Some(v) = c.get("text-align-last") {
+            st.align_last = match v.trim() {
+                "center" => Some(Align::Center),
+                "right" | "end" => Some(Align::Right),
+                "justify" => Some(Align::Justify),
+                "left" | "start" => Some(Align::Left),
+                _ => None,
+            };
+        }
+        if let Some(v) = c.get("text-indent") {
+            let v = v
+                .trim()
+                .trim_end_matches(" hanging")
+                .trim_end_matches(" each-line");
+            st.indent = dim(c, "text-indent", self.avail_w, st.size)
+                .or_else(|| parse_len(v, self.avail_w, st.size))
+                .unwrap_or(0.0);
+        }
+        if let Some(v) = c.get("letter-spacing") {
+            let v = v.trim();
+            st.ls = if v == "normal" {
+                0.0
+            } else {
+                parse_len(v, st.size, st.size).unwrap_or(0.0)
+            };
+        }
+        if let Some(v) = c.get("word-spacing") {
+            let v = v.trim();
+            st.ws = if v == "normal" {
+                0.0
+            } else {
+                parse_len(v, st.size, st.size).unwrap_or(0.0)
+            };
+        }
+        if let Some(v) = c.get("tab-size") {
+            let v = v.trim();
+            st.tab = v
+                .parse::<f32>()
+                .ok()
+                .or_else(|| parse_len(v, st.size, st.size).map(|px| px / (st.size * 0.3)))
+                .unwrap_or(8.0)
+                .max(0.0);
+        }
+        if let Some(v) = c.get("text-shadow") {
+            st.shadow = parse_text_shadow(v, st.size, st.color);
+        }
+        if let Some(v) = c.get("font-variant").or_else(|| c.get("font-variant-caps")) {
+            st.small_caps = v.trim() == "small-caps";
+        }
+        if let Some(v) = c.get("hyphens") {
+            st.hyphens_none = v.trim() == "none";
+        }
         if let Some(v) = c.get("white-space") {
             let v = v.trim();
-            st.pre = matches!(v, "pre" | "pre-wrap");
-            st.nowrap = matches!(v, "pre" | "pre-wrap" | "nowrap");
+            st.pre = matches!(v, "pre" | "pre-wrap" | "break-spaces");
+            st.pre_line = v == "pre-line";
+            st.nowrap = matches!(v, "pre" | "nowrap");
         }
         if let Some(v) = c.get("overflow-wrap").or_else(|| c.get("word-wrap")) {
             st.break_word |= matches!(v.trim(), "break-word" | "anywhere");
@@ -3252,10 +3519,32 @@ impl<'a> Layouter<'a> {
             st.break_word |= matches!(v.trim(), "break-all" | "break-word");
         }
         if let Some(v) = c.get("vertical-align") {
-            st.shift = match v.as_str() {
-                "sub" => -0.3,
-                "super" => 0.35,
-                _ => 0.0,
+            let v = v.trim();
+            st.va = match v {
+                "sub" => Va::Shift(-0.3),
+                "super" => Va::Shift(0.35),
+                "top" | "text-top" => Va::Top,
+                "middle" => Va::Middle,
+                "bottom" | "text-bottom" => Va::Bottom,
+                "baseline" | "-moz-middle-with-baseline" => Va::Baseline,
+                _ => {
+                    // <length> and <percentage> (of line-height) fold into
+                    // a fraction-of-size baseline shift
+                    let px = parse_len(v, st.size, st.size).or_else(|| {
+                        let lh = match st.line_h {
+                            Some(LineH::Mul(m)) => st.size * m,
+                            Some(LineH::Px(p)) => p,
+                            None => st.size * 1.2,
+                        };
+                        v.strip_suffix('%')
+                            .and_then(|p| p.parse::<f32>().ok())
+                            .map(|p| lh * p / 100.0)
+                    });
+                    match px {
+                        Some(px) => Va::Shift(px / st.size),
+                        None => Va::Baseline,
+                    }
+                }
             };
         }
         if let Some(v) = c.get("line-height") {
@@ -3493,6 +3782,8 @@ impl<'a> Layouter<'a> {
         let saved_mx = self.margin_x;
         let saved_avail = self.avail_w;
         let saved_align = self.align;
+        let saved_align_last = self.align_last;
+        let saved_ellip = self.ellipsis_clip;
         let inner_w = if let Some(w) = w_prop {
             if w_is_outer {
                 (w - pl - pr - bw_h).max(0.0)
@@ -3516,6 +3807,21 @@ impl<'a> Layouter<'a> {
         let content_mx = self.margin_x; // outside-::marker anchor
         self.avail_w = inner_w;
         self.align = st.align;
+        self.align_last = st.align_last;
+        // text-indent shifts the first line only — it rides into
+        // flush_line as a pending offset (wrap checks get it via line_x)
+        if st.indent != 0.0 {
+            self.indent_pending = st.indent;
+            self.line_x += st.indent;
+        }
+        // text-overflow:ellipsis needs overflow clipping to be visible
+        self.ellipsis_clip = if c.get("text-overflow").map(String::as_str) == Some("ellipsis")
+            && borderfx::clips_overflow(c)
+        {
+            Some(inner_w)
+        } else {
+            None
+        };
 
         // background/border need the final rect — reserve placeholders.
         // The patch covers the border box (padding included).
@@ -3860,6 +4166,8 @@ impl<'a> Layouter<'a> {
         self.margin_x = saved_mx;
         self.avail_w = saved_avail;
         self.align = saved_align;
+        self.align_last = saved_align_last;
+        self.ellipsis_clip = saved_ellip;
         // out-of-flow boxes reserve no flow space
         if let Some((fy, fmx, favail)) = flow {
             self.y = fy;
@@ -3996,7 +4304,7 @@ impl<'a> Layouter<'a> {
 
         let top = self.y;
         let f0 = self.floats.len();
-        let saved = (self.margin_x, self.avail_w, self.align);
+        let saved = (self.margin_x, self.avail_w, self.align, self.align_last);
         let outer_x = if right {
             self.margin_x + self.avail_w - ri - box_w - mr.max(0.0)
         } else {
@@ -4005,6 +4313,11 @@ impl<'a> Layouter<'a> {
         self.margin_x = outer_x + pl + bw_l;
         self.avail_w = inner;
         self.align = st.align;
+        self.align_last = st.align_last;
+        if st.indent != 0.0 {
+            self.indent_pending = st.indent;
+            self.line_x += st.indent;
+        }
 
         let shadows = borderfx::parse_shadows(c, size, bd, st.color);
         let outline = borderfx::outline(c, size, bd, st.color);
@@ -4144,6 +4457,7 @@ impl<'a> Layouter<'a> {
         self.margin_x = saved.0;
         self.avail_w = saved.1;
         self.align = saved.2;
+        self.align_last = saved.3;
         // floats take no vertical space in normal flow
         self.y = top;
         self.floats.push(Float {
@@ -4261,12 +4575,13 @@ impl<'a> Layouter<'a> {
             self.y += mt.max(0.0);
         }
 
-        let saved = (self.margin_x, self.avail_w, self.align);
+        let saved = (self.margin_x, self.avail_w, self.align, self.align_last);
         if !nested {
             self.margin_x += ml.max(0.0);
             self.avail_w -= ml.max(0.0);
         }
         self.align = st.align;
+        self.align_last = st.align_last;
         let avail = self.avail_w.max(1.0);
 
         // `width` attribute (px/%) or CSS `width` sizes the table box
@@ -4590,6 +4905,7 @@ impl<'a> Layouter<'a> {
         self.margin_x = saved.0;
         self.avail_w = saved.1;
         self.align = saved.2;
+        self.align_last = saved.3;
         if !nested {
             self.y += mb.max(0.0);
         }
@@ -6193,15 +6509,34 @@ impl<'a> Layouter<'a> {
         let saved_floats = std::mem::take(&mut self.floats);
         // box interiors aren't part of an enclosing inline's transform run
         let saved_xf = self.cur_xf.take();
-        let saved = (self.y, self.margin_x, self.avail_w, self.align);
+        let saved = (
+            self.y,
+            self.margin_x,
+            self.avail_w,
+            self.align,
+            self.align_last,
+            self.ellipsis_clip,
+            self.indent_pending,
+        );
         let saved_lx = self.line_x;
         let saved_ps = self.pending_space;
+        let saved_pg = self.pending_gap;
         self.y = y0;
         self.margin_x = x0;
         self.avail_w = avail.max(1.0);
         self.align = st.align;
+        self.align_last = st.align_last;
+        self.ellipsis_clip = if c.get("text-overflow").map(String::as_str) == Some("ellipsis")
+            && borderfx::clips_overflow(c)
+        {
+            Some(self.avail_w)
+        } else {
+            None
+        };
+        self.indent_pending = st.indent;
         self.line_x = 0.0;
         self.pending_space = false;
+        self.pending_gap = 0.0;
         let st0 = self.stickies.len();
         // containing-block height for positioned descendants
         let saved_cb_h = self.cb_h;
@@ -6279,9 +6614,13 @@ impl<'a> Layouter<'a> {
         self.margin_x = saved.1;
         self.avail_w = saved.2;
         self.align = saved.3;
+        self.align_last = saved.4;
+        self.ellipsis_clip = saved.5;
+        self.indent_pending = saved.6;
         self.line = saved_line;
         self.line_x = saved_lx;
         self.pending_space = saved_ps;
+        self.pending_gap = saved_pg;
         self.floats = saved_floats;
         self.cur_xf = saved_xf;
         (items, bottom, hits)
@@ -6345,8 +6684,15 @@ impl<'a> Layouter<'a> {
             }
         }
         if let Some(items) = w.items {
-            // inline-block: box bottom sits on the baseline
-            let dy = baseline - w.box_h;
+            // inline-block vertical-align: default bottom-on-baseline;
+            // line-box keywords anchor to the line box edges
+            let dy = match w.va {
+                Va::Top => line_top,
+                Va::Middle => line_top + line_h / 2.0 - w.box_h / 2.0,
+                Va::Bottom => line_top + line_h - w.box_h,
+                Va::Shift(f) => baseline - w.box_h - f * w.size,
+                Va::Baseline => baseline - w.box_h,
+            };
             for it in items {
                 self.items.push(offset_item(it, x, dy));
             }
@@ -6368,15 +6714,48 @@ impl<'a> Layouter<'a> {
                     color: bg,
                 });
             }
+            let baseline = match w.va {
+                Va::Baseline => baseline,
+                Va::Shift(f) => baseline - f * w.size,
+                // top/middle/bottom on a text run — run edges vs the line
+                // box (text-top/text-bottom approximate as top/bottom)
+                Va::Top => line_top + w.ascent,
+                Va::Middle => line_top + line_h / 2.0 + w.ascent / 2.0,
+                Va::Bottom => line_top + line_h - w.size * 0.25,
+            };
+            // text-shadow: offset clones under the run, blurred via a
+            // filter group when a blur radius is set
+            for &(sdx, sdy, blur, scol) in &w.shadow {
+                if blur > 0.5 {
+                    self.items
+                        .push(DisplayItem::PushEffect(colorfx::Effect::Filter(
+                            colorfx::parse_filter(&format!("blur({blur:.1}px)"), w.size, scol),
+                        )));
+                }
+                self.items.push(DisplayItem::Text {
+                    x: x + sdx,
+                    baseline: baseline + sdy,
+                    text: w.text.clone(),
+                    font: w.font,
+                    size: w.size,
+                    color: scol,
+                    deco: TextDeco::NONE,
+                    ls: w.ls,
+                    href: None,
+                });
+                if blur > 0.5 {
+                    self.items.push(DisplayItem::PopEffect);
+                }
+            }
             self.items.push(DisplayItem::Text {
                 x,
-                baseline: baseline - w.shift * w.size,
+                baseline,
                 text: w.text,
                 font: w.font,
                 size: w.size,
                 color: w.color,
-                underline: w.underline,
-                strike: w.strike,
+                deco: w.deco,
+                ls: w.ls,
                 href: w.href,
             });
         }
@@ -6835,14 +7214,17 @@ impl<'a> Layouter<'a> {
         if w <= 0.0 {
             return;
         }
+        let gap = self.take_gap();
         self.line.push(Word {
             text: String::new(),
             font: usize::MAX,
             size: 0.0,
             color: 0,
-            underline: false,
-            strike: false,
-            shift: 0.0,
+            deco: TextDeco::NONE,
+            va: Va::Baseline,
+            gap_before: gap,
+            ls: 0.0,
+            shadow: Vec::new(),
             width: w,
             ascent: 0.0,
             line_h: 0.0,
@@ -6876,14 +7258,17 @@ impl<'a> Layouter<'a> {
         if self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line();
         }
+        let gap = self.take_gap();
         self.line.push(Word {
             text: String::new(),
             font: usize::MAX,
             size: 0.0,
             color: 0,
-            underline: false,
-            strike: false,
-            shift: 0.0,
+            deco: TextDeco::NONE,
+            va: Va::Baseline,
+            gap_before: gap,
+            ls: 0.0,
+            shadow: Vec::new(),
             width: w,
             ascent: ascent.min(h),
             line_h: h + mb,
@@ -7177,22 +7562,53 @@ impl<'a> Layouter<'a> {
 
     fn text(&mut self, text: &str, st: &Style) {
         if st.pre {
+            // whitespace preserved verbatim; \n forces a line break,
+            // \t expands to `tab-size` space widths
             for (i, seg) in text.split('\n').enumerate() {
                 if i > 0 {
                     self.flush_line();
                 }
+                let seg = seg.replace('\t', &" ".repeat(st.tab.round() as usize));
+                let mut first = i == 0;
                 for word in seg.split(' ') {
                     if word.is_empty() {
-                        self.pending_space = true;
+                        // every preserved space earns its own gap
+                        if !first && !self.line.is_empty() {
+                            if let Some(fi) = self.resolve_font(st) {
+                                let gw = self.space_w(fi, st);
+                                self.pending_gap += gw + st.ws + st.ls;
+                            }
+                        }
                         continue;
                     }
+                    if !first {
+                        self.pending_space = true;
+                    }
                     self.word_with_space(word, st);
-                    self.pending_space = true;
+                    first = false;
                 }
-                self.pending_space = false;
+            }
+            self.pending_space = false;
+            return;
+        }
+        if st.pre_line {
+            // whitespace collapses like normal text but \n still breaks
+            for (i, seg) in text.split('\n').enumerate() {
+                if i > 0 {
+                    self.flush_line();
+                    self.pending_space = false;
+                    self.pending_gap = 0.0;
+                }
+                self.text_collapse(seg, st);
             }
             return;
         }
+        self.text_collapse(text, st);
+    }
+
+    /// normal whitespace-collapse path: runs of whitespace become one
+    /// pending space, words split on any whitespace
+    fn text_collapse(&mut self, text: &str, st: &Style) {
         if text.chars().next().is_some_and(|c| c.is_whitespace()) {
             self.pending_space = true;
         }
@@ -7269,23 +7685,82 @@ impl<'a> Layouter<'a> {
         Some(primary)
     }
 
+    /// advance of one space in this font+size
+    fn space_w(&mut self, font: usize, st: &Style) -> f32 {
+        self.fonts
+            .font(font)
+            .map(|f| f.advance_units(f.glyph_id(' ')) as f32 * st.size / f.units_per_em() as f32)
+            .unwrap_or(st.size * 0.3)
+    }
+
+    /// Take the pending whitespace gap — stamped on the next pushed word
+    /// and counted in `line_x` for wrap checks.
+    fn take_gap(&mut self) -> f32 {
+        let g = std::mem::take(&mut self.pending_gap);
+        self.line_x += g;
+        g
+    }
+
     fn word_with_space(&mut self, word: &str, st: &Style) {
         let Some(font) = self.resolve_font_covering(word, st) else {
             return;
         };
-        let space_w = self
-            .fonts
-            .font(font)
-            .map(|f| f.advance_units(f.glyph_id(' ')) as f32 * st.size / f.units_per_em() as f32)
-            .unwrap_or(st.size * 0.3);
         if self.pending_space && !self.line.is_empty() {
-            self.line_x += space_w;
-            if let Some(last) = self.line.last_mut() {
-                last.width += space_w;
-            }
+            // whitespace collapses to one gap; word-spacing widens it and
+            // letter-spacing applies to the space char itself
+            self.pending_gap += self.space_w(font, st) + st.ws + st.ls;
         }
         self.pending_space = false;
         self.push_word(word, st, font);
+    }
+
+    /// one small-caps segment: lowercase-source runs painted as caps at
+    /// reduced size, uppercase-source runs at full size
+    fn push_case_run(&mut self, run: &str, st: &Style, font: usize, small: bool) {
+        let size = st.size * if small { 0.78 } else { 1.0 };
+        let (w, ascent, line_h) = {
+            let Some(f) = self.fonts.font(font) else {
+                return;
+            };
+            let upem = f.units_per_em() as f32;
+            (
+                f.measure(run, size) + st.ls * run.chars().count() as f32,
+                f.ascender as f32 * size / upem,
+                match st.line_h {
+                    Some(LineH::Mul(m)) => size * m,
+                    Some(LineH::Px(p)) => p,
+                    None => f.line_height(size),
+                },
+            )
+        };
+        if !st.nowrap && self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
+            self.flush_line_wrap();
+        }
+        let gap = self.take_gap();
+        self.line.push(Word {
+            text: run.to_string(),
+            font,
+            size,
+            color: st.color,
+            deco: st.deco.clone(),
+            va: st.va,
+            gap_before: gap,
+            ls: st.ls,
+            shadow: st.shadow.clone(),
+            href: st.href.clone(),
+            width: w,
+            ascent,
+            line_h,
+            bg: st.inline_bg,
+            items: None,
+            hits: Vec::new(),
+            box_h: 0.0,
+            dx: st.rel_x,
+            dy: st.rel_y,
+            xf: self.cur_xf.clone(),
+            owner: st.hit_owner,
+        });
+        self.line_x += w;
     }
 
     fn word(&mut self, word: &str, st: &Style) {
@@ -7348,16 +7823,19 @@ impl<'a> Layouter<'a> {
                             && self.line_x + fw > self.content_width() + 0.5
                             && !self.line.is_empty()
                         {
-                            self.flush_line();
+                            self.flush_line_wrap();
                         }
+                        let gap = self.take_gap();
                         self.line.push(Word {
                             text: fcs,
                             font: ffont,
                             size: fst.size,
                             color: fst.color,
-                            underline: fst.underline,
-                            strike: fst.strike,
-                            shift: fst.shift,
+                            deco: fst.deco.clone(),
+                            va: fst.va,
+                            gap_before: gap,
+                            ls: fst.ls,
+                            shadow: fst.shadow.clone(),
                             href: fst.href.clone(),
                             width: fw,
                             ascent: fascent,
@@ -7385,13 +7863,56 @@ impl<'a> Layouter<'a> {
         if word.is_empty() {
             return;
         }
+        self.push_word_body(word, st, font);
+    }
+
+    /// Wrap+push a (transformed, first-letter-stripped) word. `&shy;`
+    /// splits at the last fitting hyphenation point; small-caps segments
+    /// the word by source case; letter-spacing widens the measure.
+    fn push_word_body(&mut self, word: &str, st: &Style, font: usize) {
+        // soft hyphens: strip for the fit check; only a wrap break shows
+        // them (hyphens:manual — the default; `none` disables entirely)
+        let clean: String;
+        let raw = word;
+        let word = if word.contains('\u{ad}') {
+            clean = word.replace('\u{ad}', "");
+            &clean
+        } else {
+            word
+        };
+        if word.is_empty() {
+            return;
+        }
+        if st.small_caps && word.chars().any(|c| c.is_lowercase()) {
+            // fake small-caps: lowercase-source runs render as uppercase
+            // at ~0.78em — each contiguous run becomes its own word
+            let mut seg = String::new();
+            let mut seg_lower = false;
+            for c in word.chars() {
+                let lower = c.is_lowercase();
+                if !seg.is_empty() && lower != seg_lower {
+                    let seg = std::mem::take(&mut seg);
+                    self.push_case_run(&seg, st, font, seg_lower);
+                }
+                seg_lower = lower;
+                if lower {
+                    seg.extend(c.to_uppercase());
+                } else {
+                    seg.push(c);
+                }
+            }
+            if !seg.is_empty() {
+                self.push_case_run(&seg, st, font, seg_lower);
+            }
+            return;
+        }
         let (w, ascent, line_h) = {
             let Some(f) = self.fonts.font(font) else {
                 return;
             };
             let upem = f.units_per_em() as f32;
             (
-                f.measure(word, st.size),
+                f.measure(word, st.size) + st.ls * word.chars().count() as f32,
                 f.ascender as f32 * st.size / upem,
                 match st.line_h {
                     Some(LineH::Mul(m)) => st.size * m,
@@ -7401,7 +7922,43 @@ impl<'a> Layouter<'a> {
             )
         };
         if !st.nowrap && self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
-            self.flush_line();
+            // &shy; split first: last opportunity that fits earns a hyphen
+            if !st.hyphens_none && raw.contains('\u{ad}') {
+                let mut cut = None;
+                let mut frag = String::new();
+                for (bi, c) in raw.char_indices() {
+                    if c == '\u{ad}' {
+                        if frag.is_empty() {
+                            continue;
+                        }
+                        let mut t = frag.clone();
+                        t.push('-');
+                        let fw = self
+                            .fonts
+                            .font(font)
+                            .map(|f| f.measure(&t, st.size))
+                            .unwrap_or(0.0)
+                            + st.ls * t.chars().count() as f32;
+                        if self.line_x + fw <= self.content_width() + 0.5 {
+                            cut = Some(bi);
+                        } else {
+                            break;
+                        }
+                    } else {
+                        frag.push(c);
+                    }
+                }
+                if let Some(bi) = cut {
+                    let mut head: String = raw[..bi].replace('\u{ad}', "");
+                    head.push('-');
+                    let rest: String = raw[bi + '\u{ad}'.len_utf8()..].to_string();
+                    self.push_word_body(&head, st, font);
+                    self.flush_line_wrap();
+                    self.push_word_body(&rest, st, font);
+                    return;
+                }
+            }
+            self.flush_line_wrap();
         }
         if st.break_word && !st.nowrap && w > self.content_width() + 0.5 && self.line.is_empty() {
             // word longer than the line — split mid-word (overflow-wrap etc.)
@@ -7415,14 +7972,17 @@ impl<'a> Layouter<'a> {
                     })
                     .unwrap_or(st.size * 0.5);
                 if cw + fw > self.content_width() + 0.5 && !chunk.is_empty() {
+                    let gap = self.take_gap();
                     self.line.push(Word {
                         text: chunk.clone(),
                         font,
                         size: st.size,
                         color: st.color,
-                        underline: st.underline,
-                        strike: st.strike,
-                        shift: st.shift,
+                        deco: st.deco.clone(),
+                        va: st.va,
+                        gap_before: gap,
+                        ls: st.ls,
+                        shadow: st.shadow.clone(),
                         href: st.href.clone(),
                         width: cw,
                         ascent,
@@ -7436,7 +7996,7 @@ impl<'a> Layouter<'a> {
                         xf: self.cur_xf.clone(),
                         owner: st.hit_owner,
                     });
-                    self.flush_line();
+                    self.flush_line_wrap();
                     chunk.clear();
                     cw = 0.0;
                 }
@@ -7444,14 +8004,17 @@ impl<'a> Layouter<'a> {
                 cw += fw;
             }
             if !chunk.is_empty() {
+                let gap = self.take_gap();
                 self.line.push(Word {
                     text: chunk,
                     font,
                     size: st.size,
                     color: st.color,
-                    underline: st.underline,
-                    strike: st.strike,
-                    shift: st.shift,
+                    deco: st.deco.clone(),
+                    va: st.va,
+                    gap_before: gap,
+                    ls: st.ls,
+                    shadow: st.shadow.clone(),
                     href: st.href.clone(),
                     width: cw,
                     ascent,
@@ -7469,14 +8032,17 @@ impl<'a> Layouter<'a> {
             }
             return;
         }
+        let gap = self.take_gap();
         self.line.push(Word {
             text: word.to_string(),
             font,
             size: st.size,
             color: st.color,
-            underline: st.underline,
-            strike: st.strike,
-            shift: st.shift,
+            deco: st.deco.clone(),
+            va: st.va,
+            gap_before: gap,
+            ls: st.ls,
+            shadow: st.shadow.clone(),
             href: st.href.clone(),
             width: w,
             ascent,
@@ -7494,6 +8060,17 @@ impl<'a> Layouter<'a> {
     }
 
     fn flush_line(&mut self) {
+        // forced break — end of block, <br>, explicit newline: the last
+        // line isn't justified (text-align-last applies instead)
+        self.flush_line_inner(true)
+    }
+
+    /// wrap-point flush — the line is justified when text-align:justify
+    fn flush_line_wrap(&mut self) {
+        self.flush_line_inner(false)
+    }
+
+    fn flush_line_inner(&mut self, forced: bool) {
         if self.line.is_empty() {
             self.pending_space = false;
             return;
@@ -7517,9 +8094,10 @@ impl<'a> Layouter<'a> {
                 w.font = fi;
                 w.size = fst.size;
                 w.color = fst.color;
-                w.underline = fst.underline;
-                w.strike = fst.strike;
-                w.shift = fst.shift;
+                w.deco = fst.deco.clone();
+                w.va = fst.va;
+                w.ls = fst.ls;
+                w.shadow = fst.shadow.clone();
                 w.width = f.measure(&w.text, fst.size);
                 w.ascent = f.ascender as f32 * fst.size / upem;
                 w.line_h = match fst.line_h {
@@ -7546,17 +8124,91 @@ impl<'a> Layouter<'a> {
             );
         let max_ascent = self.line.iter().map(|w| w.ascent).fold(0.0f32, f32::max);
         let baseline = self.y + max_ascent;
-        let used = self.line.iter().map(|w| w.width).sum::<f32>();
-        let mut x = self.line_origin()
-            + match self.align {
-                Align::Left => 0.0,
-                Align::Center => ((self.content_width() - used) / 2.0).max(0.0),
-                Align::Right => (self.content_width() - used).max(0.0),
-            };
-        // per-word x positions on this line
+
+        // text-overflow:ellipsis — the block clipped its content box and
+        // asked for "…": drop tail words, then truncate the last one to
+        // fit the ellipsis inside the content edge
+        if let Some(clip) = self.ellipsis_clip {
+            let limit = self.line_origin() + clip;
+            let mut used = self
+                .line
+                .iter()
+                .map(|w| w.gap_before + w.width)
+                .sum::<f32>();
+            while used > clip + 0.5 && self.line.len() > 1 {
+                let w = self.line.pop().unwrap();
+                used -= w.gap_before + w.width;
+            }
+            if used > clip + 0.5 {
+                if let Some(w) = self.line.last_mut() {
+                    let _ = limit;
+                    let avail = (clip - w.gap_before).max(0.0);
+                    if let Some(f) = self.fonts.font(w.font) {
+                        let ew = f.measure("\u{2026}", w.size);
+                        let mut keep = 0usize;
+                        let mut acc = 0.0f32;
+                        for (i, c) in w.text.char_indices() {
+                            let cw = f.advance(f.glyph_id(c), w.size) + w.ls;
+                            if acc + cw + ew > avail {
+                                break;
+                            }
+                            acc += cw;
+                            keep = i + c.len_utf8();
+                        }
+                        w.text.truncate(keep);
+                        w.text.push('\u{2026}');
+                        w.width = acc + ew;
+                        w.deco = TextDeco::NONE;
+                    }
+                }
+            }
+        }
+
+        let used = self
+            .line
+            .iter()
+            .map(|w| w.gap_before + w.width)
+            .sum::<f32>();
+        // forced (block-end/br) lines aren't justified — text-align-last
+        // applies; auto falls back to start for justified text
+        let align = if forced {
+            match self.align_last {
+                Some(a) => a,
+                None => {
+                    if self.align == Align::Justify {
+                        Align::Left
+                    } else {
+                        self.align
+                    }
+                }
+            }
+        } else {
+            self.align
+        };
+        let n_gaps = self.line.iter().filter(|w| w.gap_before > 0.0).count() as f32;
+        // text-align:justify shares the leftover width across word gaps
+        let justify_extra = if align == Align::Justify && !forced && n_gaps > 0.0 {
+            ((self.content_width() - used) / n_gaps).max(0.0)
+        } else {
+            0.0
+        };
+        let off = match align {
+            Align::Left | Align::Justify => 0.0,
+            Align::Center => ((self.content_width() - used) / 2.0).max(0.0),
+            Align::Right => (self.content_width() - used).max(0.0),
+        };
+        let mut x = self.line_origin() + off + std::mem::take(&mut self.indent_pending);
+        // per-word x positions on this line — gap_before lands *before*
+        // the word, widened by justify_extra
         let n = self.line.len();
         let mut xs = Vec::with_capacity(n);
         for w in &self.line {
+            x += w.gap_before
+                + if w.gap_before > 0.0 {
+                    justify_extra
+                } else {
+                    0.0
+                };
             xs.push(x);
             x += w.width;
         }
@@ -7635,6 +8287,7 @@ impl<'a> Layouter<'a> {
         self.y += line_h;
         self.line_x = 0.0;
         self.pending_space = false;
+        self.pending_gap = 0.0;
     }
 
     /// `::before`/`::after` generated content — emitted as the element's
@@ -7852,8 +8505,8 @@ impl<'a> Layouter<'a> {
             font,
             size: mst.size,
             color: mst.color,
-            underline: mst.underline,
-            strike: mst.strike,
+            deco: mst.deco.clone(),
+            ls: mst.ls,
             href: None,
         });
     }
@@ -7937,6 +8590,21 @@ mod tests {
             .iter()
             .filter(|i| matches!(i, DisplayItem::Text { .. }))
             .collect()
+    }
+
+    /// (x, baseline, size, color, text) for a Text item — test extractor
+    fn tinfo(i: &DisplayItem) -> (f32, f32, f32, Color, &str) {
+        match i {
+            DisplayItem::Text {
+                x,
+                baseline,
+                size,
+                color,
+                text,
+                ..
+            } => (*x, *baseline, *size, *color, text),
+            _ => unreachable!(),
+        }
     }
 
     #[test]
@@ -9699,5 +10367,190 @@ mod tests {
         // outer list is translate·rotate → wraps too (rotate present)
         let (cx, cy) = h_in.5.apply(h_in.0 + 1.0, h_in.1 + 1.0);
         assert_eq!(hit_at(&hits, cx, cy), Some(h_in.4));
+    }
+    #[test]
+    fn letter_spacing_widens_words() {
+        let (a, _, _) = lay("<p>hello</p>");
+        let (b, _, _) = lay("<style>p{letter-spacing:2px}</style><p>hello</p>");
+        let (t, b) = (texts(&a), texts(&b));
+        if let (
+            DisplayItem::Text { ls: l0, .. },
+            DisplayItem::Text {
+                ls: l1, text: t1, ..
+            },
+        ) = (t[0], b[0])
+        {
+            assert_eq!(*l0, 0.0);
+            assert_eq!(*l1, 2.0);
+            assert_eq!(t1, "hello");
+        }
+    }
+
+    #[test]
+    fn word_spacing_widens_gap() {
+        let (a, _, _) = lay("<p>one two</p>");
+        let (b, _, _) = lay("<style>p{word-spacing:20px}</style><p>one two</p>");
+        let get2 = |items: &[DisplayItem]| -> f32 { tinfo(texts(items)[1]).0 };
+        assert!(get2(&b) - get2(&a) > 19.0, "gap grew by ~20px");
+    }
+
+    #[test]
+    fn text_align_justify_stretches() {
+        let (items, _, _) = lay(
+            "<style>p{text-align:justify;width:160px}</style>             <p>alpha beta gamma delta epsilon zeta</p>",
+        );
+        let t = texts(&items);
+        let b1 = tinfo(t[0]).1;
+        let b2 = tinfo(t[t.len() - 1]).1;
+        assert!(b2 > b1, "text wrapped to a second line");
+        // a justified wrap stretches gaps: words on line 1 sit further
+        // apart than under plain left alignment
+        let xs: Vec<f32> = t
+            .iter()
+            .map(|i| tinfo(i))
+            .filter(|i| i.1 == b1)
+            .map(|i| i.0)
+            .collect();
+        assert!(xs.len() >= 3, "3+ words on line 1: {xs:?}");
+        let (plain, _, _) = lay(
+            "<style>p{width:160px}</style>             <p>alpha beta gamma delta epsilon zeta</p>",
+        );
+        let tp = texts(&plain);
+        let pb1 = tinfo(tp[0]).1;
+        let pxs: Vec<f32> = tp
+            .iter()
+            .map(|i| tinfo(i))
+            .filter(|i| i.1 == pb1)
+            .map(|i| i.0)
+            .collect();
+        assert!(
+            xs[1] > pxs[1] + 1.0,
+            "justify stretched the gap: {xs:?} vs {pxs:?}"
+        );
+    }
+
+    #[test]
+    fn text_indent_first_line_only() {
+        let (items, _, _) = lay(
+            "<style>p{text-indent:40px;width:120px}</style>             <p>aaaa bbbb cccc dddd eeee ffff</p>",
+        );
+        let t = texts(&items);
+        let (x0, b0, _, _, _) = tinfo(t[0]);
+        assert!(x0 >= 39.0, "first line indented: x={x0}");
+        // a word on the second line returns to the content edge
+        let second = t.iter().find(|i| tinfo(i).1 > b0);
+        if let Some(i) = second {
+            let (sx, _, _, _, _) = tinfo(i);
+            assert!(sx < 20.0, "second line not indented: x={sx}");
+        }
+    }
+
+    #[test]
+    fn pre_line_breaks_and_collapses() {
+        let (items, _, _) =
+            lay("<style>p{white-space:pre-line;width:400px}</style>             <p>a   b\nc</p>");
+        let t = texts(&items);
+        // 'a' and 'b' share line 1 (spaces collapsed), 'c' on line 2
+        let b0 = tinfo(t[0]).1;
+        assert!(
+            t.iter().any(|i| tinfo(i).1 > b0 + 1.0),
+            "\\n broke the line"
+        );
+    }
+
+    #[test]
+    fn decoration_lines_and_style() {
+        let (items, _, _) = lay(
+            "<style>.u{text-decoration:underline wavy red 2px}             .o{text-decoration:overline}             .n{text-decoration:none}</style>             <p><span class=u>a</span><span class=o>b</span><u><span class=n>c</span></u></p>",
+        );
+        let t = texts(&items);
+        if let DisplayItem::Text { deco, .. } = t[0] {
+            assert!(deco.underline() && deco.style == DecoStyle::Wavy);
+            assert_eq!(deco.thick, Some(2.0));
+        }
+        if let DisplayItem::Text { deco, .. } = t[1] {
+            assert!(deco.lines & 2 != 0, "overline bit");
+            assert!(!deco.underline());
+        }
+        if let DisplayItem::Text { deco, .. } = t[2] {
+            assert_eq!(deco.lines, 0, "none clears inherited underline");
+        }
+    }
+
+    #[test]
+    fn text_shadow_emits_copies() {
+        let (items, _, _) = lay("<style>p{text-shadow:5px 3px 0 #f00}</style><p>hi</p>");
+        let t = texts(&items);
+        assert_eq!(t.len(), 2, "shadow copy + main run");
+        let (sx, sb, _, sc, _) = tinfo(t[0]);
+        let (mx, mb, _, _, _) = tinfo(t[1]);
+        assert_eq!(sx - mx, 5.0);
+        assert_eq!(sb - mb, 3.0);
+        assert_eq!(sc, bgra(255, 0, 0));
+    }
+
+    #[test]
+    fn text_overflow_ellipsis() {
+        let (items, _, _) = lay(
+            "<style>p{overflow:hidden;text-overflow:ellipsis;             white-space:nowrap;width:80px}</style>             <p>supercalifragilisticexpialidocious</p>",
+        );
+        let t = texts(&items);
+        let text = tinfo(t[t.len() - 1]).4;
+        assert!(text.ends_with('\u{2026}'), "ends with ellipsis: {text}");
+        assert!(text.len() < 40, "truncated: {text}");
+    }
+
+    #[test]
+    fn small_caps_scales_lowercase() {
+        let (items, _, _) = lay("<style>p{font-variant:small-caps}</style><p>Ab</p>");
+        let t = texts(&items);
+        let strs: Vec<(&str, f32)> = t
+            .iter()
+            .map(|i| {
+                let (_, _, sz, _, tx) = tinfo(i);
+                (tx, sz)
+            })
+            .collect();
+        assert!(
+            strs.iter().any(|(t, s)| *t == "B" && *s < 16.0),
+            "b → small cap: {strs:?}"
+        );
+    }
+
+    #[test]
+    fn vertical_align_sub_shift() {
+        let (items, _, _) = lay("<p>a<sub>b</sub></p>");
+        let t = texts(&items);
+        let (ba, bb) = (tinfo(t[0]).1, tinfo(t[1]).1);
+        assert!(bb > ba + 2.0, "sub sits lower");
+    }
+
+    #[test]
+    fn tab_size_expands() {
+        let (a, _, _) = lay("<pre>x\ty</pre>");
+        let (b, _, _) = lay("<style>pre{tab-size:2}</style><pre>x\ty</pre>");
+        let gx = |items: &[DisplayItem]| -> f32 { tinfo(texts(items)[1]).0 };
+        assert!(
+            gx(&a) - gx(&b) > 10.0,
+            "tab 8 vs 2: {} vs {}",
+            gx(&a),
+            gx(&b)
+        );
+    }
+
+    #[test]
+    fn soft_hyphen_breaks_with_hyphen() {
+        let (items, _, _) =
+            lay("<style>p{width:90px}</style>             <p>aaaaa bbbb\u{ad}cccc\u{ad}dddd</p>");
+        let t = texts(&items);
+        let strs: Vec<String> = t.iter().map(|i| tinfo(i).4.to_string()).collect();
+        assert!(
+            strs.iter().all(|s| !s.contains('\u{ad}')),
+            "no raw shy: {strs:?}"
+        );
+        assert!(
+            strs.iter().any(|s| s.ends_with('-')),
+            "a shy break shows a hyphen: {strs:?}"
+        );
     }
 }

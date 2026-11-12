@@ -438,8 +438,8 @@ fn paint_span(
                 font,
                 size,
                 color,
-                underline,
-                strike,
+                deco,
+                ls,
                 href: _,
             } => {
                 let mut pen = *x;
@@ -462,31 +462,22 @@ fn paint_span(
                             *color,
                         );
                     }
-                    pen += advance;
+                    pen += advance + ls;
                     prev = gid;
                 }
                 let end = pen;
-                if *underline {
-                    let uy = *baseline + 0.1 * size;
-                    let thick = (size / 14.0).max(1.0);
-                    canvas.fill_rect(
-                        *x as i32,
-                        uy as i32,
-                        (end - *x) as u32,
-                        thick as u32,
-                        *color,
-                    );
-                }
-                if *strike {
-                    let sy = *baseline - 0.28 * size;
-                    let thick = (size / 16.0).max(1.0);
-                    canvas.fill_rect(
-                        *x as i32,
-                        sy as i32,
-                        (end - *x) as u32,
-                        thick as u32,
-                        *color,
-                    );
+                let dcol = deco.color.unwrap_or(*color);
+                let thick = deco.thick.unwrap_or((size / 14.0).max(1.0));
+                // line y centers: underline ~0.1em below baseline (+offset),
+                // overline on the ascent, strike ~0.28em above baseline
+                let lines = [
+                    deco.underline()
+                        .then_some(*baseline + 0.1 * size + deco.offset.unwrap_or(0.0)),
+                    (deco.lines & 2 != 0).then_some(*baseline - size * 0.85),
+                    deco.strike().then_some(*baseline - 0.28 * size),
+                ];
+                for ly in lines.into_iter().flatten() {
+                    paint_deco_line(canvas, *x, ly, end - *x, thick, deco.style, dcol);
                 }
             }
             DisplayItem::PushTransform { .. } | DisplayItem::PopTransform => {}
@@ -545,6 +536,62 @@ fn paint_transformed(
     canvas.blit_affine(&tile.pixels, tw, th, &bm);
 }
 
+/// One `text-decoration` line — solid/double/dotted/dashed/wavy at the
+/// given y center. Wavy approximates the sine with a ±thick zigzag.
+fn paint_deco_line(
+    canvas: &mut Canvas,
+    x0: f32,
+    y: f32,
+    w: f32,
+    thick: f32,
+    style: rowser_layout::DecoStyle,
+    color: u32,
+) {
+    use rowser_layout::DecoStyle::*;
+    let (x0, w, t) = (x0 as i32, w.max(0.0) as u32, thick.max(1.0) as u32);
+    if w == 0 {
+        return;
+    }
+    let yi = y as i32;
+    match style {
+        Solid => canvas.fill_rect(x0, yi - t as i32 / 2, w, t, color),
+        Double => {
+            let g = t.max(1);
+            canvas.fill_rect(x0, yi - t as i32 / 2 - g as i32, w, t, color);
+            canvas.fill_rect(x0, yi + t as i32 / 2 + g as i32, w, t, color);
+        }
+        Dotted => {
+            let step = (t * 3).max(2);
+            let mut x = x0;
+            while (x - x0) < w as i32 {
+                canvas.fill_rect(x, yi - t as i32 / 2, t, t, color);
+                x += step as i32;
+            }
+        }
+        Dashed => {
+            let dash = (t * 4).max(4);
+            let step = (t * 7).max(6);
+            let mut x = x0;
+            while (x - x0) < w as i32 {
+                let dw = (dash as i32).min(w as i32 - (x - x0)).max(0) as u32;
+                canvas.fill_rect(x, yi - t as i32 / 2, dw, t, color);
+                x += step as i32;
+            }
+        }
+        Wavy => {
+            let step = (t * 2).max(2) as i32;
+            let mut x = x0;
+            let mut up = false;
+            while (x - x0) < w as i32 {
+                let yy = if up { yi - t as i32 } else { yi };
+                canvas.fill_rect(x, yy, step.max(1) as u32, t, color);
+                up = !up;
+                x += step;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,8 +609,8 @@ mod tests {
                 font,
                 size: 24.0,
                 color: BLACK,
-                underline: false,
-                strike: false,
+                deco: rowser_layout::TextDeco::NONE,
+                ls: 0.0,
                 href: None,
             },
             DisplayItem::Image {
