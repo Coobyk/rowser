@@ -7498,9 +7498,8 @@ impl<'a> Layouter<'a> {
                     .or_else(|| aspect_ratio(c).map(|r| w / r))
                     .unwrap_or(w.min(48.0).max(16.0));
                 let items = self
-                    .doc
-                    .attr(node, "src")
-                    .map(|src| vec![self.fit_image_item(c, st.size, w, h, src)])
+                    .img_src(node, w)
+                    .map(|src| vec![self.fit_image_item(c, st.size, w, h, &src)])
                     .unwrap_or_default();
                 Some((
                     w,
@@ -7511,6 +7510,44 @@ impl<'a> Layouter<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `srcset` candidate picker: `w` descriptors resolve against the
+    /// element's layout width, `x` against 1 dpr — prefer the smallest
+    /// candidate that covers `want`, else the largest available.
+    fn img_src(&self, node: NodeId, want: f32) -> Option<String> {
+        if let Some(ss) = self.doc.attr(node, "srcset") {
+            let mut best: Option<(f32, String)> = None;
+            for cand in ss.split(',') {
+                let mut it = cand.trim().split_whitespace();
+                let Some(url) = it.next() else { continue };
+                let d = it.next().unwrap_or("1x");
+                let score = if let Some(w) = d.strip_suffix('w') {
+                    w.parse::<f32>().unwrap_or(0.0)
+                } else {
+                    d.trim_end_matches('x').parse::<f32>().unwrap_or(1.0) * want
+                };
+                let better = match &best {
+                    None => true,
+                    Some((bs, _)) => {
+                        if score >= want && *bs < want {
+                            true
+                        } else if score >= want && *bs >= want {
+                            score < *bs
+                        } else {
+                            score > *bs
+                        }
+                    }
+                };
+                if better && !url.is_empty() {
+                    best = Some((score, url.to_string()));
+                }
+            }
+            if let Some((_, u)) = best {
+                return Some(u);
+            }
+        }
+        self.doc.attr(node, "src").map(String::from)
     }
 
     /// `object-fit`-aware image item for a replaced element in box-local
@@ -10690,5 +10727,18 @@ mod tests {
             }
         }
         assert!(saw_yes && saw_hidden);
+    }
+
+    #[test]
+    fn srcset_picks_covering_candidate() {
+        let (items, _, _) = lay(
+            r#"<img width="300" src="fallback.png"              srcset="small.png 200w, mid.png 400w, big.png 1200w">"#,
+        );
+        let src = items.iter().find_map(|i| match i {
+            DisplayItem::Image { src, .. } | DisplayItem::BgImage { src, .. } => Some(src.as_str()),
+            _ => None,
+        });
+        // want=300 → smallest covering is mid (400w)
+        assert_eq!(src, Some("mid.png"));
     }
 }
