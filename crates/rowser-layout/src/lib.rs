@@ -295,6 +295,8 @@ struct Style {
     rtl: bool,
     /// user-select:none — words from this element can't be selected
     no_select: bool,
+    /// line-clamp/-webkit-line-clamp: 0 = unclamped
+    line_clamp: i32,
     /// overflow-wrap:break-word|anywhere, word-break:break-all — overwide
     /// words may split mid-word; otherwise they overflow
     break_word: bool,
@@ -366,6 +368,7 @@ fn base_style() -> Style {
         shadow: Vec::new(),
         rtl: false,
         no_select: false,
+        line_clamp: 0,
         break_word: false,
         align: Align::Left,
         href: None,
@@ -2664,6 +2667,10 @@ pub struct Layouter<'a> {
     align_last: Option<Align>,
     /// direction:rtl — flush_line emits words right-to-left
     rtl: bool,
+    /// line-clamp: lines remaining before the block truncates (0 = off)
+    clamp_left: i32,
+    /// set once clamp_left runs out — drops all further content
+    clamping: bool,
     line: Vec<Word>,
     line_x: f32,
     pending_space: bool,
@@ -2804,6 +2811,8 @@ impl<'a> Layouter<'a> {
             align: Align::Left,
             align_last: None,
             rtl: false,
+            clamp_left: 0,
+            clamping: false,
             line: Vec::new(),
             line_x: 0.0,
             pending_space: false,
@@ -3025,6 +3034,9 @@ impl<'a> Layouter<'a> {
         let mut segs: Vec<(usize, usize, i64)> =
             vec![(self.items.len(), self.hits.len(), stacking::L_INLINE)];
         for &ch in self.doc.children(node) {
+            if self.clamping {
+                break;
+            }
             let key = if matches!(self.doc.kind(ch), NodeKind::Element { .. }) {
                 let cc = self.style(ch);
                 stacking::child_layer(&cc)
@@ -3538,6 +3550,9 @@ impl<'a> Layouter<'a> {
         {
             st.no_select = matches!(v.trim(), "none" | "-moz-none");
         }
+        if let Some(v) = c.get("line-clamp").or_else(|| c.get("-webkit-line-clamp")) {
+            st.line_clamp = v.trim().parse::<i32>().unwrap_or(0);
+        }
         if let Some(v) = c.get("unicode-bidi") {
             // bidi-override forces rtl reorder; isolate/plaintext keep
             // the direction's natural behavior (our approximation)
@@ -3822,6 +3837,7 @@ impl<'a> Layouter<'a> {
         let saved_align_last = self.align_last;
         let saved_rtl = self.rtl;
         let saved_ellip = self.ellipsis_clip;
+        let saved_clamp = (self.clamp_left, self.clamping);
         let inner_w = if let Some(w) = w_prop {
             if w_is_outer {
                 (w - pl - pr - bw_h).max(0.0)
@@ -3847,6 +3863,9 @@ impl<'a> Layouter<'a> {
         self.align = st.align;
         self.align_last = st.align_last;
         self.rtl = st.rtl;
+        if st.line_clamp > 0 && !self.clamping {
+            self.clamp_left = st.line_clamp;
+        }
         // text-indent shifts the first line only — it rides into
         // flush_line as a pending offset (wrap checks get it via line_x)
         if st.indent != 0.0 {
@@ -4208,6 +4227,7 @@ impl<'a> Layouter<'a> {
         self.align_last = saved_align_last;
         self.rtl = saved_rtl;
         self.ellipsis_clip = saved_ellip;
+        (self.clamp_left, self.clamping) = saved_clamp;
         // out-of-flow boxes reserve no flow space
         if let Some((fy, fmx, favail)) = flow {
             self.y = fy;
@@ -6574,6 +6594,8 @@ impl<'a> Layouter<'a> {
             self.ellipsis_clip,
             self.indent_pending,
             self.rtl,
+            self.clamp_left,
+            self.clamping,
         );
         let saved_lx = self.line_x;
         let saved_ps = self.pending_space;
@@ -6584,6 +6606,11 @@ impl<'a> Layouter<'a> {
         self.align = st.align;
         self.align_last = st.align_last;
         self.rtl = st.rtl;
+        self.clamp_left = 0;
+        self.clamping = false;
+        if st.line_clamp > 0 {
+            self.clamp_left = st.line_clamp;
+        }
         self.ellipsis_clip = if c.get("text-overflow").map(String::as_str) == Some("ellipsis")
             && borderfx::clips_overflow(c)
         {
@@ -6676,6 +6703,8 @@ impl<'a> Layouter<'a> {
         self.ellipsis_clip = saved.5;
         self.indent_pending = saved.6;
         self.rtl = saved.7;
+        self.clamp_left = saved.8;
+        self.clamping = saved.9;
         self.line = saved_line;
         self.line_x = saved_lx;
         self.pending_space = saved_ps;
@@ -7661,6 +7690,9 @@ impl<'a> Layouter<'a> {
     }
 
     fn text(&mut self, text: &str, st: &Style) {
+        if self.clamping {
+            return;
+        }
         if st.pre {
             // whitespace preserved verbatim; \n forces a line break,
             // \t expands to `tab-size` space widths
@@ -7871,6 +7903,9 @@ impl<'a> Layouter<'a> {
     }
 
     fn push_word(&mut self, word: &str, st: &Style, font: usize) {
+        if self.clamping {
+            return;
+        }
         let owned: String;
         let word = match st.transform {
             1 => {
@@ -8401,6 +8436,27 @@ impl<'a> Layouter<'a> {
         self.line_x = 0.0;
         self.pending_space = false;
         self.pending_gap = 0.0;
+        // line-clamp — count the emitted line; a wrap flush exhausting
+        // the budget appends "\u{2026}" and drops all further content
+        if self.clamp_left > 0 {
+            self.clamp_left -= 1;
+            if self.clamp_left == 0 {
+                self.clamping = true;
+                if !forced {
+                    for it in self.items.iter_mut().rev() {
+                        if let DisplayItem::Text { text, .. } = it {
+                            if !text.is_empty() {
+                                text.push(char::from_u32(0x2026).unwrap());
+                                break;
+                            }
+                        }
+                        if !matches!(it, DisplayItem::PopEffect | DisplayItem::PopClip) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// `::before`/`::after` generated content — emitted as the element's
@@ -10740,5 +10796,37 @@ mod tests {
         });
         // want=300 → smallest covering is mid (400w)
         assert_eq!(src, Some("mid.png"));
+    }
+
+    #[test]
+    fn line_clamp_truncates_with_ellipsis() {
+        let (items, _, _) = lay(
+            r#"<style>p{width:60px;-webkit-line-clamp:2}</style>             <p>one two three four five six seven eight nine ten</p>"#,
+        );
+        let t = texts(&items);
+        let strs: Vec<String> = t.iter().map(|i| tinfo(i).4.to_string()).collect();
+        assert!(
+            strs.iter().any(|s| s.ends_with('\u{2026}')),
+            "ellipsis: {strs:?}"
+        );
+        for w in ["eight", "nine", "ten"] {
+            assert!(!strs.iter().any(|s| s.contains(w)), "{w} leaked: {strs:?}");
+        }
+    }
+
+    #[test]
+    fn webkit_box_maps_to_flex() {
+        let (items, _, _) = lay(
+            r#"<style>d{display:-webkit-box}i{width:20px;height:10px;background:#f00}</style>             <d><i></i><i></i></d>"#,
+        );
+        let xs: Vec<f32> = items
+            .iter()
+            .filter_map(|i| match i {
+                DisplayItem::FillRect { x, color, .. } if *color == bgra(255, 0, 0) => Some(*x),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(xs.len(), 2);
+        assert!((xs[1] - xs[0] - 20.0).abs() < 1.0, "flex row: {xs:?}");
     }
 }

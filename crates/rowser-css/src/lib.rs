@@ -2029,6 +2029,15 @@ fn each_decl(prop: &str, value: &str, mut f: impl FnMut(&str, &str)) {
 
 /// Physical-property expansion shared by `each_decl` — see its docs.
 fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
+    // `-webkit-box` is the legacy flex display (line-clamp idiom) —
+    // normalize so every display consumer sees `flex`
+    if prop == "display" {
+        match value.trim() {
+            "-webkit-box" => return f("display", "flex"),
+            "-webkit-inline-box" => return f("display", "inline-flex"),
+            _ => {}
+        }
+    }
     if prop == "list-style" {
         // `list-style: <type> <position> <image>` in any order — split into
         // the longhands layout reads (quoted strings can hold spaces;
