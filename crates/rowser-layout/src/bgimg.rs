@@ -29,6 +29,8 @@ pub(crate) struct Layer {
     clip: u8,
     /// background-attachment: fixed pins the positioning area to the viewport
     fixed: bool,
+    /// background-blend-mode — this layer composites over the ones below
+    blend: crate::colorfx::BlendMode,
 }
 
 #[derive(Clone)]
@@ -127,6 +129,7 @@ pub(crate) fn items_for(
         } else {
             area(x, y, w, h, &b.pad, &b.brd, l.origin)
         };
+        let layer_start = out.len();
         match &l.img {
             Img::None => {}
             Img::Url(src) => {
@@ -161,6 +164,15 @@ pub(crate) fn items_for(
                 });
             }
             Img::Grad(g) => emit_gradient(&mut out, g, l, clip, pa, &mut budget),
+        }
+        // background-blend-mode: a non-normal layer composites over the
+        // layers already emitted beneath it
+        if l.blend != crate::colorfx::BlendMode::Normal && out.len() > layer_start {
+            out.insert(
+                layer_start,
+                DisplayItem::PushEffect(crate::colorfx::Effect::Blend(l.blend)),
+            );
+            out.push(DisplayItem::PopEffect);
         }
     }
     out
@@ -549,6 +561,7 @@ fn parse_layers(c: &Props, em: f32, vh: f32, vw: f32, current: u32) -> Vec<Layer
     let origins = layer_list(c, "background-origin");
     let clips = layer_list(c, "background-clip");
     let atts = layer_list(c, "background-attachment");
+    let blends = layer_list(c, "background-blend-mode");
     fn pick<'a>(l: &[&'a str], i: usize, d: &'a str) -> &'a str {
         if l.is_empty() {
             d
@@ -581,6 +594,8 @@ fn parse_layers(c: &Props, em: f32, vh: f32, vw: f32, current: u32) -> Vec<Layer
             fixed: pick(&atts, i, "scroll")
                 .to_ascii_lowercase()
                 .contains("fixed"),
+            blend: crate::colorfx::BlendMode::parse(pick(&blends, i, "normal"))
+                .unwrap_or(crate::colorfx::BlendMode::Normal),
         });
     }
     out

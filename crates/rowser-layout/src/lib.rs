@@ -3134,7 +3134,17 @@ impl<'a> Layouter<'a> {
         if let Some(c) = self.style_cache.get(&node) {
             return Rc::clone(c);
         }
-        let c = Rc::new(self.ctx.computed(node));
+        let mut props = self.ctx.computed(node);
+        // paint containment (paint/strict/content include it) forces
+        // clipping at the element's box — approximated as overflow:hidden
+        if props.get("contain").is_some_and(|v| {
+            v.split_whitespace()
+                .any(|t| matches!(t, "paint" | "strict" | "content"))
+        }) && props.get("overflow").is_none()
+        {
+            props.insert("overflow".to_string(), "hidden".to_string());
+        }
+        let c = Rc::new(props);
         self.style_cache.insert(node, Rc::clone(&c));
         c
     }
@@ -3149,14 +3159,22 @@ impl<'a> Layouter<'a> {
             NodeKind::Text(t) => self.text(t, style),
             NodeKind::Comment(_) => {}
             NodeKind::Element { tag, .. } => {
-                if let Some(id) = self.doc.attr(node, "id") {
-                    if !id.is_empty() {
-                        self.anchors.push((id.to_string(), self.y + self.scroll));
-                    }
-                }
                 let c = self.style(node);
                 let mut st = style.clone();
                 self.apply_computed(&c, &mut st);
+                if let Some(id) = self.doc.attr(node, "id") {
+                    if !id.is_empty() {
+                        // scroll-margin-top shifts the anchor's scroll target
+                        // up (the element wants breathing room when jumped to)
+                        let sm = c
+                            .get("scroll-margin-top")
+                            .or_else(|| c.get("scroll-margin"))
+                            .and_then(|v| parse_len(v.split_whitespace().next()?, 0.0, st.size))
+                            .unwrap_or(0.0);
+                        self.anchors
+                            .push((id.to_string(), self.y + self.scroll - sm));
+                    }
+                }
                 // the `.sr-only` a11y pattern — a 1x1 overflow:hidden clip.
                 // Laying it out would wrap its text into a visible strip.
                 let visually_hidden = c.get("overflow").map(String::as_str) == Some("hidden")
