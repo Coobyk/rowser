@@ -3339,10 +3339,15 @@ impl<'a> Layouter<'a> {
         } else {
             None
         };
-        // `left`+`right`/`top`+`bottom` on a positioned box stretch it to the
-        // containing block
+        // `left`+`right`/`top`+`bottom` stretch an out-of-flow box to the
+        // containing block — relative/sticky over-constrained insets just
+        // ignore the block-end edge instead
         let inset_w = ins_l.zip(ins_r).map(|(l, r)| (cb.w - l - r).max(0.0));
-        let inset_h = ins_t.zip(ins_b).map(|(t, b)| (cb_h_res - t - b).max(0.0));
+        let inset_h = if oof {
+            ins_t.zip(ins_b).map(|(t, b)| (cb_h_res - t - b).max(0.0))
+        } else {
+            None
+        };
         let size = st.size;
         let [mt, mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));

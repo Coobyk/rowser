@@ -110,7 +110,7 @@ pub enum Simple {
     Checked,
     Disabled,
     Enabled,
-    /// `:root` / `:host` — the html element.
+    /// `:root` — the html element.
     Root,
     /// `:is(list)` — matches any selector in list, max-arg specificity.
     Is(Vec<Selector>),
@@ -918,10 +918,14 @@ impl<'a> CssParser<'a> {
                 "first-line" => Simple::PseudoElem(PseudoElem::FirstLine),
                 "first-child" => Simple::FirstChild,
                 "last-child" => Simple::LastChild,
-                "root" | "host" => {
-                    // :host(...) args skipped — no shadow DOM
+                "root" => Simple::Root,
+                // :host/:host-context select a shadow host — we build no
+                // shadow trees, so a hoisted <style>'s :host rules must
+                // never leak onto the document (real bug: MDN's shadow
+                // :host{display:inline-flex} restyled <html>).
+                "host" | "host-context" => {
                     self.skip_paren_arg();
-                    Simple::Root
+                    Simple::Never
                 }
                 "first-of-type" => Simple::FirstOfType,
                 "last-of-type" => Simple::LastOfType,
@@ -2891,77 +2895,6 @@ fn supports_leaf(inner: &str) -> bool {
 }
 
 #[cfg(test)]
-mod dbg_tests {
-    use super::*;
-    #[test]
-    fn dbg_coobyk() {
-        let css = std::fs::read_to_string("/tmp/coobyk.css").unwrap();
-        let sh = parse(&css);
-        eprintln!("RULES: {}", sh.rules.len());
-        eprintln!(
-            "display:flex decls: {}",
-            sh.rules
-                .iter()
-                .filter(|r| r
-                    .decls
-                    .iter()
-                    .any(|d| d.prop == "display" && d.value.contains("flex")))
-                .count()
-        );
-        eprintln!(
-            "--spacing decls: {}",
-            sh.rules
-                .iter()
-                .filter(|r| r.decls.iter().any(|d| d.prop == "--spacing"))
-                .count()
-        );
-        eprintln!(
-            "gap decls: {}",
-            sh.rules
-                .iter()
-                .filter(|r| r.decls.iter().any(|d| d.prop == "gap"))
-                .count()
-        );
-    }
-}
-
-#[cfg(test)]
-mod dbg2 {
-    use super::*;
-    use rowser_dom::{Node, NodeKind};
-    fn el(d: &mut rowser_dom::Document, p: NodeId, tag: &str, cls: &str) -> NodeId {
-        let mut attrs = std::collections::HashMap::new();
-        attrs.insert("class".to_string(), cls.to_string());
-        d.nodes.push(Node {
-            kind: NodeKind::Element {
-                tag: tag.into(),
-                attrs,
-            },
-            parent: None,
-            children: vec![],
-            sibling_index: 0,
-        });
-        let id = d.nodes.len() - 1;
-        d.append(p, id);
-        id
-    }
-    #[test]
-    fn dbg_vars() {
-        let css =
-            ":root,:host{--spacing:.25rem;--bg:#fff}.x{padding-left:calc(var(--spacing) * 2)}";
-        let sh = parse(css);
-        eprintln!("rules: {}", sh.rules.len());
-        let mut d = rowser_dom::Document::new();
-        let root = d.root;
-        let html = el(&mut d, root, "html", "");
-        let a = el(&mut d, html, "a", "x");
-        let c = computed(&d, a, &[&sh]);
-        eprintln!("computed: {:?}", c);
-        eprintln!("html customs: {:?}", element_customs(&d, html, &[&sh]));
-    }
-}
-
-#[cfg(test)]
 mod sel4 {
     use super::*;
     use rowser_dom::{Document, NodeId};
@@ -3118,8 +3051,9 @@ mod sel4 {
         assert!(matches(&doc, html, &s));
         let s2 = sel(":where(.dark,.dark *)");
         assert!(matches(&doc, p, &s2));
-        // :host ≈ :root
-        assert!(matches(&doc, html, &sel(":host")));
+        // no shadow DOM: :host never matches; :root still selects <html>
+        assert!(!matches(&doc, html, &sel(":host")));
+        assert!(!matches(&doc, html, &sel(":host(.dark)")));
         assert!(matches(&doc, html, &sel(":root")));
         // light doc: dark variant must NOT match
         let light = rowser_html::parse("<html><body><p></p></body></html>");
