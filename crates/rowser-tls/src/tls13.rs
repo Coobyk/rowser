@@ -6,9 +6,11 @@
 //! (we answer a CertificateRequest with an empty Certificate). Certificate
 //! verify supports RSA PKCS#1 v1.5, RSA-PSS and ECDSA P-256/P-384.
 //!
-//! NOT supported (fails closed): HelloRetryRequest, PSK/resumption, 0-RTT,
-//! client auth with a real certificate, Ed25519, DTLS. Post-handshake
-//! NewSessionTicket is read and discarded; KeyUpdate is honored.
+//! NOT supported (fails closed): HelloRetryRequest, 0-RTT, client auth
+//! with a real certificate, Ed25519, DTLS. PSK resumption IS supported:
+//! NewSessionTicket is parsed into [`ResumptionTicket`]s (drained via
+//! [`TlsStream::take_resumption_tickets`]) and offered via
+//! [`TlsStream::connect_resumed`]; KeyUpdate is honored.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -170,8 +172,64 @@ fn ext(typ: u16, data: &[u8]) -> Vec<u8> {
     e
 }
 
+/// A TLS 1.3 resumption ticket: the PSK derived from a session's
+/// resumption master secret plus the server's opaque NewSessionTicket.
+/// Feed back via [`TlsStream::connect_resumed`] to re-open a connection
+/// to the same host without a full handshake (saves one RTT and the
+/// certificate verification). Authenticates the server by the PSK bound
+/// to the original, fully-verified handshake — so only resume from
+/// tickets harvested from sessions that passed
+/// [`TlsStream::verify_certificate`].
+#[derive(Clone, Debug)]
+pub struct ResumptionTicket {
+    /// `Derive-Secret(resumption_master_secret, "resumption", nonce)`.
+    psk: Vec<u8>,
+    /// Opaque `PskIdentity` the server echoes.
+    ticket: Vec<u8>,
+    /// `ticket_age_add` — obfuscates the ticket's real age on resumption.
+    age_add: u32,
+    /// Unix time we received the ticket (for the obfuscated age).
+    issued_at: i64,
+    /// Unix expiry: `issued_at + ticket_lifetime` from the server.
+    expires_at: i64,
+    /// Hash algorithm of the suite the ticket was issued under — the PSK
+    /// is only valid for a suite with the same hash (RFC 8446 §4.2.11.2).
+    hash: HashAlg,
+}
+
+impl ResumptionTicket {
+    /// True once the server-declared `ticket_lifetime` has elapsed.
+    pub fn expired(&self) -> bool {
+        x509::now_unix() >= self.expires_at
+    }
+}
+
+/// Binder for an offered resumption PSK: an HMAC like `Finished`, keyed
+/// from the early secret, over the truncated ClientHello (RFC 8446
+/// §4.2.11.2 — the transcript ends after `OfferedPsks.identities`).
+fn resumption_binder(
+    alg: HashAlg,
+    psk: &[u8],
+    truncated_ch: &[u8],
+) -> Result<Vec<u8>> {
+    let early = hkdf::extract(alg, &[], psk);
+    let empty_hash = alg.hash(&[]);
+    let binder_key = hkdf::derive_secret(alg, &early, "res binder", &empty_hash)?;
+    let fin_key = hkdf::expand_label(alg, &binder_key, "finished", &[], alg.hash_len())?;
+    Ok(hmac(alg, &fin_key, &alg.hash(truncated_ch)))
+}
+
 /// Build the ClientHello handshake message (4-byte header included).
-fn build_client_hello(host: &str, pubkey: &[u8; 32], random: &[u8; 32], sid: &[u8; 32]) -> Vec<u8> {
+/// When `psk` is given, a `pre_shared_key` extension is appended LAST
+/// (as the RFC requires) and its binder filled in over the truncated
+/// transcript.
+fn build_client_hello(
+    host: &str,
+    pubkey: &[u8; 32],
+    random: &[u8; 32],
+    sid: &[u8; 32],
+    psk: Option<&ResumptionTicket>,
+) -> Result<Vec<u8>> {
     let mut exts = Vec::new();
 
     // server_name — only for DNS hosts, not IP literals.
@@ -219,8 +277,31 @@ fn build_client_hello(host: &str, pubkey: &[u8; 32], random: &[u8; 32], sid: &[u
     exts.extend_from_slice(&ext(0x000d, &sa));
 
     // psk_key_exchange_modes: psk_dhe_ke — required for the server to send
-    // tickets; harmless to advertise since we never use the PSK itself.
+    // tickets, and the mode we resume with.
     exts.extend_from_slice(&ext(0x002d, &[0x01, 0x01]));
+
+    // pre_shared_key — MUST be the last extension (RFC 8446 §4.2.11).
+    // Built with a zeroed binder first; the real binder is computed over
+    // the serialized CH truncated before the binders list, then patched in.
+    let psk_ext_len = if let Some(t) = psk {
+        let age_ms = (x509::now_unix() - t.issued_at).max(0) as u64 * 1000;
+        let obfuscated_age = (t.age_add as u64).wrapping_add(age_ms) as u32;
+        let mut identities = Vec::new();
+        identities.extend_from_slice(&(t.ticket.len() as u16).to_be_bytes());
+        identities.extend_from_slice(&t.ticket);
+        identities.extend_from_slice(&obfuscated_age.to_be_bytes());
+        let binders_len = 1 + t.hash.hash_len();
+        let mut data = Vec::new();
+        data.extend_from_slice(&(identities.len() as u16).to_be_bytes());
+        data.extend_from_slice(&identities);
+        data.extend_from_slice(&(binders_len as u16).to_be_bytes());
+        data.push(t.hash.hash_len() as u8);
+        data.extend(std::iter::repeat(0u8).take(t.hash.hash_len()));
+        exts.extend_from_slice(&ext(0x0029, &data));
+        Some(2 + binders_len)
+    } else {
+        None
+    };
 
     // legacy body
     let mut body = Vec::new();
@@ -234,12 +315,23 @@ fn build_client_hello(host: &str, pubkey: &[u8; 32], random: &[u8; 32], sid: &[u
     body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
     body.extend_from_slice(&exts);
 
-    handshake_msg(HS_CLIENT_HELLO, &body)
+    let mut ch = handshake_msg(HS_CLIENT_HELLO, &body);
+    if let (Some(t), Some(tail)) = (psk, psk_ext_len) {
+        // `tail` bytes at the end are `u16 binders_len || u8 len || zeros`
+        // — the truncated transcript stops just before them.
+        let trunc = ch.len() - tail;
+        let binder = resumption_binder(t.hash, &t.psk, &ch[..trunc])?;
+        ch[trunc + 3..trunc + 3 + t.hash.hash_len()].copy_from_slice(&binder);
+    }
+    Ok(ch)
 }
 
 struct ServerHello {
     suite: CipherSuite,
     peer_pubkey: [u8; 32],
+    /// `Some(i)` when the server accepted our offered PSK identity `i`
+    /// (always 0 — we only ever offer one) → abbreviated handshake.
+    psk_selected: Option<u16>,
 }
 
 /// RFC 8446 §4.1.3 — ServerHello.random for HelloRetryRequest is
@@ -283,6 +375,7 @@ fn parse_server_hello(body: &[u8]) -> Result<ServerHello> {
 
     let mut peer_pubkey = None;
     let mut versions_ok = false;
+    let mut psk_selected = None;
     let mut i = 0;
     while i + 4 <= exts.len() {
         let typ = u16::from_be_bytes([exts[i], exts[i + 1]]);
@@ -314,7 +407,14 @@ fn parse_server_hello(body: &[u8]) -> Result<ServerHello> {
                 pk.copy_from_slice(&data[4..4 + 32]);
                 peer_pubkey = Some(pk);
             }
-            0x0029 => return Err(Error::Unsupported("pre_shared_key chosen")),
+            0x0029 => {
+                // pre_shared_key: selected_identity (u16). Only legal as
+                // an answer to a PSK we offered; handshake() checks that.
+                if data.len() != 2 {
+                    return Err(Error::Decode("pre_shared_key: bad len"));
+                }
+                psk_selected = Some(u16::from_be_bytes([data[0], data[1]]));
+            }
             _ => {}
         }
     }
@@ -322,7 +422,11 @@ fn parse_server_hello(body: &[u8]) -> Result<ServerHello> {
         return Err(Error::Decode("serverhello: no supported_versions"));
     }
     let peer_pubkey = peer_pubkey.ok_or(Error::Decode("serverhello: no key_share"))?;
-    Ok(ServerHello { suite, peer_pubkey })
+    Ok(ServerHello {
+        suite,
+        peer_pubkey,
+        psk_selected,
+    })
 }
 
 /// Parse the Certificate handshake body into a list of DER certs.
@@ -485,6 +589,16 @@ pub struct TlsStream {
     /// Handshake bytes reassembly buffer (post-handshake messages).
     hs_buf: Vec<u8>,
     peer_certs: Vec<Certificate>,
+    /// True when this session was resumed from a `ResumptionTicket` —
+    /// the peer authenticated via the PSK, so no certificate chain was
+    /// sent and `verify_certificate` is a no-op.
+    resumed: bool,
+    /// `resumption_master_secret` — basis for NewSessionTicket PSKs.
+    /// Empty on a resumed session (RFC 8446: tickets from a resumption
+    /// would chain; we don't bother).
+    res_master: Vec<u8>,
+    /// Tickets harvested from post-handshake NewSessionTicket messages.
+    tickets: Vec<ResumptionTicket>,
     eof: bool,
 }
 
@@ -493,26 +607,68 @@ impl TlsStream {
     /// `host` goes into SNI (unless it is an IP literal).
     pub fn connect(host: &str, port: u16, tcp: TcpStream) -> io::Result<TlsStream> {
         let _ = port;
-        handshake(host, tcp).map_err(io::Error::from)
+        handshake(host, tcp, None).map_err(io::Error::from)
+    }
+
+    /// Connect offering session resumption with `ticket` (obtained from
+    /// [`TlsStream::take_resumption_tickets`] on an earlier, verified
+    /// connection to the same host). The server may still choose a full
+    /// handshake — check [`TlsStream::resumed`] before skipping
+    /// certificate verification.
+    pub fn connect_resumed(
+        host: &str,
+        port: u16,
+        tcp: TcpStream,
+        ticket: &ResumptionTicket,
+    ) -> io::Result<TlsStream> {
+        let _ = port;
+        handshake(host, tcp, Some(ticket)).map_err(io::Error::from)
+    }
+
+    /// Whether this session was resumed from a ticket (abbreviated
+    /// handshake — the server proved possession of the PSK instead of a
+    /// certificate).
+    pub fn resumed(&self) -> bool {
+        self.resumed
+    }
+
+    /// Resumption tickets the server has sent so far (drained). Call
+    /// after reads — NewSessionTicket arrives post-handshake. Only use a
+    /// ticket for [`TlsStream::connect_resumed`] if this session passed
+    /// certificate verification.
+    pub fn take_resumption_tickets(&mut self) -> Vec<ResumptionTicket> {
+        std::mem::take(&mut self.tickets)
     }
 
     /// Peer certificates, leaf first, as presented during the handshake.
+    /// Empty on a resumed session.
     pub fn peer_certificates(&self) -> &[Certificate] {
         &self.peer_certs
     }
 
     /// Verify the peer's certificate chain against the system root store
     /// (`/etc/ssl/certs`), including hostname and validity checks.
+    ///
+    /// On a resumed session this is a no-op returning `Ok`: the peer
+    /// authenticated via the resumption PSK, which is only worth
+    /// anything if the ticket came from a previously verified session.
     pub fn verify_certificate(&self) -> Result<()> {
-        let store = TrustStore::system();
+        if self.resumed {
+            return Ok(());
+        }
+        let store = x509::system_store();
         if store.roots.is_empty() {
             return Err(Error::Verify("no system roots found"));
         }
-        x509::verify_server_chain(&self.peer_certs, &self.host, &store, x509::now_unix())
+        x509::verify_server_chain(&self.peer_certs, &self.host, store, x509::now_unix())
     }
 
     /// Verify against an explicit root store instead of the system one.
+    /// Also a no-op on resumed sessions — see [`Self::verify_certificate`].
     pub fn verify_certificate_with(&self, store: &TrustStore, now: i64) -> Result<()> {
+        if self.resumed {
+            return Ok(());
+        }
         x509::verify_server_chain(&self.peer_certs, &self.host, store, now)
     }
 
@@ -647,7 +803,15 @@ impl TlsStream {
             }
             let msg: Vec<u8> = self.hs_buf.drain(..4 + len).collect();
             match msg[0] {
-                HS_NEW_SESSION_TICKET => { /* ignore */ }
+                HS_NEW_SESSION_TICKET => {
+                    if let Some(t) = parse_session_ticket(
+                        &msg[4..],
+                        self.suite.hash_alg(),
+                        &self.res_master,
+                    ) {
+                        self.tickets.push(t);
+                    }
+                }
                 HS_KEY_UPDATE => {
                     if len < 1 {
                         return Err(Error::Decode("key_update: empty"));
@@ -728,8 +892,51 @@ impl Write for TlsStream {
     }
 }
 
+/// Parse a NewSessionTicket body (RFC 8446 §4.6.1) into a resumption
+/// ticket: `lifetime u32 || age_add u32 || nonce opaque || ticket opaque
+/// || extensions`. Returns `None` on malformed input — a bad ticket is
+/// skipped, never fatal.
+fn parse_session_ticket(
+    body: &[u8],
+    alg: HashAlg,
+    res_master: &[u8],
+) -> Option<ResumptionTicket> {
+    if res_master.is_empty() || body.len() < 9 {
+        return None;
+    }
+    let lifetime = u32::from_be_bytes(body[0..4].try_into().ok()?);
+    let age_add = u32::from_be_bytes(body[4..8].try_into().ok()?);
+    let nlen = body[8] as usize;
+    if body.len() < 9 + nlen + 2 {
+        return None;
+    }
+    let nonce = &body[9..9 + nlen];
+    let mut pos = 9 + nlen;
+    let tlen = u16::from_be_bytes(body[pos..pos + 2].try_into().ok()?) as usize;
+    pos += 2;
+    if body.len() < pos + tlen {
+        return None;
+    }
+    let ticket = body[pos..pos + tlen].to_vec();
+    // psk = Derive-Secret(res_master, "resumption", ticket_nonce) — the
+    // derive hashes Messages internally, so pass Hash(nonce).
+    let psk = hkdf::derive_secret(alg, res_master, "resumption", &alg.hash(nonce)).ok()?;
+    let issued_at = x509::now_unix();
+    Some(ResumptionTicket {
+        psk,
+        ticket,
+        age_add,
+        issued_at,
+        expires_at: issued_at.saturating_add(lifetime as i64),
+        hash: alg,
+    })
+}
+
 /// The whole handshake: returns a connected stream on success.
-fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
+/// `ticket`, when `Some`, offers PSK resumption — the server may accept
+/// (abbreviated handshake) or ignore it (full handshake); `resumed` on
+/// the returned stream reports which happened.
+fn handshake(host: &str, mut tcp: TcpStream, ticket: Option<&ResumptionTicket>) -> Result<TlsStream> {
     let priv_key = PrivateKey::generate();
     let pub_key = priv_key.public_key();
 
@@ -738,7 +945,7 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
     crate::rand_bytes(&mut random);
     crate::rand_bytes(&mut sid);
 
-    let ch = build_client_hello(host, &pub_key.0, &random, &sid);
+    let ch = build_client_hello(host, &pub_key.0, &random, &sid, ticket)?;
     // Send as a plaintext handshake record (legacy version 0x0301).
     {
         let mut rec = Vec::with_capacity(5 + ch.len());
@@ -782,13 +989,31 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
     let suite = sh.suite;
     let alg = suite.hash_alg();
 
+    // ---- resumption negotiation ----
+    let resumed = match (ticket, sh.psk_selected) {
+        (Some(t), Some(0)) => {
+            // RFC 8446 §4.2.11.2: the suite's hash must match the PSK's.
+            if t.hash != alg {
+                return Err(Error::Decode("resumed suite hash mismatch"));
+            }
+            true
+        }
+        (Some(_), None) => false, // server declined the PSK: full handshake
+        (Some(_), Some(_)) => return Err(Error::Decode("psk: bad selected identity")),
+        (None, Some(_)) => return Err(Error::Decode("psk chosen but none offered")),
+        (None, None) => false,
+    };
+
     // ---- key schedule ----
     let shared = priv_key.dh(&crate::x25519::PublicKey(sh.peer_pubkey));
     if shared.iter().all(|&b| b == 0) {
         return Err(Error::Verify("x25519 all-zero shared secret"));
     }
     let zeros = vec![0u8; alg.hash_len()];
-    let early = hkdf::extract(alg, &[], &zeros);
+    let early = match ticket {
+        Some(t) if resumed => hkdf::extract(alg, &[], &t.psk),
+        _ => hkdf::extract(alg, &[], &zeros),
+    };
     let empty_hash = hash_of(alg, &[]);
     let derived = hkdf::derive_secret(alg, &early, "derived", &empty_hash)?;
     let hs_secret = hkdf::extract(alg, &derived, &shared);
@@ -944,6 +1169,7 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
         handshake_msg(HS_FINISHED, &vd)
     };
     out_msgs.extend_from_slice(&fin_msg);
+    transcript.extend_from_slice(&fin_msg);
 
     // Send a compat CCS then the encrypted client flight.
     write_record(&mut tcp, RT_CHANGE_CIPHER, &[0x01])?;
@@ -963,6 +1189,10 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
         write_record(&mut tcp, RT_APPDATA, &rec)?;
     }
 
+    // resumption master secret — covers CH .. client Finished; used to
+    // derive PSKs from NewSessionTicket nonces.
+    let res_master = hkdf::derive_secret(alg, &master, "res master", &hash_of(alg, &transcript))?;
+
     // Switch to application traffic keys.
     let read_keys = traffic_from_secret(suite, &s_ap)?;
     let write_keys = traffic_from_secret(suite, &c_ap)?;
@@ -979,6 +1209,9 @@ fn handshake(host: &str, mut tcp: TcpStream) -> Result<TlsStream> {
         // NewSessionTicket) get processed on the first pump.
         hs_buf: hsbuf,
         peer_certs,
+        resumed,
+        res_master,
+        tickets: Vec::new(),
         eof: false,
     })
 }

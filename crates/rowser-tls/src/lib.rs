@@ -35,8 +35,8 @@ mod x25519;
 mod x509;
 
 pub use sha2::HashAlg;
-pub use tls13::TlsStream;
-pub use x509::{Certificate, PublicKey, TrustStore};
+pub use tls13::{ResumptionTicket, TlsStream};
+pub use x509::{Certificate, PublicKey, TrustStore, system_store};
 
 /// Error type for the whole crate. Crypto/decoding failures carry a static
 /// description; I/O failures propagate [`io::Error`].

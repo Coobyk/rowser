@@ -543,6 +543,17 @@ impl TrustStore {
     }
 }
 
+/// The system trust store, loaded and DER-decoded once per process.
+///
+/// [`TrustStore::system`] walks and parses every PEM under
+/// `/etc/ssl/certs` on each call — roughly a hundred certificates, which
+/// dominated per-connection cost when every `https` request opened a
+/// fresh TLS session. Verification hot paths should use this instead.
+pub fn system_store() -> &'static TrustStore {
+    static STORE: std::sync::OnceLock<TrustStore> = std::sync::OnceLock::new();
+    STORE.get_or_init(TrustStore::system)
+}
+
 /// Does `pattern` (a dNSName or CN) match `host`? Supports a leading
 /// `*.` wildcard covering exactly the leftmost label.
 fn dns_name_matches(pattern: &str, host: &str) -> bool {
