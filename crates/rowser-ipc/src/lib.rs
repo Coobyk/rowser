@@ -154,6 +154,14 @@ pub enum ToRenderer {
         x: f32,
         y: f32,
     },
+    /// Key press for the focused element. `key` is the platform key name
+    /// ("enter", "backspace", "left", ...), `text` the printable text it
+    /// produced ("" for non-printables), `shift` for Shift+Tab etc.
+    Key {
+        key: String,
+        text: String,
+        shift: bool,
+    },
     /// Request a text dump of the DOM tree (inspector).
     DomDump,
     Shutdown,
@@ -185,6 +193,27 @@ pub enum ToBrowser {
     /// CSS `cursor` keyword for the hovered element ("auto"/"" = default).
     /// Sent only when the resolved value changes.
     Cursor(String),
+    /// A repainted sub-rectangle of the current frame: premultiplied
+    /// BGRA `width*height*4` bytes composited at (x,y) into the stored
+    /// frame. Sent instead of `Frame` when only part of the page changed.
+    FrameRegion {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
+    /// Integral scroll on an unpinned page: the stored frame shifted by
+    /// `dy` device px (positive = content moved up — scrolling down),
+    /// then the freshly exposed strip composited at (x,y,w,h).
+    ScrollDelta {
+        dy: i32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    },
 }
 
 const TAG_PING: u8 = 0;
@@ -196,6 +225,7 @@ const TAG_DOMDUMP: u8 = 6;
 const TAG_SELECT: u8 = 8;
 const TAG_MOUSEMOVE: u8 = 9;
 const TAG_MOUSEDOWN: u8 = 10;
+const TAG_KEY: u8 = 11;
 const TAG_SHUTDOWN: u8 = 4;
 
 const TAG_PONG: u8 = 0;
@@ -208,6 +238,8 @@ const TAG_NAV_REQUEST: u8 = 6;
 const TAG_BDOMDUMP: u8 = 7;
 const TAG_SELTEXT: u8 = 8;
 const TAG_CURSOR: u8 = 9;
+const TAG_FRAME_REGION: u8 = 10;
+const TAG_SCROLL_DELTA: u8 = 11;
 
 impl ToRenderer {
     pub fn encode(&self) -> Vec<u8> {
@@ -253,6 +285,12 @@ impl ToRenderer {
                 w.u32(x.to_bits());
                 w.u32(y.to_bits());
             }
+            Self::Key { key, text, shift } => {
+                w.u8(TAG_KEY);
+                w.string(key);
+                w.string(text);
+                w.u8(*shift as u8);
+            }
             Self::DomDump => w.u8(TAG_DOMDUMP),
             Self::Shutdown => w.u8(TAG_SHUTDOWN),
         }
@@ -289,6 +327,11 @@ impl ToRenderer {
             TAG_MOUSEDOWN => Self::MouseDown {
                 x: f32::from_bits(r.u32()?),
                 y: f32::from_bits(r.u32()?),
+            },
+            TAG_KEY => Self::Key {
+                key: r.string()?,
+                text: r.string()?,
+                shift: r.u8()? != 0,
             },
             TAG_DOMDUMP => Self::DomDump,
             TAG_SHUTDOWN => Self::Shutdown,
@@ -346,6 +389,36 @@ impl ToBrowser {
                 w.u8(TAG_CURSOR);
                 w.string(css);
             }
+            Self::FrameRegion {
+                x,
+                y,
+                width,
+                height,
+                pixels,
+            } => {
+                w.u8(TAG_FRAME_REGION);
+                w.u32(*x);
+                w.u32(*y);
+                w.u32(*width);
+                w.u32(*height);
+                w.bytes(pixels);
+            }
+            Self::ScrollDelta {
+                dy,
+                x,
+                y,
+                width,
+                height,
+                pixels,
+            } => {
+                w.u8(TAG_SCROLL_DELTA);
+                w.u32(*dy as u32);
+                w.u32(*x);
+                w.u32(*y);
+                w.u32(*width);
+                w.u32(*height);
+                w.bytes(pixels);
+            }
         }
         w.into_payload()
     }
@@ -367,6 +440,21 @@ impl ToBrowser {
             TAG_BDOMDUMP => Self::DomDump(r.string()?),
             TAG_SELTEXT => Self::SelText(r.string()?),
             TAG_CURSOR => Self::Cursor(r.string()?),
+            TAG_FRAME_REGION => Self::FrameRegion {
+                x: r.u32()?,
+                y: r.u32()?,
+                width: r.u32()?,
+                height: r.u32()?,
+                pixels: r.bytes()?,
+            },
+            TAG_SCROLL_DELTA => Self::ScrollDelta {
+                dy: r.u32()? as i32,
+                x: r.u32()?,
+                y: r.u32()?,
+                width: r.u32()?,
+                height: r.u32()?,
+                pixels: r.bytes()?,
+            },
             tag => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -430,6 +518,21 @@ mod tests {
             ToBrowser::DomDump("<html>".into()),
             ToBrowser::SelText("selected words".into()),
             ToBrowser::Cursor("pointer".into()),
+            ToBrowser::FrameRegion {
+                x: 4,
+                y: 8,
+                width: 2,
+                height: 3,
+                pixels: (0..24).collect(),
+            },
+            ToBrowser::ScrollDelta {
+                dy: -42,
+                x: 0,
+                y: 10,
+                width: 4,
+                height: 2,
+                pixels: vec![255; 32],
+            },
         ];
         for msg in msgs {
             assert_eq!(ToBrowser::decode(&msg.encode()).unwrap(), msg);

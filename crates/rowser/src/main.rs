@@ -30,6 +30,10 @@ struct Tab {
     child: Option<Child>,
     ipc_out: Option<UnixStream>,
     frame: Option<Arc<RenderImage>>,
+    /// Persistent BGRA framebuffer + its size — `Frame` replaces it,
+    /// `FrameRegion`/`ScrollDelta` composite into it between frames.
+    pixels: Vec<u8>,
+    buf_size: (u32, u32),
     title: String,
     url: String,
     alive: bool,
@@ -45,6 +49,54 @@ impl Tab {
         if let Some(out) = &mut self.ipc_out {
             let _ = write_frame(out, &msg.encode());
         }
+    }
+
+    /// Rebuild `frame` from the persistent buffer after a composite.
+    fn refresh_frame(&mut self) {
+        let (w, h) = self.buf_size;
+        if let Some(buf) = image::RgbaImage::from_raw(w, h, self.pixels.clone()) {
+            self.frame = Some(Arc::new(RenderImage::new([image::Frame::new(buf)])));
+        }
+    }
+
+    /// Composite a BGRA sub-rect into the persistent buffer at (x,y).
+    fn blit(&mut self, x: u32, y: u32, w: u32, h: u32, px: &[u8]) {
+        let (bw, bh) = self.buf_size;
+        if bw == 0
+            || bh == 0
+            || x >= bw
+            || y >= bh
+            || w > bw - x
+            || h > bh - y
+            || px.len() != w as usize * h as usize * 4
+        {
+            return;
+        }
+        let stride = bw as usize * 4;
+        let row_bytes = w as usize * 4;
+        for row in 0..h as usize {
+            let dst = (y as usize + row) * stride + x as usize * 4;
+            let src = row * row_bytes;
+            self.pixels[dst..dst + row_bytes].copy_from_slice(&px[src..src + row_bytes]);
+        }
+    }
+
+    /// Shift the stored frame by `dy` device px (positive = content moved
+    /// up — scrolling down), then composite the newly exposed strip.
+    fn scroll_blit(&mut self, dy: i32, x: u32, y: u32, w: u32, h: u32, px: &[u8]) {
+        let (bw, _bh) = self.buf_size;
+        if bw == 0 {
+            return;
+        }
+        let stride = bw as usize * 4;
+        let d = dy.unsigned_abs() as usize * stride;
+        let len = self.pixels.len();
+        if dy > 0 && d < len {
+            self.pixels.copy_within(d.., 0);
+        } else if dy < 0 && d < len {
+            self.pixels.copy_within(..len - d, d);
+        }
+        self.blit(x, y, w, h, px);
     }
 
     /// Navigate, recording the visit in history (drops forward entries).
@@ -230,6 +282,8 @@ impl BrowserView {
             child: None,
             ipc_out: None,
             frame: None,
+            pixels: Vec::new(),
+            buf_size: (0, 0),
             title: "New Tab".into(),
             url: url.clone(),
             alive: false,
@@ -356,6 +410,8 @@ impl BrowserView {
             child: None,
             ipc_out: None,
             frame: None,
+            pixels: Vec::new(),
+            buf_size: (0, 0),
             title: "New Tab".into(),
             url: url.clone(),
             alive: false,
@@ -470,9 +526,30 @@ impl BrowserView {
                         height,
                         pixels,
                     } => {
-                        if let Some(buf) = image::RgbaImage::from_raw(width, height, pixels) {
-                            tab.frame = Some(Arc::new(RenderImage::new([image::Frame::new(buf)])));
-                        }
+                        tab.buf_size = (width, height);
+                        tab.pixels = pixels;
+                        tab.refresh_frame();
+                    }
+                    ToBrowser::FrameRegion {
+                        x,
+                        y,
+                        width,
+                        height,
+                        pixels,
+                    } => {
+                        tab.blit(x, y, width, height, &pixels);
+                        tab.refresh_frame();
+                    }
+                    ToBrowser::ScrollDelta {
+                        dy,
+                        x,
+                        y,
+                        width,
+                        height,
+                        pixels,
+                    } => {
+                        tab.scroll_blit(dy, x, y, width, height, &pixels);
+                        tab.refresh_frame();
                     }
                     ToBrowser::LoadDone => {}
                     ToBrowser::NavigationRequest(url) => tab.navigate(&url),
@@ -489,6 +566,8 @@ impl BrowserView {
                     tab.alive = false;
                     tab.ipc_out = None;
                     tab.frame = None;
+                    tab.pixels.clear();
+                    tab.buf_size = (0, 0);
                     tab.title = "crashed".into();
                 }
             }
@@ -1052,7 +1131,20 @@ impl Render for BrowserView {
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        // Page input: while the URL bar isn't editing and
+                        // no accel/Alt modifier is held, hand the key to
+                        // the renderer — it edits focused controls,
+                        // submits forms on Enter, and Tab-moves focus.
+                        if !editing && !ctrl && !m.alt {
+                            let text = ks.key_char.clone().unwrap_or_default();
+                            view.tabs[view.active].send(&ToRenderer::Key {
+                                key: ks.key.clone(),
+                                text,
+                                shift: m.shift,
+                            });
+                        }
+                    }
                 }
                 cx.notify();
             }))
