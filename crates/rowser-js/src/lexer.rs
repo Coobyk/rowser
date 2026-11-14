@@ -73,6 +73,11 @@ pub enum Kw {
     Yield,
     Super,
     Debugger,
+    /// always-reserved words: `with` (stmt unsupported → always a parse
+    /// error, which strict-mode negative tests count as a pass) and
+    /// `enum` (reserved in all modes)
+    With,
+    Enum,
 }
 
 impl Kw {
@@ -123,6 +128,8 @@ impl Kw {
             Yield => "yield",
             Super => "super",
             Debugger => "debugger",
+            With => "with",
+            Enum => "enum",
         }
     }
 }
@@ -174,6 +181,8 @@ fn keyword(s: &str) -> Option<Kw> {
         "yield" => Yield,
         "super" => Super,
         "debugger" => Debugger,
+        "with" => With,
+        "enum" => Enum,
         _ => return None,
     })
 }
@@ -185,6 +194,12 @@ pub struct Token {
     pub col: u32,
     /// true if a newline separated this token from the previous one (for ASI)
     pub newline_before: bool,
+    /// legacy-octal number (`0755`) or octal/`\8`-style string escape —
+    /// strict-mode early error
+    pub octal: bool,
+    /// token contains a `\` escape — an escaped `"use strict"` directive
+    /// does NOT enable strict mode per spec
+    pub escaped: bool,
 }
 
 const PUNCTS: &[&str] = &[
@@ -201,6 +216,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
         line: 1,
         col: 1,
         newline: true,
+        tok_octal: false,
+        tok_escaped: false,
     };
     lx.run()
 }
@@ -211,6 +228,11 @@ struct Lexer {
     line: u32,
     col: u32,
     newline: bool,
+    /// set by number()/string()/template() when the token is a legacy
+    /// octal literal or carries an octal/\8-style escape (strict error)
+    tok_octal: bool,
+    /// set when the token contains any `\` escape sequence
+    tok_escaped: bool,
 }
 
 impl Lexer {
@@ -220,10 +242,17 @@ impl Lexer {
     fn peek2(&self) -> Option<char> {
         self.chars.get(self.i + 1).copied()
     }
+    fn peek3(&self) -> Option<char> {
+        self.chars.get(self.i + 2).copied()
+    }
+    /// LineTerminator: \n, \r (folding \r\n), \u2028, \u2029
     fn bump(&mut self) -> Option<char> {
         let c = self.peek()?;
         self.i += 1;
-        if c == '\n' {
+        if c == '\r' || c == '\n' || c == '\u{2028}' || c == '\u{2029}' {
+            if c == '\r' && self.peek() == Some('\n') {
+                self.i += 1;
+            }
             self.line += 1;
             self.col = 1;
             self.newline = true;
@@ -248,6 +277,8 @@ impl Lexer {
                     line,
                     col,
                     newline_before,
+                    octal: false,
+                    escaped: false,
                 });
                 return Ok(out);
             };
@@ -259,8 +290,8 @@ impl Lexer {
                 || (c == '.' && self.peek2().is_some_and(|d| d.is_ascii_digit()))
             {
                 Tok::Num(self.number()?)
-            } else if is_ident_start(c) {
-                let name = self.ident();
+            } else if is_ident_start(c) || c == '\\' {
+                let name = self.ident()?;
                 match keyword(&name) {
                     Some(kw) => Tok::Kw(kw),
                     None => Tok::Ident(name),
@@ -268,7 +299,7 @@ impl Lexer {
             } else if c == '#' {
                 // `#name` — private class member / brand check (`#x in obj`)
                 self.bump();
-                let name = self.ident();
+                let name = self.ident()?;
                 Tok::Ident(format!("#{name}"))
             } else if c == '/' && slash_is_regex(out.last()) {
                 // regex-literal context; if the scan fails (e.g. it was
@@ -280,11 +311,16 @@ impl Lexer {
             } else {
                 self.punct()?
             };
+            let (octal, escaped) = (self.tok_octal, self.tok_escaped);
+            self.tok_octal = false;
+            self.tok_escaped = false;
             out.push(Token {
                 tok,
                 line,
                 col,
                 newline_before,
+                octal,
+                escaped,
             });
         }
     }
@@ -292,17 +328,33 @@ impl Lexer {
     fn skip_trivia(&mut self) -> Result<(), Error> {
         loop {
             match self.peek() {
-                Some(c) if c.is_whitespace() || c == '\u{feff}' => {
+                // JS whitespace excludes vertical tab (\x0B); BOM is ws
+                Some(c) if (c.is_whitespace() || c == '\u{feff}') && c != '\u{b}' => {
                     self.bump();
+                }
+                // hashbang `#!` only valid as the first two chars of a script
+                Some('#') if self.i == 0 && self.peek2() == Some('!') => {
+                    self.skip_line_comment();
+                }
+                // Annex B `<!--` opens a line comment anywhere
+                Some('<')
+                    if self.peek2() == Some('!')
+                        && self.peek3() == Some('-')
+                        && self.chars.get(self.i + 3) == Some(&'-') =>
+                {
+                    self.skip_line_comment();
+                }
+                // Annex B `-->` opens a line comment only at line start
+                Some('-')
+                    if self.newline
+                        && self.peek2() == Some('-')
+                        && self.peek3() == Some('>') =>
+                {
+                    self.skip_line_comment();
                 }
                 Some('/') => match self.peek2() {
                     Some('/') => {
-                        while let Some(c) = self.peek() {
-                            if c == '\n' {
-                                break;
-                            }
-                            self.bump();
-                        }
+                        self.skip_line_comment();
                     }
                     Some('*') => {
                         self.bump();
@@ -326,30 +378,61 @@ impl Lexer {
         }
     }
 
-    fn ident(&mut self) -> String {
-        let mut s = String::new();
+    /// Consume until (not including) a LineTerminator or EOF.
+    fn skip_line_comment(&mut self) {
         while let Some(c) = self.peek() {
-            if is_ident_part(c) {
-                s.push(c);
-                self.bump();
-            } else if c == '\\' {
-                // minimal \u escape in identifiers
-                self.bump();
-                if self.peek() == Some('u') {
-                    self.bump();
-                    if let Some(cp) = self.hex_digits(4) {
-                        if let Some(ch) = char::from_u32(cp) {
-                            s.push(ch);
-                        }
-                    }
-                } else {
-                    break;
-                }
-            } else {
+            if c == '\n' || c == '\r' || c == '\u{2028}' || c == '\u{2029}' {
                 break;
             }
+            self.bump();
         }
-        s
+    }
+
+    fn ident(&mut self) -> Result<String, Error> {
+        let mut s = String::new();
+        loop {
+            match self.peek() {
+                Some(c) if is_ident_part(c) => {
+                    s.push(c);
+                    self.bump();
+                }
+                Some('\\') => {
+                    self.tok_escaped = true;
+                    self.bump();
+                    if self.peek() != Some('u') {
+                        return Err(self.err("invalid identifier escape"));
+                    }
+                    self.bump();
+                    let cp = if self.peek() == Some('{') {
+                        self.bump();
+                        let mut v: u32 = 0;
+                        let mut any = false;
+                        while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
+                            v = v * 16 + d;
+                            any = true;
+                            self.bump();
+                        }
+                        if self.peek() != Some('}') || !any || v > 0x10ffff {
+                            return Err(self.err("bad unicode escape in identifier"));
+                        }
+                        self.bump();
+                        v
+                    } else {
+                        self.hex_digits(4)
+                            .ok_or_else(|| self.err("bad unicode escape in identifier"))?
+                    };
+                    match char::from_u32(cp) {
+                        Some(ch) if is_ident_part(ch) => s.push(ch),
+                        _ => return Err(self.err("bad unicode escape in identifier")),
+                    }
+                }
+                _ => break,
+            }
+        }
+        if s.is_empty() {
+            return Err(self.err("expected identifier"));
+        }
+        Ok(s)
     }
 
     fn hex_digits(&mut self, n: usize) -> Option<u32> {
@@ -422,7 +505,73 @@ impl Lexer {
                 _ => {}
             }
         }
-        // legacy octal 0o handled above; leading-zero decimal like 010 → treat as decimal
+        // legacy octal: `0` followed by octal digits (may include 8/9 which
+        // makes it a NonOctalDecimalIntegerLiteral — still a strict error)
+        if self.peek() == Some('0')
+            && self.peek2().is_some_and(|c| c.is_ascii_digit())
+        {
+            let mut oct = true;
+            let mut digits = String::new();
+            let mut has_underscore = false;
+            while let Some(c) = self.peek() {
+                match c {
+                    '0'..='9' => {
+                        if c >= '8' {
+                            oct = false;
+                        }
+                        digits.push(c);
+                        self.bump();
+                    }
+                    '_' => {
+                        has_underscore = true;
+                        self.bump();
+                    }
+                    _ => break,
+                }
+            }
+            // `08.5`, `010e2` — plain decimal, continue to the general path
+            if matches!(self.peek(), Some('.') | Some('e') | Some('E')) {
+                s = digits;
+                if oct {
+                    self.tok_octal = false;
+                }
+                let mut seen_dot = false;
+                let mut seen_exp = false;
+                while let Some(c) = self.peek() {
+                    match c {
+                        '0'..='9' => s.push(self.bump().unwrap()),
+                        '.' if !seen_dot && !seen_exp => {
+                            seen_dot = true;
+                            s.push(self.bump().unwrap());
+                        }
+                        'e' | 'E' if !seen_exp => {
+                            seen_exp = true;
+                            s.push('e');
+                            self.bump();
+                            if matches!(self.peek(), Some('+') | Some('-')) {
+                                s.push(self.bump().unwrap());
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                return self.number_tail(s);
+            }
+            if has_underscore {
+                return Err(self.err("separators are not allowed in legacy octal"));
+            }
+            self.tok_octal = true;
+            let v = if oct {
+                u64::from_str_radix(&digits, 8).map(|n| n as f64).ok()
+            } else {
+                digits.parse::<f64>().ok()
+            };
+            return match v {
+                Some(n) => self.number_tail_ok(n),
+                None => Err(self.err("bad number literal")),
+            };
+        }
+        // leading-zero decimal like `0` alone; general path
         let mut seen_dot = false;
         let mut seen_exp = false;
         while let Some(c) = self.peek() {
@@ -455,20 +604,40 @@ impl Lexer {
                 _ => break,
             }
         }
-        s.parse::<f64>()
-            .map_err(|_| self.err(format!("bad number literal `{s}`")))
+        self.number_tail(s)
+    }
+
+    fn number_tail(&mut self, s: String) -> Result<f64, Error> {
+        let n = s
+            .parse::<f64>()
+            .map_err(|_| self.err(format!("bad number literal `{s}`")))?;
+        self.number_tail_ok(n)
+    }
+
+    /// after any numeric literal: a letter directly abutting it is an error
+    fn number_tail_ok(&mut self, n: f64) -> Result<f64, Error> {
+        if self.peek().is_some_and(is_ident_start) {
+            return Err(self.err("identifier directly after number"));
+        }
+        Ok(n)
     }
 
     fn string(&mut self, quote: char) -> Result<String, Error> {
         self.bump(); // quote
         let mut s = String::new();
         loop {
-            let Some(c) = self.bump() else {
+            let Some(c) = self.peek() else {
                 return Err(self.err("unterminated string"));
             };
             match c {
-                c if c == quote => return Ok(s),
+                c if c == quote => {
+                    self.bump();
+                    return Ok(s);
+                }
+                '\n' | '\r' => return Err(self.err("newline in string literal")),
                 '\\' => {
+                    self.tok_escaped = true;
+                    self.bump();
                     let Some(e) = self.bump() else {
                         return Err(self.err("unterminated escape"));
                     };
@@ -479,45 +648,73 @@ impl Lexer {
                         'b' => s.push('\u{8}'),
                         'f' => s.push('\u{c}'),
                         'v' => s.push('\u{b}'),
-                        '0' => s.push('\0'),
-                        'x' => {
-                            if let Some(cp) = self.hex_digits(2) {
-                                if let Some(ch) = char::from_u32(cp) {
-                                    s.push(ch);
+                        '0'..='7' => {
+                            // legacy octal escape \1–\7, \00–\377 (a bare
+                            // \0 with no octal digit following is the NUL
+                            // escape, not an octal escape)
+                            let mut v = e.to_digit(8).unwrap();
+                            let mut ndig = 0;
+                            for _ in 0..2 {
+                                match self.peek().and_then(|d| d.to_digit(8)) {
+                                    Some(d) if v < 32 => {
+                                        v = v * 8 + d;
+                                        ndig += 1;
+                                        self.bump();
+                                    }
+                                    _ => break,
                                 }
                             }
+                            if e != '0' || ndig > 0 {
+                                self.tok_octal = true;
+                            }
+                            s.push(char::from_u32(v).unwrap_or('\0'));
+                        }
+                        '8' | '9' => {
+                            // \8 \9 — NotEscapeSequence-ish; keep char, flag octal
+                            self.tok_octal = true;
+                            s.push(e);
+                        }
+                        'x' => {
+                            let Some(cp) = self.hex_digits(2) else {
+                                return Err(self.err("bad \\x escape"));
+                            };
+                            s.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
                         }
                         'u' => {
-                            if self.peek() == Some('{') {
+                            let cp = if self.peek() == Some('{') {
                                 self.bump();
                                 let mut v: u32 = 0;
-                                while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
-                                    v = v * 16 + d;
+                                let mut any = false;
+                                while let Some(d) = self.peek().and_then(|c| c.to_digit(16))
+                                {
+                                    v = v.saturating_mul(16).saturating_add(d);
+                                    any = true;
                                     self.bump();
                                 }
-                                if self.peek() == Some('}') {
-                                    self.bump();
+                                if self.peek() != Some('}') || !any || v > 0x10ffff {
+                                    return Err(self.err("bad \\u escape"));
                                 }
-                                if let Some(ch) = char::from_u32(v) {
-                                    s.push(ch);
-                                }
-                            } else if let Some(cp) = self.hex_digits(4) {
-                                if let Some(ch) = char::from_u32(cp) {
-                                    s.push(ch);
-                                }
-                            }
+                                self.bump();
+                                v
+                            } else {
+                                self.hex_digits(4)
+                                    .ok_or_else(|| self.err("bad \\u escape"))?
+                            };
+                            let Some(ch) = char::from_u32(cp) else {
+                                return Err(self.err("bad \\u escape"));
+                            };
+                            s.push(ch);
                         }
                         '\n' => {} // line continuation
-                        '\r' => {
-                            if self.peek() == Some('\n') {
-                                self.bump();
-                            }
-                        }
+                        '\r' => {} // \r or \r\n continuation — bump already folded
+                        '\u{2028}' | '\u{2029}' => {}
                         other => s.push(other),
                     }
                 }
-                '\n' => return Err(self.err("newline in string literal")),
-                c => s.push(c),
+                c => {
+                    s.push(c);
+                    self.bump();
+                }
             }
         }
     }
@@ -553,29 +750,78 @@ impl Lexer {
                         'n' => cur.push('\n'),
                         't' => cur.push('\t'),
                         'r' => cur.push('\r'),
+                        'b' => cur.push('\u{8}'),
+                        'f' => cur.push('\u{c}'),
+                        'v' => cur.push('\u{b}'),
+                        '0'..='9' => {
+                            // legacy octal / \8\9 in a template — NotEscape;
+                            // flag so untagged templates become a parse error
+                            self.tok_octal = true;
+                            self.tok_escaped = true;
+                            cur.push('\\');
+                            cur.push(e);
+                        }
                         '`' => cur.push('`'),
                         '$' => cur.push('$'),
                         'x' => {
-                            if let Some(cp) = self.hex_digits(2) {
-                                if let Some(ch) = char::from_u32(cp) {
+                            match self
+                                .hex_digits(2)
+                                .and_then(char::from_u32)
+                            {
+                                Some(ch) => {
+                                    self.tok_escaped = true;
                                     cur.push(ch);
+                                }
+                                None => {
+                                    self.tok_escaped = true;
+                                    cur.push_str("\\x");
                                 }
                             }
                         }
                         'u' => {
-                            if let Some(cp) = self.hex_digits(4) {
-                                if let Some(ch) = char::from_u32(cp) {
+                            let cp = if self.peek() == Some('{') {
+                                self.bump();
+                                let mut v: u32 = 0;
+                                let mut any = false;
+                                while let Some(d) =
+                                    self.peek().and_then(|c| c.to_digit(16))
+                                {
+                                    v = v.saturating_mul(16).saturating_add(d);
+                                    any = true;
+                                    self.bump();
+                                }
+                                if self.peek() == Some('}') && any && v <= 0x10ffff {
+                                    self.bump();
+                                    char::from_u32(v)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                self.hex_digits(4).and_then(char::from_u32)
+                            };
+                            match cp {
+                                Some(ch) => {
+                                    self.tok_escaped = true;
                                     cur.push(ch);
+                                }
+                                None => {
+                                    self.tok_escaped = true;
+                                    cur.push_str("\\u");
                                 }
                             }
                         }
                         '\n' => {}
+                        '\r' => {}
+                        '\u{2028}' | '\u{2029}' => {}
                         other => {
+                            self.tok_escaped = true;
                             cur.push('\\');
                             cur.push(other);
                         }
                     }
                 }
+                // cooked template: raw \r / \r\n normalize to \n (bump folds)
+                '\r' => cur.push('\n'),
                 c => cur.push(c),
             }
         }
@@ -667,14 +913,15 @@ impl Lexer {
                     self.rewind(si, sl, sc, sn);
                     return None;
                 }
-                Some('\n') | Some('\r') => {
+                Some('\n') | Some('\r') | Some('\u{2028}') | Some('\u{2029}') => {
                     self.rewind(si, sl, sc, sn);
                     return None;
                 }
                 Some('\\') => {
                     self.bump();
                     match self.peek() {
-                        Some('\n') | Some('\r') | None => {
+                        Some('\n') | Some('\r') | Some('\u{2028}') | Some('\u{2029}')
+                        | None => {
                             self.rewind(si, sl, sc, sn);
                             return None;
                         }
@@ -798,6 +1045,8 @@ fn slash_is_regex(prev: Option<&Token>) -> bool {
                 | Import
                 | Export
                 | Debugger
+                | With
+                | Enum
         ),
         // keywords NOT listed can end an expression (`this`, literals) or act
         // as contextual identifiers (`let`, `of`, `as`, `get`, `set`,

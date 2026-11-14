@@ -588,6 +588,10 @@ pub struct Scope {
     pub home: RefCell<Option<ObjRef>>,
     /// set on ctor scopes for `super()`
     pub ctor_fn: RefCell<Value>,
+    /// this scope is a function's parameter environment while defaults are
+    /// being evaluated — `eval("var arguments")` / `var eval` inside it is
+    /// a SyntaxError per EvalDeclarationInstantiation
+    pub param_env: std::cell::Cell<bool>,
 }
 
 pub type EnvRef = Rc<Scope>;
@@ -603,6 +607,7 @@ impl Scope {
             new_target: RefCell::new(Value::Und),
             home: RefCell::new(None),
             ctor_fn: RefCell::new(Value::Und),
+            param_env: std::cell::Cell::new(false),
         })
     }
 }
@@ -710,6 +715,9 @@ pub struct Interp {
     /// parsed AST (blocks, try/catch/finally bodies) go through here —
     /// they live for the whole run; function bodies use `fn_hoist`.
     slice_hoist: FxMap<(usize, usize), Rc<Hoisted>>,
+    /// the installed `eval` function — direct `eval(...)` calls compare
+    /// against this to pick the caller-environment evaluation path
+    pub eval_fn: Option<Value>,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -767,6 +775,7 @@ impl Interp {
             interned: FxSet::default(),
             fn_hoist: FxMap::default(),
             slice_hoist: FxMap::default(),
+            eval_fn: None,
         }
     }
 
@@ -2285,6 +2294,11 @@ impl Interp {
         params: &[Param],
         args: &[Value],
     ) -> Result<(), Value> {
+        if params.iter().any(|p| matches!(p, Param::Default(..))) {
+            // default expressions evaluate in the parameter environment —
+            // flag it so direct eval there rejects `var arguments`/`var eval`
+            scope.param_env.set(true);
+        }
         let mut i = 0;
         for p in params {
             match p {
@@ -3737,6 +3751,21 @@ impl Interp {
             }
             _ => {
                 let f = self.eval_expr(callee, env)?;
+                // direct eval: the callee resolved to THE installed eval fn —
+                // run the source in the caller's own environment
+                if let Expr::Ident(n) = callee {
+                    if n == "eval" && self.is_eval_fn(&f) {
+                        let argv = self.eval_args(args, env)?;
+                        let Some(first) = argv.into_iter().next() else {
+                            return Ok(Value::Und);
+                        };
+                        let Value::Str(src) = &first else {
+                            return Ok(first);
+                        };
+                        let src = src.clone();
+                        return self.eval_source(&src, env.clone());
+                    }
+                }
                 let argv = self.eval_args(args, env)?;
                 if !self.is_callable(&f) {
                     let tn = self.type_name(&f);
@@ -3744,6 +3773,14 @@ impl Interp {
                 }
                 self.call(&f, Value::Und, argv)
             }
+        }
+    }
+
+    /// is `f` the installed global `eval` function object?
+    fn is_eval_fn(&self, f: &Value) -> bool {
+        match (f, &self.eval_fn) {
+            (Value::Obj(a), Some(Value::Obj(b))) => Rc::ptr_eq(a, b),
+            _ => false,
         }
     }
 
@@ -4047,6 +4084,57 @@ impl Interp {
             }
             _ => Err(self.ref_err("invalid assignment target")),
         }
+    }
+
+    /// Evaluate `src` as a program in `env` — the engine behind both direct
+    /// and indirect `eval()`. Parse errors surface as thrown SyntaxError
+    /// values so JS try/catch sees them.
+    pub fn eval_source(&mut self, src: &str, env: EnvRef) -> ERes {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(self.range_err("Maximum call stack size exceeded"));
+        }
+        let r = (|| {
+            let stmts = match parser::parse(src) {
+                Ok(s) => s,
+                Err(e) => return Err(self.syntax_err(e.msg)),
+            };
+            // `var arguments`/`var eval` inside a parameter environment is an
+            // early SyntaxError (the implicit binding can't be redeclared)
+            {
+                let h = self.hoisted_slice(&stmts);
+                let mut bad = h.vars.iter().any(|n| &**n == "arguments" || &**n == "eval");
+                if !bad {
+                    bad = h.fns.iter().any(|f| {
+                        f.name.as_deref() == Some("arguments") || f.name.as_deref() == Some("eval")
+                    });
+                }
+                if bad {
+                    let mut cur = Some(&env);
+                    while let Some(s) = cur {
+                        if s.param_env.get() {
+                            return Err(self.syntax_err(
+                                "cannot declare `arguments`/`eval` in eval within a parameter environment",
+                            ));
+                        }
+                        cur = s.parent.as_ref();
+                    }
+                }
+            }
+            self.hoist_body(&stmts, &env)?;
+            let mut last = Value::Und;
+            for s in &stmts {
+                match self.exec_stmt(s, &env) {
+                    Ok(Completion::Normal(v)) | Ok(Completion::Return(v)) => last = v,
+                    Ok(_) => {}
+                    Err(v) => return Err(v),
+                }
+            }
+            Ok(last)
+        })();
+        self.depth -= 1;
+        r
     }
 
     // -- top-level ---------------------------------------------------------------

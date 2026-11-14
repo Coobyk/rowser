@@ -382,7 +382,7 @@ fn install_protos(i: &mut Interp) {
         }
     }
 
-    // -- iterator proto: [Symbol.iterator]() { return this } --
+    // -- iterator proto: [Symbol.iterator]() { return this } + helpers --
     {
         let p = i.p.iterator.clone();
         let f = native(i, "[Symbol.iterator]", iter_self);
@@ -390,6 +390,30 @@ fn install_protos(i: &mut Interp) {
             .props
             .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(f));
         method(i, &p, "next", iter_next);
+        for (name, f) in [
+            ("map", iter_map as NativeFn),
+            ("filter", iter_filter),
+            ("flatMap", iter_flat_map),
+            ("take", iter_take),
+            ("drop", iter_drop),
+            ("reduce", iter_reduce),
+            ("forEach", iter_for_each),
+            ("every", iter_every),
+            ("some", iter_some),
+            ("find", iter_find),
+            ("toArray", iter_to_array),
+            ("indexed", iter_indexed),
+        ] {
+            method(i, &p, name, f);
+        }
+        // Iterator ctor (abstract) + from/concat statics
+        let itctor = make_ctor(i, "Iterator", iter_ctor, p.clone());
+        if let Value::Obj(o) = &itctor {
+            method(i, o, "from", iter_from);
+            method(i, o, "concat", iter_concat);
+        }
+        i.set_builtin(&p, "constructor", itctor.clone());
+        define_global(i, "Iterator", itctor);
     }
 
     // -- RegExp.prototype --
@@ -459,6 +483,231 @@ pub(crate) fn make_iter(i: &mut Interp, items: Vec<Value>) -> Value {
         ObjKind::Iter { items, idx: 0 },
     )));
     Value::Obj(o)
+}
+
+/// `this` must be an object — Iterator helpers require it.
+fn iter_this(i: &mut Interp, this: &Value) -> Result<(), Value> {
+    if !matches!(this, Value::Obj(_)) {
+        return Err(i.type_err("Iterator.prototype method called on non-object"));
+    }
+    Ok(())
+}
+
+/// drain `this` via the iteration protocol (consuming generic iterators,
+/// snapshotting Vec-backed ones).
+fn iter_drain(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
+    i.iter_values(this)
+}
+
+fn iter_ctor(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
+    Err(i.type_err("The Iterator constructor cannot be constructed directly"))
+}
+
+/// `Iterator.from(obj)` — object with `next` is wrapped (returned as-is when
+/// it's already one of ours); iterable values are drained to a snapshot.
+fn iter_from(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let v = arg(args, 0);
+    let Value::Obj(o) = &v else {
+        return Err(i.type_err("Iterator.from requires an object"));
+    };
+    // already an iterator object → spec wraps; ours can return directly
+    if matches!(o.borrow().kind, ObjKind::Iter { .. }) {
+        return Ok(v.clone());
+    }
+    // has a `next` method → treat as an iterator: drain via protocol now
+    // (eager snapshot keeps Vec-backed semantics consistent)
+    let next = i.get_prop(&v, &PropKey::from_str("next"))?;
+    if i.is_callable(&next) {
+        let mut out = Vec::new();
+        loop {
+            if out.len() > 100_000 {
+                return Err(i.range_err("iteration limit exceeded"));
+            }
+            let r = i.call(&next, v.clone(), vec![])?;
+            let done = i.get_prop(&r, &PropKey::from_str("done"))?;
+            if i.to_bool(&done) {
+                break;
+            }
+            out.push(i.get_prop(&r, &PropKey::from_str("value"))?);
+        }
+        return Ok(make_iter(i, out));
+    }
+    // iterable → Symbol.iterator
+    let items = i.iter_values(&v)?;
+    Ok(make_iter(i, items))
+}
+
+/// `Iterator.concat(...iters)` — lazy spec concat; we eagerly concatenate.
+fn iter_concat(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let mut out = Vec::new();
+    for a in args {
+        out.extend(i.iter_values(a)?);
+    }
+    Ok(make_iter(i, out))
+}
+
+fn iter_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let f = arg(args, 0);
+    if !i.is_callable(&f) {
+        return Err(i.type_err("mapper is not a function"));
+    }
+    let items = iter_drain(i, this)?;
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, v) in items.into_iter().enumerate() {
+        out.push(i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?);
+    }
+    Ok(make_iter(i, out))
+}
+
+fn iter_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let f = arg(args, 0);
+    if !i.is_callable(&f) {
+        return Err(i.type_err("predicate is not a function"));
+    }
+    let items = iter_drain(i, this)?;
+    let mut out = Vec::new();
+    for (idx, v) in items.into_iter().enumerate() {
+        let keep = i.call(&f, Value::Und, vec![v.clone(), Value::Num(idx as f64)])?;
+        if i.to_bool(&keep) {
+            out.push(v);
+        }
+    }
+    Ok(make_iter(i, out))
+}
+
+fn iter_flat_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let f = arg(args, 0);
+    if !i.is_callable(&f) {
+        return Err(i.type_err("mapper is not a function"));
+    }
+    let items = iter_drain(i, this)?;
+    let mut out = Vec::new();
+    for (idx, v) in items.into_iter().enumerate() {
+        let r = i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?;
+        out.extend(i.iter_values(&r)?);
+    }
+    Ok(make_iter(i, out))
+}
+
+fn iter_take(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let n = i.to_num(&arg(args, 0))?;
+    if n.is_nan() || n < 0.0 {
+        return Err(i.range_err("take limit must be a non-negative number"));
+    }
+    let items = iter_drain(i, this)?;
+    Ok(make_iter(i, items.into_iter().take(n as usize).collect()))
+}
+
+fn iter_drop(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let n = i.to_num(&arg(args, 0))?;
+    if n.is_nan() || n < 0.0 {
+        return Err(i.range_err("drop limit must be a non-negative number"));
+    }
+    let items = iter_drain(i, this)?;
+    Ok(make_iter(i, items.into_iter().skip(n as usize).collect()))
+}
+
+fn iter_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let f = arg(args, 0);
+    if !i.is_callable(&f) {
+        return Err(i.type_err("reducer is not a function"));
+    }
+    let items = iter_drain(i, this)?;
+    let mut it = items.into_iter();
+    let (mut acc, mut idx) = match args.get(1) {
+        Some(v) => (v.clone(), 0usize),
+        None => match it.next() {
+            Some(v) => (v, 1),
+            None => return Err(i.type_err("Reduce of empty iterator with no initial value")),
+        },
+    };
+    for v in it {
+        acc = i.call(&f, Value::Und, vec![acc, v, Value::Num(idx as f64)])?;
+        idx += 1;
+    }
+    Ok(acc)
+}
+
+fn iter_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let f = arg(args, 0);
+    if !i.is_callable(&f) {
+        return Err(i.type_err("callback is not a function"));
+    }
+    for (idx, v) in iter_drain(i, this)?.into_iter().enumerate() {
+        i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?;
+    }
+    Ok(Value::Und)
+}
+
+fn iter_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let f = arg(args, 0);
+    if !i.is_callable(&f) {
+        return Err(i.type_err("predicate is not a function"));
+    }
+    for (idx, v) in iter_drain(i, this)?.into_iter().enumerate() {
+        let r = i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?;
+        if !i.to_bool(&r) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn iter_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let f = arg(args, 0);
+    if !i.is_callable(&f) {
+        return Err(i.type_err("predicate is not a function"));
+    }
+    for (idx, v) in iter_drain(i, this)?.into_iter().enumerate() {
+        let r = i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?;
+        if i.to_bool(&r) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn iter_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let f = arg(args, 0);
+    if !i.is_callable(&f) {
+        return Err(i.type_err("predicate is not a function"));
+    }
+    for (idx, v) in iter_drain(i, this)?.into_iter().enumerate() {
+        let r = i.call(&f, Value::Und, vec![v.clone(), Value::Num(idx as f64)])?;
+        if i.to_bool(&r) {
+            return Ok(v);
+        }
+    }
+    Ok(Value::Und)
+}
+
+fn iter_to_array(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let items = iter_drain(i, this)?;
+    Ok(Value::Obj(i.new_arr(items)))
+}
+
+fn iter_indexed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let items = iter_drain(i, this)?;
+    let out: Vec<Value> = items
+        .into_iter()
+        .enumerate()
+        .map(|(idx, v)| {
+            Value::Obj(i.new_arr(vec![Value::Num(idx as f64), v]))
+        })
+        .collect();
+    Ok(make_iter(i, out))
 }
 
 // ---------------------------------------------------------------------------
@@ -884,8 +1133,17 @@ fn install_globals(i: &mut Interp) {
         ("alert", g_noop),
         ("btoa", g_btoa),
         ("atob", g_atob),
+        ("eval", g_eval),
     ] {
         define_global(i, n, native(i, n, f));
+    }
+    // remember the installed eval so direct `eval(...)` calls take the
+    // caller-environment path
+    {
+        let g = i.global.clone();
+        if let Some(v) = i.env_lookup(&g, "eval") {
+            i.eval_fn = Some(v);
+        }
     }
 
     // WeakMap/WeakSet minimal → alias to Map/Set behavior
@@ -4738,6 +4996,20 @@ fn g_set_timeout(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
 
 fn g_noop(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Und)
+}
+
+/// `eval(x)` reached as an ordinary call — indirect eval → global scope.
+/// (Direct eval is intercepted in `eval_call` before the native runs.)
+fn g_eval(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let Some(first) = args.first() else {
+        return Ok(Value::Und);
+    };
+    let Value::Str(src) = first else {
+        return Ok(first.clone());
+    };
+    let src = src.clone();
+    let g = i.global.clone();
+    i.eval_source(&src, g)
 }
 
 fn g_queue_microtask(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
