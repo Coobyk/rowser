@@ -831,17 +831,24 @@ impl Interp {
     // -- error helpers ------------------------------------------------------
     pub fn err_obj(&mut self, proto: &ObjRef, name: &str, msg: &str) -> Value {
         let o = Rc::new(RefCell::new(Obj::new(Some(proto.clone()), ObjKind::Err)));
-        o.borrow_mut().props.insert(
-            PropKey::from_str("message"),
-            Prop::data(Value::Str(Rc::from(msg))),
-        );
-        o.borrow_mut().props.insert(
-            PropKey::from_str("name"),
-            Prop::data(Value::Str(Rc::from(name))),
-        );
+        // spec: error own props are writable+configurable, non-enumerable
+        let p = |v: Value| Prop {
+            val: v,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            get: None,
+            set: None,
+        };
+        o.borrow_mut()
+            .props
+            .insert(PropKey::from_str("message"), p(Value::Str(Rc::from(msg))));
+        o.borrow_mut()
+            .props
+            .insert(PropKey::from_str("name"), p(Value::Str(Rc::from(name))));
         o.borrow_mut().props.insert(
             PropKey::from_str("stack"),
-            Prop::data(Value::Str(Rc::from(format!("{name}: {msg}")))),
+            p(Value::Str(Rc::from(format!("{name}: {msg}")))),
         );
         Value::Obj(o)
     }
@@ -1084,6 +1091,23 @@ impl Interp {
             .props
             .insert(PropKey::from_str(key), Prop::builtin(v));
     }
+
+    /// `set_builtin` with explicit attributes — for spec-mandated
+    /// non-writable / non-configurable installs (constants, fn metadata).
+    pub fn set_attr(&self, o: &ObjRef, key: &str, v: Value, writable: bool, configurable: bool) {
+        o.borrow_mut().props.insert(
+            PropKey::from_str(key),
+            Prop {
+                val: v,
+                writable,
+                enumerable: false,
+                configurable,
+                get: None,
+                set: None,
+            },
+        );
+    }
+
     pub fn native(&self, name: &str, f: NativeFn) -> Value {
         let o = Rc::new(RefCell::new(Obj::new(
             Some(self.p.func.clone()),
@@ -1092,8 +1116,9 @@ impl Interp {
                 f,
             }),
         )));
-        self.set_builtin(&o, "length", Value::Num(0.0));
-        self.set_builtin(&o, "name", Value::Str(Rc::from(name)));
+        // fn .length/.name: {writable:false, enumerable:false, configurable:true}
+        self.set_attr(&o, "length", Value::Num(0.0), false, true);
+        self.set_attr(&o, "name", Value::Str(Rc::from(name)), false, true);
         Value::Obj(o)
     }
 
@@ -1424,15 +1449,20 @@ impl Interp {
         if let ObjKind::Arr(items) = &mut b.kind {
             if let PropKey::S(s) = &key {
                 if let Some(i) = arr_index(s) {
-                    if i >= items.len() {
+                    // dense backing — writes past the cap are holey-array
+                    // semantics we can't honor; drop instead of OOMing on
+                    // arr[2**31] = x
+                    if i >= items.len() && i <= 8_000_000 {
                         items.resize(i + 1, Value::Und);
                     }
-                    items[i] = v;
+                    if i < items.len() {
+                        items[i] = v;
+                    }
                     return Ok(());
                 }
                 if s.as_ref() == "length" {
                     if let Value::Num(n) = v {
-                        let n = n.max(0.0) as usize;
+                        let n = (n.max(0.0) as usize).min(8_000_000);
                         items.resize(n, Value::Und);
                         return Ok(());
                     }
@@ -1558,15 +1588,17 @@ impl Interp {
         let mut b = o.borrow_mut();
         if let ObjKind::Arr(items) = &mut b.kind {
             if let Some(i) = arr_index(key) {
-                if i >= items.len() {
+                if i >= items.len() && i <= 8_000_000 {
                     items.resize(i + 1, Value::Und);
                 }
-                items[i] = v;
+                if i < items.len() {
+                    items[i] = v;
+                }
                 return Ok(());
             }
             if key == "length" {
                 if let Value::Num(n) = v {
-                    let n = n.max(0.0) as usize;
+                    let n = (n.max(0.0) as usize).min(8_000_000);
                     items.resize(n, Value::Und);
                     return Ok(());
                 }
@@ -1589,6 +1621,9 @@ impl Interp {
                     return true;
                 }
             }
+        }
+        if b.props.get_str(key).is_some_and(|p| !p.configurable) {
+            return false;
         }
         b.props.remove_str(key);
         true
@@ -1669,6 +1704,9 @@ impl Interp {
                     }
                 }
             }
+        }
+        if b.props.get(key).is_some_and(|p| !p.configurable) {
+            return false;
         }
         b.props.remove(key);
         true
@@ -2133,9 +2171,14 @@ impl Interp {
         match kind {
             ObjKind::Func(Func::Native { f: nf, name }) => {
                 // natives act as their own ctor (Error, Array(1,2), etc.)
+                // — but only ctors (make_ctor sets `.prototype`); plain
+                // methods like Math.abs are not [[Construct]]-able
                 let proto_prop = self
                     .obj_get_raw(&o.clone(), &PropKey::from_str("prototype"))
                     .unwrap_or(Value::Und);
+                if matches!(proto_prop, Value::Und) {
+                    return Err(self.type_err(format!("{name} is not a constructor")));
+                }
                 let this = if let Value::Obj(proto) = &proto_prop {
                     Value::Obj(Rc::new(RefCell::new(Obj::new(
                         Some(proto.clone()),
@@ -2608,8 +2651,8 @@ impl Interp {
             }),
         )));
         let name = def.name.clone().unwrap_or_default();
-        self.set_builtin(&o, "name", Value::Str(Rc::from(name.as_str())));
-        self.set_builtin(&o, "length", Value::Num(param_count(&def.params) as f64));
+        self.set_attr(&o, "name", Value::Str(Rc::from(name.as_str())), false, true);
+        self.set_attr(&o, "length", Value::Num(param_count(&def.params) as f64), false, true);
         if !def.is_arrow {
             let proto = self.new_obj();
             self.set_builtin(&proto, "constructor", Value::Obj(o.clone()));
@@ -4121,11 +4164,31 @@ pub fn js_num_str(n: f64) -> String {
     if n == 0.0 {
         return "0".into();
     }
-    if n == n.trunc() && n.abs() < 1e21 {
-        return format!("{}", n as i64);
+    let abs = n.abs();
+    if (1e-6..1e21).contains(&abs) {
+        // decimal notation — integral values print full digits ({:.0}
+        // handles magnitudes past i64::MAX where `as i64` saturates);
+        // non-integral values use Display's shortest round-trip form
+        return if n == n.trunc() {
+            format!("{n:.0}")
+        } else {
+            format!("{n}")
+        };
     }
-    let s = format!("{n}");
-    s
+    // exponential: Rust's {:e} gives "1e21"/"1.5e-7"; JS wants an
+    // explicit '+' on positive exponents and no leading-zero padding
+    let s = format!("{n:e}");
+    match s.find('e') {
+        Some(i) => {
+            let (m, e) = (&s[..i], &s[i + 1..]);
+            if let Some(d) = e.strip_prefix('-') {
+                format!("{m}e-{d}")
+            } else {
+                format!("{m}e+{e}")
+            }
+        }
+        None => s,
+    }
 }
 
 fn param_count(params: &[Param]) -> usize {

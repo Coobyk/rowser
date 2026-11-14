@@ -176,7 +176,7 @@ pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
                 return Ok(items.clone());
             }
             let len = i.get_prop_str(v, "length")?;
-            let n = i.to_num(&len)? as usize;
+            let n = (i.to_num(&len)?.max(0.0) as usize).min(8_000_000);
             let mut out = Vec::with_capacity(n.min(1_000_000));
             for k in 0..n {
                 out.push(i.get_prop(v, &idx_key(k))?);
@@ -469,6 +469,15 @@ fn install_globals(i: &mut Interp) {
     define_global(i, "undefined", Value::Und);
     define_global(i, "NaN", Value::Num(f64::NAN));
     define_global(i, "Infinity", Value::Num(f64::INFINITY));
+    // spec: NaN/Infinity/undefined are non-writable non-configurable
+    // global data properties
+    for (n, v) in [
+        ("NaN", Value::Num(f64::NAN)),
+        ("Infinity", Value::Num(f64::INFINITY)),
+        ("undefined", Value::Und),
+    ] {
+        i.set_attr(&i.p.global.clone(), n, v, false, false);
+    }
     let g = i.p.global.clone();
     define_global(i, "globalThis", Value::Obj(g.clone()));
     define_global(i, "window", Value::Obj(g.clone()));
@@ -575,7 +584,7 @@ fn install_globals(i: &mut Interp) {
             ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
             ("NaN", f64::NAN),
         ] {
-            i.set_builtin(o, n, Value::Num(v));
+            i.set_attr(o, n, Value::Num(v), false, false);
         }
         define_global(i, "Number", ctor);
     }
@@ -584,6 +593,12 @@ fn install_globals(i: &mut Interp) {
     {
         let ctor = make_ctor(i, "Boolean", boolean_ctor, i.p.boolean.clone());
         define_global(i, "Boolean", ctor);
+    }
+
+    // -- Function --
+    {
+        let ctor = make_ctor(i, "Function", function_ctor, i.p.func.clone());
+        define_global(i, "Function", ctor);
     }
 
     // -- Symbol --
@@ -682,7 +697,7 @@ fn install_globals(i: &mut Interp) {
             ("SQRT2", std::f64::consts::SQRT_2),
             ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
         ] {
-            i.set_builtin(&m, n, Value::Num(v));
+            i.set_attr(&m, n, Value::Num(v), false, false);
         }
         define_global(i, "Math", Value::Obj(m));
     }
@@ -917,7 +932,7 @@ fn make_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: ObjRef) -> Value {
             f,
         }),
     )));
-    i.set_builtin(&o, "name", Value::Str(Rc::from(name)));
+    i.set_attr(&o, "name", Value::Str(Rc::from(name)), false, true);
     i.set_builtin(&o, "prototype", Value::Obj(proto.clone()));
     i.set_builtin(&proto, "constructor", Value::Obj(o.clone()));
     Value::Obj(o)
@@ -1036,11 +1051,30 @@ fn obj_get_proto(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     }
 }
 
+/// Would `o.proto = p` close a cycle? Walks p's chain looking for `o`;
+/// the hop cap treats pathological pre-existing chains as cyclic.
+fn proto_cycle(o: &ObjRef, p: &ObjRef) -> bool {
+    let mut cur = Some(p.clone());
+    let mut hops = 0usize;
+    while let Some(c) = cur {
+        if Rc::ptr_eq(&c, o) {
+            return true;
+        }
+        cur = c.borrow().proto.clone();
+        hops += 1;
+        if hops > 100_000 {
+            return true;
+        }
+    }
+    false
+}
+
 fn obj_set_proto(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let _ = i;
     if let (Value::Obj(o), v) = (this, &arg(args, 0)) {
         match v {
-            Value::Obj(p) => o.borrow_mut().proto = Some(p.clone()),
+            // __proto__ set silently ignores a cycle-forming value
+            Value::Obj(p) if !proto_cycle(o, p) => o.borrow_mut().proto = Some(p.clone()),
             Value::Null => o.borrow_mut().proto = None,
             _ => {}
         }
@@ -1149,41 +1183,123 @@ fn define_prop_from_desc(
     key: PropKey,
     desc: &Value,
 ) -> Result<(), Value> {
-    let mut prop = {
-        let b = o.borrow();
-        b.props.get(&key).cloned().unwrap_or(Prop {
-            val: Value::Und,
-            writable: true,
-            enumerable: true,
-            configurable: true,
-            get: None,
-            set: None,
-        })
-    };
-    // accessor?
     let (has_get, gv) = read_desc_prop(i, desc, "get")?;
     let (has_set, sv) = read_desc_prop(i, desc, "set")?;
     let (has_val, vv) = read_desc_prop(i, desc, "value")?;
-    if has_get || has_set {
-        prop.get = if has_get { Some(gv) } else { prop.get };
-        prop.set = if has_set { Some(sv) } else { prop.set };
-        prop.writable = false;
-        prop.enumerable = false;
+    let (has_w, wv) = read_desc_prop(i, desc, "writable")?;
+    let (has_e, ev) = read_desc_prop(i, desc, "enumerable")?;
+    let (has_c, cv) = read_desc_prop(i, desc, "configurable")?;
+    let is_acc = has_get || has_set;
+    // ToPropertyDescriptor validity (spec 6.2.6.5 steps 5-7)
+    if is_acc && (has_val || has_w) {
+        return Err(i.type_err(
+            "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+        ));
     }
-    if has_val {
-        prop.val = vv;
+    if has_get && !matches!(gv, Value::Und) && !i.is_callable(&gv) {
+        return Err(i.type_err("Getter must be a function"));
+    }
+    if has_set && !matches!(sv, Value::Und) && !i.is_callable(&sv) {
+        return Err(i.type_err("Setter must be a function"));
+    }
+
+    // array element / length targets live in the dense store, not props
+    {
+        let mut b = o.borrow_mut();
+        if let ObjKind::Arr(items) = &mut b.kind {
+            if let PropKey::S(s) = &key {
+                if let Some(idx) = arr_index(s) {
+                    if is_acc {
+                        return Err(i.type_err("Invalid property descriptor"));
+                    }
+                    if idx < items.len() {
+                        if has_val {
+                            items[idx] = vv;
+                        }
+                    } else if has_val && idx <= 8_000_000 {
+                        items.resize(idx + 1, Value::Und);
+                        items[idx] = vv;
+                    }
+                    return Ok(());
+                }
+                if s.as_ref() == "length" {
+                    if let (Value::Num(n), true) = (&vv, has_val) {
+                        let n = (n.max(0.0) as usize).min(8_000_000);
+                        items.resize(n, Value::Und);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    let existing = {
+        let b = o.borrow();
+        b.props.get(&key).cloned()
+    };
+    // non-configurable existing prop — ValidateAndApplyPropertyDescriptor
+    // constraints (spec 10.1.6.3): attribute changes, data↔accessor kind
+    // changes, and writes to non-writable values all throw.
+    if let Some(old) = &existing {
+        if !old.configurable {
+            if has_c && i.to_bool(&cv) {
+                return Err(i.type_err("Cannot redefine property"));
+            }
+            if has_e && i.to_bool(&ev) != old.enumerable {
+                return Err(i.type_err("Cannot redefine property"));
+            }
+            if is_acc != old.is_accessor() {
+                return Err(i.type_err("Cannot redefine property"));
+            }
+            if old.is_accessor() {
+                if has_get && !i.same_value(&gv, old.get.as_ref().unwrap_or(&Value::Und))? {
+                    return Err(i.type_err("Cannot redefine property"));
+                }
+                if has_set && !i.same_value(&sv, old.set.as_ref().unwrap_or(&Value::Und))? {
+                    return Err(i.type_err("Cannot redefine property"));
+                }
+            } else if !old.writable {
+                if has_w && i.to_bool(&wv) {
+                    return Err(i.type_err("Cannot redefine property"));
+                }
+                if has_val && !i.same_value(&vv, &old.val)? {
+                    return Err(i.type_err("Cannot redefine property"));
+                }
+            }
+        }
+    }
+    let mut prop = existing.unwrap_or(Prop {
+        // NEW property: attributes absent from the desc default to false
+        // (spec) — unlike ordinary assignment which defaults all true.
+        val: Value::Und,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+        get: None,
+        set: None,
+    });
+    if is_acc {
+        if has_get {
+            prop.get = if matches!(gv, Value::Und) { None } else { Some(gv) };
+        }
+        if has_set {
+            prop.set = if matches!(sv, Value::Und) { None } else { Some(sv) };
+        }
+        prop.val = Value::Und;
+        prop.writable = false;
+    } else {
+        if has_val {
+            prop.val = vv;
+        }
+        if has_w {
+            prop.writable = i.to_bool(&wv);
+        }
         prop.get = None;
         prop.set = None;
     }
-    let (has_w, wv) = read_desc_prop(i, desc, "writable")?;
-    if has_w {
-        prop.writable = i.to_bool(&wv);
-    }
-    let (has_e, ev) = read_desc_prop(i, desc, "enumerable")?;
     if has_e {
         prop.enumerable = i.to_bool(&ev);
     }
-    let (has_c, cv) = read_desc_prop(i, desc, "configurable")?;
     if has_c {
         prop.configurable = i.to_bool(&cv);
     }
@@ -1272,11 +1388,15 @@ fn obj_get_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 }
 
 fn obj_set_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let _ = i;
     let t = arg(args, 0);
     if let (Value::Obj(o), v) = (&t, &arg(args, 1)) {
         match v {
-            Value::Obj(p) => o.borrow_mut().proto = Some(p.clone()),
+            Value::Obj(p) => {
+                if proto_cycle(o, p) {
+                    return Err(i.type_err("Cyclic __proto__ value"));
+                }
+                o.borrow_mut().proto = Some(p.clone());
+            }
             Value::Null => o.borrow_mut().proto = None,
             _ => {}
         }
@@ -1430,9 +1550,9 @@ fn fn_apply(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn fn_bind(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let Value::Obj(_) = this else {
+    if !i.is_callable(this) {
         return Err(i.type_err("Bind must be called on a function"));
-    };
+    }
     let bound = Rc::new(RefCell::new(Obj::new(
         Some(i.p.func.clone()),
         ObjKind::Bound {
@@ -1441,7 +1561,19 @@ fn fn_bind(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             extra: args.iter().skip(1).cloned().collect(),
         },
     )));
-    i.set_builtin(&bound, "name", Value::Str(Rc::from("bound")));
+    // spec: name = "bound " + target.name; length = max(0, L - N) where L
+    // is the target's .length and N the bound-arg count
+    let tname = match i.get_prop_str(this, "name") {
+        Ok(Value::Str(s)) => s.to_string(),
+        _ => String::new(),
+    };
+    i.set_attr(&bound, "name", Value::Str(Rc::from(format!("bound {tname}"))), false, true);
+    let tlen = match i.get_prop_str(this, "length") {
+        Ok(v) => i.to_num(&v).unwrap_or(0.0),
+        Err(_) => 0.0,
+    };
+    let blen = (tlen - (args.len() as f64 - 1.0).max(0.0)).max(0.0);
+    i.set_attr(&bound, "length", Value::Num(blen), false, true);
     Ok(Value::Obj(bound))
 }
 
@@ -1470,6 +1602,11 @@ fn array_ctor(i: &mut Interp, _this: &Value, args: &[Value]) -> NResult {
     if args.len() == 1 {
         if let Value::Num(n) = args[0] {
             if n >= 0.0 && n == n.trunc() && n < 4294967295.0 {
+                // dense Vec backing — can't honor holey arrays past a
+                // sane bound (spec allows 2^32-1; real engines go sparse)
+                if n > 8_000_000.0 {
+                    return Err(i.range_err("Invalid array length"));
+                }
                 return Ok(Value::Obj(i.new_arr(vec![Value::Und; n as usize])));
             }
             return Err(i.range_err("Invalid array length"));
@@ -1576,7 +1713,7 @@ fn arr_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         }
         return Ok(Value::Obj(i.new_arr(vec![])));
     }
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let len = items.len();
     let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
     let end = match arg(args, 1) {
@@ -1621,7 +1758,7 @@ fn arr_splice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let mut out = arr_clone(this);
+    let mut out = to_elems(i, this)?;
     for a in args {
         match a {
             Value::Obj(o) if matches!(o.borrow().kind, ObjKind::Arr(_)) => {
@@ -1641,7 +1778,7 @@ fn arr_join(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     // snapshot the items: to_str on an element can run user code that
     // mutates the array, so we can't hold the borrow across it — but we
     // can append straight into the output instead of a Vec<String> + join.
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let mut out = String::new();
     for (k, it) in items.iter().enumerate() {
         if k > 0 {
@@ -1671,11 +1808,11 @@ fn arr_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                         return Ok(Value::Num(k as f64));
                     }
                 }
+                return Ok(Value::Num(-1.0));
             }
         }
-        return Ok(Value::Num(-1.0));
     }
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), items.len());
     for (k, v) in items.iter().enumerate().skip(start) {
         if strict_val_eq(v, &needle) {
@@ -1685,7 +1822,7 @@ fn arr_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(Value::Num(-1.0))
 }
 
-fn arr_last_index_of(_i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+fn arr_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let needle = arg(args, 0);
     // no user code runs here — scan in place under one borrow
     if let Value::Obj(o) = this {
@@ -1696,6 +1833,13 @@ fn arr_last_index_of(_i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                     return Ok(Value::Num(k as f64));
                 }
             }
+            return Ok(Value::Num(-1.0));
+        }
+    }
+    let items = to_elems(i, this)?;
+    for k in (0..items.len()).rev() {
+        if strict_val_eq(&items[k], &needle) {
+            return Ok(Value::Num(k as f64));
         }
     }
     Ok(Value::Num(-1.0))
@@ -1721,7 +1865,6 @@ fn same_value_zero(a: &Value, b: &Value) -> bool {
 }
 
 fn arr_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let _ = i;
     let needle = arg(args, 0);
     // no user code runs here — scan in place under one borrow
     if let Value::Obj(o) = this {
@@ -1730,13 +1873,14 @@ fn arr_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             return Ok(Value::Bool(items.iter().any(|v| same_value_zero(v, &needle))));
         }
     }
-    Ok(Value::Bool(false))
+    let items = to_elems(i, this)?;
+    Ok(Value::Bool(items.iter().any(|v| same_value_zero(v, &needle))))
 }
 
 fn arr_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     for (k, v) in items.iter().enumerate() {
         let r = i.call(
             &cb,
@@ -1753,7 +1897,7 @@ fn arr_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     for (k, v) in items.iter().enumerate() {
         let r = i.call(
             &cb,
@@ -1770,7 +1914,7 @@ fn arr_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     for k in (0..items.len()).rev() {
         let r = i.call(
             &cb,
@@ -1787,7 +1931,7 @@ fn arr_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     for k in (0..items.len()).rev() {
         let r = i.call(
             &cb,
@@ -1804,7 +1948,7 @@ fn arr_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult 
 fn arr_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let mut out = Vec::new();
     for (k, v) in items.iter().enumerate() {
         let r = i.call(
@@ -1822,7 +1966,7 @@ fn arr_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let mut out = Vec::with_capacity(items.len());
     for (k, v) in items.iter().enumerate() {
         out.push(i.call(
@@ -1837,7 +1981,7 @@ fn arr_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     for (k, v) in items.iter().enumerate() {
         i.call(
             &cb,
@@ -1850,7 +1994,7 @@ fn arr_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn arr_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let (mut acc, start) = match args.get(1) {
         Some(v) => (v.clone(), 0),
         None => {
@@ -1872,7 +2016,7 @@ fn arr_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn arr_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let (mut acc, start) = match args.get(1) {
         Some(v) => (v.clone(), items.len()),
         None => {
@@ -1895,7 +2039,7 @@ fn arr_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     for (k, v) in items.iter().enumerate() {
         let r = i.call(
             &cb,
@@ -1912,7 +2056,7 @@ fn arr_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     for (k, v) in items.iter().enumerate() {
         let r = i.call(
             &cb,
@@ -1928,7 +2072,7 @@ fn arr_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn arr_flat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let depth = i.to_num(&arg(args, 0)).unwrap_or(1.0) as usize;
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     fn rec(i: &Interp, items: Vec<Value>, d: usize, out: &mut Vec<Value>) {
         let _ = i;
         for v in items {
@@ -2079,7 +2223,7 @@ fn arr_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         }
         return Ok(Value::Und);
     }
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
     let idx = if n < 0.0 {
         items.len() as i64 + n as i64
@@ -2093,7 +2237,7 @@ fn arr_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     Ok(make_iter(
         i,
         (0..items.len()).map(|k| Value::Num(k as f64)).collect(),
@@ -2101,11 +2245,12 @@ fn arr_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 fn arr_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(make_iter(i, arr_clone(this)))
+    let items = to_elems(i, this)?;
+    Ok(make_iter(i, items))
 }
 
 fn arr_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let items = arr_clone(this);
+    let items = to_elems(i, this)?;
     let mut out = Vec::new();
     for (k, v) in items.into_iter().enumerate() {
         out.push(Value::Obj(i.new_arr(vec![Value::Num(k as f64), v])));
@@ -2488,6 +2633,9 @@ fn expand_replacement(rep: &str, matched: &str, pos: usize, whole: &str) -> Stri
 fn str_pad_start(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let target = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
+    if target > 1_000_000 {
+        return Err(i.range_err("Invalid string length"));
+    }
     let pad = match arg(args, 1) {
         Value::Und => " ".to_string(),
         v => i.to_str(&v)?,
@@ -2508,6 +2656,9 @@ fn str_pad_start(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn str_pad_end(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let target = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
+    if target > 1_000_000 {
+        return Err(i.range_err("Invalid string length"));
+    }
     let pad = match arg(args, 1) {
         Value::Und => " ".to_string(),
         v => i.to_str(&v)?,
@@ -2812,6 +2963,26 @@ fn boolean_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     }
 }
 
+/// `Function(p1, …, pN, body)` — compiles a global-scoped function from
+/// the argument sources (spec CreateDynamicFunction, minus realm checks).
+fn function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let (params, body) = match args.split_last() {
+        None => (String::new(), String::new()),
+        Some((b, ps)) => {
+            let mut names = Vec::with_capacity(ps.len());
+            for p in ps {
+                names.push(i.to_str(p)?);
+            }
+            (names.join(","), i.to_str(b)?)
+        }
+    };
+    let src = format!("(function anonymous({params}) {{\n{body}\n}})");
+    match i.run(&src) {
+        Ok(v) => Ok(v),
+        Err(e) => Err(i.syntax_err(format!("{e}"))),
+    }
+}
+
 fn symbol_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if matches!(this, Value::Obj(_)) {
         return Err(i.type_err("Symbol is not a constructor"));
@@ -2883,12 +3054,14 @@ fn error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     };
     if let Value::Obj(o) = this {
         o.borrow_mut().kind = ObjKind::Err;
-        i.set_data(o, "message", Value::Str(Rc::from(msg.as_str())));
-        i.set_data(o, "name", Value::Str(Rc::from("Error")));
-        i.set_data(
+        i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
+        i.set_attr(o, "name", Value::Str(Rc::from("Error")), true, true);
+        i.set_attr(
             o,
             "stack",
             Value::Str(Rc::from(format!("Error: {msg}").as_str())),
+            true,
+            true,
         );
         return Ok(this.clone());
     }
@@ -2905,12 +3078,14 @@ macro_rules! sub_err_ctor {
             };
             if let Value::Obj(o) = this {
                 o.borrow_mut().kind = ObjKind::Err;
-                i.set_data(o, "message", Value::Str(Rc::from(msg.as_str())));
-                i.set_data(o, "name", Value::Str(Rc::from($jname)));
-                i.set_data(
+                i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
+                i.set_attr(o, "name", Value::Str(Rc::from($jname)), true, true);
+                i.set_attr(
                     o,
                     "stack",
                     Value::Str(Rc::from(format!("{}: {}", $jname, msg).as_str())),
+                    true,
+                    true,
                 );
                 return Ok(this.clone());
             }
@@ -3231,7 +3406,8 @@ fn json_stringify(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         _ => String::new(),
     };
     let mut out = String::new();
-    if json_ser_into(i, &v, &indent, 0, &mut out)? {
+    let mut stack = Vec::new();
+    if json_ser_into(i, &v, &indent, 0, &mut out, &mut stack)? {
         Ok(Value::Str(Rc::from(out.as_str())))
     } else {
         Ok(Value::Und)
@@ -3253,6 +3429,7 @@ fn json_ser_into(
     indent: &str,
     level: usize,
     out: &mut String,
+    stack: &mut Vec<usize>,
 ) -> Result<bool, Value> {
     // replacer via toJSON
     let tj = i.get_prop_str(v, "toJSON").unwrap_or(Value::Und);
@@ -3284,6 +3461,13 @@ fn json_ser_into(
             true
         }
         Value::Obj(o) => {
+            // cyclic structure → TypeError (JSON.stringify spec); the
+            // ancestor stack distinguishes cycles from merely shared refs
+            let ptr = Rc::as_ptr(o) as usize;
+            if stack.contains(&ptr) {
+                return Err(i.type_err("circular structure"));
+            }
+            stack.push(ptr);
             enum K {
                 Arr(Vec<Value>),
                 Obj,
@@ -3298,90 +3482,94 @@ fn json_ser_into(
                     _ => K::Obj,
                 }
             };
-            match k {
-                K::Skip => false,
-                K::Arr(items) => {
-                    if indent.is_empty() {
-                        out.push('[');
-                        for (n, it) in items.iter().enumerate() {
-                            if n > 0 {
-                                out.push(',');
-                            }
-                            if !json_ser_into(i, it, indent, level + 1, out)? {
-                                out.push_str("null");
-                            }
-                        }
-                        out.push(']');
-                    } else if items.is_empty() {
-                        out.push_str("[]");
-                    } else {
-                        out.push_str("[\n");
-                        json_pad(out, indent, level + 1);
-                        for (n, it) in items.iter().enumerate() {
-                            if n > 0 {
-                                out.push_str(",\n");
-                                json_pad(out, indent, level + 1);
-                            }
-                            if !json_ser_into(i, it, indent, level + 1, out)? {
-                                out.push_str("null");
-                            }
-                        }
-                        out.push('\n');
-                        json_pad(out, indent, level);
-                        out.push(']');
-                    }
-                    true
-                }
-                K::Obj => {
-                    let entries = own_enum_entries(&v2);
-                    let sep_colon: &str = if indent.is_empty() { ":" } else { ": " };
-                    let open_len = out.len();
-                    if indent.is_empty() {
-                        out.push('{');
-                    } else {
-                        out.push_str("{\n");
-                        json_pad(out, indent, level + 1);
-                    }
-                    let mut first = true;
-                    for (key, slot) in entries {
-                        let val = match slot {
-                            Some(val) => val,
-                            None => i.get_prop(&v2, &key)?,
-                        };
-                        // serialize first — skip the key entirely when the
-                        // value is omitted
-                        let mut tmp = String::new();
-                        if json_ser_into(i, &val, indent, level + 1, &mut tmp)? {
-                            if !first {
-                                if indent.is_empty() {
+            let r: Result<bool, Value> = (|| {
+                Ok(match k {
+                    K::Skip => false,
+                    K::Arr(items) => {
+                        if indent.is_empty() {
+                            out.push('[');
+                            for (n, it) in items.iter().enumerate() {
+                                if n > 0 {
                                     out.push(',');
-                                } else {
+                                }
+                                if !json_ser_into(i, it, indent, level + 1, out, stack)? {
+                                    out.push_str("null");
+                                }
+                            }
+                            out.push(']');
+                        } else if items.is_empty() {
+                            out.push_str("[]");
+                        } else {
+                            out.push_str("[\n");
+                            json_pad(out, indent, level + 1);
+                            for (n, it) in items.iter().enumerate() {
+                                if n > 0 {
                                     out.push_str(",\n");
                                     json_pad(out, indent, level + 1);
                                 }
+                                if !json_ser_into(i, it, indent, level + 1, out, stack)? {
+                                    out.push_str("null");
+                                }
                             }
-                            first = false;
-                            if let PropKey::S(s) = &key {
-                                json_escape_into(s, out);
-                            }
-                            out.push_str(sep_colon);
-                            out.push_str(&tmp);
+                            out.push('\n');
+                            json_pad(out, indent, level);
+                            out.push(']');
                         }
+                        true
                     }
-                    if indent.is_empty() {
-                        out.push('}');
-                    } else if first {
-                        // nothing written (empty obj or all values omitted) → {}
-                        out.truncate(open_len);
-                        out.push_str("{}");
-                    } else {
-                        out.push('\n');
-                        json_pad(out, indent, level);
-                        out.push('}');
+                    K::Obj => {
+                        let entries = own_enum_entries(&v2);
+                        let sep_colon: &str = if indent.is_empty() { ":" } else { ": " };
+                        let open_len = out.len();
+                        if indent.is_empty() {
+                            out.push('{');
+                        } else {
+                            out.push_str("{\n");
+                            json_pad(out, indent, level + 1);
+                        }
+                        let mut first = true;
+                        for (key, slot) in entries {
+                            let val = match slot {
+                                Some(val) => val,
+                                None => i.get_prop(&v2, &key)?,
+                            };
+                            // serialize first — skip the key entirely when the
+                            // value is omitted
+                            let mut tmp = String::new();
+                            if json_ser_into(i, &val, indent, level + 1, &mut tmp, stack)? {
+                                if !first {
+                                    if indent.is_empty() {
+                                        out.push(',');
+                                    } else {
+                                        out.push_str(",\n");
+                                        json_pad(out, indent, level + 1);
+                                    }
+                                }
+                                first = false;
+                                if let PropKey::S(s) = &key {
+                                    json_escape_into(s, out);
+                                }
+                                out.push_str(sep_colon);
+                                out.push_str(&tmp);
+                            }
+                        }
+                        if indent.is_empty() {
+                            out.push('}');
+                        } else if first {
+                            // nothing written (empty obj or all values omitted) → {}
+                            out.truncate(open_len);
+                            out.push_str("{}");
+                        } else {
+                            out.push('\n');
+                            json_pad(out, indent, level);
+                            out.push('}');
+                        }
+                        true
                     }
-                    true
-                }
-            }
+                })
+            })();
+            stack.pop();
+            r?
         }
     })
 }

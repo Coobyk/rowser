@@ -1816,4 +1816,138 @@ mod tests {
             2.0
         );
     }
+
+    #[test]
+    fn proto_cycle_rejected() {
+        // a.__proto__ = b; b.__proto__ = a must not create a lookup cycle —
+        // __proto__ set silently ignores it, setPrototypeOf throws
+        let v = eval("var a={},b={}; a.__proto__=b; b.__proto__=a; b.x = 1; a.x");
+        match v {
+            Ok(Value::Num(1.0)) => {}
+            other => panic!("__proto__ cycle set"),
+        }
+        match eval("var a={},b={}; a.__proto__=b; Object.setPrototypeOf(b,a)") {
+            Err(_) => {}
+            Ok(v) => panic!("setPrototypeOf cycle accepted"),
+        }
+        // deep-but-finite chains still resolve
+        assert_eq!(num("var a={x:9},b={},c={}; c.__proto__=b; b.__proto__=a; c.x"), 9.0);
+    }
+
+    #[test]
+    fn json_stringify_circular_throws() {
+        match eval("var a=[]; a[0]=a; JSON.stringify(a)") {
+            Err(e) => assert!(format!("{e}").contains("circular") || format!("{e}").contains("TypeError")),
+            Ok(v) => panic!("circular stringify succeeded"),
+        }
+        // shared (non-cyclic) refs serialize fine
+        assert_eq!(
+            s("var o={x:1}; JSON.stringify({a:o,b:o})"),
+            "{\"a\":{\"x\":1},\"b\":{\"x\":1}}"
+        );
+    }
+
+    #[test]
+    fn define_property_semantics() {
+        // new prop: absent attrs default to false (spec), not true
+        assert!(b(
+            "var o={}; Object.defineProperty(o,'x',{value:1});\
+             var d=Object.getOwnPropertyDescriptor(o,'x');\
+             d.value===1 && !d.writable && !d.enumerable && !d.configurable"
+        ));
+        // existing prop: absent attrs are preserved
+        assert!(b(
+            "var o={x:5}; Object.defineProperty(o,'x',{value:7});\
+             var d=Object.getOwnPropertyDescriptor(o,'x');\
+             d.value===7 && d.writable && d.enumerable && d.configurable"
+        ));
+        // value+accessor mixing throws
+        match eval("Object.defineProperty({},'x',{value:1,get:function(){}})") {
+            Err(_) => {}
+            Ok(v) => panic!("mixed descriptor accepted"),
+        }
+        // non-configurable: enumerable flip throws
+        match eval(
+            "var o={}; Object.defineProperty(o,'x',{value:1});\
+             Object.defineProperty(o,'x',{enumerable:true})",
+        ) {
+            Err(_) => {}
+            Ok(v) => panic!("non-configurable redef accepted"),
+        }
+        // defineProperty on array index writes the element
+        assert_eq!(num("var a=[1,2,3]; Object.defineProperty(a,'1',{value:9}); a[1]"), 9.0);
+    }
+
+    #[test]
+    fn delete_honors_configurable() {
+        assert!(b(
+            "var o={}; Object.defineProperty(o,'x',{value:1});\
+             delete o.x === false && 'x' in o"
+        ));
+        assert!(b("var o={x:1}; delete o.x === true && !('x' in o)"));
+    }
+
+    #[test]
+    fn number_to_string_spec() {
+        // integral magnitudes past i64::MAX must not saturate
+        assert_eq!(s("String(1e20)"), "100000000000000000000");
+        assert_eq!(s("String(1e21)"), "1e+21");
+        assert_eq!(s("String(1e-7)"), "1e-7");
+        assert_eq!(s("String(0.000001)"), "0.000001");
+        assert_eq!(s("String(123.456)"), "123.456");
+        assert_eq!(s("String(-1e21)"), "-1e+21");
+    }
+
+    #[test]
+    fn function_global_and_bind() {
+        assert!(b("typeof Function === 'function'"));
+        assert!(b("typeof Function.prototype.bind === 'function'"));
+        // new Function compiles a working global-scoped function
+        assert_eq!(num("var f = new Function('a','b','return a+b'); f(3,4)"), 7.0);
+        // bind on non-callable throws
+        match eval("var o={}; o.__proto__=Function.prototype; o.bind()") {
+            Err(_) => {}
+            Ok(v) => panic!("bind on non-callable ok"),
+        }
+        // bound fn metadata
+        assert!(b(
+            "function g(a,b,c){}; var h=g.bind(null,1,2); h.length===1 && h.name==='bound g'"
+        ));
+    }
+
+    #[test]
+    fn natives_not_constructible() {
+        match eval("new Math.abs()") {
+            Err(_) => {}
+            Ok(v) => panic!("new Math.abs() ok"),
+        }
+        // real ctors still work
+        assert!(b("new Object() instanceof Object"));
+        assert!(b("new Error('x') instanceof Error"));
+    }
+
+    #[test]
+    fn array_methods_on_array_likes() {
+        // spec: iteration methods read .length + indexed props
+        assert_eq!(
+            num("Array.prototype.map.call({length:3,0:'a',1:'b',2:'c'},function(x){return x+'!'}).join(',') === 'a!,b!,c!' ? 1:0"),
+            1.0
+        );
+        assert_eq!(
+            num("Array.prototype.indexOf.call({length:2,0:'x',1:'y'},'y')"),
+            1.0
+        );
+        assert_eq!(
+            num("Array.prototype.reduce.call({length:3,0:1,1:2,2:3},function(a,b){return a+b})"),
+            6.0
+        );
+    }
+
+    #[test]
+    fn error_props_non_enumerable() {
+        assert!(b(
+            "var e = new Error('m'); Object.keys(e).length === 0 && e.message === 'm'"
+        ));
+        assert!(b("Math.PI === Math.PI && Object.getOwnPropertyDescriptor(Math,'PI').writable === false"));
+    }
 }
