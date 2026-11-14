@@ -628,6 +628,16 @@ struct Page {
     /// `::selection` background tint (r,g,b) resolved from the document's
     /// stylesheets — lazily computed on the first apply_sel.
     sel_tint: Option<(u32, u32, u32)>,
+    /// Drag endpoints in document space (x0,y0,x1,y1). `sel` rects are
+    /// baked in the items' scroll space — a full re-layout rebuilds items
+    /// at the new scroll, so rects are re-derived from these instead of
+    /// going stale (the fast scroll path shifts `sel` in place).
+    sel_anchor: Option<(f32, f32, f32, f32)>,
+    /// Per-item char-boundary cache for `text_boxes` — the kern+advance
+    /// walk per text item is the bulk of selection cost, so `starts`
+    /// vectors are reused across drag events. Invalidated when `items`
+    /// is rebuilt; in-place scroll shifts keep x offsets valid.
+    sel_starts: Option<Vec<Option<std::rc::Rc<Vec<f32>>>>>,
     /// Interaction state (`:hover`/`:focus`/`:active`/`:target`) — fed
     /// into every layout pass so dynamic pseudo-classes restyle.
     state: rowser_css::PseudoState,
@@ -691,6 +701,8 @@ impl Page {
             sel: Vec::new(),
             sel_text: String::new(),
             sel_tint: None,
+            sel_anchor: None,
+            sel_starts: None,
             state: rowser_css::PseudoState::default(),
             edit: None,
             last_cursor: String::new(),
@@ -718,6 +730,8 @@ impl Page {
         self.sel.clear();
         self.sel_text.clear();
         self.sel_tint = None;
+        self.sel_anchor = None;
+        self.sel_starts = None;
         self.state = rowser_css::PseudoState::default();
         self.edit = None;
         self.last_cursor.clear();
@@ -1773,6 +1787,16 @@ impl Page {
             self.anchors = anchors;
             self.layout_dirty = false;
             self.caret_moved = false;
+            // Items rebuilt — char-boundary cache and baked sel rects are
+            // stale. Re-derive the selection from its document-space
+            // anchors so it follows the text across re-layouts (scrolls
+            // on pinned pages, JS-driven changes).
+            self.sel_starts = None;
+            if self.sel_anchor.is_some() {
+                self.dirty_sel();
+                self.resel(fonts);
+                self.dirty_sel();
+            }
         } else if self.caret_moved {
             if self.patch_caret(fonts) {
                 self.caret_moved = false;
@@ -1808,13 +1832,42 @@ impl Page {
     }
 
     /// Recompute `sel`/`sel_text` for a drag from (x0,y0) to (x1,y1) —
-    /// viewport-space device px, same coordinates `Click` uses.
+    /// viewport-space device px, same coordinates `Click` uses. Anchors
+    /// are kept in document space so a re-layout can re-derive the rects.
     fn update_sel(&mut self, fonts: &mut FontCache, x0: f32, y0: f32, x1: f32, y1: f32) {
         self.dirty_sel();
-        let (rects, text) = compute_selection(&self.items, fonts, x0, y0, x1, y1);
+        self.sel_anchor = Some((
+            x0,
+            y0 + self.items_scroll,
+            x1,
+            y1 + self.items_scroll,
+        ));
+        self.resel(fonts);
+        self.dirty_sel();
+    }
+
+    /// Recompute `sel`/`sel_text` from `sel_anchor` at the current
+    /// scroll. Char-boundary vectors are cached per item — the kern walk
+    /// is what made dragging expensive on text-heavy pages.
+    fn resel(&mut self, fonts: &mut FontCache) {
+        let Some((ax, ay, bx, by)) = self.sel_anchor else {
+            self.sel.clear();
+            self.sel_text.clear();
+            return;
+        };
+        let mut starts = self.sel_starts.take().unwrap_or_default();
+        let (rects, text) = compute_selection(
+            &self.items,
+            fonts,
+            ax,
+            ay - self.items_scroll,
+            bx,
+            by - self.items_scroll,
+            &mut starts,
+        );
+        self.sel_starts = Some(starts);
         self.sel = rects;
         self.sel_text = text;
-        self.dirty_sel();
     }
 
     /// Drop the selection. Returns whether one existed (caller must
@@ -1826,6 +1879,7 @@ impl Page {
         }
         self.sel.clear();
         self.sel_text.clear();
+        self.sel_anchor = None;
         had
     }
 
@@ -1877,7 +1931,7 @@ struct TextBox<'a> {
     top: f32,
     bot: f32,
     /// Char-boundary offsets relative to `x`; `starts.len() == chars + 1`.
-    starts: Vec<f32>,
+    starts: std::rc::Rc<Vec<f32>>,
 }
 
 impl TextBox<'_> {
@@ -1888,13 +1942,20 @@ impl TextBox<'_> {
 
 /// Flatten the display list's Text items (already in reading order) into
 /// hit-testable boxes. Char boundaries use the same kern+advance walk the
-/// painter does, so clicks land where the ink actually is.
+/// painter does, so clicks land where the ink actually is. The `starts`
+/// walk is cached per item in `starts_cache` (indexed by item position)
+/// — re-layout invalidates it, scroll shifts keep it valid.
 fn text_boxes<'a>(
     items: &'a [rowser_layout::DisplayItem],
     fonts: &mut FontCache,
+    starts_cache: &mut Vec<Option<std::rc::Rc<Vec<f32>>>>,
 ) -> Vec<TextBox<'a>> {
+    if starts_cache.len() != items.len() {
+        starts_cache.clear();
+        starts_cache.resize_with(items.len(), || None);
+    }
     let mut out = Vec::new();
-    for it in items {
+    for (idx, it) in items.iter().enumerate() {
         let rowser_layout::DisplayItem::Text {
             x,
             baseline,
@@ -1910,34 +1971,39 @@ fn text_boxes<'a>(
         if text.is_empty() || !sel {
             continue;
         }
-        let (starts, top, bot) = match fonts.font(*font) {
-            Some(f) => {
-                let upem = f.units_per_em() as f32;
-                let mut starts = Vec::with_capacity(text.chars().count() + 1);
-                starts.push(0.0);
-                let (mut pen, mut prev) = (0.0f32, 0u16);
-                for c in text.chars() {
-                    let gid = f.glyph_id(c);
-                    pen += f.kern(prev, gid) as f32 * size / upem;
-                    pen += f.advance(gid, *size);
-                    starts.push(pen);
-                    prev = gid;
-                }
-                let ascent = f.ascent(*size);
-                (
-                    starts,
-                    baseline - ascent,
-                    baseline - ascent + f.line_height(*size),
-                )
+        let starts = match &starts_cache[idx] {
+            Some(s) => s.clone(),
+            None => {
+                let s = std::rc::Rc::new(match fonts.font(*font) {
+                    Some(f) => {
+                        let upem = f.units_per_em() as f32;
+                        let mut starts = Vec::with_capacity(text.chars().count() + 1);
+                        starts.push(0.0);
+                        let (mut pen, mut prev) = (0.0f32, 0u16);
+                        for c in text.chars() {
+                            let gid = f.glyph_id(c);
+                            pen += f.kern(prev, gid) as f32 * size / upem;
+                            pen += f.advance(gid, *size);
+                            starts.push(pen);
+                            prev = gid;
+                        }
+                        starts
+                    }
+                    // Font handle went missing — rough box so the item still selects.
+                    None => (0..=text.chars().count())
+                        .map(|i| i as f32 * size * 0.5)
+                        .collect(),
+                });
+                starts_cache[idx] = Some(s.clone());
+                s
             }
-            // Font handle went missing — rough box so the item still selects.
-            None => (
-                (0..=text.chars().count())
-                    .map(|i| i as f32 * size * 0.5)
-                    .collect(),
-                baseline - size,
-                baseline + size * 0.4,
-            ),
+        };
+        let (top, bot) = match fonts.font(*font) {
+            Some(f) => {
+                let ascent = f.ascent(*size);
+                (baseline - ascent, baseline - ascent + f.line_height(*size))
+            }
+            None => (baseline - size, baseline + size * 0.4),
         };
         out.push(TextBox {
             text,
@@ -2010,6 +2076,7 @@ fn hit_pos(boxes: &[TextBox], x: f32, y: f32) -> Option<(usize, usize)> {
 /// Char-level selection between two viewport-space points. Returns the
 /// highlight rects (line-height tall, kern-accurate width) and the
 /// covered text — words joined by ' ', line breaks by '\n'.
+/// `starts_cache` is a per-item char-boundary cache (sized to items).
 fn compute_selection(
     items: &[rowser_layout::DisplayItem],
     fonts: &mut FontCache,
@@ -2017,8 +2084,9 @@ fn compute_selection(
     y0: f32,
     x1: f32,
     y1: f32,
+    starts_cache: &mut Vec<Option<std::rc::Rc<Vec<f32>>>>,
 ) -> (Vec<(f32, f32, f32, f32)>, String) {
-    let boxes = text_boxes(items, fonts);
+    let boxes = text_boxes(items, fonts, starts_cache);
     let (Some(a), Some(b)) = (hit_pos(&boxes, x0, y0), hit_pos(&boxes, x1, y1)) else {
         return (Vec::new(), String::new());
     };
