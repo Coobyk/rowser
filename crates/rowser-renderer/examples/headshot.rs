@@ -214,12 +214,11 @@ fn run_scripts(
             },
             None => s.body.clone(),
         };
-        if let Err(e) = dc.eval(&src) {
+        if let Err(e) = dc.eval_bounded(&src, std::time::Duration::from_secs(30)) {
             eprintln!("[js] {e}");
         }
     }
-    dc.flush_raf();
-    dc.run_timers();
+    dc.pump_bounded(std::time::Duration::from_secs(5));
     for e in &dc.errors {
         eprintln!("[js] {e}");
     }

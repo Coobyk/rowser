@@ -483,7 +483,10 @@ pub struct Interp {
     pub output: Vec<String>,
     /// recorded import/export specifiers
     pub modules: Vec<String>,
-    pub labels: Vec<String>,
+    /// Label set by `Labeled` for the loop statement it directly wraps;
+    /// taken by the loop arm on entry so `continue <lbl>` is only
+    /// consumed by the loop that actually carries the label.
+    pub pending_label: Option<String>,
     pub depth: usize,
     pub sym_counter: u64,
     pub rng: u64,
@@ -497,6 +500,15 @@ pub struct Interp {
     pub last_throw_trace: Vec<String>,
     /// recorded `x.$$typeof` reads: "value <- object" (debug)
     pub typeof_reads: Vec<String>,
+    /// statements executed this session (drives deadline polling)
+    pub steps: u64,
+    /// once tripped every `exec_stmt` errors until cleared — makes the
+    /// interrupt uncatchable by JS try/catch (each catch body re-errors)
+    pub interrupted: bool,
+    /// wall-clock bound for the current embedder turn; `None` = unbounded
+    pub deadline: Option<std::time::Instant>,
+    /// stmt being executed when the interrupt tripped (triage aid)
+    pub interrupt_site: Option<String>,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -532,7 +544,7 @@ impl Interp {
             },
             output: Vec::new(),
             modules: Vec::new(),
-            labels: Vec::new(),
+            pending_label: None,
             depth: 0,
             sym_counter: 16,
             rng: {
@@ -546,7 +558,48 @@ impl Interp {
             call_trace: std::collections::VecDeque::new(),
             last_throw_trace: Vec::new(),
             typeof_reads: Vec::new(),
+            steps: 0,
+            interrupted: false,
+            deadline: None,
+            interrupt_site: None,
         }
+    }
+
+    /// Poll the execution budget. Called once per statement: cheap while
+    /// unbounded, a hard uncatchable unwind once the deadline trips —
+    /// JS try/catch can't swallow it because subsequent statements keep
+    /// erroring until the embedder clears `interrupted`.
+    #[inline]
+    pub fn tick(&mut self) -> Result<(), Value> {
+        if self.interrupted {
+            return Err(self.interrupt_err());
+        }
+        self.steps = self.steps.wrapping_add(1);
+        if self.steps & 0x3ff == 0 {
+            if let Some(d) = self.deadline {
+                if std::time::Instant::now() >= d {
+                    self.interrupted = true;
+                    return Err(self.interrupt_err());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn interrupt_err(&mut self) -> Value {
+        self.range_err("script execution budget exceeded")
+    }
+
+    /// Arm a wall-clock budget for the next turn; clears a prior trip.
+    pub fn arm_deadline(&mut self, budget: std::time::Duration) {
+        self.deadline = Some(std::time::Instant::now() + budget);
+        self.interrupted = false;
+    }
+
+    /// Disarm the budget at turn end (also clears a trip).
+    pub fn disarm_deadline(&mut self) {
+        self.deadline = None;
+        self.interrupted = false;
     }
 
     /// xorshift64 for Math.random (not crypto-grade, spec-fine).
@@ -2001,6 +2054,21 @@ impl Interp {
     }
 
     pub fn exec_stmt(&mut self, s: &Stmt, env: &EnvRef) -> SRes {
+        if self.interrupted {
+            return Err(self.interrupt_err());
+        }
+        self.steps = self.steps.wrapping_add(1);
+        if self.steps & 0x3ff == 0 {
+            if let Some(d) = self.deadline {
+                if std::time::Instant::now() >= d {
+                    self.interrupted = true;
+                    let mut dbg = format!("{s:?}");
+                    dbg.truncate(400);
+                    self.interrupt_site = Some(dbg);
+                    return Err(self.interrupt_err());
+                }
+            }
+        }
         match s {
             Stmt::Empty => Ok(Completion::Empty),
             Stmt::Expr(e) => Ok(Completion::Normal(self.eval_expr(e, env)?)),
@@ -2053,6 +2121,7 @@ impl Interp {
                 }
             }
             Stmt::While { c, body } => {
+                let my_label = self.pending_label.take();
                 let mut last = Value::Und;
                 loop {
                     let cv = self.eval_expr(c, env)?;
@@ -2069,7 +2138,7 @@ impl Interp {
                             break;
                         }
                         Completion::Continue(l) => {
-                            if l.is_none() || self.labels.contains(&l.clone().unwrap_or_default()) {
+                            if l.is_none() || l.as_deref() == my_label.as_deref() {
                                 continue;
                             }
                             return Ok(Completion::Continue(l));
@@ -2080,6 +2149,7 @@ impl Interp {
                 Ok(Completion::Normal(last))
             }
             Stmt::DoWhile { body, c } => {
+                let my_label = self.pending_label.take();
                 let mut last = Value::Und;
                 loop {
                     match self.exec_stmt(body, env)? {
@@ -2092,9 +2162,7 @@ impl Interp {
                             break;
                         }
                         Completion::Continue(l) => {
-                            if !(l.is_none()
-                                || self.labels.contains(&l.clone().unwrap_or_default()))
-                            {
+                            if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
                                 return Ok(Completion::Continue(l));
                             }
                         }
@@ -2113,6 +2181,7 @@ impl Interp {
                 update,
                 body,
             } => {
+                let my_label = self.pending_label.take();
                 let scope = Scope::new(Some(env.clone()), false);
                 if let Some(init) = init {
                     match init {
@@ -2154,9 +2223,7 @@ impl Interp {
                             break;
                         }
                         Completion::Continue(l) => {
-                            if !(l.is_none()
-                                || self.labels.contains(&l.clone().unwrap_or_default()))
-                            {
+                            if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
                                 return Ok(Completion::Continue(l));
                             }
                         }
@@ -2169,6 +2236,7 @@ impl Interp {
                 Ok(Completion::Normal(last))
             }
             Stmt::ForIn { left, right, body } => {
+                let my_label = self.pending_label.take();
                 let rv = self.eval_expr(right, env)?;
                 let keys = self.enum_keys(&rv);
                 let scope = Scope::new(Some(env.clone()), false);
@@ -2185,9 +2253,7 @@ impl Interp {
                             return Ok(Completion::Normal(last));
                         }
                         Completion::Continue(l) => {
-                            if !(l.is_none()
-                                || self.labels.contains(&l.clone().unwrap_or_default()))
-                            {
+                            if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
                                 return Ok(Completion::Continue(l));
                             }
                         }
@@ -2197,6 +2263,7 @@ impl Interp {
                 Ok(Completion::Normal(last))
             }
             Stmt::ForOf { left, right, body } => {
+                let my_label = self.pending_label.take();
                 let rv = self.eval_expr(right, env)?;
                 let items = self.iter_values(&rv)?;
                 let scope = Scope::new(Some(env.clone()), false);
@@ -2213,9 +2280,7 @@ impl Interp {
                             return Ok(Completion::Normal(last));
                         }
                         Completion::Continue(l) => {
-                            if !(l.is_none()
-                                || self.labels.contains(&l.clone().unwrap_or_default()))
-                            {
+                            if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
                                 return Ok(Completion::Continue(l));
                             }
                         }
@@ -2328,11 +2393,11 @@ impl Interp {
                         | Stmt::ForOf { .. }
                 );
                 if is_loop {
-                    self.labels.push(label.clone());
+                    self.pending_label = Some(label.clone());
                 }
                 let res = self.exec_stmt(inner, env);
-                if is_loop {
-                    self.labels.pop();
+                if is_loop && self.pending_label.as_deref() == Some(label.as_str()) {
+                    self.pending_label = None;
                 }
                 match res {
                     Ok(Completion::Break(Some(n))) if n == *label => Ok(Completion::Empty),
@@ -2914,7 +2979,7 @@ impl Interp {
     }
 
     fn eval_call(&mut self, callee: &Expr, args: &[Arg], env: &EnvRef) -> ERes {
-        if self.call_trace.len() >= 64 {
+        if self.call_trace.len() >= 4096 {
             self.call_trace.pop_front();
         }
         self.call_trace

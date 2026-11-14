@@ -1786,4 +1786,34 @@ mod tests {
         assert!(b("Reflect.getPrototypeOf([]) === Array.prototype"));
         assert_eq!(num("Reflect.apply((a, b) => a + b, null, [3, 4])"), 7.0);
     }
+
+    #[test]
+    fn labeled_continue_targets_labeled_loop() {
+        // continue <lbl> must skip to the labeled loop, not continue the
+        // innermost enclosing loop — regression: inner for used to swallow it.
+        assert_eq!(
+            num("let n = 0; outer: for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) { if (j > 0) continue outer; n++; } } n"),
+            3.0
+        );
+        // labeled continue in an unlabeled inner loop propagates outward
+        assert_eq!(
+            num("let n = 0; a: for (let i = 0; i < 4; i++) { for (;;) { n++; if (i < 2) continue a; break; } } n"),
+            4.0
+        );
+        // inner labeled loop only consumes its own label
+        assert_eq!(
+            num("let s = ''; a: for (let i = 0; i < 2; i++) { b: for (let j = 0; j < 2; j++) { if (j === 0) continue b; s += i + '' + j; } } s === '01' || s === '0111' ? 1 : 0"),
+            1.0
+        );
+        // while + do-while + for-in honor labels too
+        assert_eq!(
+            num("let n = 0; w: while (n < 5) { n++; let i = 0; while (i < 10) { i++; if (i > 2) continue w; } } n"),
+            5.0
+        );
+        // labeled break still works through nested loops
+        assert_eq!(
+            num("let n = 0; a: for (let i = 0; i < 5; i++) { for (let j = 0; j < 5; j++) { if (j === 2) break a; n++; } } n"),
+            2.0
+        );
+    }
 }

@@ -2735,14 +2735,15 @@ fn run_page_scripts(
             // take the Document down with it — return what we have.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 for src in sources.iter().flatten() {
-                    if let Err(e) = dc.eval(src) {
+                    // 30s per script: a runaway bundle errors out instead
+                    // of hanging the JS thread (and the browser) forever.
+                    if let Err(e) = dc.eval_bounded(src, std::time::Duration::from_secs(30)) {
                         logs.push(format!("[js] {e}"));
                     }
                 }
                 // React-style scheduling: rAF first, then one timers round
                 // (which also drains microtasks + MessageChannel ports).
-                dc.flush_raf();
-                dc.run_timers();
+                dc.pump_bounded(std::time::Duration::from_secs(5));
             }));
             for e in &dc.errors {
                 logs.push(format!("[js] {e}"));
@@ -2765,12 +2766,18 @@ fn run_page_scripts(
                     } => {
                         let mut logs = Vec::new();
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if let Err(e) = dc.dispatch_event(nid, &ty, client) {
+                            // 5s turn budget: the event handler plus the
+                            // rAF/timer/microtask work it schedules must
+                            // not hang the JS thread (and the browser).
+                            if let Err(e) = dc.dispatch_event_pumped(
+                                nid,
+                                &ty,
+                                client,
+                                std::time::Duration::from_secs(5),
+                            ) {
                                 let msg = dc.ctx.interp.inspect(&e, 0);
                                 logs.push(format!("[js] event {ty}: {msg}"));
                             }
-                            dc.flush_raf();
-                            dc.run_timers();
                         }));
                         for e in dc.errors.drain(..) {
                             logs.push(format!("[js] {e}"));

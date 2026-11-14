@@ -3958,14 +3958,86 @@ impl DomContext {
         r
     }
 
+    /// `eval` under a wall-clock budget: a runaway script errors out
+    /// instead of hanging the embedder thread. Partial mutations stay.
+    pub fn eval_bounded(&mut self, src: &str, budget: std::time::Duration) -> Result<Value, Error> {
+        self.ctx.interp.arm_deadline(budget);
+        let r = self.ctx.eval(src);
+        self.drain_microtasks();
+        if self.ctx.interp.interrupted {
+            self.errors
+                .push("eval: script execution budget exceeded".into());
+        }
+        self.ctx.interp.disarm_deadline();
+        r
+    }
+
+    /// One scheduler round (rAF then timers + microtasks) under a
+    /// wall-clock budget.
+    pub fn pump_bounded(&mut self, budget: std::time::Duration) {
+        self.ctx.interp.arm_deadline(budget);
+        self.flush_raf();
+        self.run_timers();
+        if self.ctx.interp.interrupted {
+            self.errors
+                .push("scheduler pump: execution budget exceeded".into());
+        }
+        self.ctx.interp.disarm_deadline();
+    }
+
+    /// `dispatch_event` + scheduler pump under one wall-clock budget —
+    /// the path the renderer's click handler uses, so a pathological
+    /// listener can't hang the browser.
+    pub fn dispatch_event_pumped(
+        &mut self,
+        nid: NodeId,
+        ty: &str,
+        client: (f64, f64),
+        budget: std::time::Duration,
+    ) -> Result<bool, Value> {
+        self.ctx.interp.arm_deadline(budget);
+        let r = self.dispatch_event(nid, ty, client);
+        self.flush_raf();
+        self.run_timers();
+        if self.ctx.interp.interrupted {
+            self.errors
+                .push(format!("event {ty}: execution budget exceeded"));
+        }
+        self.ctx.interp.disarm_deadline();
+        r
+    }
+
+    /// Debug: pending scheduler work (microtasks, timers, port msgs, raf)
+    /// plus interpreter steps — embedders can watch convergence.
+    pub fn pending_counts(&mut self) -> (usize, usize, usize, usize, u64) {
+        let i = &mut self.ctx.interp;
+        let steps = i.steps;
+        let (m, t, p, r) = with_ds(i, |ds| {
+            (
+                ds.microtasks.len(),
+                ds.timers.len(),
+                ds.port_msgs.len(),
+                ds.raf.len(),
+            )
+        });
+        (m, t, p, r, steps)
+    }
+
     /// Run the microtask queue to quiescence (bounded).
     pub fn drain_microtasks(&mut self) {
         let i = &mut self.ctx.interp;
-        for _ in 0..100_000usize {
+        for n in 0..100_000usize {
+            if i.interrupted {
+                break;
+            }
             let job = with_ds(i, |ds| ds.microtasks.pop_front());
             let Some((cb, args)) = job else { break };
             if !i.is_callable(&cb) {
                 continue;
+            }
+            if std::env::var("ROWSR_JS_DRAIN").is_ok() && n % 1000 == 0 {
+                let pending = with_ds(i, |ds| ds.microtasks.len());
+                eprintln!("[drain] job {n} pending={pending} cb={}", i.inspect(&cb, 0).chars().take(160).collect::<String>());
             }
             if let Err(e) = i.call(&cb, Value::Und, args) {
                 let msg = i.inspect(&e, 0);
@@ -3984,7 +4056,7 @@ impl DomContext {
             )
         });
         for (_, cb) in jobs {
-            if !i.is_callable(&cb) {
+            if i.interrupted || !i.is_callable(&cb) {
                 continue;
             }
             if let Err(e) = i.call(&cb, Value::Und, vec![Value::Num(now)]) {
@@ -4006,6 +4078,9 @@ impl DomContext {
         });
         let mut requeue = Vec::new();
         for j in jobs {
+            if i.interrupted {
+                break;
+            }
             if i.is_callable(&j.cb) {
                 if let Err(e) = i.call(&j.cb, Value::Und, j.args.clone()) {
                     let msg = i.inspect(&e, 0);
