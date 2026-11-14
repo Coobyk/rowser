@@ -113,6 +113,8 @@ pub const SYM_REPLACE: u64 = 6;
 pub const SYM_SPLIT: u64 = 7;
 pub const SYM_SEARCH: u64 = 8;
 pub const SYM_MATCHALL: u64 = 9;
+pub const SYM_IS_CONCAT_SPREADABLE: u64 = 10;
+pub const SYM_SPECIES: u64 = 11;
 const REST_PAT_KEY: &str = "\u{0}rest";
 
 // ---------------------------------------------------------------------------
@@ -295,6 +297,9 @@ impl PropMap {
             .iter()
             .filter_map(move |k| self.get(k).map(|p| (k, p)))
     }
+    pub fn values(&self) -> impl Iterator<Item = &Prop> + '_ {
+        self.map.values().chain(self.syms.values())
+    }
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Prop> + '_ {
         self.map.values_mut().chain(self.syms.values_mut())
     }
@@ -323,6 +328,8 @@ pub struct Obj {
     pub proto: Option<ObjRef>,
     pub props: PropMap,
     pub kind: ObjKind,
+    /// spec [[Extensible]] — false after preventExtensions/seal/freeze
+    pub extensible: bool,
 }
 
 #[derive(Clone)]
@@ -557,6 +564,7 @@ impl Obj {
             proto,
             props: PropMap::new(),
             kind,
+            extensible: true,
         }
     }
     pub fn is_callable(&self) -> bool {
@@ -1211,6 +1219,42 @@ impl Interp {
         }
     }
 
+    /// spec ToObject: primitives box to wrapper objects carrying the
+    /// matching prototype (Boolean/Number/String/Symbol.prototype).
+    pub fn to_object(&mut self, v: &Value) -> ERes {
+        match v {
+            Value::Obj(_) => Ok(v.clone()),
+            Value::Und | Value::Null => Err(self.type_err(
+                "Cannot convert undefined or null to object",
+            )),
+            _ => {
+                let proto = match v {
+                    Value::Bool(_) => self.p.boolean.clone(),
+                    Value::Num(_) => self.p.number.clone(),
+                    Value::Str(_) => self.p.string.clone(),
+                    Value::Sym(..) => self.p.symbol.clone(),
+                    _ => unreachable!(),
+                };
+                let obj = Rc::new(RefCell::new(Obj::new(Some(proto), ObjKind::Ord)));
+                // String wrappers expose length + indexed characters
+                if let Value::Str(s) = v {
+                    let len = s.chars().count();
+                    for (k, c) in s.chars().enumerate() {
+                        obj.borrow_mut().props.insert(
+                            PropKey::from_str(&k.to_string()),
+                            Prop::data(Value::Str(Rc::from(c.to_string().as_str()))),
+                        );
+                    }
+                    obj.borrow_mut().props.insert(
+                        PropKey::from_str("length"),
+                        Prop::builtin(Value::Num(len as f64)),
+                    );
+                }
+                Ok(Value::Obj(obj))
+            }
+        }
+    }
+
     /// `get_prop` by borrowed string key — the `obj.name` fast path that
     /// avoids building a `PropKey`/interning an `Rc` per member access.
     pub fn get_prop_str(&mut self, base: &Value, key: &str) -> ERes {
@@ -1453,8 +1497,11 @@ impl Interp {
             let next = c.borrow().proto.clone();
             cur = next;
         }
-        // define own prop
+        // define own prop — non-extensible: sloppy silent no-op
         let mut b = o.borrow_mut();
+        if !b.extensible {
+            return Ok(());
+        }
         if let ObjKind::Arr(items) = &mut b.kind {
             if let PropKey::S(s) = &key {
                 if let Some(i) = arr_index(s) {
@@ -1593,8 +1640,11 @@ impl Interp {
             let next = c.borrow().proto.clone();
             cur = next;
         }
-        // define own prop
+        // define own prop — non-extensible: sloppy silent no-op
         let mut b = o.borrow_mut();
+        if !b.extensible {
+            return Ok(());
+        }
         if let ObjKind::Arr(items) = &mut b.kind {
             if let Some(i) = arr_index(key) {
                 if i >= items.len() && i <= 8_000_000 {
@@ -2167,6 +2217,23 @@ impl Interp {
         }
     }
 
+    /// spec IsConstructor: user fns unless arrow/method (home set),
+    /// natives only with an own `.prototype`, bound fns delegate.
+    pub fn is_constructor(&self, v: &Value) -> bool {
+        let Value::Obj(o) = v else { return false };
+        match &o.borrow().kind {
+            ObjKind::Func(Func::User { def, home, ctor, .. }) => {
+                !def.is_arrow
+                    && (!matches!(ctor, CtorKind::NotClass) || home.is_none())
+            }
+            ObjKind::Func(Func::Native { .. }) => self
+                .obj_get_raw(o, &PropKey::from_str("prototype"))
+                .is_some_and(|p| !matches!(p, Value::Und)),
+            ObjKind::Bound { target, .. } => self.is_constructor(target),
+            _ => false,
+        }
+    }
+
     /// `new f(args)` / class construction.
     /// `new_target` overrides the proto source for derived-class super() calls.
     pub fn construct(&mut self, f: &Value, args: Vec<Value>, new_target: Option<Value>) -> ERes {
@@ -2176,6 +2243,11 @@ impl Interp {
         let Value::Obj(o) = f else {
             return Err(self.type_err("value is not a constructor"));
         };
+        if let Some(nt) = &new_target {
+            if !self.is_constructor(nt) {
+                return Err(self.type_err("newTarget is not a constructor"));
+            }
+        }
         let kind = o.borrow().kind.clone();
         match kind {
             ObjKind::Func(Func::Native { f: nf, name }) => {
@@ -2210,11 +2282,13 @@ impl Interp {
             ObjKind::Func(Func::User {
                 def,
                 env,
-                home: _,
+                home,
                 ctor,
             }) => {
-                if def.is_arrow {
-                    return Err(self.type_err("arrow function is not a constructor"));
+                if def.is_arrow
+                    || (home.is_some() && matches!(ctor, CtorKind::NotClass))
+                {
+                    return Err(self.type_err("value is not a constructor"));
                 }
                 let nt = new_target.unwrap_or_else(|| f.clone());
                 // prototype for the new object: new_target.prototype or obj proto

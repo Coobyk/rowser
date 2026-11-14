@@ -137,8 +137,81 @@ fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Und)
 }
 
+/// spec `length` for built-ins — number of required positional params.
+/// `native()` defaults to 0; this table corrects the methods Test262
+/// checks. Names are the `name` given to `native()`.
+const NATIVE_ARITY: &[(&str, f64)] = &[
+    // Array statics + prototype
+    ("at", 1.0), ("concat", 1.0), ("copyWithin", 2.0), ("every", 1.0),
+    ("fill", 1.0), ("filter", 1.0), ("find", 1.0), ("findIndex", 1.0),
+    ("findLast", 1.0), ("findLastIndex", 1.0), ("flatMap", 1.0),
+    ("forEach", 1.0), ("includes", 1.0), ("indexOf", 1.0), ("join", 1.0),
+    ("lastIndexOf", 1.0), ("map", 1.0), ("push", 1.0), ("reduce", 1.0),
+    ("reduceRight", 1.0), ("slice", 2.0), ("some", 1.0), ("sort", 1.0),
+    ("splice", 2.0), ("unshift", 1.0), ("with", 2.0), ("toSorted", 1.0),
+    ("toSpliced", 2.0), ("from", 1.0), ("isArray", 1.0),
+    // Object
+    ("assign", 2.0), ("create", 2.0), ("defineProperties", 2.0),
+    ("defineProperty", 3.0), ("entries", 1.0), ("freeze", 1.0),
+    ("fromEntries", 1.0), ("getOwnPropertyDescriptor", 2.0),
+    ("getOwnPropertyDescriptors", 1.0), ("getOwnPropertyNames", 1.0),
+    ("getOwnPropertySymbols", 1.0), ("getPrototypeOf", 1.0),
+    ("groupBy", 2.0), ("hasOwn", 2.0), ("is", 2.0), ("isExtensible", 1.0),
+    ("isFrozen", 1.0), ("isSealed", 1.0), ("keys", 1.0),
+    ("preventExtensions", 1.0), ("seal", 1.0), ("setPrototypeOf", 2.0),
+    ("values", 1.0), ("hasOwnProperty", 1.0), ("isPrototypeOf", 1.0),
+    ("propertyIsEnumerable", 1.0),
+    // Function
+    ("apply", 2.0), ("bind", 1.0), ("call", 1.0),
+    // String
+    ("charAt", 1.0), ("charCodeAt", 1.0), ("codePointAt", 1.0),
+    ("endsWith", 1.0), ("localeCompare", 1.0), ("match", 1.0),
+    ("matchAll", 1.0), ("padEnd", 1.0), ("padStart", 1.0), ("repeat", 1.0),
+    ("replace", 2.0), ("replaceAll", 2.0), ("search", 1.0),
+    ("split", 2.0), ("startsWith", 1.0), ("substring", 2.0),
+    ("fromCharCode", 0.0), ("fromCodePoint", 0.0), ("raw", 1.0),
+    // Number
+    ("isFinite", 1.0), ("isInteger", 1.0), ("isNaN", 1.0),
+    ("isSafeInteger", 1.0), ("parseFloat", 1.0), ("parseInt", 2.0),
+    ("toExponential", 1.0), ("toFixed", 1.0), ("toPrecision", 1.0),
+    // Math
+    ("abs", 1.0), ("acos", 1.0), ("acosh", 1.0), ("asin", 1.0),
+    ("asinh", 1.0), ("atan", 1.0), ("atan2", 2.0), ("atanh", 1.0),
+    ("cbrt", 1.0), ("ceil", 1.0), ("clz32", 1.0), ("cos", 1.0),
+    ("cosh", 1.0), ("exp", 1.0), ("expm1", 1.0), ("floor", 1.0),
+    ("fround", 1.0), ("imul", 2.0), ("log", 1.0), ("log10", 1.0),
+    ("log1p", 1.0), ("log2", 1.0), ("pow", 2.0), ("round", 1.0),
+    ("sign", 1.0), ("sin", 1.0), ("sinh", 1.0), ("sqrt", 1.0),
+    ("tan", 1.0), ("tanh", 1.0), ("trunc", 1.0),
+    // JSON
+    ("parse", 2.0), ("stringify", 3.0),
+    // Reflect
+    ("construct", 2.0), ("deleteProperty", 2.0), ("ownKeys", 1.0),
+    // Promise
+    ("all", 1.0), ("allSettled", 1.0), ("any", 1.0), ("race", 1.0),
+    ("reject", 1.0), ("resolve", 1.0), ("then", 2.0), ("catch", 1.0),
+    ("finally", 1.0),
+    // Map/Set (name collisions with Reflect resolved to the Map/Set
+    // arities — same tests, better coverage)
+    ("add", 1.0), ("delete", 1.0), ("get", 1.0), ("has", 1.0),
+    ("set", 2.0),
+    // RegExp / Symbol / globals / misc
+    ("exec", 1.0), ("test", 1.0), ("compile", 2.0), ("for", 1.0),
+    ("keyFor", 1.0), ("eval", 1.0), ("decodeURI", 1.0),
+    ("decodeURIComponent", 1.0), ("encodeURI", 1.0),
+    ("encodeURIComponent", 1.0), ("escape", 1.0), ("unescape", 1.0),
+    // Iterator helpers
+    ("take", 1.0), ("drop", 1.0), ("next", 0.0), ("return", 0.0),
+];
+
 fn native(i: &Interp, name: &str, f: NativeFn) -> Value {
-    i.native(name, f)
+    let v = i.native(name, f);
+    if let Some(&(_, arity)) = NATIVE_ARITY.iter().find(|(n, _)| *n == name) {
+        if let Value::Obj(o) = &v {
+            i.set_attr(o, "length", Value::Num(arity), false, true);
+        }
+    }
+    v
 }
 
 fn method(i: &Interp, proto: &ObjRef, name: &str, f: NativeFn) {
@@ -175,16 +248,129 @@ pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
             if let ObjKind::Iter { items, .. } = &o.borrow().kind {
                 return Ok(items.clone());
             }
-            let len = i.get_prop_str(v, "length")?;
-            let n = (i.to_num(&len)?.max(0.0) as usize).min(8_000_000);
-            let mut out = Vec::with_capacity(n.min(1_000_000));
-            for k in 0..n {
-                out.push(i.get_prop(v, &idx_key(k))?);
-            }
-            Ok(out)
         }
-        _ => Ok(Vec::new()),
+        // ToObject(undefined/null) is a TypeError — every caller here is a
+        // spec operation that requires it
+        Value::Und | Value::Null => {
+            return Err(i.type_err("cannot convert undefined or null to object"));
+        }
+        _ => {} // primitives box to their wrapper: props resolve via proto
     }
+    // generic path: read `length` then indexed properties (missing → Und)
+    let len = i.get_prop_str(v, "length")?;
+    let n = (i.to_num(&len)?.max(0.0) as usize).min(8_000_000);
+    let mut out = Vec::with_capacity(n.min(1_000_000));
+    for k in 0..n {
+        out.push(i.get_prop(v, &idx_key(k))?);
+    }
+    Ok(out)
+}
+
+/// element count of an array-like (`length` clamped) — for result arrays
+/// that must preserve the source length
+fn elems_len(i: &mut Interp, v: &Value) -> Result<usize, Value> {
+    if let Value::Obj(o) = v {
+        if let ObjKind::Arr(items) = &o.borrow().kind {
+            return Ok(items.len());
+        }
+        if let ObjKind::Iter { items, .. } = &o.borrow().kind {
+            return Ok(items.len());
+        }
+    }
+    let len = i.get_prop_str(v, "length")?;
+    Ok((i.to_num(&len)?.max(0.0) as usize).min(8_000_000))
+}
+
+/// `(index, value)` for PRESENT elements only — spec HasProperty semantics.
+/// Vec-backed arrays can't distinguish `[1,,3]` holes from explicit
+/// `undefined`, so they yield every slot; generic receivers are checked
+/// via `has_prop` per index.
+pub(crate) fn to_elems_sparse(
+    i: &mut Interp,
+    v: &Value,
+) -> Result<Vec<(usize, Value)>, Value> {
+    match v {
+        Value::Obj(o) => {
+            if let ObjKind::Arr(items) = &o.borrow().kind {
+                return Ok(items.iter().cloned().enumerate().collect());
+            }
+            if let ObjKind::Iter { items, .. } = &o.borrow().kind {
+                return Ok(items.iter().cloned().enumerate().collect());
+            }
+        }
+        Value::Und | Value::Null => {
+            return Err(i.type_err("cannot convert undefined or null to object"));
+        }
+        _ => {}
+    }
+    let len = i.get_prop_str(v, "length")?;
+    let n = (i.to_num(&len)?.max(0.0) as usize).min(8_000_000);
+    let mut out = Vec::new();
+    for k in 0..n {
+        let key = idx_key(k);
+        if i.has_prop(v, &key) {
+            out.push((k, i.get_prop(v, &key)?));
+        }
+    }
+    Ok(out)
+}
+
+/// spec ArraySpeciesCreate: if `o` is an Array, result ctor =
+/// `o.constructor[@@species]` (may be null→default); else default Array.
+fn species_create(i: &mut Interp, o: &Value, len: usize) -> Result<Value, Value> {
+    let mut c = Value::Und;
+    if let Value::Obj(ob) = o {
+        if matches!(ob.borrow().kind, ObjKind::Arr(_)) {
+            c = i.get_prop_str(o, "constructor")?;
+            if matches!(c, Value::Obj(_)) {
+                c = i.get_prop(&c, &PropKey::Sym(SYM_SPECIES))?;
+                if matches!(c, Value::Null) {
+                    c = Value::Und;
+                }
+            }
+        }
+    }
+    match c {
+        Value::Und => Ok(Value::Obj(i.new_arr(vec![Value::Und; len]))),
+        c if i.is_constructor(&c) => {
+            i.construct(&c, vec![Value::Num(len as f64)], None)
+        }
+        _ => Err(i.type_err("invalid species constructor")),
+    }
+}
+
+/// spec CreateDataPropertyOrThrow on integer index — the write semantics
+/// array-into-species methods use (throws on non-configurable existing
+/// props / non-extensible targets).
+fn create_data_prop(
+    i: &mut Interp,
+    a: &Value,
+    k: usize,
+    v: Value,
+) -> Result<(), Value> {
+    if let Value::Obj(o) = a {
+        let mut b = o.borrow_mut();
+        if let ObjKind::Arr(items) = &mut b.kind {
+            if k >= items.len() {
+                items.resize(k + 1, Value::Und);
+            }
+            items[k] = v;
+            return Ok(());
+        }
+        let key = PropKey::from_str(&k.to_string());
+        match b.props.get(&key) {
+            Some(p) if !p.configurable => {
+                return Err(i.type_err("Cannot redefine property"))
+            }
+            None if !b.extensible => {
+                return Err(i.type_err("object is not extensible"))
+            }
+            _ => {}
+        }
+        b.props.insert(key, Prop::data(v));
+        return Ok(());
+    }
+    i.set_prop(a, PropKey::from_str(&k.to_string()), v)
 }
 
 pub(crate) fn clamp_index(n: f64, len: usize) -> usize {
@@ -766,10 +952,10 @@ fn install_globals(i: &mut Interp) {
             ("setPrototypeOf", obj_set_prototype_of),
             ("create", obj_create),
             ("freeze", obj_freeze),
-            ("seal", obj_freeze),
+            ("seal", obj_seal),
             ("isFrozen", obj_is_frozen),
-            ("isSealed", obj_is_frozen),
-            ("preventExtensions", obj_identity),
+            ("isSealed", obj_is_sealed),
+            ("preventExtensions", obj_prevent_ext),
             ("isExtensible", obj_is_extensible),
             ("fromEntries", obj_from_entries),
             ("is", obj_is),
@@ -785,6 +971,13 @@ fn install_globals(i: &mut Interp) {
     {
         let ctor = make_ctor(i, "Array", array_ctor, i.p.array.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
+        // Array[@@species] — spec getter returning the constructor
+        let species_get =
+            native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
+        o.borrow_mut().props.insert(
+            PropKey::Sym(SYM_SPECIES),
+            Prop::accessor(Some(species_get), None),
+        );
         i.set_builtin(o, "isArray", native(i, "isArray", array_is_array));
         i.set_builtin(o, "from", native(i, "from", array_from));
         i.set_builtin(o, "of", native(i, "of", array_of));
@@ -868,6 +1061,16 @@ fn install_globals(i: &mut Interp) {
             o,
             "toStringTag",
             Value::Sym(SYM_TOSTRINGTAG, Rc::from("Symbol.toStringTag")),
+        );
+        i.set_builtin(
+            o,
+            "isConcatSpreadable",
+            Value::Sym(SYM_IS_CONCAT_SPREADABLE, Rc::from("Symbol.isConcatSpreadable")),
+        );
+        i.set_builtin(
+            o,
+            "species",
+            Value::Sym(SYM_SPECIES, Rc::from("Symbol.species")),
         );
         i.set_builtin(o, "for", native(i, "for", symbol_for));
         i.set_builtin(o, "keyFor", native(i, "keyFor", symbol_key_for));
@@ -1526,6 +1729,9 @@ fn define_prop_from_desc(
             }
         }
     }
+    if existing.is_none() && !o.borrow().extensible {
+        return Err(i.type_err("Cannot define property: object is not extensible"));
+    }
     let mut prop = existing.unwrap_or(Prop {
         // NEW property: attributes absent from the desc default to false
         // (spec) — unlike ordinary assignment which defaults all true.
@@ -1648,6 +1854,11 @@ fn obj_get_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 fn obj_set_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let t = arg(args, 0);
     if let (Value::Obj(o), v) = (&t, &arg(args, 1)) {
+        if !o.borrow().extensible {
+            return Err(i.type_err(
+                "Object.setPrototypeOf called on non-extensible object",
+            ));
+        }
         match v {
             Value::Obj(p) => {
                 if proto_cycle(o, p) {
@@ -1687,20 +1898,63 @@ fn obj_freeze(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
     if let Value::Obj(o) = &v {
         let mut b = o.borrow_mut();
+        b.extensible = false;
         for p in b.props.values_mut() {
             p.writable = false;
             p.configurable = false;
         }
-        b.props
-            .insert_str("$frozen", Prop::builtin(Value::Bool(true)));
     }
     Ok(v)
+}
+
+fn obj_seal(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let _ = i;
+    let v = arg(args, 0);
+    if let Value::Obj(o) = &v {
+        let mut b = o.borrow_mut();
+        b.extensible = false;
+        for p in b.props.values_mut() {
+            p.configurable = false;
+        }
+    }
+    Ok(v)
+}
+
+fn obj_prevent_ext(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let _ = i;
+    let v = arg(args, 0);
+    if let Value::Obj(o) = &v {
+        o.borrow_mut().extensible = false;
+    }
+    Ok(v)
+}
+
+/// spec integrity check: non-extensible + all own props non-configurable
+/// (+ non-writable for data props when `frozen`)
+fn integrity(o: &ObjRef, frozen: bool) -> bool {
+    let b = o.borrow();
+    if b.extensible {
+        return false;
+    }
+    let ok = b
+        .props
+        .values()
+        .all(|p| !p.configurable && (!frozen || p.is_accessor() || !p.writable));
+    ok
 }
 
 fn obj_is_frozen(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let _ = i;
     if let Value::Obj(o) = &arg(args, 0) {
-        return Ok(Value::Bool(o.borrow().props.contains_str("$frozen")));
+        return Ok(Value::Bool(integrity(o, true)));
+    }
+    Ok(Value::Bool(true))
+}
+
+fn obj_is_sealed(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let _ = i;
+    if let Value::Obj(o) = &arg(args, 0) {
+        return Ok(Value::Bool(integrity(o, false)));
     }
     Ok(Value::Bool(true))
 }
@@ -1711,7 +1965,10 @@ fn obj_identity(_i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 fn obj_is_extensible(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let _ = i;
-    Ok(Value::Bool(matches!(arg(args, 0), Value::Obj(_))))
+    Ok(Value::Bool(match &arg(args, 0) {
+        Value::Obj(o) => o.borrow().extensible,
+        _ => false,
+    }))
 }
 
 fn obj_from_entries(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -1883,6 +2140,9 @@ fn array_is_array(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 fn array_from(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let src = arg(args, 0);
+    if matches!(src, Value::Und | Value::Null) {
+        return Err(i.type_err("Array.from requires an array-like or iterable"));
+    }
     let items = match i.iter_values(&src) {
         Ok(v) => v,
         Err(_) => to_elems(i, &src)?,
@@ -1947,85 +2207,135 @@ fn arr_unshift(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    // fast path: numeric/absent bounds can't run user code — slice in place
-    // under one borrow instead of snapshotting the whole array.
-    if matches!(arg(args, 0), Value::Num(_) | Value::Und)
-        && matches!(arg(args, 1), Value::Num(_) | Value::Und)
-    {
-        if let Value::Obj(o) = this {
-            let b = o.borrow();
-            if let ObjKind::Arr(items) = &b.kind {
-                let len = items.len();
-                let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
-                let end = match arg(args, 1) {
-                    Value::Und => len,
-                    v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
-                };
-                let out = if start < end {
-                    items[start..end].to_vec()
-                } else {
-                    Vec::new()
-                };
-                return Ok(Value::Obj(i.new_arr(out)));
-            }
-        }
-        return Ok(Value::Obj(i.new_arr(vec![])));
-    }
-    let items = to_elems(i, this)?;
-    let len = items.len();
+    // spec: ToObject → length → bounds → ArraySpeciesCreate(O, count) →
+    // copy only PRESENT indices (HasProperty)
+    let len = elems_len(i, this)?;
     let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
     let end = match arg(args, 1) {
         Value::Und => len,
         v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
     };
-    let out = if start < end {
-        items[start..end].to_vec()
-    } else {
-        Vec::new()
-    };
-    Ok(Value::Obj(i.new_arr(out)))
+    let a = species_create(i, this, end.saturating_sub(start))?;
+    let items = to_elems_sparse(i, this)?;
+    let mut n = 0usize;
+    for (k, v) in items {
+        if k >= start && k < end {
+            create_data_prop(i, &a, n, v)?;
+            n += 1;
+        }
+    }
+    Ok(a)
 }
 
 fn arr_splice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let mut removed = Vec::new();
-    if let Value::Obj(o) = this {
-        if let ObjKind::Arr(items) = &mut o.borrow_mut().kind {
-            let len = items.len();
-            let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
-            let del = match args.get(1) {
-                None => len - start,
-                Some(v) => {
-                    let n = i.to_num(v).unwrap_or(0.0);
-                    if n < 0.0 {
-                        0
-                    } else {
-                        (n as usize).min(len - start)
-                    }
-                }
-            };
-            let tail: Vec<Value> = items.split_off(start);
-            removed = tail[..del.min(tail.len())].to_vec();
-            let rest = tail[del.min(tail.len())..].to_vec();
-            for (k, v) in args.iter().skip(2).enumerate() {
-                items.insert(start + k, v.clone());
+    // spec order: length/bounds coercions (user code) → removed array via
+    // ArraySpeciesCreate → element read → mutation of `this`.
+    let len = elems_len(i, this)?;
+    let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
+    let del = match args.get(1) {
+        None => len - start,
+        Some(v) => {
+            let n = i.to_num(v).unwrap_or(0.0);
+            if n < 0.0 {
+                0
+            } else {
+                (n as usize).min(len - start)
             }
-            items.extend(rest);
+        }
+    };
+    let items = to_elems_sparse(i, this)?;
+    let a = species_create(i, this, del)?;
+    for (k, v) in &items {
+        if *k >= start && *k < start + del {
+            create_data_prop(i, &a, k - start, v.clone())?;
         }
     }
-    Ok(Value::Obj(i.new_arr(removed)))
+    let insert: Vec<Value> = args.iter().skip(2).cloned().collect();
+    // dense fast path — no user code below
+    if let Value::Obj(o) = this {
+        if let ObjKind::Arr(elems) = &mut o.borrow_mut().kind {
+            if start <= elems.len() {
+                let tail = elems.split_off(start);
+                let rest = tail[del.min(tail.len())..].to_vec();
+                for (k, v) in insert.iter().enumerate() {
+                    elems.insert(start + k, v.clone());
+                }
+                elems.extend(rest);
+            }
+            return Ok(a);
+        }
+    }
+    // generic receiver: rebuild indexed props + length
+    let new_len = len - del + insert.len();
+    let mut nv: Vec<Option<Value>> = vec![None; new_len];
+    for (k, v) in items {
+        if k < start {
+            nv[k] = Some(v);
+        } else if k >= start + del {
+            let nk = k - del + insert.len();
+            if nk < nv.len() {
+                nv[nk] = Some(v);
+            }
+        }
+    }
+    for (k, v) in insert.iter().enumerate() {
+        if start + k < nv.len() {
+            nv[start + k] = Some(v.clone());
+        }
+    }
+    for (k, v) in nv.iter().enumerate() {
+        match v {
+            Some(v) => {
+                i.set_prop(this, PropKey::from_str(&k.to_string()), v.clone())?
+            }
+            None => {
+                i.delete_prop(this, &PropKey::from_str(&k.to_string()));
+            }
+        }
+    }
+    for k in new_len..len {
+        i.delete_prop(this, &PropKey::from_str(&k.to_string()));
+    }
+    i.set_prop(
+        this,
+        PropKey::from_str("length"),
+        Value::Num(new_len as f64),
+    )?;
+    Ok(a)
 }
 
 fn arr_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let mut out = to_elems(i, this)?;
-    for a in args {
-        match a {
-            Value::Obj(o) if matches!(o.borrow().kind, ObjKind::Arr(_)) => {
-                out.extend(arr_clone(a));
+    // spec: E = ToObject(this) — primitives box to wrappers; A =
+    // ArraySpeciesCreate(O,0); each element of [E, ...args] spreads iff
+    // IsConcatSpreadable.
+    let boxed = i.to_object(this)?;
+    let a = species_create(i, this, 0)?;
+    let mut n = 0usize;
+    for e in std::iter::once(&boxed).chain(args.iter()) {
+        let spreadable = match e {
+            Value::Obj(o) => {
+                let flag =
+                    i.get_prop(e, &PropKey::Sym(SYM_IS_CONCAT_SPREADABLE))?;
+                if matches!(flag, Value::Und) {
+                    matches!(o.borrow().kind, ObjKind::Arr(_))
+                } else {
+                    i.to_bool(&flag)
+                }
             }
-            other => out.push(other.clone()),
+            _ => false,
+        };
+        if spreadable {
+            // spread visits only PRESENT indices (HasProperty)
+            for (_, v) in to_elems_sparse(i, e)? {
+                create_data_prop(i, &a, n, v)?;
+                n += 1;
+            }
+        } else {
+            create_data_prop(i, &a, n, e.clone())?;
+            n += 1;
         }
     }
-    Ok(Value::Obj(i.new_arr(out)))
+    Ok(a)
 }
 
 fn arr_join(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -2070,23 +2380,56 @@ fn arr_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             }
         }
     }
-    let items = to_elems(i, this)?;
-    let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), items.len());
-    for (k, v) in items.iter().enumerate().skip(start) {
-        if strict_val_eq(v, &needle) {
+    let len = elems_len(i, this)?;
+    let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), len);
+    // skip missing properties — HasProperty, not Get
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items {
+        if k < start {
+            continue;
+        }
+        if strict_val_eq(&v, &needle) {
             return Ok(Value::Num(k as f64));
         }
     }
     Ok(Value::Num(-1.0))
 }
 
+/// spec start index for lastIndexOf: `fromIndex` (default len-1), negative
+/// counts from the end; starting before 0 yields -1.
+fn last_index_start(n: f64, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let k = if n.is_nan() {
+        len as i64 - 1
+    } else if n < 0.0 {
+        len as i64 + n as i64
+    } else {
+        (n as i64).min(len as i64 - 1)
+    };
+    (k >= 0).then_some(k as usize)
+}
+
 fn arr_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let needle = arg(args, 0);
-    // no user code runs here — scan in place under one borrow
+    // fromIndex may run user code (valueOf) — convert BEFORE borrowing
+    let from = match args.get(1) {
+        Some(v) => Some(i.to_num(v)?),
+        None => None,
+    };
+    // no user code runs from here — scan in place under one borrow
     if let Value::Obj(o) = this {
         let b = o.borrow();
         if let ObjKind::Arr(items) = &b.kind {
-            for k in (0..items.len()).rev() {
+            let start = match from {
+                Some(n) => last_index_start(n, items.len()),
+                None => items.len().checked_sub(1),
+            };
+            let Some(start) = start else {
+                return Ok(Value::Num(-1.0));
+            };
+            for k in (0..=start).rev() {
                 if strict_val_eq(&items[k], &needle) {
                     return Ok(Value::Num(k as f64));
                 }
@@ -2094,10 +2437,22 @@ fn arr_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             return Ok(Value::Num(-1.0));
         }
     }
-    let items = to_elems(i, this)?;
-    for k in (0..items.len()).rev() {
-        if strict_val_eq(&items[k], &needle) {
-            return Ok(Value::Num(k as f64));
+    let len = elems_len(i, this)?;
+    let start = match from {
+        Some(n) => last_index_start(n, len),
+        None => len.checked_sub(1),
+    };
+    let Some(start) = start else {
+        return Ok(Value::Num(-1.0));
+    };
+    // skip missing properties — HasProperty, not Get
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items.iter().rev() {
+        if *k > start {
+            continue;
+        }
+        if strict_val_eq(v, &needle) {
+            return Ok(Value::Num(*k as f64));
         }
     }
     Ok(Value::Num(-1.0))
@@ -2138,12 +2493,12 @@ fn arr_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    for (k, v) in items.iter().enumerate() {
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items.iter() {
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(k as f64), this.clone()],
+            vec![v.clone(), Value::Num(*k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
             return Ok(v.clone());
@@ -2155,15 +2510,15 @@ fn arr_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    for (k, v) in items.iter().enumerate() {
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items.iter() {
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(k as f64), this.clone()],
+            vec![v.clone(), Value::Num(*k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(Value::Num(k as f64));
+            return Ok(Value::Num(*k as f64));
         }
     }
     Ok(Value::Num(-1.0))
@@ -2172,15 +2527,15 @@ fn arr_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    for k in (0..items.len()).rev() {
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items.iter().rev() {
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![items[k].clone(), Value::Num(k as f64), this.clone()],
+            vec![v.clone(), Value::Num(*k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(items[k].clone());
+            return Ok(v.clone());
         }
     }
     Ok(Value::Und)
@@ -2189,15 +2544,15 @@ fn arr_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    for k in (0..items.len()).rev() {
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items.iter().rev() {
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![items[k].clone(), Value::Num(k as f64), this.clone()],
+            vec![v.clone(), Value::Num(*k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(Value::Num(k as f64));
+            return Ok(Value::Num(*k as f64));
         }
     }
     Ok(Value::Num(-1.0))
@@ -2206,45 +2561,49 @@ fn arr_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult 
 fn arr_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    let mut out = Vec::new();
-    for (k, v) in items.iter().enumerate() {
+    let items = to_elems_sparse(i, this)?;
+    let a = species_create(i, this, 0)?;
+    let mut n = 0usize;
+    for (k, v) in items {
         let r = i.call(
             &cb,
             this_arg.clone(),
             vec![v.clone(), Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
-            out.push(v.clone());
+            create_data_prop(i, &a, n, v)?;
+            n += 1;
         }
     }
-    Ok(Value::Obj(i.new_arr(out)))
+    Ok(a)
 }
 
 fn arr_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    let mut out = Vec::with_capacity(items.len());
-    for (k, v) in items.iter().enumerate() {
-        out.push(i.call(
+    let items = to_elems_sparse(i, this)?;
+    let len = elems_len(i, this)?;
+    let a = species_create(i, this, len)?;
+    for (k, v) in items {
+        let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(k as f64), this.clone()],
-        )?);
+            vec![v, Value::Num(k as f64), this.clone()],
+        )?;
+        create_data_prop(i, &a, k, r)?;
     }
-    Ok(Value::Obj(i.new_arr(out)))
+    Ok(a)
 }
 
 fn arr_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    for (k, v) in items.iter().enumerate() {
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items {
         i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(k as f64), this.clone()],
+            vec![v, Value::Num(k as f64), this.clone()],
         )?;
     }
     Ok(Value::Und)
@@ -2252,21 +2611,22 @@ fn arr_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn arr_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
-    let items = to_elems(i, this)?;
-    let (mut acc, start) = match args.get(1) {
-        Some(v) => (v.clone(), 0),
-        None => {
-            if items.is_empty() {
-                return Err(i.type_err("Reduce of empty array with no initial value"));
+    let items = to_elems_sparse(i, this)?;
+    let mut it = items.into_iter();
+    let mut acc = match args.get(1) {
+        Some(v) => v.clone(),
+        None => match it.next() {
+            Some((_, v)) => v,
+            None => {
+                return Err(i.type_err("Reduce of empty array with no initial value"))
             }
-            (items[0].clone(), 1)
-        }
+        },
     };
-    for (k, v) in items.iter().enumerate().skip(start) {
+    for (k, v) in it {
         acc = i.call(
             &cb,
             Value::Und,
-            vec![acc, v.clone(), Value::Num(k as f64), this.clone()],
+            vec![acc, v, Value::Num(k as f64), this.clone()],
         )?;
     }
     Ok(acc)
@@ -2274,21 +2634,22 @@ fn arr_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn arr_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
-    let items = to_elems(i, this)?;
-    let (mut acc, start) = match args.get(1) {
-        Some(v) => (v.clone(), items.len()),
-        None => {
-            if items.is_empty() {
-                return Err(i.type_err("Reduce of empty array with no initial value"));
+    let items = to_elems_sparse(i, this)?;
+    let mut it = items.into_iter().rev();
+    let mut acc = match args.get(1) {
+        Some(v) => v.clone(),
+        None => match it.next() {
+            Some((_, v)) => v,
+            None => {
+                return Err(i.type_err("Reduce of empty array with no initial value"))
             }
-            (items[items.len() - 1].clone(), items.len() - 1)
-        }
+        },
     };
-    for k in (0..start).rev() {
+    for (k, v) in it {
         acc = i.call(
             &cb,
             Value::Und,
-            vec![acc, items[k].clone(), Value::Num(k as f64), this.clone()],
+            vec![acc, v, Value::Num(k as f64), this.clone()],
         )?;
     }
     Ok(acc)
@@ -2297,12 +2658,12 @@ fn arr_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    for (k, v) in items.iter().enumerate() {
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items {
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(k as f64), this.clone()],
+            vec![v, Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
             return Ok(Value::Bool(true));
@@ -2314,12 +2675,12 @@ fn arr_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems(i, this)?;
-    for (k, v) in items.iter().enumerate() {
+    let items = to_elems_sparse(i, this)?;
+    for (k, v) in items {
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(k as f64), this.clone()],
+            vec![v, Value::Num(k as f64), this.clone()],
         )?;
         if !i.to_bool(&r) {
             return Ok(Value::Bool(false));
@@ -2329,30 +2690,66 @@ fn arr_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_flat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let depth = i.to_num(&arg(args, 0)).unwrap_or(1.0) as usize;
-    let items = to_elems(i, this)?;
-    fn rec(i: &Interp, items: Vec<Value>, d: usize, out: &mut Vec<Value>) {
-        let _ = i;
-        for v in items {
+    let depth = match arg(args, 0) {
+        Value::Und => 1,
+        v => (i.to_num(&v)?.max(0.0)) as usize,
+    };
+    let items = to_elems_sparse(i, this)?;
+    let a = species_create(i, this, 0)?;
+    let mut n = 0usize;
+    fn rec(
+        i: &mut Interp,
+        items: Vec<(usize, Value)>,
+        d: usize,
+        a: &Value,
+        n: &mut usize,
+    ) -> Result<(), Value> {
+        for (_, v) in items {
             if d > 0 {
                 if let Value::Obj(o) = &v {
                     if let ObjKind::Arr(inner) = &o.borrow().kind {
-                        rec(i, inner.clone(), d - 1, out);
+                        let inner: Vec<(usize, Value)> =
+                            inner.iter().cloned().enumerate().collect();
+                        rec(i, inner, d - 1, a, n)?;
                         continue;
                     }
                 }
             }
-            out.push(v);
+            create_data_prop(i, a, *n, v)?;
+            *n += 1;
         }
+        Ok(())
     }
-    let mut out = Vec::new();
-    rec(i, items, depth.max(1), &mut out);
-    Ok(Value::Obj(i.new_arr(out)))
+    rec(i, items, depth, &a, &mut n)?;
+    Ok(a)
 }
 
 fn arr_flat_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let mapped = arr_map(i, this, args)?;
-    arr_flat(i, &mapped, &[Value::Num(1.0)])
+    let cb = arg(args, 0);
+    let this_arg = arg(args, 1);
+    let items = to_elems_sparse(i, this)?;
+    let a = species_create(i, this, 0)?;
+    let mut n = 0usize;
+    for (k, v) in items {
+        let r = i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v, Value::Num(k as f64), this.clone()],
+        )?;
+        // FlattenIntoArray depth 1: arrays expand, others append
+        if let Value::Obj(o) = &r {
+            if let ObjKind::Arr(inner) = &o.borrow().kind {
+                for x in inner.clone() {
+                    create_data_prop(i, &a, n, x)?;
+                    n += 1;
+                }
+                continue;
+            }
+        }
+        create_data_prop(i, &a, n, r)?;
+        n += 1;
+    }
+    Ok(a)
 }
 
 fn arr_fill(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -5116,7 +5513,7 @@ fn reflect_apply(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 fn reflect_construct(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let f = arg(args, 0);
     let list = to_elems(i, &arg(args, 1))?;
-    i.construct(&f, list, None)
+    i.construct(&f, list, args.get(2).cloned())
 }
 
 // ===========================================================================
