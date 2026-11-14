@@ -2101,6 +2101,91 @@ fn radius_corners(value: &str) -> [Option<String>; 4] {
     out
 }
 
+/// `border`-family shorthand token split → (width, style, color) raw
+/// strings. Width = border-width keywords or any <length>; style = the
+/// border-style keyword set; anything else is taken as the color.
+fn border_components(value: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let (mut w, mut s, mut c) = (None, None, None);
+    for t in cascade::split_ws_parens(value) {
+        if matches!(
+            t,
+            "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset"
+                | "none" | "hidden"
+        ) {
+            if s.is_none() {
+                s = Some(t.to_string());
+                continue;
+            }
+        }
+        if matches!(t, "thin" | "medium" | "thick") || is_len_or_pct(t) {
+            if w.is_none() {
+                w = Some(t.to_string());
+                continue;
+            }
+        }
+        if c.is_none() {
+            c = Some(t.to_string());
+        }
+    }
+    (w, s, c)
+}
+
+/// `font` shorthand → (prop, value) longhand pairs. Grammar:
+/// `[[style||variant||weight||stretch]]? size[/line-height] family`.
+/// The size is the first token that parses as a length/percent or is a
+/// font-size keyword; everything after it is the family list.
+fn font_shorthand(value: &str) -> Option<Vec<(&'static str, String)>> {
+    let toks = cascade::split_ws_parens(value);
+    let (mut style, mut variant, mut weight, mut stretch) =
+        ("normal", "normal", "normal", "normal");
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        let size_tok = t.split('/').next().unwrap_or(t);
+        let is_size = is_len_or_pct(size_tok)
+            || matches!(
+                size_tok,
+                "xx-small" | "x-small" | "small" | "medium" | "large" | "x-large"
+                    | "xx-large" | "xxx-large" | "larger" | "smaller"
+            );
+        if is_size {
+            break;
+        }
+        match t.to_ascii_lowercase().as_str() {
+            "italic" | "oblique" => style = "italic",
+            "small-caps" => variant = "small-caps",
+            "bold" | "bolder" | "lighter" => weight = toks[i],
+            "normal" => {}
+            s if s.parse::<u16>().map(|n| (100..=900).contains(&n)) == Ok(true) => {
+                weight = toks[i]
+            }
+            "ultra-condensed" | "extra-condensed" | "condensed" | "semi-condensed"
+            | "semi-expanded" | "expanded" | "extra-expanded" | "ultra-expanded" => {
+                stretch = toks[i]
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let size_tok = toks.get(i)?;
+    let (size, lh) = size_tok.split_once('/').unwrap_or((size_tok, ""));
+    let mut out = vec![
+        ("font-style", style.to_string()),
+        ("font-variant", variant.to_string()),
+        ("font-weight", weight.to_string()),
+        ("font-stretch", stretch.to_string()),
+        ("font-size", size.to_string()),
+    ];
+    if !lh.is_empty() {
+        out.push(("line-height", lh.to_string()));
+    }
+    let family = toks[i + 1..].join(" ");
+    if !family.is_empty() {
+        out.push(("font-family", family));
+    }
+    Some(out)
+}
+
 /// Does `t` look like a <length> or <percentage> (for shorthand token
 /// classification — units aren't validated beyond a numeric prefix)?
 fn is_len_or_pct(t: &str) -> bool {
@@ -2445,9 +2530,24 @@ fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
         return;
     }
     match prop {
-        // `border` resets every longhand of all four sides.
+        // `font` shorthand: `font: [style variant weight stretch]?
+        // size[/line-height] family` — extract each component into its
+        // longhand; unparsed prefix keywords stay their defaults.
+        "font" => {
+            f("font", value);
+            if let Some(long) = font_shorthand(value) {
+                for (p, v) in long {
+                    f(p, &v);
+                }
+            }
+        }
+        // `border` resets every longhand of all four sides. Emit the
+        // parsed width/style/color components when extractable; absent
+        // components carry the raw shorthand (the painter's parts parser
+        // ignores non-matching tokens, so paint behavior is unchanged).
         "border" => {
             f("border", value);
+            let (bw, bs, bc) = border_components(value);
             for (w, s, c) in [
                 ("border-top-width", "border-top-style", "border-top-color"),
                 (
@@ -2466,9 +2566,9 @@ fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
                     "border-left-color",
                 ),
             ] {
-                f(w, value);
-                f(s, value);
-                f(c, value);
+                f(w, bw.as_deref().unwrap_or(value));
+                f(s, bs.as_deref().unwrap_or(value));
+                f(c, bc.as_deref().unwrap_or(value));
             }
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
@@ -2491,9 +2591,10 @@ fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
                 ),
             };
             f(prop, value);
-            f(w, value);
-            f(s, value);
-            f(c, value);
+            let (bw, bs, bc) = border_components(value);
+            f(w, bw.as_deref().unwrap_or(value));
+            f(s, bs.as_deref().unwrap_or(value));
+            f(c, bc.as_deref().unwrap_or(value));
         }
         "border-radius" => {
             f("border-radius", value);
@@ -2512,14 +2613,37 @@ fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
         }
         "outline" => {
             f("outline", value);
-            f("outline-width", value);
-            f("outline-style", value);
-            f("outline-color", value);
+            let (bw, bs, bc) = border_components(value);
+            f("outline-width", bw.as_deref().unwrap_or(value));
+            f("outline-style", bs.as_deref().unwrap_or(value));
+            f("outline-color", bc.as_deref().unwrap_or(value));
         }
         "overflow" => {
             f("overflow", value);
-            f("overflow-x", value);
-            f("overflow-y", value);
+            let mut it = value.split_whitespace();
+            let x = it.next().unwrap_or("visible");
+            let y = it.next().unwrap_or(x);
+            f("overflow-x", x);
+            f("overflow-y", y);
+        }
+        "text-decoration" => {
+            f("text-decoration", value);
+            // line keywords are the shorthand's required component —
+            // expose them on the -line longhand too (spec expansion);
+            // style/color/thickness stay on the shorthand prop for the
+            // painter's parts parser.
+            let lines: Vec<&str> = value
+                .split_whitespace()
+                .filter(|t| {
+                    matches!(
+                        *t,
+                        "underline" | "overline" | "line-through" | "blink" | "none"
+                    )
+                })
+                .collect();
+            if !lines.is_empty() {
+                f("text-decoration-line", &lines.join(" "));
+            }
         }
         "gap" => {
             f("gap", value);
@@ -3704,9 +3828,9 @@ mod sel4 {
         let p = doc.find_deep(doc.root, "p").unwrap();
         let s = parse("p{border:2px dashed red;border-top-color:blue}");
         let c = computed(&doc, p, &[&s]);
-        // side shorthands carry the full token list for component extraction
-        assert_eq!(c.get("border-left-width").unwrap(), "2px dashed red");
-        assert_eq!(c.get("border-left-style").unwrap(), "2px dashed red");
+        // shorthand components expand into each side's longhands
+        assert_eq!(c.get("border-left-width").unwrap(), "2px");
+        assert_eq!(c.get("border-left-style").unwrap(), "dashed");
         assert_eq!(c.get("border-top-color").unwrap(), "blue");
     }
 
@@ -3740,8 +3864,10 @@ mod sel4 {
         let p = doc.find_deep(doc.root, "p").unwrap();
         let s = parse("p{outline:2px solid red;overflow:hidden}");
         let c = computed(&doc, p, &[&s]);
-        assert_eq!(c.get("outline-width").unwrap(), "2px solid red");
+        assert_eq!(c.get("outline-width").unwrap(), "2px");
+        assert_eq!(c.get("outline-style").unwrap(), "solid");
         assert_eq!(c.get("overflow-x").unwrap(), "hidden");
+        assert_eq!(c.get("overflow-y").unwrap(), "hidden");
     }
 
     #[test]

@@ -97,15 +97,18 @@ impl CustomSrc for RawLayers<'_> {
                 Some(Wide::Inherit | Wide::Unset) => {}
             }
         }
-        if let Some(v) = self.root.get(name) {
-            return Some(v.clone());
-        }
+        // custom properties inherit — the parent's resolved value (which
+        // itself resolves own→parent→…→html) shadows `:root` raws; the
+        // root map only matters for subtrees detached from <html>.
         if let Some(par) = self.parent {
             if let Some(v) = par.get(name) {
                 if self.defs.get(name).map(|d| d.inherits).unwrap_or(true) {
                     return Some(v);
                 }
             }
+        }
+        if let Some(v) = self.root.get(name) {
+            return Some(v.clone());
         }
         self.initial(name)
     }
