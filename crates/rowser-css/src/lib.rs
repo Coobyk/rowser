@@ -19,6 +19,7 @@
 
 use rowser_dom::{Document, NodeId};
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 pub mod cascade;
 mod pseudo;
@@ -174,6 +175,10 @@ pub struct PseudoState {
     pub active: Option<NodeId>,
     /// URL fragment (`#x`) for `:target`.
     pub target_frag: Option<String>,
+    /// Caret (char index) inside the focused text control — layout draws
+    /// it; `None` when focus isn't an editable control. Not a selector
+    /// input — purely a paint hint piggybacking on `focused`.
+    pub caret: Option<usize>,
 }
 
 /// One `@import` statement: target url + the media list it applies
@@ -184,6 +189,7 @@ pub struct Import {
     pub media: String,
 }
 
+#[derive(Clone)]
 pub struct StyleSheet {
     pub rules: Vec<Rule>,
     /// `@import` statements in document order — the loader splices the
@@ -193,6 +199,10 @@ pub struct StyleSheet {
     /// Cascade-layer index per rule (parallel to `rules`); `u32::MAX` =
     /// unlayered, which beats every layered rule of the same importance.
     layers: Vec<u32>,
+    /// Specificity per selector (parallel to `rules[].selectors`),
+    /// rebuilt by `reindex` so the per-node cascade never re-walks a
+    /// selector just to order a declaration.
+    specs: Vec<Vec<(u32, u32, u32)>>,
     /// Rightmost-compound index built at parse time: rules bucketed by a
     /// tag/class/id their rightmost compound requires. `plain` holds rules
     /// whose rightmost compound needs no such key (`*`, `[attr]`, pseudos).
@@ -201,6 +211,14 @@ pub struct StyleSheet {
     by_class: FxHashMap<String, Vec<u32>>,
     by_id: FxHashMap<String, Vec<u32>>,
     plain: Vec<u32>,
+    /// Rules whose rightmost compound carries `::pseudo-element` of each
+    /// [`PseudoElem`] kind, by `kind as usize`. These can never match a
+    /// real element, so the element cascade skips them entirely;
+    /// [`StyleCtx::computed_pseudo`] merges its kind's bucket into its
+    /// candidate list. (Selectors whose rightmost compound contains a
+    /// never-matching simple — `Never`/`Unsupported`/`:visited` — are not
+    /// indexed at all: they can't match an element or a pseudo box.)
+    pseudos: [Vec<u32>; 7],
     /// `@keyframes` name → declarations of its end (`to`/`100%`/last)
     /// frame, used to emulate animation-fill-mode resting state.
     pub keyframes: FxHashMap<String, Vec<Decl>>,
@@ -273,10 +291,12 @@ pub fn parse_vw(css: &str, vw: f32) -> StyleSheet {
         rules,
         imports: p.imports,
         layers,
+        specs: Vec::new(),
         by_tag: FxHashMap::default(),
         by_class: FxHashMap::default(),
         by_id: FxHashMap::default(),
         plain: Vec::new(),
+        pseudos: Default::default(),
         keyframes: p.keyframes.into_iter().collect(),
         properties: p
             .properties
@@ -321,32 +341,73 @@ impl StyleSheet {
         self.by_class.clear();
         self.by_id.clear();
         self.plain.clear();
+        for p in &mut self.pseudos {
+            p.clear();
+        }
         for (i, rule) in self.rules.iter().enumerate() {
-            let mut bucketed = false;
             for sel in &rule.selectors {
+                // `::pseudo-element` rightmost compounds live in their own
+                // per-kind bucket — they never match a real element, so the
+                // element index shouldn't scan them. A never-matching
+                // simple in ANY compound makes the whole selector dead
+                // (likewise a `::` in a non-rightmost compound — matching
+                // walks leftward and computed_pseudo only looks at the
+                // rightmost one).
+                let mut kinds = 0u8;
+                let mut dead = false;
+                for (part_i, (_, simples)) in sel.parts.iter().enumerate() {
+                    let rightmost = part_i + 1 == sel.parts.len();
+                    for s in simples {
+                        match s {
+                            Simple::PseudoElem(k) if rightmost => {
+                                kinds |= 1 << (*k as usize)
+                            }
+                            Simple::PseudoElem(_) => dead = true,
+                            Simple::Never | Simple::Unsupported | Simple::Visited => {
+                                dead = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if kinds != 0 {
+                    for k in 0..self.pseudos.len() {
+                        if kinds & (1 << k) != 0
+                            && self.pseudos[k].last() != Some(&(i as u32))
+                        {
+                            self.pseudos[k].push(i as u32);
+                        }
+                    }
+                    continue;
+                }
+                if dead {
+                    continue;
+                }
                 match rightmost_key(sel) {
                     Some(("id", k)) => {
                         self.by_id.entry(k.to_string()).or_default().push(i as u32);
-                        bucketed = true;
                     }
                     Some(("class", k)) => {
                         self.by_class
                             .entry(k.to_string())
                             .or_default()
                             .push(i as u32);
-                        bucketed = true;
                     }
                     Some(("tag", k)) => {
                         self.by_tag.entry(k.to_string()).or_default().push(i as u32);
-                        bucketed = true;
                     }
-                    _ => {}
+                    // an unkeyed selector can match ANY element — the rule
+                    // must stay visible even when sibling selectors are
+                    // keyed (`a, * {}` still applies to non-`a` nodes)
+                    _ => self.plain.push(i as u32),
                 }
             }
-            if !bucketed {
-                self.plain.push(i as u32);
-            }
         }
+        self.specs = self
+            .rules
+            .iter()
+            .map(|r| r.selectors.iter().map(specificity).collect())
+            .collect();
     }
 
     /// Positions of rules that could match `node`, in sheet order, appended
@@ -377,6 +438,44 @@ impl StyleSheet {
         out.sort_unstable();
         out.dedup();
     }
+
+    /// `candidates_into` plus the `::kind` pseudo-element rules — the
+    /// candidate set for [`StyleCtx::computed_pseudo`]. Pseudo selectors
+    /// can't match a real element so they're absent from the element
+    /// index; here the `pseudos[kind]` bucket is merged back in (both
+    /// lists are sorted by rule index, so a linear merge preserves the
+    /// document order `order` keys rely on).
+    fn candidates_pseudo_into(
+        &self,
+        doc: &Document,
+        node: NodeId,
+        kind: PseudoElem,
+        out: &mut Vec<u32>,
+    ) {
+        self.candidates_into(doc, node, out);
+        let extra = &self.pseudos[kind as usize];
+        if extra.is_empty() {
+            return;
+        }
+        let mut merged = Vec::with_capacity(out.len() + extra.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < out.len() && j < extra.len() {
+            let (a, b) = (out[i], extra[j]);
+            if a <= b {
+                merged.push(a);
+                i += 1;
+                if a == b {
+                    j += 1;
+                }
+            } else {
+                merged.push(b);
+                j += 1;
+            }
+        }
+        merged.extend_from_slice(&out[i..]);
+        merged.extend_from_slice(&extra[j..]);
+        *out = merged;
+    }
 }
 
 struct CssParser<'a> {
@@ -398,6 +497,16 @@ struct CssParser<'a> {
     imports: Vec<Import>,
     /// `@font-face` descriptors collected for `StyleSheet::fonts`.
     font_faces: Vec<FontFace>,
+}
+
+/// UTF-8 sequence length from a lead byte (1 on malformed).
+fn utf8_len(b: u8) -> usize {
+    match b {
+        0..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    }
 }
 
 impl<'a> CssParser<'a> {
@@ -663,15 +772,22 @@ impl<'a> CssParser<'a> {
                         self.pos += 1;
                     }
                 } else if let Some(lit) = self.peek() {
-                    out.push(lit as char);
-                    self.pos += 1;
+                    // escaped literal char — may lead a UTF-8 sequence
+                    let n = utf8_len(lit).min(self.s.len() - self.pos);
+                    out.push_str(&String::from_utf8_lossy(&self.s[self.pos..self.pos + n]));
+                    self.pos += n;
                 }
             } else if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_') || c >= 0x80 {
                 // case preserved — class/id/attr-value identifiers are
                 // case-sensitive; callers wanting ASCII-CI (tags, props,
                 // at-rule names, pseudos) lowercase the result themselves
-                out.push(c as char);
-                self.pos += 1;
+                let n = if c >= 0x80 {
+                    utf8_len(c).min(self.s.len() - self.pos)
+                } else {
+                    1
+                };
+                out.push_str(&String::from_utf8_lossy(&self.s[self.pos..self.pos + n]));
+                self.pos += n;
             } else {
                 break;
             }
@@ -1340,11 +1456,51 @@ fn attr_op_matches(doc: &Document, node: NodeId, a: &str, op: &AttrOp, v: &str, 
     let Some(av) = doc.attr(node, a) else {
         return false;
     };
-    let (av, v) = if ci {
-        (av.to_lowercase(), v.to_lowercase())
-    } else {
-        (av.to_string(), v.to_string())
-    };
+    if !ci {
+        return match op {
+            AttrOp::Eq => av == v,
+            AttrOp::Includes => !v.is_empty() && av.split_whitespace().any(|w| w == v),
+            AttrOp::DashMatch => {
+                av == v || (av.len() > v.len() && av.starts_with(v) && av.as_bytes()[v.len()] == b'-')
+            }
+            AttrOp::Prefix => !v.is_empty() && av.starts_with(v),
+            AttrOp::Suffix => !v.is_empty() && av.ends_with(v),
+            AttrOp::Substring => !v.is_empty() && av.contains(v),
+        };
+    }
+    // `i` flag compares ASCII-insensitively without allocating; the
+    // lowercase path stays for non-ASCII values (beyond the flag's scope,
+    // but preserves prior behavior on them)
+    if av.is_ascii() && v.is_ascii() {
+        let (av, v) = (av.as_bytes(), v.as_bytes());
+        return match op {
+            AttrOp::Eq => av.eq_ignore_ascii_case(v),
+            AttrOp::Includes => {
+                !v.is_empty()
+                    && av
+                        .split(|&c| (c as char).is_whitespace())
+                        .any(|w| !w.is_empty() && w.eq_ignore_ascii_case(v))
+            }
+            AttrOp::DashMatch => {
+                av.eq_ignore_ascii_case(v)
+                    || (av.len() > v.len()
+                        && av[..v.len()].eq_ignore_ascii_case(v)
+                        && av[v.len()] == b'-')
+            }
+            AttrOp::Prefix => {
+                !v.is_empty() && av.len() >= v.len() && av[..v.len()].eq_ignore_ascii_case(v)
+            }
+            AttrOp::Suffix => {
+                !v.is_empty() && av.len() >= v.len() && av[av.len() - v.len()..].eq_ignore_ascii_case(v)
+            }
+            AttrOp::Substring => {
+                !v.is_empty()
+                    && av.len() >= v.len()
+                    && av.windows(v.len()).any(|w| w.eq_ignore_ascii_case(v))
+            }
+        };
+    }
+    let (av, v) = (av.to_lowercase(), v.to_lowercase());
     match op {
         AttrOp::Eq => av == v,
         AttrOp::Includes => !v.is_empty() && av.split_whitespace().any(|w| w == v.as_str()),
@@ -1462,30 +1618,47 @@ fn rel_step(doc: &Document, from: NodeId, rel: &Selector, i: usize, st: &PseudoS
     }
 }
 
+/// Tag/id/class snapshot of a node — the rightmost-compound prefilter
+/// reads it for every candidate selector, so it's fetched once per node
+/// instead of once per selector.
+struct NodeKey<'x> {
+    tag: Option<&'x str>,
+    id: Option<&'x str>,
+    class: Option<&'x str>,
+}
+
+fn node_key<'x>(doc: &'x Document, node: NodeId) -> NodeKey<'x> {
+    NodeKey {
+        tag: doc.tag(node),
+        id: doc.attr(node, "id"),
+        class: doc.attr(node, "class"),
+    }
+}
+
 /// Cheap bail: the rightmost compound's tag/classes/id must hold on `node`
 /// for the selector to match — lets computed() skip most rules without
 /// running the full matcher.
-fn rightmost_ok(doc: &Document, node: NodeId, s: &Selector) -> bool {
+fn rightmost_ok(key: &NodeKey<'_>, s: &Selector) -> bool {
     let Some((_, simples)) = s.parts.last() else {
         return false;
     };
     for sm in simples {
         match sm {
             Simple::Tag(t) => {
-                if doc.tag(node) != Some(t.as_str()) {
+                if key.tag != Some(t.as_str()) {
                     return false;
                 }
             }
             Simple::Class(cl) => {
-                let has = doc
-                    .attr(node, "class")
+                let has = key
+                    .class
                     .is_some_and(|a| a.split_whitespace().any(|c| c == cl));
                 if !has {
                     return false;
                 }
             }
             Simple::Id(i) => {
-                if doc.attr(node, "id") != Some(i.as_str()) {
+                if key.id != Some(i.as_str()) {
                     return false;
                 }
             }
@@ -1499,6 +1672,26 @@ fn compound_matches(doc: &Document, node: NodeId, simples: &[Simple], st: &Pseud
     simples.iter().all(|s| simple_matches(doc, node, s, st))
 }
 
+/// `compound_matches` against a precomputed [`NodeKey`] — the subject
+/// node's tag/class/id lookups happen once per `computed`, not once per
+/// candidate selector.
+fn compound_matches_key(
+    doc: &Document,
+    node: NodeId,
+    simples: &[Simple],
+    key: &NodeKey<'_>,
+    st: &PseudoState,
+) -> bool {
+    simples.iter().all(|s| match s {
+        Simple::Tag(t) => key.tag == Some(t.as_str()),
+        Simple::Class(c) => key
+            .class
+            .is_some_and(|a| a.split_whitespace().any(|x| x == c)),
+        Simple::Id(i) => key.id == Some(i.as_str()),
+        _ => simple_matches(doc, node, s, st),
+    })
+}
+
 /// Match a selector against an element node (right-to-left), with no
 /// interaction state — `:hover`/`:focus`/... never match here; callers
 /// holding a [`PseudoState`] should use `matches_st` (or `StyleCtx`).
@@ -1509,20 +1702,45 @@ pub fn matches(doc: &Document, node: NodeId, sel: &Selector) -> bool {
 /// Match a selector under an explicit interaction state — same walk as
 /// [`matches`], but the dynamic-state simples consult `st`.
 fn matches_st(doc: &Document, node: NodeId, sel: &Selector, st: &PseudoState) -> bool {
+    matches_st_key(doc, node, sel, st, &node_key(doc, node))
+}
+
+/// `matches_st` with a caller-fetched [`NodeKey`] — used on the hot
+/// cascade paths that check many selectors against the same node.
+fn matches_st_key(
+    doc: &Document,
+    node: NodeId,
+    sel: &Selector,
+    st: &PseudoState,
+    key: &NodeKey<'_>,
+) -> bool {
     let n = sel.parts.len();
     if n == 0 {
         return false;
     }
     let (_, last) = &sel.parts[n - 1];
-    if !compound_matches(doc, node, last, st) {
+    if !compound_matches_key(doc, node, last, key, st) {
         return false;
     }
+    rest_matches(doc, node, &sel.parts, st)
+}
+
+/// Leftward ancestor/sibling walk over `parts[..len-1]` once the rightmost
+/// compound has matched `node`. Shared by `matches_st` and the
+/// pseudo-element subject check in `pseudo.rs` (which skips `::` simples
+/// in the rightmost compound instead of cloning the selector).
+fn rest_matches(
+    doc: &Document,
+    node: NodeId,
+    parts: &[(Combinator, Vec<Simple>)],
+    st: &PseudoState,
+) -> bool {
     // walk leftward: parts[i].0 is the combinator between compounds i-1
     // and i — it tells how to find the parts[i-1] node from `cur`.
     let mut cur = node;
-    for i in (1..n).rev() {
-        let comb = sel.parts[i].0;
-        let simples = &sel.parts[i - 1].1;
+    for i in (1..parts.len()).rev() {
+        let comb = parts[i].0;
+        let simples = &parts[i - 1].1;
         match comb {
             Combinator::Child => {
                 let Some(p) = doc.parent(cur) else {
@@ -1583,12 +1801,23 @@ pub struct StyleCtx<'a> {
     sheets: Vec<&'a StyleSheet>,
     buf: Vec<u32>,
     /// html element's `--*` decls, resolved on first var() use.
-    root_customs: Option<StrMap<String>>,
-    /// Resolved outputs of ancestor elements, memoized for the parent
-    /// lookups done by inherit/unset/all:inherit and the inherited-prop
-    /// pass. Queried nodes themselves are not stored (layout has its own
-    /// Rc'd style_cache).
-    node_memo: FxHashMap<NodeId, cascade::NodeOut>,
+    root_customs: Option<Arc<StrMap<String>>>,
+    /// `@property --x` registrations merged across the sheet set,
+    /// built once — the same map serves every `finish` call.
+    prop_defs: Option<Arc<FxHashMap<String, cascade::PropertyDef>>>,
+    /// Resolved outputs of every `computed` node plus the ancestors that
+    /// `parent_entry` materialized, memoized for the parent lookups done
+    /// by inherit/unset/all:inherit and the inherited-prop pass. Storing
+    /// queried nodes too means each element cascades once — previously an
+    /// internal element was computed again when a child looked it up as
+    /// a parent. Arc'd: children share the parent's maps instead of
+    /// cloning them into every `finish`.
+    node_memo: FxHashMap<NodeId, Arc<cascade::NodeOut>>,
+    /// `(prop, value)` → expanded longhand pairs, memoized — the same
+    /// declarations expand on every matching element. Keyed by a 64-bit
+    /// Fx hash with the raw strings stored alongside to verify hits
+    /// (cheap probe: no per-lookup allocation).
+    expand_memo: cascade::ExpandMemo,
     /// Interaction state `:hover`/`:focus`/... match against.
     state: PseudoState,
 }
@@ -1633,30 +1862,49 @@ impl<'a> StyleCtx<'a> {
             sheets: sheets.to_vec(),
             buf: Vec::new(),
             root_customs: None,
+            prop_defs: None,
             node_memo: FxHashMap::default(),
+            expand_memo: FxHashMap::default(),
             state: PseudoState::default(),
         }
     }
 
     /// Install the interaction state (`:hover`, `:focus`, `:active`,
-    /// `:target`) the next `computed` calls match against.
+    /// `:target`) the next `computed` calls match against. Changes
+    /// which selectors match, so memoized node results are invalidated.
     pub fn set_state(&mut self, state: PseudoState) {
         self.state = state;
+        self.node_memo.clear();
     }
 
     /// The `<html>` element's own custom-property declarations, computed
     /// once and shared read-only thereafter (an empty map if there's no
     /// html element — same as the previous per-node `find_deep` miss).
-    fn root_customs(&mut self) -> &StrMap<String> {
+    fn root_customs(&mut self) -> Arc<StrMap<String>> {
         if self.root_customs.is_none() {
-            self.root_customs = Some(
+            self.root_customs = Some(Arc::new(
                 self.doc
                     .find_deep(self.doc.root, "html")
                     .map(|h| element_customs(self.doc, h, &self.sheets))
                     .unwrap_or_default(),
-            );
+            ));
         }
-        self.root_customs.as_ref().unwrap()
+        self.root_customs.as_ref().unwrap().clone()
+    }
+
+    /// `@property --x` descriptors merged across sheets (last wins),
+    /// built once per ctx.
+    fn prop_defs(&mut self) -> Arc<FxHashMap<String, cascade::PropertyDef>> {
+        if self.prop_defs.is_none() {
+            let mut defs = FxHashMap::default();
+            for sh in &self.sheets {
+                for (n, d) in &sh.properties {
+                    defs.insert(n.clone(), d.clone());
+                }
+            }
+            self.prop_defs = Some(Arc::new(defs));
+        }
+        self.prop_defs.as_ref().unwrap().clone()
     }
 
     /// Cascaded + resolved computed style for `node`: winning declaration
@@ -1669,7 +1917,14 @@ impl<'a> StyleCtx<'a> {
         if let Some(o) = self.node_memo.get(&node) {
             return o.props.clone();
         }
-        self.node_style(node).props
+        // Memoize the queried node too — `finish` resolves parents via
+        // `parent_entry`, so an un-memoized element would be cascaded a
+        // second time the first time a child asks for it. Same
+        // deterministic output, half the cascades on a tree walk.
+        let o = self.node_style(node);
+        let props = o.props.clone();
+        self.node_memo.insert(node, Arc::new(o));
+        props
     }
 }
 
@@ -1789,7 +2044,7 @@ fn ws_tokens(s: &str) -> Vec<&str> {
                 st = i;
                 continue;
             }
-            c if (c as char).is_whitespace() && depth <= 0 => {
+            c if c.is_ascii_whitespace() && depth <= 0 => {
                 if st < i {
                     out.push(&s[st..i]);
                 }
@@ -2193,17 +2448,52 @@ fn expand_decl(prop: &str, value: &str, f: &mut impl FnMut(&str, &str)) {
         // `border` resets every longhand of all four sides.
         "border" => {
             f("border", value);
-            for side in ["top", "right", "bottom", "left"] {
-                f(&format!("border-{side}-width"), value);
-                f(&format!("border-{side}-style"), value);
-                f(&format!("border-{side}-color"), value);
+            for (w, s, c) in [
+                ("border-top-width", "border-top-style", "border-top-color"),
+                (
+                    "border-right-width",
+                    "border-right-style",
+                    "border-right-color",
+                ),
+                (
+                    "border-bottom-width",
+                    "border-bottom-style",
+                    "border-bottom-color",
+                ),
+                (
+                    "border-left-width",
+                    "border-left-style",
+                    "border-left-color",
+                ),
+            ] {
+                f(w, value);
+                f(s, value);
+                f(c, value);
             }
         }
         "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            let (w, s, c) = match prop {
+                "border-top" => ("border-top-width", "border-top-style", "border-top-color"),
+                "border-right" => (
+                    "border-right-width",
+                    "border-right-style",
+                    "border-right-color",
+                ),
+                "border-bottom" => (
+                    "border-bottom-width",
+                    "border-bottom-style",
+                    "border-bottom-color",
+                ),
+                _ => (
+                    "border-left-width",
+                    "border-left-style",
+                    "border-left-color",
+                ),
+            };
             f(prop, value);
-            f(&format!("{prop}-width"), value);
-            f(&format!("{prop}-style"), value);
-            f(&format!("{prop}-color"), value);
+            f(w, value);
+            f(s, value);
+            f(c, value);
         }
         "border-radius" => {
             f("border-radius", value);
@@ -2402,6 +2692,8 @@ fn expand_grid(value: &str) -> Vec<(&'static str, String)> {
 fn element_customs(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> StrMap<String> {
     let mut out = StrMap::default();
     let mut buf = Vec::new();
+    let key = node_key(doc, node);
+    let st = PseudoState::default();
     for sh in sheets {
         sh.candidates_into(doc, node, &mut buf);
         for &ri in &buf {
@@ -2409,7 +2701,7 @@ fn element_customs(doc: &Document, node: NodeId, sheets: &[&StyleSheet]) -> StrM
             if !r
                 .selectors
                 .iter()
-                .any(|s| rightmost_ok(doc, node, s) && matches(doc, node, s))
+                .any(|s| rightmost_ok(&key, s) && matches_st_key(doc, node, s, &st, &key))
             {
                 continue;
             }
@@ -2482,19 +2774,37 @@ pub fn document_sheets(doc: &Document) -> Vec<StyleSheet> {
 }
 
 /// Like `document_sheets` but evaluates @media against `viewport_w` px.
+/// The sheets are a pure function of (style texts, viewport, scheme), and
+/// layout re-collects them on every repaint — the latest parse is memoized
+/// thread-locally and cloned back instead of re-parsed.
 pub fn document_sheets_vw(doc: &Document, viewport_w: f32) -> Vec<StyleSheet> {
-    let mut sheets = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
     for id in doc.descendants(doc.root) {
         if doc.tag(id) == Some("style") {
-            let text: String = doc
-                .children(id)
-                .iter()
-                .filter_map(|&c| doc.text(c))
-                .collect();
-            sheets.push(parse_vw(&text, viewport_w));
+            texts.push(
+                doc.children(id)
+                    .iter()
+                    .filter_map(|&c| doc.text(c))
+                    .collect(),
+            );
         }
     }
-    sheets
+    // exact inputs — never a stale hit (a hash key could, in theory,
+    // collide into someone else's sheets)
+    let key = (viewport_w.to_bits(), dark_mode(), texts);
+    thread_local! {
+        static SHEET_CACHE: std::cell::RefCell<(Option<(u32, bool, Vec<String>)>, Vec<StyleSheet>)> =
+            const { std::cell::RefCell::new((None, Vec::new())) };
+    }
+    SHEET_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0.as_ref() == Some(&key) {
+            return c.1.clone();
+        }
+        let sheets: Vec<StyleSheet> = key.2.iter().map(|t| parse_vw(t, viewport_w)).collect();
+        *c = (Some(key), sheets.clone());
+        sheets
+    })
 }
 
 #[cfg(test)]
@@ -2532,6 +2842,16 @@ mod tests {
     }
 
     #[test]
+    fn utf8_ident() {
+        // non-ASCII idents must not be mangled into Latin-1 — the class
+        // selector has to match the DOM's UTF-8 class attribute
+        let doc = rowser_html::parse("<body><p class='cläss'>x</p></body>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let sheet = parse(".cläss { color: red }");
+        assert!(matches(&doc, p, &sheet.rules[0].selectors[0]));
+    }
+
+    #[test]
     fn selector_matching() {
         let doc = rowser_html::parse(
             "<body><div id=a class='x y'><p><b>deep</b></p><p class=x>two</p></div></body>",
@@ -2554,6 +2874,17 @@ mod tests {
         let author = parse("p { color: blue } .x { color: green } #a { color: red }");
         let c = computed(&doc, p, &[&ua, &author]);
         assert_eq!(c.get("color").unwrap(), "red");
+    }
+
+    #[test]
+    fn mixed_keyed_unkeyed_selectors() {
+        // `a, *` — the unkeyed selector must still match non-`a` nodes:
+        // a selector list lands in `plain` when ANY of its selectors
+        // lacks a rightmost key, not only when all of them do.
+        let doc = rowser_html::parse("<body><div></div><a href=x></a></body>");
+        let div = doc.find_deep(doc.root, "div").unwrap();
+        let sh = parse("a, * { k: v }");
+        assert_eq!(computed(&doc, div, &[&sh]).get("k").unwrap(), "v");
     }
 
     #[test]

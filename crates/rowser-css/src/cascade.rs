@@ -10,10 +10,15 @@
 //! compound), and the extra media features evaluated at parse time.
 
 use crate::{
-    decl_wins, each_decl, inline_decls, matches_st, rightmost_ok, specificity, StrMap, StyleCtx,
+    decl_wins, each_decl, inline_decls, matches_st_key, node_key, rightmost_ok, specificity,
+    StrMap, StyleCtx,
 };
 use rowser_dom::NodeId;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// Declaration ordering key: (important, origin, layer, spec, order).
 pub(crate) type WinKey = (bool, u8, u32, (u32, u32, u32), usize);
@@ -30,12 +35,160 @@ pub struct PropertyDef {
     pub initial: Option<String>,
 }
 
-/// One node's fully resolved output: the public props map plus resolved
-/// custom properties (descendants inherit + look them up for var()).
+/// One node's fully resolved output: the public props map plus its
+/// custom-property environment (descendants inherit + look it up for
+/// var()). `None` = no `--*` names are in scope at all.
 #[derive(Clone, Default)]
 pub(crate) struct NodeOut {
     pub props: StrMap<String>,
-    pub customs: StrMap<String>,
+    pub customs: Option<Arc<NodeCustoms>>,
+}
+
+/// A node's effective custom-property environment, stored as the node's
+/// own cascaded `--*` decls layered over the shared `:root` raws, the
+/// parent's resolved environment, and `@property` registrations — with
+/// values resolved lazily per name (memoized). Resolving N nodes × M
+/// custom props thus costs O(actual lookups), not an O(N×M) map rebuild
+/// per element: the eager version cloned the whole inherited set into
+/// every node on var()-heavy pages.
+pub(crate) struct NodeCustoms {
+    /// This node's cascaded `--*` decls (raw text; CSS-wide keywords
+    /// stay — masking is applied at lookup time).
+    own: StrMap<String>,
+    /// `:root` element's own `--*` decls (raw) — one shared map per ctx.
+    root: Arc<StrMap<String>>,
+    /// `@property` registrations merged across sheets — shared per ctx.
+    defs: Arc<FxHashMap<String, PropertyDef>>,
+    /// Parent element's environment — the inherited layer.
+    parent: Option<Arc<NodeCustoms>>,
+    /// Per-name resolution memo. `None` values are tombstones: a name
+    /// that resolved to guaranteed-invalid masks lower layers, matching
+    /// the absent entries of the old eager map.
+    memo: RefCell<FxHashMap<String, Option<String>>>,
+}
+
+/// The raw layers a node's resolution draws from, in precedence order —
+/// the same order the old eager `CustomLayers` used: own (with
+/// wide-keyword masking), `:root` raws, parent's *resolved* values gated
+/// by `inherits:false`, then `@property` initial-values.
+struct RawLayers<'x> {
+    own: &'x StrMap<String>,
+    root: &'x StrMap<String>,
+    parent: Option<&'x NodeCustoms>,
+    defs: &'x FxHashMap<String, PropertyDef>,
+}
+
+impl<'x> RawLayers<'x> {
+    fn initial(&self, name: &str) -> Option<String> {
+        self.defs.get(name).and_then(|d| d.initial.clone())
+    }
+}
+
+impl CustomSrc for RawLayers<'_> {
+    fn lookup(&self, name: &str) -> Option<String> {
+        if let Some(v) = self.own.get(name) {
+            match css_wide(v) {
+                None => return Some(v.clone()),
+                // a removing keyword on the node masks the lower layers —
+                // a registered initial-value still fills it afterwards
+                Some(Wide::Initial | Wide::Revert | Wide::RevertLayer) => {
+                    return self.initial(name);
+                }
+                Some(Wide::Inherit | Wide::Unset) => {}
+            }
+        }
+        if let Some(v) = self.root.get(name) {
+            return Some(v.clone());
+        }
+        if let Some(par) = self.parent {
+            if let Some(v) = par.get(name) {
+                if self.defs.get(name).map(|d| d.inherits).unwrap_or(true) {
+                    return Some(v);
+                }
+            }
+        }
+        self.initial(name)
+    }
+}
+
+/// `CustomSrc` over a node's effective customs — for substituting var()
+/// in regular properties, pending shorthands, and `@property` initials.
+struct Eff<'x>(Option<&'x NodeCustoms>);
+
+impl CustomSrc for Eff<'_> {
+    fn lookup(&self, name: &str) -> Option<String> {
+        self.0.and_then(|c| c.get(name))
+    }
+}
+
+impl NodeCustoms {
+    /// This node's effective resolved value for `--name` — memoized;
+    /// `None` = absent or guaranteed-invalid.
+    fn get(&self, name: &str) -> Option<String> {
+        if let Some(v) = self.memo.borrow().get(name) {
+            return v.clone();
+        }
+        let layers = RawLayers {
+            own: &self.own,
+            root: &self.root,
+            parent: self.parent.as_deref(),
+            defs: &self.defs,
+        };
+        let mut r = VarResolver::from_src(&layers);
+        let mut v = r.custom(name);
+        // `@property` syntax gate — the same post-pass the eager map ran:
+        // a registered value failing its syntax is invalid at computed
+        // time, so the registration's initial-value (resolved against
+        // this node's env) takes over — or the name drops out entirely.
+        if let (Some(d), Some(val)) = (self.defs.get(name), v.as_deref()) {
+            if !syntax_ok(&d.syntax, val) {
+                // seed the bad value first: an initial-value referencing
+                // this name resolves against it, like the eager map did
+                self.memo
+                    .borrow_mut()
+                    .insert(name.to_string(), Some(val.to_string()));
+                v = match &d.initial {
+                    Some(init) => {
+                        let eff = Eff(Some(self));
+                        let mut r2 = VarResolver::from_src(&eff);
+                        r2.subst(init)
+                    }
+                    None => None,
+                };
+            }
+        }
+        self.memo.borrow_mut().insert(name.to_string(), v.clone());
+        v
+    }
+}
+
+/// `(prop, value)` → expanded longhand pairs memo: hashed to a u64 key
+/// with the raw strings kept alongside for hit verification.
+pub(crate) type ExpandMemo =
+    FxHashMap<u64, (Rc<Vec<(String, String)>>, String, String)>;
+
+/// Memoized [`each_decl`] — the same declaration strings expand on every
+/// matching element, so the tokenize-and-fan-out work (and its Vec
+/// allocations) runs once per unique decl per ctx.
+pub(crate) fn expanded_decls(
+    cache: &mut ExpandMemo,
+    prop: &str,
+    value: &str,
+) -> Rc<Vec<(String, String)>> {
+    let mut h = rustc_hash::FxHasher::default();
+    prop.hash(&mut h);
+    value.hash(&mut h);
+    let h = h.finish();
+    if let Some((pairs, kp, kv)) = cache.get(&h) {
+        if kp.as_str() == prop && kv.as_str() == value {
+            return pairs.clone();
+        }
+    }
+    let mut pairs = Vec::new();
+    each_decl(prop, value, |p, v| pairs.push((p.to_string(), v.to_string())));
+    let pairs = Rc::new(pairs);
+    cache.insert(h, (pairs.clone(), prop.to_string(), value.to_string()));
+    pairs
 }
 
 /// Accumulator handed from the match pass to [`StyleCtx::finish`].
@@ -241,18 +394,42 @@ fn split_first_comma(s: &str) -> (&str, Option<&str>) {
     (s, None)
 }
 
+/// Lookup source for `var(--name)` — a plain customs map, or the layered
+/// own/:root/parent/@property sources a node's effective map is drawn
+/// from (see `finish`).
+pub(crate) trait CustomSrc {
+    fn lookup(&self, name: &str) -> Option<String>;
+}
+
+impl CustomSrc for StrMap<String> {
+    fn lookup(&self, name: &str) -> Option<String> {
+        self.get(name).cloned()
+    }
+}
+
 /// `var()`/`env()` substitution with memoized custom-property resolution
 /// and cycle detection. `subst` returns `None` when the value is
 /// "guaranteed-invalid" (unresolvable var() with no fallback, or a cycle).
-pub(crate) struct VarResolver<'a> {
-    customs: &'a StrMap<String>,
+pub(crate) struct VarResolver<'a, S: CustomSrc + ?Sized> {
+    customs: &'a S,
     memo: FxHashMap<String, Option<String>>,
     stack: Vec<String>,
     depth: usize,
 }
 
-impl<'a> VarResolver<'a> {
+impl<'a> VarResolver<'a, StrMap<String>> {
     pub(crate) fn new(customs: &'a StrMap<String>) -> Self {
+        VarResolver {
+            customs,
+            memo: FxHashMap::default(),
+            stack: Vec::new(),
+            depth: 0,
+        }
+    }
+}
+
+impl<'a, S: CustomSrc + ?Sized> VarResolver<'a, S> {
+    pub(crate) fn from_src(customs: &'a S) -> Self {
         VarResolver {
             customs,
             memo: FxHashMap::default(),
@@ -267,10 +444,15 @@ impl<'a> VarResolver<'a> {
         if let Some(r) = self.memo.get(name) {
             return r.clone();
         }
-        let raw = self.customs.get(name)?.clone();
+        let raw = self.customs.lookup(name)?;
         if self.stack.iter().any(|n| n == name) {
             self.memo.insert(name.to_string(), None);
             return None;
+        }
+        // var-free values pass through — skip the subst clone
+        if !has_fn(&raw) {
+            self.memo.insert(name.to_string(), Some(raw.clone()));
+            return Some(raw);
         }
         self.stack.push(name.to_string());
         let r = self.subst(&raw);
@@ -286,13 +468,18 @@ impl<'a> VarResolver<'a> {
             return None;
         }
         let mut out = value.to_string();
+        // resume scanning at the splice point — no `var(`/`env(` can
+        // start before it (the prefix was already clean, replacements
+        // are resolved var-free text), so a k-var value scans in O(n)
+        // instead of O(k·n)
+        let mut scan = 0usize;
         let mut guard = 0usize;
         loop {
             guard += 1;
             if guard > 1024 {
                 return None;
             }
-            let Some((start, open)) = find_fn(&out, 0) else {
+            let Some((start, open)) = find_fn(&out, scan) else {
                 break;
             };
             let mut depth = 1i32;
@@ -333,10 +520,16 @@ impl<'a> VarResolver<'a> {
                 }
             };
             out = format!("{}{}{}", &out[..start], rep, &out[end..]);
+            scan = start;
         }
         Some(out)
     }
 }
+
+// The old `CustomLayers` struct that eagerly layered the custom-prop
+// sources was replaced by `RawLayers` + `NodeCustoms` (same precedence:
+// own → :root → parent-resolved → @property initial) which resolves the
+// layers lazily per name.
 
 /// Is `prop` in the inherited-property set? (Standard text/table set;
 /// `font` and `text-decoration*` included approximately.)
@@ -676,6 +869,24 @@ fn element_parent(doc: &rowser_dom::Document, n: NodeId) -> Option<NodeId> {
     Some(p)
 }
 
+/// Cached specificity of `sheet.rules[ri].selectors[si]` — the
+/// `reindex`-built table normally answers; `specificity` is recomputed
+/// only if `rules` were mutated without a `reindex` (same staleness
+/// contract as `layers`).
+pub(crate) fn rule_spec(
+    sheet: &crate::StyleSheet,
+    ri: u32,
+    si: usize,
+    s: &crate::Selector,
+) -> (u32, u32, u32) {
+    sheet
+        .specs
+        .get(ri as usize)
+        .and_then(|v| v.get(si))
+        .copied()
+        .unwrap_or_else(|| specificity(s))
+}
+
 /// Winner-map merge helper for `cascaded_prop` (kept as a free fn so
 /// nested closures don't fight over a captured `&mut best`).
 fn take_best(best: &mut Option<(String, WinKey)>, v: &str, key: WinKey) {
@@ -692,11 +903,12 @@ fn take_best(best: &mut Option<(String, WinKey)>, v: &str, key: WinKey) {
 impl<'a> StyleCtx<'a> {
     /// Parent element's resolved output, memoized in `node_memo` so chains
     /// of inherit/unset/all:inherit lookups compute each ancestor once.
-    fn parent_entry(&mut self, node: NodeId) -> Option<NodeOut> {
+    /// Arc'd — `finish` only reads it, so sharing beats cloning both maps.
+    fn parent_entry(&mut self, node: NodeId) -> Option<Arc<NodeOut>> {
         let p = element_parent(self.doc, node)?;
         if !self.node_memo.contains_key(&p) {
             let o = self.node_style(p);
-            self.node_memo.insert(p, o);
+            self.node_memo.insert(p, Arc::new(o));
         }
         self.node_memo.get(&p).cloned()
     }
@@ -709,10 +921,11 @@ impl<'a> StyleCtx<'a> {
         &mut self,
         node: NodeId,
         prop: &str,
-        customs: &StrMap<String>,
+        eff: &Eff<'_>,
         keep: &dyn Fn(u8, u32) -> bool,
     ) -> Option<String> {
         let doc = self.doc;
+        let key = node_key(doc, node);
         let mut best: Option<(String, WinKey)> = None;
         let mut order = 0usize;
         for (origin, sheet) in self.sheets.iter().enumerate() {
@@ -725,10 +938,10 @@ impl<'a> StyleCtx<'a> {
                 }
                 let mut spec = (0u32, 0u32, 0u32);
                 let mut matched = false;
-                for s in &rule.selectors {
-                    if rightmost_ok(doc, node, s) && matches_st(doc, node, s, &self.state) {
+                for (si, s) in rule.selectors.iter().enumerate() {
+                    if rightmost_ok(&key, s) && matches_st_key(doc, node, s, &self.state, &key) {
                         matched = true;
-                        let sp = specificity(s);
+                        let sp = rule_spec(sheet, ri, si, s);
                         if sp > spec {
                             spec = sp;
                         }
@@ -749,7 +962,7 @@ impl<'a> StyleCtx<'a> {
                         }
                     } else if shorthand_sides(&d.prop).is_some() && has_fn(&d.value) {
                         // var()-shorthand → resolve and pick `prop`'s side
-                        let mut r = VarResolver::new(customs);
+                        let mut r = VarResolver::from_src(eff);
                         if let Some(rv) = r.subst(&d.value) {
                             let toks = split_ws_parens(&rv);
                             assign_sides(&d.prop, &toks, |sp, tv| {
@@ -777,9 +990,12 @@ impl<'a> StyleCtx<'a> {
     /// before `each_decl`, and `order` now ticks per declaration.)
     pub(crate) fn node_style(&mut self, node: NodeId) -> NodeOut {
         let doc = self.doc;
+        let key = node_key(doc, node);
+        let inline = doc.attr(node, "style");
         let mut acc = Acc::default();
         // props whose winning decl is !important — the inline style
-        // attribute may only override those with !important of its own
+        // attribute may only override those with !important of its own.
+        // Only populated when the node HAS an inline style to gate.
         let mut important_props: FxHashSet<String> = FxHashSet::default();
         let mut order = 0usize;
         for (origin, sheet) in self.sheets.iter().enumerate() {
@@ -792,10 +1008,10 @@ impl<'a> StyleCtx<'a> {
                 // any matched at all — in one pass over the selector list
                 let mut spec = (0u32, 0u32, 0u32);
                 let mut matched = false;
-                for s in &rule.selectors {
-                    if rightmost_ok(doc, node, s) && matches_st(doc, node, s, &self.state) {
+                for (si, s) in rule.selectors.iter().enumerate() {
+                    if rightmost_ok(&key, s) && matches_st_key(doc, node, s, &self.state, &key) {
                         matched = true;
-                        let sp = specificity(s);
+                        let sp = rule_spec(sheet, ri, si, s);
                         if sp > spec {
                             spec = sp;
                         }
@@ -813,7 +1029,7 @@ impl<'a> StyleCtx<'a> {
                     let nk = (d.important, origin as u8, layer, spec, order);
                     order += 1;
                     if feed(&mut acc, &d.prop, &d.value, nk) {
-                        if d.important {
+                        if d.important && inline.is_some() {
                             if let Some(sides) = shorthand_sides(&d.prop) {
                                 for s in sides {
                                     important_props.insert(s.to_string());
@@ -822,12 +1038,14 @@ impl<'a> StyleCtx<'a> {
                         }
                         continue;
                     }
-                    each_decl(&d.prop, &d.value, |prop, val| {
-                        if d.important {
-                            important_props.insert(prop.to_string());
+                    let track_imp = d.important && inline.is_some();
+                    let expanded = expanded_decls(&mut self.expand_memo, &d.prop, &d.value);
+                    for (prop, val) in expanded.iter() {
+                        if track_imp {
+                            important_props.insert(prop.clone());
                         }
                         merge(&mut acc.out, prop, val, nk);
-                    });
+                    }
                 }
             }
         }
@@ -835,7 +1053,7 @@ impl<'a> StyleCtx<'a> {
         // beats author rules but loses to author !important; an !important
         // decl inside it behaves as an author-origin !important (and so
         // still loses to a UA !important, per Cascade 5).
-        if let Some(s) = doc.attr(node, "style") {
+        if let Some(s) = inline {
             for d in inline_decls(s) {
                 if d.prop.starts_with("--") {
                     acc.customs.insert(d.prop.clone(), d.value.clone());
@@ -855,15 +1073,17 @@ impl<'a> StyleCtx<'a> {
                     // Merge through decl_wins rather than stomping: a UA
                     // !important (origin 0) and layered author !important
                     // still beat the unlayered author-level inline decl.
-                    each_decl(&d.prop, &d.value, |prop, val| {
-                        important_props.insert(prop.to_string());
+                    let expanded = expanded_decls(&mut self.expand_memo, &d.prop, &d.value);
+                    for (prop, val) in expanded.iter() {
+                        important_props.insert(prop.clone());
                         merge(&mut acc.out, prop, val, nk);
-                    });
+                    }
                 } else {
                     // An `all: * !important` decl outranks every normal
                     // inline decl (it expands to important on each prop).
                     let any_imp_all = acc.all.iter().any(|(_, k)| k.0);
-                    each_decl(&d.prop, &d.value, |prop, val| {
+                    let expanded = expanded_decls(&mut self.expand_memo, &d.prop, &d.value);
+                    for (prop, val) in expanded.iter() {
                         if !important_props.contains(prop) && !any_imp_all {
                             acc.out.insert(
                                 prop.to_string(),
@@ -877,7 +1097,7 @@ impl<'a> StyleCtx<'a> {
                                 ),
                             );
                         }
-                    });
+                    }
                 }
             }
         }
@@ -898,7 +1118,15 @@ impl<'a> StyleCtx<'a> {
                             if d.prop.starts_with("--") {
                                 continue;
                             }
-                            let val = crate::resolve_vars(&d.value, &out.customs);
+                            // subst against the node's customs; on
+                            // guaranteed-invalid the raw text is kept,
+                            // like `resolve_vars` did.
+                            let val = {
+                                let eff = Eff(out.customs.as_deref());
+                                VarResolver::from_src(&eff)
+                                    .subst(&d.value)
+                                    .unwrap_or_else(|| d.value.clone())
+                            };
                             each_decl(&d.prop, &val, |p, v| {
                                 out.props.insert(p.to_string(), v.to_string());
                             });
@@ -916,96 +1144,33 @@ impl<'a> StyleCtx<'a> {
     /// `font-size` normalization to absolute px.
     pub(crate) fn finish(&mut self, node: NodeId, mut acc: Acc) -> NodeOut {
         // `@property` registrations, last-wins per name across sheets
-        // (owned: sheets can't be borrowed across &mut self calls).
-        let mut defs: FxHashMap<String, PropertyDef> = FxHashMap::default();
-        for sh in &self.sheets {
-            for (n, d) in &sh.properties {
-                defs.insert(n.clone(), d.clone());
-            }
-        }
+        let defs = self.prop_defs();
         // Parent's resolved output — the source for inherit/unset/
         // all:inherit and the inherited-property pass.
         let parent = self.parent_entry(node);
 
         // ---------- custom properties ----------
+        // The effective `--*` environment is a lazy chain (own raws over
+        // shared :root raws over the parent's resolved set over
+        // @property initials) — names resolve on demand and memoize,
+        // instead of resolving+cloning every visible name per node.
         let need_customs = !acc.customs.is_empty()
             || !defs.is_empty()
             || !acc.pending.is_empty()
-            || parent.as_ref().is_some_and(|p| !p.customs.is_empty())
+            || parent.as_ref().is_some_and(|p| p.customs.is_some())
             || acc.out.values().any(|e| has_fn(&e.0));
-        let mut resolved_customs: StrMap<String> = StrMap::default();
-        if need_customs {
-            let mut raw: StrMap<String> = StrMap::default();
-            // :root globals — the base fallback (detached nodes, and the
-            // html element itself whose parent chain ends at Document)
-            for (k, v) in self.root_customs().clone() {
-                raw.insert(k, v);
-            }
-            // inherited custom props (unless registered inherits:false)
-            if let Some(par) = &parent {
-                for (k, v) in &par.customs {
-                    let inh = defs.get(k.as_str()).map(|d| d.inherits).unwrap_or(true);
-                    if inh {
-                        raw.entry(k.clone()).or_insert_with(|| v.clone());
-                    }
-                }
-            }
-            // own declarations (keywords resolved against the base map)
-            for (k, v) in &acc.customs {
-                match css_wide(v) {
-                    Some(Wide::Initial) | Some(Wide::Revert) | Some(Wide::RevertLayer) => {
-                        raw.remove(k);
-                    }
-                    // inherit/unset: whatever the base map holds stands
-                    // (custom properties inherit by default)
-                    Some(Wide::Inherit) | Some(Wide::Unset) => {}
-                    None => {
-                        raw.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            // registered initial-values fill absent names
-            for (n, d) in &defs {
-                if !raw.contains_key(n.as_str()) {
-                    if let Some(init) = &d.initial {
-                        raw.insert(n.clone(), init.clone());
-                    }
-                }
-            }
-            {
-                let mut r = VarResolver::new(&raw);
-                for k in raw.keys() {
-                    if let Some(v) = r.custom(k) {
-                        resolved_customs.insert(k.clone(), v);
-                    }
-                }
-            }
-            // syntax gate: a mismatched registered value is invalid → the
-            // registered initial (if any) replaces it
-            for (n, d) in &defs {
-                let bad = resolved_customs
-                    .get(n.as_str())
-                    .is_some_and(|v| !syntax_ok(&d.syntax, v));
-                if bad {
-                    match &d.initial {
-                        Some(init) => {
-                            let mut r2 = VarResolver::new(&resolved_customs);
-                            match r2.subst(init) {
-                                Some(iv) => {
-                                    resolved_customs.insert(n.clone(), iv);
-                                }
-                                None => {
-                                    resolved_customs.remove(n.as_str());
-                                }
-                            }
-                        }
-                        None => {
-                            resolved_customs.remove(n.as_str());
-                        }
-                    }
-                }
-            }
-        }
+        let customs: Option<Arc<NodeCustoms>> = if need_customs {
+            Some(Arc::new(NodeCustoms {
+                own: std::mem::take(&mut acc.customs),
+                root: self.root_customs(),
+                defs: defs.clone(),
+                parent: parent.as_ref().and_then(|p| p.customs.clone()),
+                memo: RefCell::new(FxHashMap::default()),
+            }))
+        } else {
+            None
+        };
+        let eff = Eff(customs.as_deref());
 
         // ---------- `all` shorthand ----------
         let mut all_kw: Option<(Wide, WinKey)> = None;
@@ -1037,7 +1202,7 @@ impl<'a> StyleCtx<'a> {
 
         // ---------- pending var()-bearing shorthands ----------
         {
-            let mut r = VarResolver::new(&resolved_customs);
+            let mut r = VarResolver::from_src(&eff);
             for (prop, value, key) in &acc.pending {
                 let Some(rv) = r.subst(value) else { continue };
                 let toks = split_ws_parens(&rv);
@@ -1052,11 +1217,17 @@ impl<'a> StyleCtx<'a> {
             }
         }
 
-        let decl_keys: FxHashSet<String> = acc.out.keys().cloned().collect();
+        // Only `all: inherit` consults this set — skip the per-node clone
+        // of every declared prop name in the common case.
+        let decl_keys: FxHashSet<String> = if matches!(all_kw, Some((Wide::Inherit, _))) {
+            acc.out.keys().cloned().collect()
+        } else {
+            FxHashSet::default()
+        };
 
         // ---------- var()/env() substitution on surviving values ----------
         {
-            let mut r = VarResolver::new(&resolved_customs);
+            let mut r = VarResolver::from_src(&eff);
             let mut bad: Vec<String> = Vec::new();
             for (k, e) in acc.out.iter_mut() {
                 if has_fn(&e.0) {
@@ -1100,11 +1271,11 @@ impl<'a> StyleCtx<'a> {
                 Wide::Unset => unset_val(&prop),
                 Wide::Revert => {
                     // as if the decl came from an earlier origin (author → UA)
-                    self.cascaded_prop(node, &prop, &resolved_customs, &|o, _| o < orig)
+                    self.cascaded_prop(node, &prop, &eff, &|o, _| o < orig)
                 }
                 Wide::RevertLayer => {
                     // drop decls from same-or-later @layers
-                    self.cascaded_prop(node, &prop, &resolved_customs, &|_, l| l < layer)
+                    self.cascaded_prop(node, &prop, &eff, &|_, l| l < layer)
                 }
             };
             // one more level if the cascaded value is itself a keyword
@@ -1138,8 +1309,8 @@ impl<'a> StyleCtx<'a> {
             let mut dropc: Vec<String> = Vec::new();
             for (k, e) in acc.out.iter_mut() {
                 if k.starts_with("--") {
-                    match resolved_customs.get(k) {
-                        Some(v) => e.0 = v.clone(),
+                    match eff.lookup(k) {
+                        Some(v) => e.0 = v,
                         None => dropc.push(k.clone()),
                     }
                 }
@@ -1195,10 +1366,7 @@ impl<'a> StyleCtx<'a> {
             }
         }
 
-        NodeOut {
-            props,
-            customs: resolved_customs,
-        }
+        NodeOut { props, customs }
     }
 }
 
@@ -1376,6 +1544,33 @@ mod tests {
         );
         assert_eq!(c.get("margin-top").unwrap(), "7px");
         assert_eq!(c.get("color").unwrap(), "green");
+    }
+
+    #[test]
+    fn custom_own_initial_masks_parent() {
+        // `--x: initial` on the node removes the inherited value entirely
+        // — var() then falls back / is guaranteed-invalid
+        let c = props(
+            "<body><div><p></p></div></body>",
+            "div { --g: 3px } p { --g: initial; margin-top: var(--g, 1px) }",
+            "p",
+        );
+        assert_eq!(c.get("margin-top").unwrap(), "1px");
+        // ...but a registered @property initial-value still fills the gap
+        let c = props(
+            "<body><div><p></p></div></body>",
+            "@property --g { syntax: \"<length>\"; inherits: true; initial-value: 5px } \
+             div { --g: 3px } p { --g: initial; margin-top: var(--g) }",
+            "p",
+        );
+        assert_eq!(c.get("margin-top").unwrap(), "5px");
+        // --x: inherit is transparent — the parent's value flows through
+        let c = props(
+            "<body><div><p></p></div></body>",
+            "div { --g: 3px } p { --g: inherit; margin-top: var(--g) }",
+            "p",
+        );
+        assert_eq!(c.get("margin-top").unwrap(), "3px");
     }
 
     #[test]

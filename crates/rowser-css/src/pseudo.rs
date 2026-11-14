@@ -20,24 +20,25 @@ impl<'a> StyleCtx<'a> {
     /// pseudo rules' own `--*` decls, then the element's, then :root's.
     pub fn computed_pseudo(&mut self, node: NodeId, kind: PseudoElem) -> StrMap<String> {
         let doc = self.doc;
+        let key = node_key(doc, node);
         // value + ordering key: (important, origin, layer, spec, order)
         let mut out: StrMap<(String, bool, u8, u32, (u32, u32, u32), usize)> = StrMap::default();
         let mut customs: StrMap<String> = StrMap::default();
         let mut order = 0usize;
         for (origin, sheet) in self.sheets.iter().enumerate() {
-            sheet.candidates_into(doc, node, &mut self.buf);
+            sheet.candidates_pseudo_into(doc, node, kind, &mut self.buf);
             for &ri in &self.buf {
                 let rule = &sheet.rules[ri as usize];
                 let layer = sheet.layers.get(ri as usize).copied().unwrap_or(u32::MAX);
                 let mut spec = (0u32, 0u32, 0u32);
                 let mut matched = false;
-                for s in &rule.selectors {
-                    let Some(subj) = pseudo_subject(s, kind) else {
+                for (si, s) in rule.selectors.iter().enumerate() {
+                    if !sel_has_pseudo(s, kind) {
                         continue;
-                    };
-                    if rightmost_ok(doc, node, &subj) && matches(doc, node, &subj) {
+                    }
+                    if rightmost_ok(&key, s) && subject_matches(doc, node, s, &key) {
                         matched = true;
-                        let sp = specificity(s);
+                        let sp = cascade::rule_spec(sheet, ri, si, s);
                         if sp > spec {
                             spec = sp;
                         }
@@ -91,7 +92,8 @@ impl<'a> StyleCtx<'a> {
             for (k, v) in element_customs(doc, node, &self.sheets) {
                 customs.entry(k).or_insert(v);
             }
-            for (k, v) in self.root_customs().iter() {
+            let root = self.root_customs();
+            for (k, v) in root.iter() {
                 customs.entry(k.clone()).or_insert_with(|| v.clone());
             }
             for v in props.values_mut() {
@@ -102,22 +104,37 @@ impl<'a> StyleCtx<'a> {
     }
 }
 
-/// The selector an element must match for `sel` to style its `kind`
-/// pseudo: `sel` with pseudo-elements stripped from the rightmost
-/// compound (an emptied compound acts as `*`). `None` when the rightmost
-/// compound doesn't carry `::kind`.
-fn pseudo_subject(sel: &Selector, kind: PseudoElem) -> Option<Selector> {
-    let (_, last) = sel.parts.last()?;
-    if !last
-        .iter()
-        .any(|s| matches!(s, Simple::PseudoElem(k) if *k == kind))
-    {
-        return None;
+/// Does `sel`'s rightmost compound carry `::kind`?
+fn sel_has_pseudo(sel: &Selector, kind: PseudoElem) -> bool {
+    sel.parts.last().is_some_and(|(_, last)| {
+        last.iter()
+            .any(|s| matches!(s, Simple::PseudoElem(k) if *k == kind))
+    })
+}
+
+/// Element-side match for a `::kind` selector: the rightmost compound
+/// with pseudo-elements ignored (they're checked by `sel_has_pseudo`;
+/// an emptied compound acts as `*`), plus the usual leftward walk —
+/// what `matches` would do on a stripped selector, without cloning it.
+fn subject_matches(doc: &Document, node: NodeId, sel: &Selector, key: &NodeKey<'_>) -> bool {
+    let n = sel.parts.len();
+    if n == 0 {
+        return false;
     }
-    let mut parts = sel.parts.clone();
-    let last = &mut parts.last_mut().unwrap().1;
-    last.retain(|s| !matches!(s, Simple::PseudoElem(_)));
-    Some(Selector { parts })
+    let st = &PseudoState::default();
+    let (_, last) = &sel.parts[n - 1];
+    if !last.iter().all(|s| match s {
+        Simple::PseudoElem(_) => true,
+        Simple::Tag(t) => key.tag == Some(t.as_str()),
+        Simple::Class(c) => key
+            .class
+            .is_some_and(|a| a.split_whitespace().any(|x| x == c)),
+        Simple::Id(i) => key.id == Some(i.as_str()),
+        _ => simple_matches(doc, node, s, st),
+    }) {
+        return false;
+    }
+    rest_matches(doc, node, &sel.parts, st)
 }
 
 #[cfg(test)]
