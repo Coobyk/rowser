@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+pollster = "0.4.0"
 rowser-image = { path = "../rowser-image" }
 rowser-layout = { path = "../rowser-layout" }
 rowser-text = { path = "../rowser-text" }
+wgpu = "30.0.2"

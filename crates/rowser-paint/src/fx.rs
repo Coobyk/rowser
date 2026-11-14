@@ -1,14 +1,13 @@
 //! fx: per-side border styles, box-shadow blur, and the overflow clip
 //! stack — the raster side of rowser-layout's borderfx items.
 
-use crate::Canvas;
+use crate::{Canvas, Fonts};
 use rowser_image::Image;
 use rowser_layout::colorfx::{
     blend_rgb, clip_covers, resolve_clip, BlendMode, ClipAbs, Effect, FilterOp,
 };
 use rowser_layout::{bgra, offset_item, DisplayItem};
 use rowser_layout::{BorderEdge, BorderStyle, Color};
-use rowser_text::FontCache;
 use std::collections::HashMap;
 
 /// An active clip region pushed by `DisplayItem::PushClip`.
@@ -70,11 +69,19 @@ pub fn scissor(clips: &[Clip], cw: i32, ch: i32) -> (i32, i32, i32, i32) {
 fn disc(cv: &mut Canvas, cx: f32, cy: f32, r: f32, color: Color) {
     let ri = r.ceil() as i32;
     let (cx, cy) = (cx.round() as i32, cy.round() as i32);
+    let r2 = r * r;
+    // the disc test is monotone in |dx| — one fill per scanline, nudged
+    // to the exact boundary the per-pixel predicate picks
     for dy in -ri..=ri {
-        for dx in -ri..=ri {
-            if (dx * dx + dy * dy) as f32 <= r * r {
-                cv.fill_rect(cx + dx, cy + dy, 1, 1, color);
-            }
+        let mut dx = ((r2 - (dy * dy) as f32).max(0.0)).sqrt() as i32;
+        while dx >= 0 && (dx * dx + dy * dy) as f32 > r2 {
+            dx -= 1;
+        }
+        while dx < ri && ((dx + 1) * (dx + 1) + dy * dy) as f32 <= r2 {
+            dx += 1;
+        }
+        if dx >= 0 {
+            cv.fill_rect(cx - dx, cy + dy, (2 * dx + 1) as u32, 1, color);
         }
     }
 }
@@ -306,6 +313,11 @@ pub fn box_shadow(
     let (bx0, by0, bx1, by1) = scissor(&clips, cv.width as i32, cv.height as i32);
     let blend = |cv: &mut Canvas, mask: &[u8], mw: usize, x0: i32, y0: i32, j: usize, i: usize| {
         let (px, py) = (x0 as f32 + i as f32 + 0.5, y0 as f32 + j as f32 + 0.5);
+        // band workers: the mask must span the canvas (blur reads halo
+        // neighbours) but writes outside the strip are dead work
+        if (py as i32) < cv.band.0 || (py as i32) >= cv.band.1 {
+            return;
+        }
         if !clips.is_empty() && !clips.iter().all(|c| c.contains(px, py)) {
             return;
         }
@@ -448,7 +460,7 @@ pub fn process(
     canvas: &mut Canvas,
     items: &[DisplayItem],
     push: usize,
-    fonts: &mut FontCache,
+    fonts: &mut Fonts<'_>,
     images: &HashMap<String, Image>,
 ) -> usize {
     let DisplayItem::PushEffect(eff) = &items[push] else {
@@ -458,18 +470,18 @@ pub fn process(
     let inner = &items[push + 1..j];
     match eff {
         Effect::Backdrop { ops, rect } => {
-            let base = rect.or_else(|| items_bbox(inner, fonts));
+            let base = rect.or_else(|| items_bbox_pub(inner, fonts));
             if let Some(b) = base {
                 backdrop_apply(canvas, b, ops);
             }
-            crate::paint_into(canvas, inner, fonts, images);
+            crate::paint_list(canvas, inner, fonts, images);
         }
         _ => {
             let pad = match eff {
                 Effect::Filter(ops) => ops_extent(ops),
                 _ => [0.0; 4],
             };
-            let base = items_bbox(inner, fonts);
+            let base = items_bbox_pub(inner, fonts);
             if let Some((x0, y0, w, h)) = base.and_then(|b| pad_int(b, pad, canvas)) {
                 let mut tile = render_tile(inner, x0, y0, w, h, fonts, images);
                 match eff {
@@ -519,7 +531,7 @@ fn matching_pop(items: &[DisplayItem], push: usize) -> usize {
 }
 
 /// Union bbox of the leaf items in a span (markers contribute nothing).
-fn items_bbox(items: &[DisplayItem], fonts: &mut FontCache) -> Option<[f32; 4]> {
+pub(crate) fn items_bbox_pub(items: &[DisplayItem], fonts: &mut Fonts<'_>) -> Option<[f32; 4]> {
     let mut bb: Option<[f32; 4]> = None;
     let mut grow = |x: f32, y: f32, w: f32, h: f32| {
         let (x2, y2) = (x + w, y + h);
@@ -543,8 +555,7 @@ fn items_bbox(items: &[DisplayItem], fonts: &mut FontCache) -> Option<[f32; 4]> 
                 ..
             } => {
                 let w = fonts
-                    .font(*font)
-                    .map(|f| f.measure(text, *size))
+                    .with_font(*font, |f| f.measure(text, *size))
                     .unwrap_or(text.len() as f32 * size * 0.5);
                 grow(*x, baseline - size * 1.2, w, size * 1.6);
             }
@@ -598,7 +609,7 @@ fn render_tile(
     y0: i32,
     w: u32,
     h: u32,
-    fonts: &mut FontCache,
+    fonts: &mut Fonts<'_>,
     images: &HashMap<String, Image>,
 ) -> Tile {
     let off: Vec<DisplayItem> = inner
@@ -607,9 +618,9 @@ fn render_tile(
         .map(|it| offset_item(it, -x0 as f32, -y0 as f32))
         .collect();
     let mut cb = Canvas::new(w, h, bgra(0, 0, 0));
-    crate::paint_into(&mut cb, &off, fonts, images);
+    crate::paint_list(&mut cb, &off, fonts, images);
     let mut cw = Canvas::new(w, h, bgra(255, 255, 255));
-    crate::paint_into(&mut cw, &off, fonts, images);
+    crate::paint_list(&mut cw, &off, fonts, images);
     let n = (w * h) as usize;
     let mut px = vec![0u8; n * 4];
     for i in 0..n {
@@ -914,13 +925,23 @@ fn mask_tile(tile: &mut Tile, m: &Image) {
     if m.width == 0 || m.height == 0 {
         return;
     }
+    let (mw, tw) = (m.width as u64, tile.w.max(1) as u64);
     for y in 0..tile.h {
         let sy =
             (y as u64 * m.height as u64 / tile.h.max(1) as u64).min(m.height as u64 - 1) as usize;
+        // sx = x·mw/tw tracked by quotient + remainder — no per-pixel div
+        let (mut q, mut r) = (0u64, 0u64);
+        let (qstep, rstep) = (mw / tw, mw % tw);
+        let srow = &m.pixels[sy * m.width as usize * 4..];
         for x in 0..tile.w {
-            let sx =
-                (x as u64 * m.width as u64 / tile.w.max(1) as u64).min(m.width as u64 - 1) as usize;
-            let ma = m.pixels[(sy * m.width as usize + sx) * 4 + 3] as u32;
+            let sx = q.min(mw - 1) as usize;
+            q += qstep;
+            r += rstep;
+            if r >= tw {
+                r -= tw;
+                q += 1;
+            }
+            let ma = srow[sx * 4 + 3] as u32;
             let i = (y * tile.w + x) * 4;
             tile.px[i + 3] = (tile.px[i + 3] as u32 * ma / 255) as u8;
         }
@@ -930,32 +951,33 @@ fn mask_tile(tile: &mut Tile, m: &Image) {
 /// Source-over composite of a straight-alpha tile onto the opaque canvas.
 fn composite(canvas: &mut Canvas, tile: &Tile) {
     let (cw, ch) = (canvas.width as i32, canvas.height as i32);
-    for y in 0..tile.h as i32 {
+    // tile range ∩ canvas ∩ band, in tile coordinates — bounds once
+    let (x0, x1) = ((-tile.ox).max(0), (tile.w as i32).min(cw - tile.ox));
+    let (y0, y1) = (
+        (-tile.oy).max(0).max(canvas.band.0 - tile.oy),
+        (tile.h as i32)
+            .min(ch - tile.oy)
+            .min(canvas.band.1 - tile.oy),
+    );
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
         let gy = tile.oy + y;
-        if gy < 0 || gy >= ch {
-            continue;
-        }
-        for x in 0..tile.w as i32 {
-            let gx = tile.ox + x;
-            if gx < 0 || gx >= cw {
-                continue;
-            }
-            let si = ((y * tile.w as i32 + x) * 4) as usize;
-            let di = ((gy * cw + gx) * 4) as usize;
-            let a = tile.px[si + 3] as u32;
-            if a == 0 {
-                continue;
-            }
+        let srow = &tile.px[((y * tile.w as i32 + x0) * 4) as usize..];
+        let di = ((gy * cw + tile.ox + x0) * 4) as usize;
+        let drow = &mut canvas.pixels[di..di + (x1 - x0) as usize * 4];
+        for (k, d) in drow.chunks_exact_mut(4).enumerate() {
+            let s = &srow[k * 4..k * 4 + 4];
+            let a = s[3] as u32;
             if a == 255 {
-                canvas.pixels[di..di + 4].copy_from_slice(&tile.px[si..si + 4]);
-            } else {
+                d.copy_from_slice(s);
+            } else if a > 0 {
                 let inv = 255 - a;
                 for k in 0..3 {
-                    canvas.pixels[di + k] = ((tile.px[si + k] as u32 * a
-                        + canvas.pixels[di + k] as u32 * inv)
-                        / 255) as u8;
+                    d[k] = ((s[k] as u32 * a + d[k] as u32 * inv) / 255) as u8;
                 }
-                canvas.pixels[di + 3] = 255;
+                d[3] = 255;
             }
         }
     }
@@ -964,16 +986,17 @@ fn composite(canvas: &mut Canvas, tile: &Tile) {
 /// Blend-mode composite: out = a·B(s,d) + (1−a)·d per channel.
 fn blend_composite(canvas: &mut Canvas, tile: &Tile, mode: BlendMode) {
     let (cw, ch) = (canvas.width as i32, canvas.height as i32);
-    for y in 0..tile.h as i32 {
+    let (x0, x1) = ((-tile.ox).max(0), (tile.w as i32).min(cw - tile.ox));
+    let (y0, y1) = (
+        (-tile.oy).max(0).max(canvas.band.0 - tile.oy),
+        (tile.h as i32)
+            .min(ch - tile.oy)
+            .min(canvas.band.1 - tile.oy),
+    );
+    for y in y0..y1 {
         let gy = tile.oy + y;
-        if gy < 0 || gy >= ch {
-            continue;
-        }
-        for x in 0..tile.w as i32 {
+        for x in x0..x1 {
             let gx = tile.ox + x;
-            if gx < 0 || gx >= cw {
-                continue;
-            }
             let si = ((y * tile.w as i32 + x) * 4) as usize;
             let di = ((gy * cw + gx) * 4) as usize;
             let a = tile.px[si + 3] as f32 / 255.0;
@@ -1034,6 +1057,7 @@ fn backdrop_apply(canvas: &mut Canvas, rect: [f32; 4], ops: &[FilterOp]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rowser_text::FontCache;
 
     fn parse_ops(v: &str) -> Vec<FilterOp> {
         rowser_layout::colorfx::parse_filter(v, 16.0, bgra(0, 0, 0))
