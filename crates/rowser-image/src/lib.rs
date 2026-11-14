@@ -13,6 +13,9 @@ pub struct Image {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    /// raster px per CSS px — supersampled SVG rasters carry 4.0 here so
+    /// their natural size for background-size/object-fit stays in CSS px
+    pub density: f32,
 }
 
 /// Ways PNG decoding can fail.
@@ -151,6 +154,7 @@ pub fn decode(bytes: &[u8]) -> Result<Image, DecodeError> {
         width: ihdr.w,
         height: ihdr.h,
         pixels,
+        density: 1.0,
     })
 }
 

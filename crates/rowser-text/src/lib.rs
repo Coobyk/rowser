@@ -5,9 +5,66 @@
 //! Rasterizes quadratic outlines with a non-zero winding scanline fill at
 //! 4x4 supersampling. CFF/OTF outlines and hinting are not supported.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
+
+/// rustc-hash-style hasher: one multiply-rotate per 8 bytes instead of
+/// SipHash — these maps key on small ints and short strings and sit on
+/// the per-word/per-glyph hot path, so hash cost matters.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    #[inline]
+    fn add(&mut self, v: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ v).wrapping_mul(Self::SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.add(u64::from_ne_bytes(c.try_into().unwrap()));
+        }
+        for &b in chunks.remainder() {
+            self.add(u64::from(b));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.add(u64::from(v));
+    }
+    #[inline]
+    fn write_u16(&mut self, v: u16) {
+        self.add(u64::from(v));
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.add(u64::from(v));
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.add(v as u64);
+    }
+}
+
+type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 // ---------- font discovery ----------
 
@@ -19,6 +76,8 @@ pub struct FontFace {
     pub bold: bool,
     pub italic: bool,
     pub path: PathBuf,
+    /// face index inside `path` — nonzero for .ttc/.otc collection members
+    pub face_index: u32,
     /// CSS weight 100–900 (scanned faces: 400, or 700 when `bold`).
     pub weight: u16,
     /// font-stretch percentage; 100 = normal width.
@@ -41,15 +100,15 @@ pub fn scan_dir(dir: &Path) -> Vec<FontFace> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let is_font = path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("ttf"));
+        let is_font = path.extension().is_some_and(|e| {
+            ["ttf", "otf", "ttc", "otc"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        });
         if !is_font {
             continue;
         }
-        if let Some(face) = inspect(&path) {
-            out.push(face);
-        }
+        out.extend(inspect(&path));
     }
     out
 }
@@ -88,21 +147,75 @@ fn dirs_home() -> PathBuf {
     std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from)
 }
 
-fn inspect(path: &Path) -> Option<FontFace> {
-    let data = fs::read(path).ok()?;
-    let font = Font::parse(&data)?;
-    let (family, bold, italic) = font.names()?;
-    Some(FontFace {
-        family,
-        bold,
-        italic,
-        path: path.to_path_buf(),
-        weight: if bold { 700 } else { 400 },
-        stretch: 100,
-        unicode_ranges: Vec::new(),
-        registered: false,
-        disabled: false,
-    })
+/// Offset table position for face `index`: 0 for a plain font file; for a
+/// TrueType/OpenType collection (`ttcf` magic) read the face directory
+/// list in the collection header.
+fn face_dir(data: &[u8], index: u32) -> Option<usize> {
+    if data.len() < 4 {
+        return None;
+    }
+    if &data[..4] == b"ttcf" {
+        let n = be_u32(data, 8);
+        if index >= n {
+            return None;
+        }
+        let o = 12 + index as usize * 4;
+        if o + 4 > data.len() {
+            return None;
+        }
+        Some(be_u32(data, o) as usize)
+    } else if index == 0 {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// Face count of a font file — 1 for plain sfnt, `numFonts` for `ttcf`.
+fn face_count(data: &[u8]) -> u32 {
+    if data.len() >= 12 && &data[..4] == b"ttcf" {
+        be_u32(data, 8).max(1)
+    } else {
+        1
+    }
+}
+
+fn inspect(path: &Path) -> Vec<FontFace> {
+    let Ok(data) = fs::read(path) else {
+        return Vec::new();
+    };
+    // Cheap metadata pass — same acceptance as `Font::parse` (glyf-outlined,
+    // usable cmap, decodable `name`) but without loading loca/hmtx, leaking
+    // the bytes, or building a swash handle. Faces that resolve get a real
+    // parse later via `Font::load`. Collections yield one FontFace each.
+    let mut out = Vec::new();
+    for index in 0..face_count(&data) {
+        let Some(dir) = face_dir(&data, index) else {
+            break;
+        };
+        let Some(tables) = find_tables_at(&data, dir) else {
+            continue;
+        };
+        if !has_cmap(&data, tables.cmap) {
+            continue;
+        }
+        let Some((family, bold, italic)) = names_at(&data, tables.name) else {
+            continue;
+        };
+        out.push(FontFace {
+            family,
+            bold,
+            italic,
+            path: path.to_path_buf(),
+            face_index: index,
+            weight: if bold { 700 } else { 400 },
+            stretch: 100,
+            unicode_ranges: Vec::new(),
+            registered: false,
+            disabled: false,
+        });
+    }
+    out
 }
 
 /// Pick the best face for (family-ish, bold, italic) from a scanned set.
@@ -146,6 +259,7 @@ struct Tables {
     cmap: usize,
     name: usize,
     kern: Option<usize>,
+    cff: usize,
 }
 
 /// A parsed TrueType font. Keeps the raw file bytes and resolves tables
@@ -165,11 +279,27 @@ pub struct Font {
     hmtx: Vec<(u16, i16)>, // (advance, lsb)
     cmap4: Option<usize>,  // offset of format-4 subtable
     cmap12: Option<usize>, // offset of format-12 subtable
-    kern_pairs: HashMap<u32, i16>,
+    /// glyph ids for chars < 128 — built once at parse; covers the vast
+    /// majority of measured text without touching the cmap tables.
+    ascii_gid: [u16; 128],
+    /// glyph ids already resolved for non-ASCII chars.
+    gid_cache: RefCell<FxHashMap<u32, u16>>,
+    kern_pairs: FxHashMap<u32, i16>,
     kern_loaded: bool,
+    /// measure() memo: px.to_bits() → text → width. Bounded — cleared
+    /// whole when `measure_cached` reaches MEASURE_CAP.
+    measure_cache: FxHashMap<u32, FxHashMap<Box<str>, f32>>,
+    measure_cached: usize,
     /// swash handle over leaked data for hinted rasterization
     swash: Option<swash::FontRef<'static>>,
 }
+
+/// Bound on `Font::measure_cache` entries per font — ~1-2MB worst case.
+const MEASURE_CAP: usize = 16384;
+/// Bound on `Font::gid_cache` entries.
+const GID_CAP: usize = 4096;
+/// Bound on `FontCache::resolved` memo entries.
+const RESOLVE_CAP: usize = 8192;
 
 fn be_u16(d: &[u8], o: usize) -> u16 {
     u16::from_be_bytes([d[o], d[o + 1]])
@@ -181,51 +311,153 @@ fn be_u32(d: &[u8], o: usize) -> u32 {
     u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
 }
 
-impl Font {
-    /// Parse a font file. Returns None for CFF fonts (no `glyf` table) and
-    /// malformed data.
-    pub fn parse(data: &[u8]) -> Option<Font> {
-        if data.len() < 12 {
+/// Locate the table directory entries `parse`/`inspect` need. Returns
+/// None for CFF fonts (no `glyf` table) and malformed data.
+fn find_tables(data: &[u8]) -> Option<Tables> {
+    find_tables_at(data, 0)
+}
+
+/// `find_tables` starting at the offset table of face `dir_off` —
+/// for TTC members the directory sits at `dir_off` while its table
+/// records hold absolute file offsets.
+fn find_tables_at(data: &[u8], dir_off: usize) -> Option<Tables> {
+    if data.len() < dir_off + 12 {
+        return None;
+    }
+    let num_tables = be_u16(data, dir_off + 4) as usize;
+    let mut tables = Tables {
+        head: 0,
+        hhea: 0,
+        maxp: 0,
+        loca: 0,
+        glyf: 0,
+        hmtx: 0,
+        cmap: 0,
+        name: 0,
+        kern: None,
+        cff: 0,
+    };
+    for i in 0..num_tables {
+        let rec = dir_off + 12 + i * 16;
+        if rec + 16 > data.len() {
             return None;
         }
-        let num_tables = be_u16(data, 4) as usize;
-        let mut tables = Tables {
-            head: 0,
-            hhea: 0,
-            maxp: 0,
-            loca: 0,
-            glyf: 0,
-            hmtx: 0,
-            cmap: 0,
-            name: 0,
-            kern: None,
+        let tag = &data[rec..rec + 4];
+        let off = be_u32(data, rec + 8) as usize;
+        if off + 4 > data.len() {
+            continue;
+        }
+        match tag {
+            b"head" => tables.head = off,
+            b"hhea" => tables.hhea = off,
+            b"maxp" => tables.maxp = off,
+            b"loca" => tables.loca = off,
+            b"glyf" => tables.glyf = off,
+            b"hmtx" => tables.hmtx = off,
+            b"cmap" => tables.cmap = off,
+            b"name" => tables.name = off,
+            b"kern" => tables.kern = Some(off),
+            b"CFF " => tables.cff = off,
+            _ => {}
+        }
+    }
+    // outlines live in `glyf` (TrueType) or `CFF ` (OpenType) — either is
+    // usable: glyph drawing goes through swash, which scales both
+    if tables.head == 0 || tables.cmap == 0 || (tables.glyf == 0 && tables.cff == 0) {
+        return None;
+    }
+    Some(tables)
+}
+
+/// Whether the `cmap` table at `base` contains a subtable `find_cmap`
+/// would accept — `Font::parse` rejects fonts without one.
+fn has_cmap(d: &[u8], base: usize) -> bool {
+    if base + 4 > d.len() {
+        return false;
+    }
+    let count = be_u16(d, base + 2) as usize;
+    for i in 0..count {
+        let rec = base + 4 + i * 8;
+        if rec + 8 > d.len() {
+            return false;
+        }
+        let platform = be_u16(d, rec);
+        let encoding = be_u16(d, rec + 2);
+        let sub = base + be_u32(d, rec + 4) as usize;
+        if sub + 2 > d.len() {
+            continue;
+        }
+        let fmt = be_u16(d, sub);
+        match (fmt, platform, encoding) {
+            (12, 3, 10) | (12, 0, _) | (4, 3, 1) | (4, 0, _) | (4, 3, 0) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `name`-table decode: (family, bold-ish, italic-ish). Shared by
+/// `Font::names` and the lightweight `inspect` pass.
+fn names_at(d: &[u8], base: usize) -> Option<(String, bool, bool)> {
+    if base == 0 || base + 6 > d.len() {
+        return None;
+    }
+    let count = be_u16(d, base + 2) as usize;
+    let strings = base + be_u16(d, base + 4) as usize;
+    let mut family = None;
+    let mut subfamily = String::new();
+    for i in 0..count {
+        let rec = base + 6 + i * 12;
+        if rec + 12 > d.len() {
+            break;
+        }
+        let platform = be_u16(d, rec);
+        let name_id = be_u16(d, rec + 6);
+        let len = be_u16(d, rec + 8) as usize;
+        let off = strings + be_u16(d, rec + 10) as usize;
+        if off + len > d.len() {
+            continue;
+        }
+        let raw = &d[off..off + len];
+        // Windows platform strings are UTF-16BE; others treat as latin1.
+        let text = if platform == 3 {
+            raw.chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .map(|c| char::from_u32(u32::from(c)).unwrap_or('?'))
+                .collect()
+        } else {
+            raw.iter().map(|&b| b as char).collect()
         };
-        for i in 0..num_tables {
-            let rec = 12 + i * 16;
-            if rec + 16 > data.len() {
-                return None;
-            }
-            let tag = &data[rec..rec + 4];
-            let off = be_u32(data, rec + 8) as usize;
-            if off + 4 > data.len() {
-                continue;
-            }
-            match tag {
-                b"head" => tables.head = off,
-                b"hhea" => tables.hhea = off,
-                b"maxp" => tables.maxp = off,
-                b"loca" => tables.loca = off,
-                b"glyf" => tables.glyf = off,
-                b"hmtx" => tables.hmtx = off,
-                b"cmap" => tables.cmap = off,
-                b"name" => tables.name = off,
-                b"kern" => tables.kern = Some(off),
-                _ => {}
-            }
+        match name_id {
+            1 | 16 if family.is_none() => family = Some(text),
+            2 | 17 => subfamily = text,
+            _ => {}
         }
-        if tables.head == 0 || tables.glyf == 0 || tables.cmap == 0 {
-            return None;
-        }
+    }
+    let sub = subfamily.to_lowercase();
+    family.map(|f| {
+        (
+            f,
+            sub.contains("bold"),
+            sub.contains("italic") || sub.contains("oblique"),
+        )
+    })
+}
+
+impl Font {
+    /// Parse a font file (face 0 of a collection, or a plain font).
+    pub fn parse(data: &[u8]) -> Option<Font> {
+        Self::parse_indexed(data, 0)
+    }
+
+    /// `parse` at face `index` inside a `ttcf` collection — the member's
+    /// offset table is located first, then parsing proceeds normally
+    /// since its table records carry absolute file offsets.
+    pub fn parse_indexed(data: &[u8], index: u32) -> Option<Font> {
+        let dir = face_dir(data, index)?;
+        let tables = find_tables_at(data, dir)?;
         let d = &data;
         let mut font = Font {
             units_per_em: be_u16(d, tables.head + 18),
@@ -245,22 +477,40 @@ impl Font {
             hmtx: Vec::new(),
             cmap4: None,
             cmap12: None,
-            kern_pairs: HashMap::new(),
+            ascii_gid: [0; 128],
+            gid_cache: RefCell::new(FxHashMap::default()),
+            kern_pairs: FxHashMap::default(),
             kern_loaded: false,
+            measure_cache: FxHashMap::default(),
+            measure_cached: 0,
             swash: None,
         };
-        font.load_loca();
+        // loca/glyf only exist on TrueType outlines — CFF glyphs draw
+        // through swash and never touch `loca`
+        if font.tables.glyf != 0 && font.tables.loca != 0 {
+            font.load_loca();
+        }
         font.load_hmtx();
         font.find_cmap();
         if font.cmap4.is_none() && font.cmap12.is_none() {
             return None;
         }
-        font.swash = swash::FontRef::from_index(font.data, 0);
+        let mut ascii_gid = [0u16; 128];
+        for (cp, slot) in ascii_gid.iter_mut().enumerate() {
+            *slot = font.glyph_uncached(cp as u32);
+        }
+        font.ascii_gid = ascii_gid;
+        font.swash = swash::FontRef::from_index(font.data, index as usize);
         Some(font)
     }
 
     pub fn load(path: &Path) -> Option<Font> {
-        Self::parse(&fs::read(path).ok()?)
+        Self::load_indexed(path, 0)
+    }
+
+    /// `load` at face `index` of a collection file.
+    pub fn load_indexed(path: &Path, index: u32) -> Option<Font> {
+        Self::parse_indexed(&fs::read(path).ok()?, index)
     }
 
     fn load_loca(&mut self) {
@@ -320,56 +570,31 @@ impl Font {
 
     /// Family name plus rough style flags from the `name` table.
     pub fn names(&self) -> Option<(String, bool, bool)> {
-        let d = &self.data;
-        let base = self.tables.name;
-        if base == 0 || base + 6 > d.len() {
-            return None;
-        }
-        let count = be_u16(d, base + 2) as usize;
-        let strings = base + be_u16(d, base + 4) as usize;
-        let mut family = None;
-        let mut subfamily = String::new();
-        for i in 0..count {
-            let rec = base + 6 + i * 12;
-            if rec + 12 > d.len() {
-                break;
-            }
-            let platform = be_u16(d, rec);
-            let name_id = be_u16(d, rec + 6);
-            let len = be_u16(d, rec + 8) as usize;
-            let off = strings + be_u16(d, rec + 10) as usize;
-            if off + len > d.len() {
-                continue;
-            }
-            let raw = &d[off..off + len];
-            // Windows platform strings are UTF-16BE; others treat as latin1.
-            let text = if platform == 3 {
-                raw.chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .map(|c| char::from_u32(u32::from(c)).unwrap_or('?'))
-                    .collect()
-            } else {
-                raw.iter().map(|&b| b as char).collect()
-            };
-            match name_id {
-                1 | 16 if family.is_none() => family = Some(text),
-                2 | 17 => subfamily = text,
-                _ => {}
-            }
-        }
-        let sub = subfamily.to_lowercase();
-        family.map(|f| {
-            (
-                f,
-                sub.contains("bold"),
-                sub.contains("italic") || sub.contains("oblique"),
-            )
-        })
+        names_at(self.data, self.tables.name)
     }
 
     /// Map a Unicode scalar to a glyph id (0 = .notdef).
+    #[inline]
     pub fn glyph_id(&self, c: char) -> u16 {
         let cp = c as u32;
+        if cp < 128 {
+            return self.ascii_gid[cp as usize];
+        }
+        if let Some(&g) = self.gid_cache.borrow().get(&cp) {
+            return g;
+        }
+        let g = self.glyph_uncached(cp);
+        let mut cache = self.gid_cache.borrow_mut();
+        if cache.len() >= GID_CAP {
+            cache.clear();
+        }
+        cache.insert(cp, g);
+        g
+    }
+
+    /// cmap lookup with no fast paths — builds `ascii_gid` at parse and
+    /// feeds `gid_cache` misses.
+    fn glyph_uncached(&self, cp: u32) -> u16 {
         if let Some(sub) = self.cmap12 {
             if let Some(g) = self.cmap12_lookup(sub, cp) {
                 return g;
@@ -479,26 +704,34 @@ impl Font {
         if !self.kern_loaded {
             self.load_kern();
         }
+        // most fonts carry no usable kern table — skip the map probe.
+        if self.kern_pairs.is_empty() {
+            return 0;
+        }
         self.kern_pairs
             .get(&((left as u32) << 16 | right as u32))
             .copied()
             .unwrap_or(0)
     }
 
+    #[inline]
     pub fn swash_font(&self) -> Option<swash::FontRef<'static>> {
         self.swash
     }
 
     /// Horizontal advance for a glyph, in font units.
+    #[inline]
     pub fn advance_units(&self, gid: u16) -> u16 {
         self.hmtx.get(gid as usize).map_or(0, |m| m.0)
     }
 
+    #[inline]
     pub fn units_per_em(&self) -> u16 {
         self.units_per_em
     }
 
     /// Line height (ascent - descent + gap) in font units.
+    #[inline]
     pub fn line_height_units(&self) -> i32 {
         self.ascender as i32 - self.descender as i32 + self.line_gap as i32
     }
@@ -507,7 +740,8 @@ impl Font {
 
     fn glyph_data(&self, gid: u16) -> Option<&[u8]> {
         let (i, n) = (gid as usize, self.num_glyphs as usize);
-        if i >= n {
+        if i >= n || self.loca.is_empty() {
+            // CFF fonts have no loca/glyf — outlines come from swash
             return None;
         }
         let (s, e) = (self.loca[i] as usize, self.loca[i + 1] as usize);
@@ -628,14 +862,16 @@ impl Font {
         // Build contours; off-curve points get implicit on-curve midpoints.
         let mut start = 0usize;
         for &end in &end_pts {
-            let idx: Vec<usize> = (start..=end).collect();
+            // contour points are flags/xs/ys[base..=end] — index directly
+            // instead of materializing an index Vec per contour
+            let base = start;
             start = end + 1;
-            if idx.len() < 2 {
+            let n = (end + 1).saturating_sub(base);
+            if n < 2 {
                 continue;
             }
-            let on = |i: usize| flags[idx[i]] & 0x01 != 0;
-            let pt = |i: usize| (xs[idx[i]] as f32, ys[idx[i]] as f32);
-            let n = idx.len();
+            let on = |i: usize| flags[base + i] & 0x01 != 0;
+            let pt = |i: usize| (xs[base + i] as f32, ys[base + i] as f32);
             // Find first on-curve point (or synthesize one).
             let first_on = (0..n).find(|&i| on(i));
             let Some(first) = first_on else { continue };
@@ -812,30 +1048,66 @@ pub struct Raster {
 
 impl Font {
     /// Pixel advance of a glyph at the given pixels-per-em.
+    #[inline]
     pub fn advance(&self, gid: u16, px: f32) -> f32 {
         self.advance_units(gid) as f32 * px / self.units_per_em as f32
     }
 
     /// Width of a text run at `px`, applying kerning.
+    /// Memoized per (px, text) — layout re-measures the same words every
+    /// repaint, so repeat calls are a hash lookup. Result is the same
+    /// f32 the uncached path would produce.
     pub fn measure(&mut self, text: &str, px: f32) -> f32 {
+        if let Some(&w) = self
+            .measure_cache
+            .get(&px.to_bits())
+            .and_then(|m| m.get(text))
+        {
+            return w;
+        }
         let s = px / self.units_per_em as f32;
+        if !self.kern_loaded {
+            self.load_kern();
+        }
+        // most fonts carry no usable kern table — hoisting the check
+        // turns the per-char `kern()` call into a skipped branch
+        let kerned = !self.kern_pairs.is_empty();
         let mut w = 0.0f32;
         let mut prev = 0u16;
         for c in text.chars() {
             let gid = self.glyph_id(c);
-            w += self.kern(prev, gid) as f32 * s;
+            if kerned {
+                w += self
+                    .kern_pairs
+                    .get(&((prev as u32) << 16 | gid as u32))
+                    .copied()
+                    .unwrap_or(0) as f32
+                    * s;
+            }
             w += self.advance_units(gid) as f32;
             prev = gid;
         }
-        w * s
+        let w = w * s;
+        if self.measure_cached >= MEASURE_CAP {
+            self.measure_cache.clear();
+            self.measure_cached = 0;
+        }
+        self.measure_cache
+            .entry(px.to_bits())
+            .or_default()
+            .insert(text.into(), w);
+        self.measure_cached += 1;
+        w
     }
 
     /// Ascent at `px` (distance from baseline to top of line box).
+    #[inline]
     pub fn ascent(&self, px: f32) -> f32 {
         self.ascender as f32 * px / self.units_per_em as f32
     }
 
     /// Full line height at `px` (ascent - descent + gap).
+    #[inline]
     pub fn line_height(&self, px: f32) -> f32 {
         self.line_height_units() as f32 * px / self.units_per_em as f32
     }
@@ -845,8 +1117,17 @@ impl Font {
 /// rasterizing glyphs is cached per (glyph, pixel size) inside `GlyphCache`.
 pub struct FontCache {
     faces: Vec<FontFace>,
-    fonts: HashMap<usize, Font>, // index into faces
-    glyphs: HashMap<(usize, u16, u32), Option<Raster>>, // (face idx, gid, px*4)
+    /// `faces[i].family.to_lowercase()`, parallel to `faces` — one
+    /// lowercasing per registered face instead of one per face per scan.
+    faces_lc: Vec<String>,
+    fonts: FxHashMap<usize, Font>, // index into faces
+    glyphs: FxHashMap<(usize, u16, u32), Option<Raster>>, // (face idx, gid, px*4)
+    /// resolve_face memo: (weight, stretch, italic, first-char|u32::MAX) →
+    /// family-list → face index. Cleared whenever `faces` mutates, so
+    /// stale results can never survive a registration or clear.
+    resolved:
+        FxHashMap<(u16, u16, bool, u32), FxHashMap<Box<str>, Option<usize>>>,
+    resolved_count: usize,
     ctx: swash::scale::ScaleContext,
 }
 
@@ -858,10 +1139,15 @@ impl Default for FontCache {
 
 impl FontCache {
     pub fn new() -> Self {
+        let faces = scan_system();
+        let faces_lc = faces.iter().map(|f| f.family.to_lowercase()).collect();
         Self {
-            faces: scan_system(),
-            fonts: HashMap::new(),
-            glyphs: HashMap::new(),
+            faces,
+            faces_lc,
+            fonts: FxHashMap::default(),
+            glyphs: FxHashMap::default(),
+            resolved: FxHashMap::default(),
+            resolved_count: 0,
             ctx: swash::scale::ScaleContext::new(),
         }
     }
@@ -869,6 +1155,7 @@ impl FontCache {
     /// Resolve `family` (a CSS comma-separated list) to a font index. Each
     /// candidate substring-matches face families; generic keywords expand to
     /// preferred concrete families.
+    #[inline]
     pub fn resolve(&mut self, family: &str, bold: bool, italic: bool) -> Option<usize> {
         self.resolve_face(family, if bold { 700 } else { 400 }, 100, italic, None)
     }
@@ -878,7 +1165,38 @@ impl FontCache {
     /// unicode-range (@font-face) only match when they cover that char.
     /// Each comma-separated name in `family` is tried in order; generic
     /// keywords expand to preferred concrete families.
+    #[inline]
     pub fn resolve_face(
+        &mut self,
+        family: &str,
+        weight: u16,
+        stretch: u16,
+        italic: bool,
+        ch: Option<char>,
+    ) -> Option<usize> {
+        // Memoized: the scan below walks every installed face per call,
+        // which dominated layout before callers memoized on their side —
+        // keeping it here covers resolve() and uncovered-word fallbacks
+        // too. u32::MAX stands in for `ch: None`.
+        let key = (weight, stretch, italic, ch.map_or(u32::MAX, |c| c as u32));
+        if let Some(&r) = self.resolved.get(&key).and_then(|m| m.get(family)) {
+            return r;
+        }
+        let r = self.resolve_face_uncached(family, weight, stretch, italic, ch);
+        if self.resolved_count >= RESOLVE_CAP {
+            self.resolved.clear();
+            self.resolved_count = 0;
+        }
+        self.resolved
+            .entry(key)
+            .or_default()
+            .insert(family.into(), r);
+        self.resolved_count += 1;
+        r
+    }
+
+    /// The face scan behind `resolve_face` — see that method's docs.
+    fn resolve_face_uncached(
         &mut self,
         family: &str,
         weight: u16,
@@ -928,7 +1246,9 @@ impl FontCache {
             for want in wants {
                 if let Some(idx) = self.best_face(&want, weight, stretch, italic, ch) {
                     if !self.fonts.contains_key(&idx) {
-                        if let Some(font) = Font::load(&self.faces[idx].path) {
+                        if let Some(font) =
+                            Font::load_indexed(&self.faces[idx].path, self.faces[idx].face_index)
+                        {
                             self.fonts.insert(idx, font);
                         }
                     }
@@ -954,7 +1274,7 @@ impl FontCache {
         let cp = ch.map(|c| c as u32);
         let mut best: Option<(usize, u32)> = None;
         for (i, f) in self.faces.iter().enumerate() {
-            if f.disabled || !f.family.to_lowercase().contains(want) {
+            if f.disabled || !self.faces_lc[i].contains(want) {
                 continue;
             }
             if !f.unicode_ranges.is_empty() {
@@ -988,6 +1308,7 @@ impl FontCache {
         best.map(|(i, _)| i)
     }
 
+    #[inline]
     pub fn font(&mut self, idx: usize) -> Option<&mut Font> {
         self.fonts.get_mut(&idx)
     }
@@ -995,25 +1316,29 @@ impl FontCache {
     /// Cached glyph raster at `px` (quantized to quarter pixels).
     pub fn raster(&mut self, idx: usize, gid: u16, px: f32) -> Option<&Raster> {
         let key = (idx, gid, (px * 4.0) as u32);
-        if !self.glyphs.contains_key(&key) {
-            let font = self.fonts.get(&idx)?;
-            let r = if let Some(sf) = font.swash_font() {
-                let mut scaler = self.ctx.builder(sf).size(px).hint(true).build();
-                swash::scale::Render::new(&[swash::scale::Source::Outline])
-                    .render(&mut scaler, gid)
-                    .map(|img| Raster {
-                        width: img.placement.width,
-                        height: img.placement.height,
-                        bearing_x: img.placement.left,
-                        bearing_y: img.placement.top,
-                        alpha: img.data,
-                    })
-            } else {
-                font.raster(gid, px)
-            };
-            self.glyphs.insert(key, r);
+        match self.glyphs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => {
+                return e.into_mut().as_ref();
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let font = self.fonts.get(&idx)?;
+                let r = if let Some(sf) = font.swash_font() {
+                    let mut scaler = self.ctx.builder(sf).size(px).hint(true).build();
+                    swash::scale::Render::new(&[swash::scale::Source::Outline])
+                        .render(&mut scaler, gid)
+                        .map(|img| Raster {
+                            width: img.placement.width,
+                            height: img.placement.height,
+                            bearing_x: img.placement.left,
+                            bearing_y: img.placement.top,
+                            alpha: img.data,
+                        })
+                } else {
+                    font.raster(gid, px)
+                };
+                e.insert(r).as_ref()
+            }
         }
-        self.glyphs.get(&key)?.as_ref()
     }
 
     /// Register a downloaded @font-face font under its declared `family`,
@@ -1030,11 +1355,13 @@ impl FontCache {
     ) -> Option<usize> {
         let font = Font::parse(bytes)?;
         let idx = self.faces.len();
+        self.faces_lc.push(family.to_lowercase());
         self.faces.push(FontFace {
             family: family.to_string(),
             bold: weight >= 600,
             italic,
             path: PathBuf::new(),
+            face_index: 0,
             weight,
             stretch: 100,
             unicode_ranges,
@@ -1042,6 +1369,8 @@ impl FontCache {
             disabled: false,
         });
         self.fonts.insert(idx, font);
+        self.resolved.clear();
+        self.resolved_count = 0;
         Some(idx)
     }
 
@@ -1059,9 +1388,11 @@ impl FontCache {
         if want.is_empty() {
             return None;
         }
-        let src = self.faces.iter().position(|f| {
-            !f.registered && !f.disabled && f.family.to_lowercase().contains(&want)
-        })?;
+        let src = self
+            .faces
+            .iter()
+            .zip(self.faces_lc.iter())
+            .position(|(f, lc)| !f.registered && !f.disabled && lc.contains(&want))?;
         let mut face = self.faces[src].clone();
         face.family = family.to_string();
         face.weight = weight;
@@ -1070,7 +1401,10 @@ impl FontCache {
         face.unicode_ranges = unicode_ranges;
         face.registered = true;
         let idx = self.faces.len();
+        self.faces_lc.push(family.to_lowercase());
         self.faces.push(face);
+        self.resolved.clear();
+        self.resolved_count = 0;
         Some(idx)
     }
 
@@ -1079,6 +1413,8 @@ impl FontCache {
     /// Indices stay stable; display lists built from a stale page still
     /// hold valid (if disabled) indices.
     pub fn clear_registered(&mut self) {
+        self.resolved.clear();
+        self.resolved_count = 0;
         for (i, f) in self.faces.iter_mut().enumerate() {
             if f.registered && !f.disabled {
                 f.disabled = true;
@@ -1119,10 +1455,13 @@ fn flatten_quad(
 /// `w`×`h` *supersamples* — coordinates are scaled by SS accordingly.
 fn raster_contour(poly: &[(f32, f32)], ox: f32, oy: f32, cov: &mut [u8], w: i32, h: i32) {
     const SS: f32 = 4.0;
+    // (x, winding delta) crossings — one buffer reused across scanlines
+    // instead of a malloc per supersampled row
+    let mut xs: Vec<(f32, i32)> = Vec::new();
     // For each scanline (supersampled row), collect edge crossings.
     for sy in 0..h {
         let y = sy as f32 + 0.5;
-        let mut xs: Vec<(f32, i32)> = Vec::new(); // (x, winding delta)
+        xs.clear();
         let n = poly.len();
         for i in 0..n {
             let (x0, y0) = poly[i];
@@ -1138,7 +1477,7 @@ fn raster_contour(poly: &[(f32, f32)], ox: f32, oy: f32, cov: &mut [u8], w: i32,
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let mut winding = 0i32;
         let mut last_x = 0f32;
-        for (x, delta) in xs {
+        for &(x, delta) in &xs {
             if winding != 0 {
                 let (a, b) = (last_x.max(0.0), x.min(w as f32));
                 let (ia, ib) = (a.floor() as i32, b.ceil() as i32);
