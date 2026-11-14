@@ -261,7 +261,7 @@ fn ws_tokens(s: &str) -> Vec<&str> {
                 st = i;
                 continue;
             }
-            c if (c as char).is_whitespace() && depth <= 0 => {
+            c if c.is_ascii_whitespace() && depth <= 0 => {
                 if st < i {
                     out.push(&s[st..i]);
                 }
@@ -330,7 +330,7 @@ fn calc_fa(inner: &str, em: f32, vh: f32, vw: f32) -> Option<(f32, f32)> {
     let mut i = 0usize;
     while i < b.len() {
         let c = b[i] as char;
-        if c.is_whitespace() {
+        if b[i].is_ascii_whitespace() {
             i += 1;
             continue;
         }
@@ -353,8 +353,8 @@ fn calc_fa(inner: &str, em: f32, vh: f32, vw: f32) -> Option<(f32, f32)> {
         }
         let st = i;
         while i < b.len()
-            && !matches!(b[i] as char, '+' | '-' | '(' | ')' | '*' | '/')
-            && !(b[i] as char).is_whitespace()
+            && !matches!(b[i], b'+' | b'-' | b'(' | b')' | b'*' | b'/')
+            && !b[i].is_ascii_whitespace()
         {
             i += 1;
         }

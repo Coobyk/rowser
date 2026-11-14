@@ -416,6 +416,7 @@ impl<'a> Layouter<'a> {
         let saved_hits = std::mem::take(&mut self.hits);
         let saved_line = std::mem::take(&mut self.line);
         let saved_floats = std::mem::take(&mut self.floats);
+        self.floats_gen += 1;
         let saved = (self.y, self.margin_x, self.avail_w, self.align);
         let saved_lx = self.line_x;
         let saved_ps = self.pending_space;
@@ -508,6 +509,7 @@ impl<'a> Layouter<'a> {
         self.line_x = saved_lx;
         self.pending_space = saved_ps;
         self.floats = saved_floats;
+        self.floats_gen += 1;
         self.inset_h = saved_ih;
         (items, hits, bottom, units)
     }

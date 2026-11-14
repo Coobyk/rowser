@@ -117,17 +117,92 @@ impl Mat {
     }
 }
 
+/// A paint value — flat color or a paint server (gradient) by table index.
+#[derive(Clone, Copy)]
+enum Fill {
+    Solid(u32),
+    Srv(u32),
+}
+
+/// A parsed gradient. Coords stay as-authored (gradientUnits decides the
+/// space); stops are (offset, ARGB) sorted by offset.
+struct Grad {
+    lin: bool,
+    /// linear: x1 y1 x2 y2 — radial: cx cy r fx fy
+    p: [f32; 6],
+    /// gradientUnits=objectBoundingBox → coords are normalized 0..1 over the
+    /// referencing shape's bbox; otherwise userSpaceOnUse
+    bbox: bool,
+    gtx: Mat, // gradientTransform
+    spread: u8, // 0 pad, 1 reflect, 2 repeat
+    stops: Vec<(f32, u32)>,
+}
+
+impl Default for Grad {
+    fn default() -> Self {
+        Grad {
+            lin: true,
+            p: [0.0; 6],
+            bbox: true,
+            gtx: Mat::ID,
+            spread: 0,
+            stops: Vec::new(),
+        }
+    }
+}
+
+/// Per-shape resolved fill: userSpaceOnUse endpoints are pre-mapped to
+/// viewBox space; B* variants stay normalized for the shape bbox.
+#[derive(Clone, Copy)]
+enum SFill {
+    Solid(u32),
+    Lin {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        g: u32,
+        a: f32,
+    },
+    Rad {
+        cx: f32,
+        cy: f32,
+        r: f32,
+        g: u32,
+        a: f32,
+    },
+    BLin {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        g: u32,
+        a: f32,
+    },
+    BRad {
+        cx: f32,
+        cy: f32,
+        r: f32,
+        g: u32,
+        a: f32,
+    },
+}
+
 /// A flattened shape in viewBox space, paint already resolved.
 struct Shape {
     subs: Vec<Sub>,
     /// ARGB fill (opacity folded in), None = `fill="none"`
-    fill: Option<u32>,
-    /// ARGB stroke color + width in viewBox units
-    stroke: Option<(u32, f32)>,
+    fill: Option<SFill>,
+    /// stroke paint + width in viewBox units
+    stroke: Option<(SFill, f32)>,
     rule: Rule,
     cap: Cap,
     join: Join,
     miter: f32,
+    /// optional clip rect in viewBox space (nested <svg> viewports)
+    clip: Option<[f32; 4]>,
+    /// shape bounds in viewBox space — objectBoundingBox gradient basis
+    bbox: [f32; 4],
 }
 
 /// Inherited paint context down the <g>/<svg> tree — fill defaults to black,
@@ -136,9 +211,9 @@ struct Shape {
 /// opacity approximated by multiplication, no offscreen pass).
 #[derive(Clone, Copy)]
 struct Paint {
-    fill: Option<u32>,
+    fill: Option<Fill>,
     falpha: f32,
-    stroke: Option<(u32, f32)>,
+    stroke: Option<(Fill, f32)>,
     salpha: f32,
     rule: Rule,
     cap: Cap,
@@ -146,6 +221,8 @@ struct Paint {
     miter: f32,
     cc: u32, // `color` property — supplies currentColor
     xf: Mat,
+    /// optional clip rect in viewBox space (nested <svg> viewports)
+    clip: Option<[f32; 4]>,
 }
 
 /// viewBox→output-pixel affine.
@@ -213,11 +290,11 @@ fn parse_transform(s: &str) -> Mat {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        while i < b.len() && !(b[i] as char).is_ascii_alphabetic() {
+        while i < b.len() && !b[i].is_ascii_alphabetic() {
             i += 1;
         }
         let st = i;
-        while i < b.len() && (b[i] as char).is_ascii_alphabetic() {
+        while i < b.len() && b[i].is_ascii_alphabetic() {
             i += 1;
         }
         if st == i {
@@ -385,7 +462,7 @@ fn parse_d(d: &str, tol: f32) -> Vec<Sub> {
     let mut last_q: Option<Pt> = None; // prev quad ctrl (T reflection)
 
     let num = |i: &mut usize| -> f32 {
-        while *i < b.len() && ((b[*i] as char).is_whitespace() || b[*i] == b',') {
+        while *i < b.len() && (b[*i].is_ascii_whitespace() || b[*i] == b',') {
             *i += 1;
         }
         let st = *i;
@@ -428,7 +505,7 @@ fn parse_d(d: &str, tol: f32) -> Vec<Sub> {
     };
     // large-arc/sweep flags are single chars and may touch neighbours ("0 01")
     let flag = |i: &mut usize| -> bool {
-        while *i < b.len() && ((b[*i] as char).is_whitespace() || b[*i] == b',') {
+        while *i < b.len() && (b[*i].is_ascii_whitespace() || b[*i] == b',') {
             *i += 1;
         }
         let f = b.get(*i) == Some(&b'1');
@@ -671,10 +748,34 @@ fn svg_color(v: &str, fallback: u32) -> Option<Option<u32>> {
     named(&l).map(Some)
 }
 
-/// `paint: url(...)`/`inherit`/unknown → keep inherited (None keeps parent).
-fn paint_of(v: Option<&str>, inherited: Option<u32>, fallback: u32) -> Option<u32> {
-    match v.and_then(|s| svg_color(s, fallback)) {
-        Some(c) => c,
+/// `paint:` — url(#id) resolves to a paint server (with an optional fallback
+/// color after it); colors fill flat; `none`/unknown keep the inherited paint.
+fn paint_of(
+    v: Option<&str>,
+    inherited: Option<Fill>,
+    fallback: u32,
+    gmap: &HashMap<String, usize>,
+) -> Option<Fill> {
+    let Some(v) = v else { return inherited };
+    let t = v.trim();
+    if let Some(l) = t.strip_prefix("url").and_then(|t| t.find('(')) {
+        let (l, r) = (l + "url".len(), t.rfind(')').unwrap_or(t.len()));
+        let id = t[l + 1..r]
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .trim_start_matches('#');
+        if let Some(&i) = gmap.get(id) {
+            return Some(Fill::Srv(i as u32));
+        }
+        // unresolved server → the fallback color after `)`, else inherit
+        return match svg_color(t[r + 1..].trim(), fallback) {
+            Some(c) => c.map(Fill::Solid),
+            None => inherited,
+        };
+    }
+    match svg_color(t, fallback) {
+        Some(Some(c)) => Some(Fill::Solid(c)),
+        Some(None) => None,
         None => inherited,
     }
 }
@@ -685,15 +786,24 @@ fn with_alpha(c: u32, k: f32) -> u32 {
 }
 
 /// Combine element props (attrs + style) onto the inherited context.
-fn elem_paint(props: &HashMap<String, String>, parent: Paint) -> Paint {
-    let at = |n: &str| props.get(n).map(String::as_str);
+fn elem_paint(
+    props: &HashMap<String, String>,
+    parent: Paint,
+    gmap: &HashMap<String, usize>,
+) -> Paint {
+    let at = |n: &str| {
+        props
+            .get(n)
+            .or_else(|| props.get(&n.to_ascii_lowercase()))
+            .map(String::as_str)
+    };
     let op = at("opacity").and_then(fnum).unwrap_or(1.0);
     let cc = at("color")
         .and_then(|v| svg_color(v, parent.cc))
         .and_then(|c| c)
         .unwrap_or(parent.cc);
     let stroke = {
-        let c = paint_of(at("stroke"), parent.stroke.map(|s| s.0), cc);
+        let c = paint_of(at("stroke"), parent.stroke.map(|s| s.0), cc, gmap);
         let w = at("stroke-width")
             .and_then(fnum)
             .or(parent.stroke.map(|s| s.1));
@@ -701,7 +811,7 @@ fn elem_paint(props: &HashMap<String, String>, parent: Paint) -> Paint {
         c.map(|c| (c, w.unwrap_or(1.0)))
     };
     Paint {
-        fill: paint_of(at("fill"), parent.fill, cc),
+        fill: paint_of(at("fill"), parent.fill, cc, gmap),
         falpha: parent.falpha * op * at("fill-opacity").and_then(fnum).unwrap_or(1.0),
         stroke,
         salpha: parent.salpha * op * at("stroke-opacity").and_then(fnum).unwrap_or(1.0),
@@ -729,6 +839,7 @@ fn elem_paint(props: &HashMap<String, String>, parent: Paint) -> Paint {
         xf: parent
             .xf
             .mul(parse_transform(at("transform").unwrap_or(""))),
+        clip: parent.clip,
     }
 }
 
@@ -737,6 +848,8 @@ fn elem_paint(props: &HashMap<String, String>, parent: Paint) -> Paint {
 struct Ctx<'a> {
     doc: &'a Document,
     ids: &'a HashMap<String, NodeId>,
+    grads: &'a [Grad],
+    gmap: &'a HashMap<String, usize>,
     tol0: f32, // flatten tolerance in viewBox units
 }
 
@@ -751,29 +864,317 @@ fn collect_ids(doc: &Document, n: NodeId, ids: &mut HashMap<String, NodeId>) {
     }
 }
 
+/// `offset` accepts a fraction or percent.
+fn grad_offset(v: &str) -> Option<f32> {
+    let v = v.trim();
+    if let Some(p) = v.strip_suffix('%') {
+        p.parse::<f32>().ok().map(|n| n / 100.0)
+    } else {
+        v.parse::<f32>().ok()
+    }
+}
+
+/// Parse one `<stop>`: offset + color/opacity from attrs or `style`.
+fn grad_stop(doc: &Document, n: NodeId) -> Option<(f32, u32)> {
+    let props = elem_props(doc, n);
+    let at = |k: &str| props.get(k).map(String::as_str);
+    let off = at("offset").and_then(grad_offset).unwrap_or(0.0);
+    let col = at("stop-color")
+        .and_then(|c| svg_color(c, 0xff000000))
+        .unwrap_or(Some(0xff000000))
+        .unwrap_or(0xff000000);
+    let al = at("stop-opacity").and_then(fnum).unwrap_or(1.0);
+    Some((off.clamp(0.0, 1.0), with_alpha(col, al)))
+}
+
+/// Parse a gradient element, following `href`/`xlink:href` chains so a child
+/// gradient inherits missing attrs and stops from its template (per spec,
+/// local attrs win; stops inherit only when the element has none).
+fn parse_grad(doc: &Document, n: NodeId, ids: &HashMap<String, NodeId>, depth: u8) -> Grad {
+    let NodeKind::Element { tag, .. } = doc.kind(n) else {
+        return Grad::default();
+    };
+    let lin = tag == "lineargradient";
+    let props = elem_props(doc, n);
+    let at = |k: &str| props.get(k).map(String::as_str);
+
+    // template lookup (defs → defs chains are common in sprites); spec
+    // defaults apply only when there's no template to inherit from
+    let href = at("xlink:href").or_else(|| at("href"));
+    let tmpl = href
+        .and_then(|h| h.trim().strip_prefix('#'))
+        .and_then(|id| ids.get(id).copied())
+        .filter(|&t| t != n && depth < 8)
+        .map(|t| parse_grad(doc, t, ids, depth + 1));
+    let mut base = tmpl.unwrap_or_else(|| {
+        if lin {
+            Grad {
+                p: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                ..Grad::default()
+            }
+        } else {
+            Grad {
+                p: [0.5, 0.5, 0.5, 0.5, 0.5, 0.0],
+                ..Grad::default()
+            }
+        }
+    });
+    base.lin = lin;
+
+    // percent coords are bbox fractions (userSpace %, rare, approximates too)
+    let num = |k: &str| {
+        at(k).and_then(|v| {
+            if let Some(p) = v.trim().strip_suffix('%') {
+                p.parse::<f32>().ok().map(|n| n / 100.0)
+            } else {
+                fnum(v)
+            }
+        })
+    };
+    if lin {
+        base.p[0] = num("x1").unwrap_or(base.p[0]);
+        base.p[1] = num("y1").unwrap_or(base.p[1]);
+        base.p[2] = num("x2").unwrap_or(base.p[2]);
+        base.p[3] = num("y2").unwrap_or(base.p[3]);
+    } else {
+        base.p[0] = num("cx").unwrap_or(base.p[0]);
+        base.p[1] = num("cy").unwrap_or(base.p[1]);
+        base.p[2] = num("r").unwrap_or(base.p[2]);
+        // fx/fy default to the resolved cx/cy
+        base.p[3] = num("fx").unwrap_or(base.p[0]);
+        base.p[4] = num("fy").unwrap_or(base.p[1]);
+    }
+    if let Some(u) = at("gradientunits") {
+        base.bbox = !u.trim().eq_ignore_ascii_case("userspaceonuse");
+    }
+    if let Some(t) = at("gradienttransform") {
+        base.gtx = parse_transform(t);
+    }
+    if let Some(s) = at("spreadmethod") {
+        base.spread = match s.trim() {
+            "reflect" => 1,
+            "repeat" => 2,
+            _ => 0,
+        };
+    }
+    // stops: local `<stop>` children win, else inherit the template's
+    let mut stops: Vec<(f32, u32)> = Vec::new();
+    for &c in doc.children(n) {
+        if let NodeKind::Element { tag, .. } = doc.kind(c) {
+            if tag == "stop" {
+                if let Some(s) = grad_stop(doc, c) {
+                    stops.push(s);
+                }
+            }
+        }
+    }
+    if !stops.is_empty() {
+        // offsets are non-decreasing per spec
+        let mut last = 0.0f32;
+        for s in &mut stops {
+            s.0 = s.0.max(last);
+            last = s.0;
+        }
+        base.stops = stops;
+    }
+    base
+}
+
+/// Index every `linearGradient`/`radialGradient` in the tree; returns the
+/// paint-server table plus an id → table-index map for `url(#id)` refs.
+fn collect_grads(
+    doc: &Document,
+    root: NodeId,
+    ids: &HashMap<String, NodeId>,
+) -> (Vec<Grad>, HashMap<String, usize>) {
+    let mut gnodes = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if let NodeKind::Element { tag, .. } = doc.kind(n) {
+            if tag == "lineargradient" || tag == "radialgradient" {
+                gnodes.push(n);
+            }
+        }
+        stack.extend_from_slice(doc.children(n));
+    }
+    let mut grads = Vec::new();
+    let mut gmap = HashMap::new();
+    for n in gnodes {
+        if let Some(id) = doc.attr(n, "id") {
+            gmap.insert(id.to_string(), grads.len());
+        }
+        grads.push(parse_grad(doc, n, ids, 0));
+    }
+    (grads, gmap)
+}
+
 /// Transform `subs` into viewBox space and record the shape.
-fn push_shape(out: &mut Vec<Shape>, mut subs: Vec<Sub>, paint: &Paint) {
+/// Resolve an inherited paint to per-shape form: userSpaceOnUse endpoints map
+/// to viewBox space now (×gradientTransform); objectBoundingBox stays
+/// normalized for the shape's bbox at sample time.
+fn sfill_of(f: Fill, a: f32, xf: Mat, gs: &[Grad]) -> Option<SFill> {
+    match f {
+        Fill::Solid(c) => Some(SFill::Solid(with_alpha(c, a))),
+        Fill::Srv(i) => {
+            let g = &gs[i as usize];
+            let m = xf.mul(g.gtx);
+            Some(if g.lin {
+                if g.bbox {
+                    SFill::BLin {
+                        x1: g.p[0],
+                        y1: g.p[1],
+                        x2: g.p[2],
+                        y2: g.p[3],
+                        g: i,
+                        a,
+                    }
+                } else {
+                    let p1 = m.map(Pt { x: g.p[0], y: g.p[1] });
+                    let p2 = m.map(Pt { x: g.p[2], y: g.p[3] });
+                    SFill::Lin {
+                        x1: p1.x,
+                        y1: p1.y,
+                        x2: p2.x,
+                        y2: p2.y,
+                        g: i,
+                        a,
+                    }
+                }
+            } else if g.bbox {
+                SFill::BRad {
+                    cx: g.p[0],
+                    cy: g.p[1],
+                    r: g.p[2],
+                    g: i,
+                    a,
+                }
+            } else {
+                let c = m.map(Pt { x: g.p[0], y: g.p[1] });
+                let f_ = m.map(Pt { x: g.p[3], y: g.p[4] });
+                let (fx, fy) = if g.p[3] == g.p[0] && g.p[4] == g.p[1] {
+                    (c.x, c.y)
+                } else {
+                    (f_.x, f_.y)
+                };
+                SFill::Rad {
+                    cx: fx,
+                    cy: fy,
+                    r: g.p[2] * m.wscale(),
+                    g: i,
+                    a,
+                }
+            })
+        }
+    }
+}
+
+impl SFill {
+    /// ARGB at viewBox-space point `v`; `bbox` = shape bounds in same space.
+    fn at(&self, gs: &[Grad], bbox: &[f32; 4], vx: f32, vy: f32) -> u32 {
+        match *self {
+            SFill::Solid(c) => c,
+            SFill::Lin { x1, y1, x2, y2, g, a } => {
+                let (dx, dy) = (x2 - x1, y2 - y1);
+                let t = ((vx - x1) * dx + (vy - y1) * dy) / (dx * dx + dy * dy).max(1e-9);
+                with_alpha(grad_at(&gs[g as usize], t), a)
+            }
+            SFill::BLin { x1, y1, x2, y2, g, a } => {
+                let g_ = &gs[g as usize];
+                let (bw, bh) = ((bbox[2] - bbox[0]).max(1e-9), (bbox[3] - bbox[1]).max(1e-9));
+                let p = g_.gtx.map(Pt {
+                    x: (vx - bbox[0]) / bw,
+                    y: (vy - bbox[1]) / bh,
+                });
+                let (dx, dy) = (x2 - x1, y2 - y1);
+                let t = ((p.x - x1) * dx + (p.y - y1) * dy) / (dx * dx + dy * dy).max(1e-9);
+                with_alpha(grad_at(g_, t), a)
+            }
+            SFill::Rad { cx, cy, r, g, a } => {
+                let t = (vx - cx).hypot(vy - cy) / r.max(1e-9);
+                with_alpha(grad_at(&gs[g as usize], t), a)
+            }
+            SFill::BRad { cx, cy, r, g, a } => {
+                let g_ = &gs[g as usize];
+                let (bw, bh) = ((bbox[2] - bbox[0]).max(1e-9), (bbox[3] - bbox[1]).max(1e-9));
+                let p = g_.gtx.map(Pt {
+                    x: (vx - bbox[0]) / bw,
+                    y: (vy - bbox[1]) / bh,
+                });
+                let t = (p.x - cx).hypot(p.y - cy) / r.max(1e-9);
+                with_alpha(grad_at(g_, t), a)
+            }
+        }
+    }
+}
+
+/// Gradient sample at param `t` (spreadMethod applied, stops lerped ARGB).
+fn grad_at(g: &Grad, t: f32) -> u32 {
+    let t = match g.spread {
+        1 => {
+            let t2 = t.rem_euclid(2.0);
+            if t2 > 1.0 { 2.0 - t2 } else { t2 }
+        }
+        2 => t.rem_euclid(1.0),
+        _ => t.clamp(0.0, 1.0),
+    };
+    let s = &g.stops;
+    let (Some(&first), Some(&last)) = (s.first(), s.last()) else {
+        return 0;
+    };
+    if t <= first.0 {
+        return first.1;
+    }
+    if t >= last.0 {
+        return last.1;
+    }
+    for w in s.windows(2) {
+        if t <= w[1].0 {
+            let k = (t - w[0].0) / (w[1].0 - w[0].0).max(1e-9);
+            let (a0, a1) = (w[0].1, w[1].1);
+            let mix = |sh: u32| {
+                let c0 = ((a0 >> sh) & 0xff) as f32;
+                let c1 = ((a1 >> sh) & 0xff) as f32;
+                ((c0 + (c1 - c0) * k).round().clamp(0.0, 255.0) as u32) << sh
+            };
+            return mix(24) | mix(16) | mix(8) | mix(0);
+        }
+    }
+    last.1
+}
+
+fn push_shape(ctx: &Ctx, out: &mut Vec<Shape>, mut subs: Vec<Sub>, paint: &Paint) {
     subs.retain(|s| !s.pts.is_empty());
     if subs.is_empty() {
         return;
     }
     let xf = paint.xf;
+    let mut bbox = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
     for s in &mut subs {
         for p in &mut s.pts {
             *p = xf.map(*p);
+            bbox[0] = bbox[0].min(p.x);
+            bbox[1] = bbox[1].min(p.y);
+            bbox[2] = bbox[2].max(p.x);
+            bbox[3] = bbox[3].max(p.y);
         }
     }
     let det = xf.wscale().max(1e-4);
+    let fill = paint
+        .fill
+        .and_then(|f| sfill_of(f, paint.falpha, paint.xf, ctx.grads));
+    let stroke = paint.stroke.and_then(|(f, w)| {
+        sfill_of(f, paint.salpha, paint.xf, ctx.grads).map(|s| (s, w * det))
+    });
     out.push(Shape {
         subs,
-        fill: paint.fill.map(|c| with_alpha(c, paint.falpha)),
-        stroke: paint
-            .stroke
-            .map(|(c, w)| (with_alpha(c, paint.salpha), w * det)),
+        fill,
+        stroke,
         rule: paint.rule,
         cap: paint.cap,
         join: paint.join,
         miter: paint.miter,
+        clip: paint.clip,
+        bbox,
     });
 }
 
@@ -795,13 +1196,18 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
     {
         return;
     }
-    let mine = elem_paint(&props, paint);
-    let at = |n: &str| props.get(n).map(String::as_str);
+    let mine = elem_paint(&props, paint, ctx.gmap);
+    let at = |n: &str| {
+        props
+            .get(n)
+            .or_else(|| props.get(&n.to_ascii_lowercase()))
+            .map(String::as_str)
+    };
     let tol = ctx.tol0 / mine.xf.wscale().max(1e-4);
     match tag.as_str() {
         "path" => {
             if let Some(d) = at("d") {
-                push_shape(out, parse_d(d, tol), &mine);
+                push_shape(ctx, out, parse_d(d, tol), &mine);
             }
         }
         "circle" | "ellipse" => {
@@ -822,7 +1228,7 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
                         y: cy + ry * a.sin(),
                     });
                 }
-                push_shape(out, vec![Sub { pts, closed: true }], &mine);
+                push_shape(ctx, out, vec![Sub { pts, closed: true }], &mine);
             }
         }
         "rect" => {
@@ -875,7 +1281,7 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
                 }
                 pts
             };
-            push_shape(out, vec![Sub { pts, closed: true }], &mine);
+            push_shape(ctx, out, vec![Sub { pts, closed: true }], &mine);
         }
         "polygon" | "polyline" => {
             if let Some(p) = at("points") {
@@ -885,6 +1291,7 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
                     .filter_map(|c| c.get(0).zip(c.get(1)).map(|(&x, &y)| Pt { x, y }))
                     .collect();
                 push_shape(
+                    ctx,
                     out,
                     vec![Sub {
                         pts,
@@ -897,6 +1304,7 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
         "line" => {
             let g = |n: &str| at(n).and_then(fnum).unwrap_or(0.0);
             push_shape(
+                ctx,
                 out,
                 vec![Sub {
                     pts: vec![
@@ -926,7 +1334,51 @@ fn walk(ctx: &Ctx, ch: NodeId, out: &mut Vec<Shape>, paint: Paint, depth: u8) {
                 }
             }
         }
-        "g" | "svg" | "symbol" | "a" | "switch" => {
+        "svg" => {
+            // a nested <svg> is a new viewport: x/y position plus its own
+            // viewBox→width/height map (preserveAspectRatio xMidYMid meet)
+            let mut m2 = mine;
+            if let Some(vb) = at("viewBox").map(|v| nums_of(v)) {
+                if vb.len() == 4 && vb[2] > 0.0 && vb[3] > 0.0 {
+                    let x = at("x").and_then(fnum).unwrap_or(0.0);
+                    let y = at("y").and_then(fnum).unwrap_or(0.0);
+                    let w = at("width").and_then(fnum).unwrap_or(vb[2]);
+                    let h = at("height").and_then(fnum).unwrap_or(vb[3]);
+                    let s = (w / vb[2]).min(h / vb[3]);
+                    m2.xf = mine.xf.mul(Mat {
+                        a: s,
+                        b: 0.0,
+                        c: 0.0,
+                        d: s,
+                        e: x + (w - vb[2] * s) / 2.0 - vb[0] * s,
+                        f: y + (h - vb[3] * s) / 2.0 - vb[1] * s,
+                    });
+                    // the new viewport clips its content (overflow:hidden
+                    // is the default) — only while the mapping stays
+                    // axis-aligned, which every sprite stack is
+                    if mine.xf.b.abs() < 1e-9 && mine.xf.c.abs() < 1e-9 {
+                        let p0 = mine.xf.map(Pt { x, y });
+                        let p1 = mine.xf.map(Pt { x: x + w, y: y + h });
+                        let (x0, y0) = (p0.x, p0.y);
+                        let (x1, y1) = (p1.x, p1.y);
+                        let r = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
+                        m2.clip = Some(match m2.clip {
+                            Some(c) => [
+                                c[0].max(r[0]),
+                                c[1].max(r[1]),
+                                c[2].min(r[2]),
+                                c[3].min(r[3]),
+                            ],
+                            None => r,
+                        });
+                    }
+                }
+            }
+            for &c in ctx.doc.children(ch) {
+                walk(ctx, c, out, m2, depth + 1);
+            }
+        }
+        "g" | "symbol" | "a" | "switch" => {
             for &c in ctx.doc.children(ch) {
                 walk(ctx, c, out, mine, depth + 1);
             }
@@ -1188,18 +1640,28 @@ fn stroke_shape(
 fn fill_polys(
     polys: &[&Poly],
     rule: Rule,
-    color: u32,
+    sf: &SFill,
+    gs: &[Grad],
+    bbox: &[f32; 4],
     out: &mut [u8],
     w: usize,
     h: usize,
     m: &VMap,
+    clip: Option<(f32, f32, f32, f32)>,
 ) {
-    if color >> 24 == 0 || m.sy.abs() < 1e-9 || m.sx.abs() < 1e-9 {
+    if matches!(sf, SFill::Solid(c) if c >> 24 == 0) || m.sy.abs() < 1e-9 || m.sx.abs() < 1e-9
+    {
         return;
     }
-    for y in 0..h {
+    let (cx0, cy0, cx1, cy1) = clip.unwrap_or((0.0, 0.0, w as f32, h as f32));
+    let y_start = (cy0 - 0.5).ceil().clamp(0.0, h as f32) as usize;
+    let y_end = (cy1 - 0.5).ceil().clamp(0.0, h as f32) as usize;
+    // crossing list is reused across rows — one alloc per shape instead of
+    // one per scanline
+    let mut xs: Vec<(f32, i32)> = Vec::new();
+    for y in y_start..y_end {
         let wy = (y as f32 + 0.5 - m.oy) / m.sy;
-        let mut xs: Vec<(f32, i32)> = Vec::new();
+        xs.clear();
         for poly in polys {
             let n = poly.len();
             if n < 2 {
@@ -1218,12 +1680,6 @@ fn fill_polys(
             continue;
         }
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        let (r, g, b, sa) = (
-            (color >> 16) & 0xff,
-            (color >> 8) & 0xff,
-            color & 0xff,
-            color >> 24,
-        );
         let mut wind = 0i32;
         let mut parity = false;
         let mut from: Option<f32> = None;
@@ -1237,10 +1693,25 @@ fn fill_polys(
             match (from, inside) {
                 (None, true) => from = Some(x),
                 (Some(x0), false) => {
-                    // pixel centres inside [x0, x)
-                    let px0 = (x0 - 0.5).ceil().max(0.0) as usize;
-                    let px1 = (x - 0.5).ceil().clamp(0.0, w as f32) as usize;
+                    // pixel centres inside [x0, x) and the clip range
+                    let px0 = (x0 - 0.5).ceil().max((cx0 - 0.5).ceil()).max(0.0) as usize;
+                    let px1 = (x - 0.5)
+                        .ceil()
+                        .min((cx1 - 0.5).ceil())
+                        .clamp(0.0, w as f32) as usize;
                     for px in px0..px1.min(w) {
+                        let wx = (px as f32 + 0.5 - m.ox) / m.sx;
+                        let color = sf.at(gs, bbox, wx, wy);
+
+                        let (r, g, b, sa) = (
+                            (color >> 16) & 0xff,
+                            (color >> 8) & 0xff,
+                            color & 0xff,
+                            color >> 24,
+                        );
+                        if sa == 0 {
+                            continue;
+                        }
                         let j = (y * w + px) * 4;
                         let da = out[j + 3] as u32;
                         let oa = (sa + da * (255 - sa) / 255).min(255);
@@ -1371,13 +1842,16 @@ pub fn render(doc: &Document, node: NodeId, w: u32, h: u32, fallback_color: u32)
     // paint tree → flattened shapes
     let mut ids = HashMap::new();
     collect_ids(doc, node, &mut ids);
+    let (grads, gmap) = collect_grads(doc, node, &ids);
     let ctx = Ctx {
         doc,
         ids: &ids,
+        grads: &grads,
+        gmap: &gmap,
         tol0,
     };
     let base = Paint {
-        fill: Some(0xff000000), // SVG default fill is black
+        fill: Some(Fill::Solid(0xff000000)), // SVG default fill is black
         falpha: 1.0,
         stroke: None,
         salpha: 1.0,
@@ -1387,8 +1861,9 @@ pub fn render(doc: &Document, node: NodeId, w: u32, h: u32, fallback_color: u32)
         miter: 4.0,
         cc: fallback_color,
         xf: Mat::ID,
+        clip: None,
     };
-    let root = elem_paint(&elem_props(doc, node), base);
+    let root = elem_paint(&elem_props(doc, node), base, &gmap);
     let mut shapes: Vec<Shape> = Vec::new();
     for &c in doc.children(node) {
         walk(&ctx, c, &mut shapes, root, 0);
@@ -1397,15 +1872,20 @@ pub fn render(doc: &Document, node: NodeId, w: u32, h: u32, fallback_color: u32)
     // fills first then strokes per shape, in document order
     let mut buf = vec![0u8; bw * bh * 4];
     for sh in &shapes {
-        if let Some(c) = sh.fill {
+        let clip = sh.clip.map(|r| {
+            let (ax, ay) = (r[0] * smap.sx + smap.ox, r[1] * smap.sy + smap.oy);
+            let (bx, by) = (r[2] * smap.sx + smap.ox, r[3] * smap.sy + smap.oy);
+            (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
+        });
+        if let Some(c) = &sh.fill {
             let polys: Vec<&Poly> = sh.subs.iter().map(|s| &s.pts).collect();
-            fill_polys(&polys, sh.rule, c, &mut buf, bw, bh, &smap);
+            fill_polys(&polys, sh.rule, c, &grads, &sh.bbox, &mut buf, bw, bh, &smap, clip);
         }
-        if let Some((c, sw)) = sh.stroke {
+        if let Some((c, sw)) = &sh.stroke {
             let mut patches = Vec::new();
-            stroke_shape(&sh.subs, sw, sh.cap, sh.join, sh.miter, tol0, &mut patches);
+            stroke_shape(&sh.subs, *sw, sh.cap, sh.join, sh.miter, tol0, &mut patches);
             for p in &patches {
-                fill_polys(&[p], Rule::NonZero, c, &mut buf, bw, bh, &smap);
+                fill_polys(&[p], Rule::NonZero, c, &grads, &sh.bbox, &mut buf, bw, bh, &smap, clip);
             }
         }
     }

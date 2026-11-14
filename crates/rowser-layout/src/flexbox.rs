@@ -352,13 +352,18 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let bd = self.backdrop;
         let bb = border_box(c);
+        let dm = self.deco_mask(node);
         let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
-        let border = borderfx::borders(c, size, st.color).map(|mut b| {
-            for col in b.color.iter_mut() {
-                *col = over(*col, bg.unwrap_or(bd));
-            }
-            b
-        });
+        let border = if dm & crate::DM_BORDER != 0 {
+            borderfx::borders(c, size, st.color).map(|mut b| {
+                for col in b.color.iter_mut() {
+                    *col = over(*col, bg.unwrap_or(bd));
+                }
+                b
+            })
+        } else {
+            None
+        };
         st.inline_bg = None; // the box paints its own bg
         if let Some(b) = bg {
             if let Some(col) = c
@@ -416,13 +421,15 @@ impl<'a> Layouter<'a> {
             self.backdrop = b;
         }
         // %-height children resolve against this box's definite content height
-        let saved_ph = self.pct_h;
+        let (saved_ph, saved_oh) = (self.pct_h, self.own_h);
         self.pct_h = h_prop
             .map(|h| if bb { h - pt - pb - bw_v } else { h })
             .or(saved_ph);
+        self.own_h = h_prop.map(|h| if bb { h - pt - pb - bw_v } else { h });
         let (items, y_end, nhits) = self.nest(node, &st, pl + bw_l, pt + bw_t, inner, c);
         self.backdrop = saved_bd;
         self.pct_h = saved_ph;
+        self.own_h = saved_oh;
         // explicit height/aspect-ratio/forced/max-height may pin the painted
         // box; min-height alone only floors it
         let natural = y_end + pb + bw_b;
@@ -441,11 +448,23 @@ impl<'a> Layouter<'a> {
         let deco = Deco {
             bg,
             border: border.clone(),
-            radius: borderfx::radius_spec(c),
-            shadows: borderfx::parse_shadows(c, size, bd, st.color),
-            clip: borderfx::clips_overflow(c),
-            outline: borderfx::outline(c, size, bd, st.color),
-            bgl: if self.canvas_bg_node == Some(node) {
+            radius: if dm & crate::DM_RADIUS != 0 {
+                borderfx::radius_spec(c)
+            } else {
+                borderfx::RadiusSpec::default()
+            },
+            shadows: if dm & crate::DM_SHADOW != 0 {
+                borderfx::parse_shadows(c, size, bd, st.color)
+            } else {
+                Vec::new()
+            },
+            clip: dm & crate::DM_CLIP != 0 && borderfx::clips_overflow(c),
+            outline: if dm & crate::DM_OUTLINE != 0 {
+                borderfx::outline(c, size, bd, st.color)
+            } else {
+                None
+            },
+            bgl: if dm & crate::DM_BGIMG == 0 || self.canvas_bg_node == Some(node) {
                 None
             } else {
                 bgimg::parse_box(
@@ -520,7 +539,11 @@ impl<'a> Layouter<'a> {
         }
         // translate/transform: a spec (translate included) tags the box's
         // line word or wraps its span — never applied here (double-shift)
-        let xf = xform::spec(c, size);
+        let xf = if dm & crate::DM_XFORM != 0 {
+            xform::spec(c, size)
+        } else {
+            None
+        };
         let (tx, ty) = if xf.is_some() {
             (0.0, 0.0)
         } else {
@@ -561,8 +584,12 @@ impl<'a> Layouter<'a> {
     ) -> (Vec<DisplayItem>, f32, Vec<Hit>, f32) {
         let saved_items = std::mem::take(&mut self.items);
         let saved_hits = std::mem::take(&mut self.hits);
-        let saved_line = std::mem::take(&mut self.line);
-        let saved_floats = std::mem::take(&mut self.floats);
+        // warm buffers swapped back on restore (see `nest`)
+        let saved_line =
+            std::mem::replace(&mut self.line, std::mem::take(&mut self.spare_line));
+        let saved_floats =
+            std::mem::replace(&mut self.floats, std::mem::take(&mut self.spare_floats));
+        self.floats_gen += 1;
         let saved = (
             self.y,
             self.margin_x,
@@ -588,8 +615,9 @@ impl<'a> Layouter<'a> {
         self.align = saved.3;
         self.line_x = saved.4;
         self.pending_space = saved.5;
-        self.line = saved_line;
-        self.floats = saved_floats;
+        self.spare_line = std::mem::replace(&mut self.line, saved_line);
+        self.spare_floats = std::mem::replace(&mut self.floats, saved_floats);
+        self.floats_gen += 1;
         let used_w = items
             .iter()
             .map(|it| match it {
@@ -599,13 +627,7 @@ impl<'a> Layouter<'a> {
                     font,
                     size,
                     ..
-                } => {
-                    *x + self
-                        .fonts
-                        .font(*font)
-                        .map(|f| f.measure(text, *size))
-                        .unwrap_or(0.0)
-                }
+                } => *x + self.measure(*font, text, *size).unwrap_or(0.0),
                 DisplayItem::FillRect { x, w, .. }
                 | DisplayItem::RoundedRect { x, w, .. }
                 | DisplayItem::Raster { x, w, .. }
@@ -620,11 +642,10 @@ impl<'a> Layouter<'a> {
     fn text_measure(&mut self, t: &str, st: &Style) -> (f32, f32) {
         let joined: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
         if let Some(fi) = self.resolve_font(st) {
-            if let Some(f) = self.fonts.font(fi) {
-                let maxc = f.measure(&joined, st.size);
+            if let Some(maxc) = self.measure(fi, &joined, st.size) {
                 let minc = t
                     .split_whitespace()
-                    .map(|w| f.measure(w, st.size))
+                    .map(|w| self.measure(fi, w, st.size).unwrap_or(0.0))
                     .fold(0.0f32, f32::max);
                 return (maxc.max(1.0), minc.max(1.0));
             }
@@ -704,18 +725,20 @@ impl<'a> Layouter<'a> {
             (col_gap, row_gap)
         };
         // container content-box extents: row main = the width (always
-        // definite here); column main = height (definite only via pct_h).
+        // definite here); column main = height (definite only when THIS
+        // box's own height resolved — not an ancestor's `pct_h`, which
+        // would stretch/center items against foreign vertical space).
         // Cross is the other axis: always definite for column, definite for
         // row only when the container has a resolvable height.
         let cont_main = if col {
-            self.pct_h
+            self.own_h
         } else {
             Some(self.content_width())
         };
         let cont_cross = if col {
             Some(self.content_width())
         } else {
-            self.pct_h
+            self.own_h
         };
         let (x0, y0) = (self.margin_x, self.y);
         // margin side indices: (main-lead, main-trail, cross-lead, cross-trail)
@@ -817,9 +840,13 @@ impl<'a> Layouter<'a> {
                     let align = falign(cc.get("align-self")).unwrap_or(cont_align);
                     let [pt, pr, pb, pl] =
                         box_sides(&cc, "padding", self.avail_w, size).map(|v| v.max(0.0));
-                    let bw = borderfx::borders(&cc, size, cst.color)
-                        .map(|b| b.w)
-                        .unwrap_or([0.0; 4]);
+                    let bw = if self.deco_mask(ch) & crate::DM_BORDER != 0 {
+                        borderfx::borders(&cc, size, cst.color)
+                    } else {
+                        None
+                    }
+                    .map(|b| b.w)
+                    .unwrap_or([0.0; 4]);
                     let bb = border_box(&cc);
                     // box extras on each axis, for border-box conversion
                     let main_pad = if col {
@@ -904,8 +931,9 @@ impl<'a> Layouter<'a> {
                             }
                         }
                         FKind::Capture => {
+                            let uw_in = cont_main.unwrap_or(self.content_width());
                             let (pitems, ph, phits, uw) = self.capture_in(
-                                cont_main.unwrap_or_else(|| self.content_width()),
+                                uw_in,
                                 cst.align,
                                 |s| s.inline(ch, &it.tag, &cc, cst.clone()),
                             );
@@ -1453,8 +1481,12 @@ impl<'a> Layouter<'a> {
                 }
                 // a transformed item wraps its emitted span (hit matrices
                 // compose inside wrap_span)
-                if let Some(sp) = it.cc.as_ref().and_then(|cc| xform::spec(cc, it.cst.size)) {
-                    self.wrap_span(&sp, it.id, i0, h0);
+                if self.deco_mask(it.id) & crate::DM_XFORM != 0 {
+                    if let Some(sp) =
+                        it.cc.as_ref().and_then(|cc| xform::spec(cc, it.cst.size))
+                    {
+                        self.wrap_span(&sp, it.id, i0, h0);
+                    }
                 }
                 max_main_end = max_main_end.max(bmain + box_main(it) + it.m[mt_i]);
             }
@@ -1482,7 +1514,9 @@ impl<'a> Layouter<'a> {
             let cc = self.style(ch);
             let mut cst = st.clone();
             self.apply_computed(&cc, &mut cst);
-            self.block(ch, self.doc.tag(ch).unwrap_or("div"), &cc, cst);
+            let has_xf =
+                self.deco_mask(ch) & crate::DM_XFORM != 0 && xform::has_matrix(&cc);
+            self.block(ch, self.doc.tag(ch).unwrap_or("div"), &cc, cst, has_xf);
         }
     }
 }

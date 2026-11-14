@@ -303,7 +303,49 @@ enum Tok {
     Skip,
 }
 
+/// Decode a CSS `<string>` body: `\hhhhhh` → codepoint (one trailing
+/// whitespace consumed), `\<newline>` → nothing (line continuation),
+/// `\<c>` → literal `c`. Input is already UTF-8 — chars, not bytes.
+fn unescape(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            None => break,
+            Some('\n') | Some('\x0c') => {}
+            Some('\r') => {
+                if it.peek() == Some(&'\n') {
+                    it.next();
+                }
+            }
+            Some(h) if h.is_ascii_hexdigit() => {
+                let mut n = h.to_digit(16).unwrap();
+                for _ in 0..5 {
+                    match it.peek().copied().filter(|c| c.is_ascii_hexdigit()) {
+                        Some(c) => {
+                            n = n * 16 + c.to_digit(16).unwrap();
+                            it.next();
+                        }
+                        None => break,
+                    }
+                }
+                if it.peek().is_some_and(|c| c.is_whitespace()) {
+                    it.next();
+                }
+                out.push(char::from_u32(n).unwrap_or('\u{fffd}'));
+            }
+            Some(c) => out.push(c),
+        }
+    }
+    out
+}
+
 /// `(byte_index_of_open_quote, contents)` per quoted string in `v`.
+/// Contents are escape-decoded (`\a0` → nbsp).
 fn quoted_strings(v: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let b = v.as_bytes();
@@ -313,15 +355,13 @@ fn quoted_strings(v: &str) -> Vec<(usize, String)> {
             let q = b[i];
             let st = i + 1;
             let mut j = st;
-            let mut s = String::new();
             while j < b.len() && b[j] != q {
                 if b[j] == b'\\' && j + 1 < b.len() {
                     j += 1;
                 }
-                s.push(b[j] as char);
                 j += 1;
             }
-            out.push((i, s));
+            out.push((i, unescape(&v[st..j.min(v.len())])));
             i = j + 1;
         } else {
             i += 1;
@@ -339,16 +379,15 @@ fn content_tokens(v: &str) -> Vec<Tok> {
         let c = b[i];
         if c == b'"' || c == b'\'' {
             let q = c;
-            let mut j = i + 1;
-            let mut s = String::new();
+            let st = i + 1;
+            let mut j = st;
             while j < b.len() && b[j] != q {
                 if b[j] == b'\\' && j + 1 < b.len() {
                     j += 1;
                 }
-                s.push(b[j] as char);
                 j += 1;
             }
-            out.push(Tok::Str(s));
+            out.push(Tok::Str(unescape(&v[st..j.min(v.len())])));
             i = j + 1;
             continue;
         }
@@ -387,7 +426,15 @@ fn content_tokens(v: &str) -> Vec<Tok> {
                     .map(|s| s.trim())
                     .collect();
                 let arg = |n: usize| args.get(n).copied().unwrap_or("");
-                let unquote = |s: &str| s.trim().trim_matches('"').trim_matches('\'').to_string();
+                let unquote = |s: &str| {
+                    let t = s.trim();
+                    let inner = t
+                        .strip_prefix('"')
+                        .and_then(|x| x.strip_suffix('"'))
+                        .or_else(|| t.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+                        .unwrap_or(t);
+                    unescape(inner)
+                };
                 out.push(match word {
                     "attr" => Tok::Attr(unquote(arg(0))),
                     "counter" => Tok::Counter(
@@ -471,7 +518,9 @@ fn type_token(tok: &str) -> Option<LType> {
         "inside" | "outside" => return None,
         _ if tok.starts_with("url(") => return None,
         _ if tok.starts_with('"') || tok.starts_with('\'') => {
-            LType::Custom(tok.trim_matches('"').trim_matches('\'').to_string())
+            let t = tok.trim();
+            let end = t.len().saturating_sub(1).max(1);
+            LType::Custom(unescape(t.get(1..end).unwrap_or("")))
         }
         _ => LType::Custom(tok.to_string()),
     })
@@ -602,6 +651,27 @@ mod tests {
         assert_eq!(fmt_counter(4, "lower-roman"), "iv");
         assert_eq!(fmt_counter(1987, "upper-roman"), "MCMLXXXVII");
         assert_eq!(fmt_counter(0, "lower-roman"), "0");
+    }
+
+    #[test]
+    fn content_string_escapes() {
+        let doc = Document::new();
+        let mut depth = 0;
+        let ct = Counters::new();
+        // \hhhhhh → codepoint (with the spec's trailing-ws consume);
+        // UTF-8 string bodies stay UTF-8
+        let c = props(&[("content", "\"\\a0 X\\b7 \"")]);
+        let t = content_text(&doc, doc.root, &c, &ct, &mut depth).unwrap();
+        assert_eq!(t, "\u{a0}X\u{b7}");
+        let c = props(&[("content", "\" · \"")]);
+        let t = content_text(&doc, doc.root, &c, &ct, &mut depth).unwrap();
+        assert_eq!(t, " · ");
+        // list markers take the same path via quoted_strings
+        let c = props(&[("list-style", "\"\\2022 \" inside")]);
+        assert_eq!(
+            list_props(&c),
+            (Some(LType::Custom("\u{2022}".to_string())), Some(true))
+        );
     }
 
     #[test]

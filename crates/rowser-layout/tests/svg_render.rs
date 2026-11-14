@@ -133,3 +133,50 @@ fn cburnett_pieces_if_fetched() {
         );
     }
 }
+
+/// `fill="url(#id)"` resolves linear/radial paint servers — bbox units,
+/// href chains, stop colors/offsets. Before paint-server support the url
+/// fell back to inherited black.
+#[test]
+fn gradient_paints_not_black() {
+    // linear, objectBoundingBox (the default units): red → blue L→R
+    let px = raster(
+        r##"<svg viewBox="0 0 10 10" width="100" height="100">
+            <defs><linearGradient id="g"><stop offset="0" stop-color="#ff0000"/><stop offset="1" stop-color="#0000ff"/></linearGradient></defs>
+            <rect x="0" y="0" width="10" height="10" fill="url(#g)"/>
+        </svg>"##,
+        100,
+        100,
+        0xff000000,
+    );
+    let px_at = |x: usize| {
+        let i = (50 * 100 + x) * 4;
+        (px[i + 2] as u32, px[i + 1] as u32, px[i] as u32) // (r,g,b)
+    };
+    let (r0, _, b0) = px_at(5);
+    let (r1, _, b1) = px_at(95);
+    assert!(r0 > 150 && b0 < 100, "left edge red-ish, got {r0},{b0}");
+    assert!(b1 > 150 && r1 < 100, "right edge blue-ish, got {r1},{b1}");
+
+    // radial, userSpaceOnUse + href chain (stops inherited from template)
+    let px = raster(
+        r##"<svg viewBox="0 0 100 100" width="100" height="100">
+            <defs>
+              <radialGradient id="base" gradientUnits="userSpaceOnUse" cx="50" cy="50" r="50">
+                <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#000000"/>
+              </radialGradient>
+              <radialGradient id="child" xlink:href="#base" xmlns:xlink="http://www.w3.org/1999/xlink"/>
+            </defs>
+            <circle cx="50" cy="50" r="45" fill="url(#child)"/>
+        </svg>"##,
+        100,
+        100,
+        0xff000000,
+    );
+    let lum = |x: usize, y: usize| {
+        let i = (y * 100 + x) * 4;
+        (px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32) / 3
+    };
+    assert!(lum(50, 50) > 200, "center white-ish, got {}", lum(50, 50));
+    assert!(lum(90, 50) < 120, "edge dark-ish, got {}", lum(90, 50));
+}

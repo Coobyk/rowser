@@ -267,8 +267,9 @@ struct Style {
     size: f32,
     bold: bool,
     italic: bool,
-    /// family name handed to FontCache::resolve (fuzzy substring match)
-    family: String,
+    /// family name handed to FontCache::resolve (fuzzy substring match);
+    /// Rc so per-element Style clones don't reallocate the string
+    family: Rc<str>,
     /// text-transform applied per word
     transform: u8, // 0 none, 1 upper, 2 lower, 3 capitalize
     color: Color,
@@ -305,7 +306,10 @@ struct Style {
     /// words may split mid-word; otherwise they overflow
     break_word: bool,
     align: Align,
-    href: Option<String>,
+    /// link target inherited by descendant words — Rc so Style clones
+    /// and per-word copies don't reallocate it (DisplayItem::Text still
+    /// owns a String; converted once at emission)
+    href: Option<Rc<str>>,
     /// line-height override: multiplier of font-size or an absolute px length
     line_h: Option<LineH>,
     /// background-color of the nearest inline ancestor; painted per-word.
@@ -354,7 +358,7 @@ fn base_style() -> Style {
         size: BASE_SIZE,
         bold: false,
         italic: false,
-        family: "liberation sans".to_string(),
+        family: "liberation sans".into(),
         transform: 0,
         color: BLACK,
         deco: TextDeco::NONE,
@@ -389,6 +393,7 @@ fn base_style() -> Style {
 
 const UA_CSS: &str = r#"
 head,title,meta,link,style,script,template,noscript,base{display:none}
+dialog:not([open]),[hidden]{display:none}
 html,body,div,p,blockquote,pre,listing,h1,h2,h3,h4,h5,h6,ul,ol,menu,dir,dl,dd,dt,
 section,article,nav,header,footer,main,aside,form,fieldset,figcaption,figure,
 address,hr,center{display:block}
@@ -425,6 +430,11 @@ code,kbd,samp,tt{font-family:monospace}
 a{color:#0000ee;text-decoration:underline}
 a[href],area[href]{cursor:pointer}
 input,textarea{cursor:text}
+input[type=hidden]{display:none}
+input,textarea,select{border:1px solid #767676;background:#fff;padding:1px 4px}
+input[type=checkbox],input[type=radio]{width:13px;height:13px;padding:0}
+input[type=submit],input[type=button],input[type=reset]{padding:1px 8px;background:#e9e9ed}
+input:focus,textarea:focus,select:focus{outline:1px solid #4d90fe}
 u,ins{text-decoration:underline}
 s,strike,del{text-decoration:line-through}
 small{font-size:.83em}
@@ -1114,7 +1124,7 @@ fn calc_len(expr: &str, rel: f32, em: f32) -> Option<f32> {
         let mut out = Vec::new();
         while i < b.len() {
             let c = b[i] as char;
-            if c.is_whitespace() {
+            if b[i].is_ascii_whitespace() {
                 i += 1;
             } else if c.is_ascii_digit()
                 || c == '.'
@@ -1468,20 +1478,23 @@ fn font_stretch_value(v: &str) -> u16 {
 
 /// Shorthand sides (top, right, bottom, left) from 1–4 values.
 fn sides(c: &Props, name: &str, rel: f32, em: f32) -> [Option<f32>; 4] {
-    if let Some(v) = c.get(name) {
-        let vals: Vec<Option<f32>> = v
-            .split_whitespace()
-            .map(|p| parse_len(p, rel, em))
-            .collect();
-        let get = |i: usize| vals.get(i).copied().flatten();
-        match vals.len() {
-            1 => [get(0); 4],
-            2 => [get(0), get(1), get(0), get(1)],
-            3 => [get(0), get(1), get(2), get(1)],
-            _ => [get(0), get(1), get(2), get(3)],
-        }
-    } else {
-        [None; 4]
+    let Some(v) = c.get(name) else {
+        return [None; 4];
+    };
+    // 1–4 tokens in the usual TRBL pattern — a fixed array avoids the
+    // Vec this used to allocate per margin/padding/inset query
+    let mut vals = [None; 4];
+    let mut n = 0usize;
+    for p in v.split_whitespace().take(4) {
+        vals[n] = parse_len(p, rel, em);
+        n += 1;
+    }
+    let get = |i: usize| if i < n { vals[i] } else { None };
+    match n {
+        1 => [get(0); 4],
+        2 => [get(0), get(1), get(0), get(1)],
+        3 => [get(0), get(1), get(2), get(1)],
+        _ => [get(0), get(1), get(2), get(3)],
     }
 }
 
@@ -1636,8 +1649,8 @@ fn margin_auto(c: &Props, left: bool) -> bool {
         return true;
     }
     if let Some(v) = c.get("margin") {
-        let t: Vec<&str> = v.split_whitespace().collect();
-        let idx = match t.len() {
+        let mut it = v.split_whitespace();
+        let idx = match it.clone().count() {
             0 => return false,
             1 => 0,
             2 | 3 => 1,
@@ -1649,7 +1662,7 @@ fn margin_auto(c: &Props, left: bool) -> bool {
                 }
             }
         };
-        return t.get(idx).is_some_and(|s| s.eq_ignore_ascii_case("auto"));
+        return it.nth(idx).is_some_and(|s| s.eq_ignore_ascii_case("auto"));
     }
     false
 }
@@ -2360,6 +2373,14 @@ fn collapse_edges(grid: &TGrid, ti: usize, bw: [f32; 4]) -> [f32; 4] {
 
 // ---------- the layouter ----------
 
+/// An inline-block's detached emission, carried on the line inside a
+/// `Word`: display items in box-local coords (origin top-left) plus the
+/// element hit rects in the same space.
+struct WordPayload {
+    items: Vec<DisplayItem>,
+    hits: Vec<Hit>,
+}
+
 struct Word {
     text: String,
     font: usize,
@@ -2380,13 +2401,14 @@ struct Word {
     width: f32,
     ascent: f32,
     line_h: f32,
-    href: Option<String>,
+    /// link target shared with the style that pushed the word — to_string'd
+    /// into the public Option<String> at emission
+    href: Option<Rc<str>>,
     /// inline background — FillRect emitted behind the text
     bg: Option<Color>,
-    /// inline-block payload: display items in box-local coords (origin top-left)
-    items: Option<Vec<DisplayItem>>,
-    /// element boxes inside the payload — same coord space as `items`
-    hits: Vec<Hit>,
+    /// inline-block payload (display items + hit rects in box-local coords,
+    /// origin top-left) — boxed so the common text-only word stays small
+    payload: Option<Box<WordPayload>>,
     /// inline-block height (baseline alignment: box bottom sits on baseline)
     box_h: f32,
     /// painted-position shift from enclosing `position:relative` inlines —
@@ -2399,6 +2421,36 @@ struct Word {
     /// inline element that produced this word — flushed into `hits` so
     /// links/spans are hoverable/clickable (`None` = block-owned).
     owner: Option<NodeId>,
+}
+
+impl Word {
+    /// Alloc-free shell — `mem::replace` target when a word moves out of
+    /// the line vec at flush_line.
+    fn ph() -> Word {
+        Word {
+            text: String::new(),
+            font: 0,
+            size: 0.0,
+            color: 0,
+            deco: TextDeco::NONE,
+            va: Va::Baseline,
+            sel: false,
+            gap_before: 0.0,
+            ls: 0.0,
+            shadow: Vec::new(),
+            width: 0.0,
+            ascent: 0.0,
+            line_h: 0.0,
+            href: None,
+            bg: None,
+            payload: None,
+            box_h: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            xf: None,
+            owner: None,
+        }
+    }
 }
 
 /// A floated box: horizontal margin-box extent [x0,x1] (emission coords)
@@ -2654,6 +2706,60 @@ struct BlockPatch {
     bgl: Option<bgimg::BoxBgs>,
 }
 
+/// Which pseudo-element kinds the sheets can generate, split by the
+/// rightmost compound's tag requirement: a `Tag` simple constrains which
+/// elements can ever match, other keys (class/id/attr/universal/none)
+/// can't be prefiltered per node — those land in `any`. Mirrors
+/// `computed_pseudo`'s `pseudo_subject` (only the rightmost compound is
+/// inspected), so a miss here means the pseudo cascade provably yields
+/// an empty map.
+fn pseudo_mask(sheets: &[&css::StyleSheet]) -> (u8, FxHashMap<String, u8>) {
+    let mut any = 0u8;
+    let mut tags: FxHashMap<String, u8> = FxHashMap::default();
+    for sh in sheets {
+        for r in &sh.rules {
+            for s in &r.selectors {
+                let Some((_, simples)) = s.parts.last() else {
+                    continue;
+                };
+                for si in simples {
+                    if let css::Simple::PseudoElem(k) = si {
+                        let bit = 1u8 << (*k as u8);
+                        match simples.iter().find_map(|s| match s {
+                            css::Simple::Tag(t) => Some(t.clone()),
+                            _ => None,
+                        }) {
+                            Some(t) => *tags.entry(t).or_insert(0) |= bit,
+                            None => any |= bit,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (any, tags)
+}
+
+/// Intrinsic-measurement memo key: `shrink_width` / `min_content_w` /
+/// `max_content_width` are deterministic in the node, its measure-relevant
+/// style fields, and the dimensions % values resolve against (avail_w,
+/// pct_h). Tuple members: node, font-size bits, weight, stretch, style
+/// flags, family, avail_w bits, pct_h bits.
+type IntrKey = (NodeId, u32, u16, u16, u16, Rc<str>, u32, u32);
+
+/// `deco_mask` bit flags — which deco/geometry-relevant property groups a
+/// computed `Props` contains, so the ~30 `c.get` probes the box paths run
+/// unconditionally collapse into a bit test per group.
+const DM_BORDER: u32 = 1 << 0; // any border-* prop borders() reads
+const DM_RADIUS: u32 = 1 << 1; // border-radius
+const DM_SHADOW: u32 = 1 << 2; // box-shadow
+const DM_OUTLINE: u32 = 1 << 3; // outline*
+const DM_CLIP: u32 = 1 << 4; // overflow*
+const DM_BGIMG: u32 = 1 << 5; // background-image / background shorthand
+const DM_XFORM: u32 = 1 << 6; // transform/translate/rotate/scale
+const DM_FX: u32 = 1 << 7; // filter, clip-path, masks, blend, backdrop-filter
+const DM_COUNTERS: u32 = 1 << 8; // counter-reset/set/increment
+
 pub struct Layouter<'a> {
     doc: &'a Document,
     /// sheet set (UA + external + <style>); shared with worker StyleCtxs
@@ -2665,10 +2771,75 @@ pub struct Layouter<'a> {
     /// probes all re-resolve the same nodes; the cascade is deterministic
     /// per node so the result is shared (Rc) instead of recomputed.
     style_cache: FxHashMap<NodeId, Rc<Props>>,
-    /// (family, weight, italic, first-char) → font index memo —
+    /// family → (weight, stretch, italic, first-char) → font index memo —
     /// FontCache::resolve scans every installed face per call, so
     /// resolving once per style is a must. u32::MAX = resolved-to-none.
-    font_memo: FxHashMap<(String, u16, bool, u32), u32>,
+    /// Nested by family so per-word lookups don't build a String key.
+    font_memo: FxHashMap<Rc<str>, FxHashMap<(u16, u16, bool, u32), u32>>,
+    /// measured advance: (font idx, size bits) → text → px. Intrinsic
+    /// probes (shrink/flex/table) and wrap retries re-measure the same
+    /// words within a pass — shape once per (font, size, word).
+    measure_memo: FxHashMap<(u32, u32), FxHashMap<Box<str>, f32>>,
+    /// (font idx, char) → the font's cmap covers it — the alphabet is
+    /// small, resolve_font_covering would otherwise scan every char of
+    /// every word through the cmap tables
+    glyph_cov: FxHashMap<(u32, u32), bool>,
+    /// font idx → 128-bit cmap coverage mask for code points < 128 —
+    /// one map hit per word instead of one per char for ASCII text
+    ascii_cov: FxHashMap<u32, u128>,
+    /// last font's ascii_cov mask — runs of same-font words skip the
+    /// map probe entirely
+    last_cov: Option<(u32, u128)>,
+    /// (font idx, size bits) → space advance
+    space_memo: FxHashMap<(u32, u32), f32>,
+    /// (font idx, size bits) → (ascent, default line-height) — the
+    /// per-word `measure_run` metrics pair; skips a FontCache hit per
+    /// word when no line-height override applies
+    run_memo: FxHashMap<(u32, u32), (f32, f32)>,
+    /// last resolve_font_ch result: (family, (weight, stretch, italic,
+    /// first char)) → font — same-style runs hit this without hashing
+    /// the family string
+    last_font: Option<(Rc<str>, (u16, u16, bool, u32), u32)>,
+    /// `float_insets` memo: (y, margin_x, avail_w bits, floats gen) →
+    /// (left, right) — the wrap check calls it per word while floats
+    /// only change per float push / nesting boundary
+    fi_memo: Option<((u32, u32, u32, u64), (f32, f32))>,
+    /// bumped on every `floats` mutation — invalidates `fi_memo`
+    floats_gen: u64,
+    /// measured advance for words short enough to key by packed bytes —
+    /// one flat (font, size, word-bytes) probe with no Box<str> key alloc
+    /// and no nested-map walk; longer words take `measure_memo`
+    measure_short: FxHashMap<(u32, u32, u64), f32>,
+    /// intrinsic-width memos keyed by `IntrKey`: table grids measure
+    /// every cell twice (shrink + preferred passes), and shrink-to-fit /
+    /// flex/grid bases re-measure subtrees already walked for an
+    /// enclosing probe. The measured functions are deterministic in
+    /// (node, measure-relevant style fields, avail_w, pct_h).
+    shrink_memo: FxHashMap<IntrKey, f32>,
+    minc_memo: FxHashMap<IntrKey, f32>,
+    maxc_memo: FxHashMap<IntrKey, f32>,
+    /// `deco_mask` per node — one presence scan over the computed props,
+    /// cached, replaces ~30 unconditional hash lookups per box with
+    /// bit tests for the deco/geometry parsers
+    deco_memo: FxHashMap<NodeId, u32>,
+    /// spare `line`/`floats` buffers swapped into `nest`/`capture_in`'s
+    /// detached emission — the inner pass writes into a warm buffer
+    /// instead of a fresh Vec
+    spare_line: Vec<Word>,
+    spare_floats: Vec<Float>,
+    /// reusable scratch: sibling paint-order segments for walk_children
+    /// and the permutation/copy buffers `stacking::reorder` needs
+    segs_scratch: Vec<(usize, usize, i64)>,
+    order_scratch: Vec<usize>,
+    seg_items: Vec<DisplayItem>,
+    seg_hits: Vec<Hit>,
+    /// pseudo-element kinds reachable per tag / via non-tag selectors
+    /// (class/id/attr/universal) — emit_pseudo skips the cascade when no
+    /// sheet rule could generate the kind for this element
+    pseudo_tags: FxHashMap<String, u8>,
+    pseudo_any: u8,
+    /// per-line word x offsets — reused across flush_line calls
+    line_xs: Vec<f32>,
     fonts: &'a mut FontCache,
     items: Vec<DisplayItem>,
     y: f32,
@@ -2725,6 +2896,11 @@ pub struct Layouter<'a> {
     /// cells) resolve against it; propagated to auto-height children so a
     /// `h-full` chain still finds the nearest definite ancestor
     pct_h: Option<f32>,
+    /// definite content height of THIS box only — no ancestor passthrough.
+    /// Flex uses it for the container's own main/cross size: a nowrap
+    /// row's line cross must be the row's own height, not a definite
+    /// ancestor's (`pct_h`), or stretch/center alignment inflates it.
+    own_h: Option<f32>,
     /// viewport width (the width passed to `layout`) for vw units and
     /// `background-attachment:fixed` positioning areas — also the initial
     /// containing block for `position:fixed`/`absolute` at the root
@@ -2811,12 +2987,36 @@ impl<'a> Layouter<'a> {
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
         sheets.extend(external.iter());
         sheets.extend(author.iter());
+        let (pseudo_any, pseudo_tags) = pseudo_mask(&sheets);
         let mut l = Layouter {
             doc,
             ctx: css::StyleCtx::new(doc, &sheets),
             sheets,
             style_cache: FxHashMap::default(),
             font_memo: FxHashMap::default(),
+            measure_memo: FxHashMap::default(),
+            glyph_cov: FxHashMap::default(),
+            ascii_cov: FxHashMap::default(),
+            last_cov: None,
+            space_memo: FxHashMap::default(),
+            run_memo: FxHashMap::default(),
+            last_font: None,
+            fi_memo: None,
+            floats_gen: 0,
+            measure_short: FxHashMap::default(),
+            shrink_memo: FxHashMap::default(),
+            minc_memo: FxHashMap::default(),
+            maxc_memo: FxHashMap::default(),
+            deco_memo: FxHashMap::default(),
+            spare_line: Vec::new(),
+            spare_floats: Vec::new(),
+            segs_scratch: Vec::new(),
+            order_scratch: Vec::new(),
+            seg_items: Vec::new(),
+            seg_hits: Vec::new(),
+            pseudo_tags,
+            pseudo_any,
+            line_xs: Vec::new(),
             fonts,
             items: Vec::new(),
             y: -scroll,
@@ -2843,6 +3043,7 @@ impl<'a> Layouter<'a> {
             hits: Vec::new(),
             backdrop: WHITE,
             pct_h: None,
+            own_h: None,
             viewport_w: width,
             canvas_bg_node: None,
             cb_stack: Vec::new(),
@@ -2928,7 +3129,21 @@ impl<'a> Layouter<'a> {
     /// Horizontal space taken by floats on (left, right) at the current y:
     /// the intrusion into this block's line box [margin_x, margin_x+avail_w].
     /// Same-side floats can't overlap, so the deepest intrusion wins.
-    fn float_insets(&self) -> (f32, f32) {
+    /// Memoized on (y, margin_x, avail_w, floats generation) — the wrap
+    /// check in push_word_body calls this per word while the answer only
+    /// changes per line or float push.
+    fn float_insets(&mut self) -> (f32, f32) {
+        let key = (
+            self.y.to_bits(),
+            self.margin_x.to_bits(),
+            self.avail_w.to_bits(),
+            self.floats_gen,
+        );
+        if let Some((k, v)) = self.fi_memo {
+            if k == key {
+                return v;
+            }
+        }
         let (mut l, mut r) = (0.0f32, 0.0f32);
         let (x0, x1) = (self.margin_x, self.margin_x + self.avail_w);
         for f in &self.floats {
@@ -2943,6 +3158,7 @@ impl<'a> Layouter<'a> {
                 l = l.max(f.x1 - x0);
             }
         }
+        self.fi_memo = Some((key, (l, r)));
         (l, r)
     }
 
@@ -3045,8 +3261,9 @@ impl<'a> Layouter<'a> {
     /// laid, so the caller passes the target along for sticky clamps.
     fn walk_children(&mut self, node: NodeId, st: &Style, sticky_top: f32, sticky_bot: f32) {
         let st0 = self.stickies.len();
-        let mut segs: Vec<(usize, usize, i64)> =
-            vec![(self.items.len(), self.hits.len(), stacking::L_INLINE)];
+        // scratch vec kept on self — one alloc for the whole pass
+        let mut segs = std::mem::take(&mut self.segs_scratch);
+        segs.push((self.items.len(), self.hits.len(), stacking::L_INLINE));
         for &ch in self.doc.children(node) {
             if self.clamping {
                 break;
@@ -3071,16 +3288,25 @@ impl<'a> Layouter<'a> {
         self.flush_line();
         // sticky fixups must apply before the reorder permutes ranges
         self.drain_stickies(st0, sticky_top, self.y.max(sticky_bot));
-        stacking::reorder(&mut self.items, &mut self.hits, &segs);
+        stacking::reorder(
+            &mut self.items,
+            &mut self.hits,
+            &segs,
+            &mut self.order_scratch,
+            &mut self.seg_items,
+            &mut self.seg_hits,
+        );
+        segs.clear();
+        self.segs_scratch = segs;
     }
 
-    fn content_width(&self) -> f32 {
+    fn content_width(&mut self) -> f32 {
         let (l, r) = self.float_insets();
         (self.avail_w - l - r).max(1.0)
     }
 
     /// x where a new line starts (left float insets included).
-    fn line_origin(&self) -> f32 {
+    fn line_origin(&mut self) -> f32 {
         self.margin_x + self.float_insets().0
     }
 
@@ -3242,9 +3468,19 @@ impl<'a> Layouter<'a> {
                     self.flush_line();
                 }
                 let (i0, h0, bd) = (self.items.len(), self.hits.len(), self.backdrop);
+                // cached prop-presence mask — gates the transform spec,
+                // counter scope, and fx wrap lookups below
+                let dm = self.deco_mask(node);
                 // CSS 2D transform spec (xform.rs) — visual-only, applied
                 // around the element's border box after its subtree emits
-                let xf = xform::spec(&c, st.size);
+                let xf = if dm & DM_XFORM != 0 {
+                    xform::spec(&c, st.size)
+                } else {
+                    None
+                };
+                // non-translate transforms take the matrix path — passed
+                // to block() so it doesn't rebuild the spec (has_matrix)
+                let xf_wrap = xf.as_ref().is_some_and(|s| s.wrap);
                 // transformed inline-level elements: stash the spec while
                 // dispatching so push_word/push_box tag the queued words
                 let saved_xf = if !direct && xf.is_some() {
@@ -3254,7 +3490,10 @@ impl<'a> Layouter<'a> {
                 };
                 // CSS counters: resets open a scope popped when the
                 // element's subtree ends (display:none — no box, no effect)
-                let counter_scope = if visually_hidden || disp == Some("none") {
+                let counter_scope = if visually_hidden
+                    || disp == Some("none")
+                    || dm & DM_COUNTERS == 0
+                {
                     Vec::new()
                 } else {
                     self.counters.enter(&c)
@@ -3289,7 +3528,7 @@ impl<'a> Layouter<'a> {
                         Some("absolute") | Some("fixed")
                     ) =>
                     {
-                        self.block(node, tag, &c, st);
+                        self.block(node, tag, &c, st, xf_wrap);
                     }
                     // floats blockify (CSS 2.1 §9.7); floated images go too —
                     // other replaced tags keep the inline path
@@ -3298,12 +3537,12 @@ impl<'a> Layouter<'a> {
                         Some("left") | Some("right")
                     ) && (!replaced || matches!(tag.as_str(), "img" | "svg")) =>
                     {
-                        self.block(node, tag, &c, st);
+                        self.block(node, tag, &c, st, xf_wrap);
                     }
                     _ if replaced => self.inline(node, tag, &c, st),
                     Some("block") | Some("list-item") | Some("flex") | Some("grid")
                     | Some("flow-root") | Some("table") => {
-                        self.block(node, tag, &c, st);
+                        self.block(node, tag, &c, st, xf_wrap);
                     }
                     // internal table parts outside a table ⇒ block
                     // (anonymous-box generation beyond that unsupported)
@@ -3312,7 +3551,7 @@ impl<'a> Layouter<'a> {
                     | Some("table-caption")
                     | Some("table-row-group")
                     | Some("table-header-group")
-                    | Some("table-footer-group") => self.block(node, tag, &c, st),
+                    | Some("table-footer-group") => self.block(node, tag, &c, st, xf_wrap),
                     // columns generate no box of their own
                     Some("table-column") | Some("table-column-group") => return,
                     Some("inline-block") | Some("inline-flex") | Some("inline-grid")
@@ -3368,13 +3607,19 @@ impl<'a> Layouter<'a> {
                 // element's emitted items as one paint-time group; rect =
                 // own border box when it recorded a hit. (inline-block
                 // items go to the line instead — see inline_block_inner.)
-                let rect = self.hits[h0..]
-                    .iter()
-                    .find(|h| h.4 == node)
-                    .map(|h| [h.0, h.1, h.2, h.3]);
-                let fx = colorfx::element_fx(&c, fx_size, fx_cur, rect);
-                if !fx.is_empty() {
-                    colorfx::wrap_vec(&mut self.items, i0, fx);
+                // Gate on the fx prop set: the rect find walks every hit
+                // this subtree emitted — pointless when no fx key exists
+                // (element_fx provably returns empty then).
+                let has_fx = dm & DM_FX != 0;
+                if has_fx {
+                    let rect = self.hits[h0..]
+                        .iter()
+                        .find(|h| h.4 == node)
+                        .map(|h| [h.0, h.1, h.2, h.3]);
+                    let fx = colorfx::element_fx(&c, fx_size, fx_cur, rect);
+                    if !fx.is_empty() {
+                        colorfx::wrap_vec(&mut self.items, i0, fx);
+                    }
                 }
                 self.counters.leave(counter_scope);
             }
@@ -3388,23 +3633,76 @@ impl<'a> Layouter<'a> {
         }
     }
 
+    /// Prop-name → slot index for `apply_computed`'s single-pass scan.
+    /// The computed map is small (cascaded decls only), so iterating it
+    /// once and dealing each queried name into a fixed slot beats ~40
+    /// keyed hash lookups per element.
     fn apply_computed(&mut self, c: &Props, st: &mut Style) {
-        if let Some(v) = c.get("font-size") {
+        let mut hit: [Option<&String>; 39] = [None; 39];
+        for (k, v) in c.iter() {
+            let i = match k.as_str() {
+                "font-size" => 0,
+                "font-weight" => 1,
+                "font-style" => 2,
+                "font-stretch" => 3,
+                "text-transform" => 4,
+                "font-family" => 5,
+                "color" => 6,
+                "text-decoration" => 7,
+                "text-decoration-line" => 8,
+                "text-decoration-style" => 9,
+                "text-decoration-color" => 10,
+                "text-decoration-thickness" => 11,
+                "text-underline-offset" => 12,
+                "text-underline-position" => 13,
+                "text-align" => 14,
+                "direction" => 15,
+                "text-align-last" => 16,
+                "text-indent" => 17,
+                "letter-spacing" => 18,
+                "word-spacing" => 19,
+                "tab-size" => 20,
+                "text-shadow" => 21,
+                "font-variant" => 22,
+                "font-variant-caps" => 23,
+                "hyphens" => 24,
+                "text-wrap" => 25,
+                "user-select" => 26,
+                "-webkit-user-select" => 27,
+                "-moz-user-select" => 28,
+                "line-clamp" => 29,
+                "-webkit-line-clamp" => 30,
+                "unicode-bidi" => 31,
+                "white-space" => 32,
+                "overflow-wrap" => 33,
+                "word-wrap" => 34,
+                "word-break" => 35,
+                "vertical-align" => 36,
+                "line-height" => 37,
+                "pointer-events" => 38,
+                _ => continue,
+            };
+            hit[i] = Some(v);
+        }
+        // handlers run in the same canonical order as the old per-prop
+        // gets — shorthand resets and or_else fallbacks are unchanged
+        let get = |i: usize| hit[i];
+        if let Some(v) = get(0) {
             st.size = parse_font_size(v, st.size);
         }
-        if let Some(v) = c.get("font-weight") {
+        if let Some(v) = get(1) {
             st.weight = font_weight_value(v, st.weight);
             st.bold = st.weight >= 600;
         }
-        if let Some(v) = c.get("font-style") {
+        if let Some(v) = get(2) {
             let v = v.trim().to_lowercase();
             st.italic = v.starts_with("italic")
                 || (v.starts_with("oblique") && !v.starts_with("oblique 0"));
         }
-        if let Some(v) = c.get("font-stretch") {
+        if let Some(v) = get(3) {
             st.stretch = font_stretch_value(v);
         }
-        if let Some(v) = c.get("text-transform") {
+        if let Some(v) = get(4) {
             st.transform = match v.trim() {
                 "uppercase" => 1,
                 "lowercase" => 2,
@@ -3412,12 +3710,12 @@ impl<'a> Layouter<'a> {
                 _ => 0,
             };
         }
-        if let Some(v) = c.get("font-family") {
+        if let Some(v) = get(5) {
             // keep the whole comma list — FontCache::resolve tries each
             // name in order and expands generic keywords itself
-            st.family = v.trim().to_lowercase();
+            st.family = v.trim().to_lowercase().into();
         }
-        if let Some(v) = c.get("color") {
+        if let Some(v) = get(6) {
             if let Some(col) = parse_color_ctx(v, Some(st.color)) {
                 st.color = over(col, self.backdrop);
             }
@@ -3425,7 +3723,7 @@ impl<'a> Layouter<'a> {
         // text-decoration shorthand + longhands → one spec. The shorthand
         // resets everything it omits; the longhands patch individual bits.
         let mut deco = st.deco.clone();
-        if let Some(v) = c.get("text-decoration") {
+        if let Some(v) = get(7) {
             let v = v.trim().to_lowercase();
             if v == "none" {
                 deco.lines = 0;
@@ -3452,7 +3750,7 @@ impl<'a> Layouter<'a> {
                 }
             }
         }
-        if let Some(v) = c.get("text-decoration-line") {
+        if let Some(v) = get(8) {
             let mut lines = 0;
             for t in v.split_whitespace() {
                 match t {
@@ -3464,7 +3762,7 @@ impl<'a> Layouter<'a> {
             }
             deco.lines = lines;
         }
-        if let Some(v) = c.get("text-decoration-style") {
+        if let Some(v) = get(9) {
             deco.style = match v.trim() {
                 "double" => DecoStyle::Double,
                 "dotted" => DecoStyle::Dotted,
@@ -3473,10 +3771,10 @@ impl<'a> Layouter<'a> {
                 _ => DecoStyle::Solid,
             };
         }
-        if let Some(v) = c.get("text-decoration-color") {
+        if let Some(v) = get(10) {
             deco.color = parse_color_ctx(v, Some(st.color));
         }
-        if let Some(v) = c.get("text-decoration-thickness") {
+        if let Some(v) = get(11) {
             let v = v.trim();
             deco.thick = if v == "auto" || v == "from-font" {
                 None
@@ -3488,7 +3786,7 @@ impl<'a> Layouter<'a> {
                     .map(|p| st.size * p / 100.0)
             };
         }
-        if let Some(v) = c.get("text-underline-offset") {
+        if let Some(v) = get(12) {
             let v = v.trim();
             deco.offset = if v == "auto" {
                 None
@@ -3501,12 +3799,12 @@ impl<'a> Layouter<'a> {
             };
         }
         // text-underline-position: under ≈ larger offset from baseline
-        if c.get("text-underline-position").map(String::as_str) == Some("under") {
+        if get(13).map(String::as_str) == Some("under") {
             deco.offset = Some(deco.offset.unwrap_or(0.0) + st.size * 0.18);
         }
         st.deco = deco;
-        if let Some(v) = c.get("text-align") {
-            let rtl = st.rtl || c.get("direction").map(String::as_str) == Some("rtl");
+        if let Some(v) = get(14) {
+            let rtl = st.rtl || get(15).map(String::as_str) == Some("rtl");
             st.align = match (v.trim(), rtl) {
                 ("center", _) | ("-webkit-center", _) | ("match-parent", _) => Align::Center,
                 ("right", _) | ("-webkit-right", _) => Align::Right,
@@ -3516,7 +3814,7 @@ impl<'a> Layouter<'a> {
                 _ => Align::Left,
             };
         }
-        if let Some(v) = c.get("text-align-last") {
+        if let Some(v) = get(16) {
             st.align_last = match v.trim() {
                 "center" => Some(Align::Center),
                 "right" | "end" => Some(Align::Right),
@@ -3525,7 +3823,7 @@ impl<'a> Layouter<'a> {
                 _ => None,
             };
         }
-        if let Some(v) = c.get("text-indent") {
+        if let Some(v) = get(17) {
             let v = v
                 .trim()
                 .trim_end_matches(" hanging")
@@ -3534,7 +3832,7 @@ impl<'a> Layouter<'a> {
                 .or_else(|| parse_len(v, self.avail_w, st.size))
                 .unwrap_or(0.0);
         }
-        if let Some(v) = c.get("letter-spacing") {
+        if let Some(v) = get(18) {
             let v = v.trim();
             st.ls = if v == "normal" {
                 0.0
@@ -3542,7 +3840,7 @@ impl<'a> Layouter<'a> {
                 parse_len(v, st.size, st.size).unwrap_or(0.0)
             };
         }
-        if let Some(v) = c.get("word-spacing") {
+        if let Some(v) = get(19) {
             let v = v.trim();
             st.ws = if v == "normal" {
                 0.0
@@ -3550,7 +3848,7 @@ impl<'a> Layouter<'a> {
                 parse_len(v, st.size, st.size).unwrap_or(0.0)
             };
         }
-        if let Some(v) = c.get("tab-size") {
+        if let Some(v) = get(20) {
             let v = v.trim();
             st.tab = v
                 .parse::<f32>()
@@ -3559,50 +3857,46 @@ impl<'a> Layouter<'a> {
                 .unwrap_or(8.0)
                 .max(0.0);
         }
-        if let Some(v) = c.get("text-shadow") {
+        if let Some(v) = get(21) {
             st.shadow = parse_text_shadow(v, st.size, st.color);
         }
-        if let Some(v) = c.get("font-variant").or_else(|| c.get("font-variant-caps")) {
+        if let Some(v) = get(22).or_else(|| get(23)) {
             st.small_caps = v.trim() == "small-caps";
         }
-        if let Some(v) = c.get("hyphens") {
+        if let Some(v) = get(24) {
             st.hyphens_none = v.trim() == "none";
         }
-        st.rtl = c.get("direction").map(String::as_str) == Some("rtl");
-        if st.rtl && c.get("text-align").is_none() {
+        st.rtl = get(15).map(String::as_str) == Some("rtl");
+        if st.rtl && get(14).is_none() {
             st.align = Align::Right;
         }
-        if let Some(v) = c.get("text-wrap") {
+        if let Some(v) = get(25) {
             st.nowrap |= v.trim() == "nowrap";
         }
-        if let Some(v) = c
-            .get("user-select")
-            .or_else(|| c.get("-webkit-user-select"))
-            .or_else(|| c.get("-moz-user-select"))
-        {
+        if let Some(v) = get(26).or_else(|| get(27)).or_else(|| get(28)) {
             st.no_select = matches!(v.trim(), "none" | "-moz-none");
         }
-        if let Some(v) = c.get("line-clamp").or_else(|| c.get("-webkit-line-clamp")) {
+        if let Some(v) = get(29).or_else(|| get(30)) {
             st.line_clamp = v.trim().parse::<i32>().unwrap_or(0);
         }
-        if let Some(v) = c.get("unicode-bidi") {
+        if let Some(v) = get(31) {
             // bidi-override forces rtl reorder; isolate/plaintext keep
             // the direction's natural behavior (our approximation)
             st.rtl |= matches!(v.trim(), "bidi-override" | "isolate-override");
         }
-        if let Some(v) = c.get("white-space") {
+        if let Some(v) = get(32) {
             let v = v.trim();
             st.pre = matches!(v, "pre" | "pre-wrap" | "break-spaces");
             st.pre_line = v == "pre-line";
             st.nowrap = matches!(v, "pre" | "nowrap");
         }
-        if let Some(v) = c.get("overflow-wrap").or_else(|| c.get("word-wrap")) {
+        if let Some(v) = get(33).or_else(|| get(34)) {
             st.break_word |= matches!(v.trim(), "break-word" | "anywhere");
         }
-        if let Some(v) = c.get("word-break") {
+        if let Some(v) = get(35) {
             st.break_word |= matches!(v.trim(), "break-all" | "break-word");
         }
-        if let Some(v) = c.get("vertical-align") {
+        if let Some(v) = get(36) {
             let v = v.trim();
             st.va = match v {
                 "sub" => Va::Shift(-0.3),
@@ -3631,7 +3925,7 @@ impl<'a> Layouter<'a> {
                 }
             };
         }
-        if let Some(v) = c.get("line-height") {
+        if let Some(v) = get(37) {
             let v = v.trim();
             st.line_h = if v == "normal" {
                 None
@@ -3644,12 +3938,14 @@ impl<'a> Layouter<'a> {
         if let Some(col) = bg_color(c, Some(st.color)) {
             st.inline_bg = Some(over(col, self.backdrop));
         }
-        if let Some(v) = c.get("pointer-events") {
+        if let Some(v) = get(38) {
             st.pe_none = matches!(v.trim(), "none");
         }
     }
 
-    fn block(&mut self, node: NodeId, tag: &str, c: &Props, mut st: Style) {
+    /// `xf_wrap` = the element's transform spec (already resolved by the
+    /// caller) needs a matrix wrap — saves rebuilding it for `has_matrix`.
+    fn block(&mut self, node: NodeId, tag: &str, c: &Props, mut st: Style, xf_wrap: bool) {
         self.flush_line();
         // a fresh block box isn't part of an enclosing inline's transformed
         // run — its own transform (if any) wraps via walk's wrap_span
@@ -3671,9 +3967,19 @@ impl<'a> Layouter<'a> {
         let cb = self.inset_cb(fixed, pos_kind == Some("absolute"));
         let cb_h_res = cb.h.or(self.cb_h).or(self.pct_h).unwrap_or(self.viewport_h);
         // `inset` shorthand + longhands + logical aliases → [t, r, b, l];
-        // % resolves against the containing block's dims
-        let [ins_t, ins_r, ins_b, ins_l] =
-            stacking::inset_sides(c, st.size, cb.w.max(1.0), cb_h_res);
+        // % resolves against the containing block's dims. Only positioned
+        // boxes (is_cb) read ins_* — except `left`+`right`, which also
+        // size a static box when `width` is auto (inset_w below).
+        let need_insets = is_cb || {
+            let any = |n: &[&str]| n.iter().any(|k| c.contains_key(*k));
+            any(&["left", "inset-inline-start", "inset-inline", "inset"])
+                && any(&["right", "inset-inline-end", "inset-inline", "inset"])
+        };
+        let [ins_t, ins_r, ins_b, ins_l] = if need_insets {
+            stacking::inset_sides(c, st.size, cb.w.max(1.0), cb_h_res)
+        } else {
+            [None; 4]
+        };
         // explicit `height` — definite containing-block height for positioned
         // descendants and a floor for this box's own extent. % resolves
         // against the containing block for positioned boxes, else the
@@ -3726,13 +4032,20 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let bd = self.backdrop;
         let bb = border_box(c);
+        // one cached prop-presence scan gates the ~30 unconditional deco
+        // lookups below — a bare <div>/<p> answers them all with bit tests
+        let dm = self.deco_mask(node);
         let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
-        let border = borderfx::borders(c, size, st.color).map(|mut b| {
-            for col in b.color.iter_mut() {
-                *col = over(*col, bg.unwrap_or(bd));
-            }
-            b
-        });
+        let border = if dm & DM_BORDER != 0 {
+            borderfx::borders(c, size, st.color).map(|mut b| {
+                for col in b.color.iter_mut() {
+                    *col = over(*col, bg.unwrap_or(bd));
+                }
+                b
+            })
+        } else {
+            None
+        };
         // the block's own background paints behind the whole box, not per word
         st.inline_bg = None;
         // this element's text sits on its own bg — re-composite the color
@@ -3750,7 +4063,7 @@ impl<'a> Layouter<'a> {
                                 // `background-image` layers resolve to display items at finish_patch
                                 // (the final box height isn't known yet). Skip a node whose
                                 // background already propagated to the canvas.
-        let bgl = if self.canvas_bg_node == Some(node) {
+        let bgl = if dm & DM_BGIMG == 0 || self.canvas_bg_node == Some(node) {
             None
         } else {
             bgimg::parse_box(
@@ -3822,10 +4135,17 @@ impl<'a> Layouter<'a> {
         // stretch (always a border-box length), or any non-oof auto width —
         // an abspos shrink-to-fit width is a content-box length
         let w_is_outer = bb || (w_explicit.is_none() && (inset_w.is_some() || !oof));
+        // margin-inline:auto results shared by the leftover-space split and
+        // the centering check below
+        let (ma_l, ma_r) = if w_prop.is_some() {
+            (margin_auto(c, true), margin_auto(c, false))
+        } else {
+            (false, false)
+        };
         if let Some(w) = w_prop {
             let outer = if w_is_outer { w } else { w + pl + pr + bw_h };
             let extra = (self.avail_w - ml - mr - outer).max(0.0);
-            match (margin_auto(c, true), margin_auto(c, false)) {
+            match (ma_l, ma_r) {
                 (true, true) => {
                     ml += extra / 2.0;
                     mr += extra / 2.0;
@@ -3880,11 +4200,12 @@ impl<'a> Layouter<'a> {
             (self.avail_w - ml - mr - pl - pr - bw_h).max(1.0)
         };
         // a definite-width block in a text-align:center context (<center>)
-        // or with margin-inline:auto gets centered
+        // gets centered — out-of-flow boxes are inset-driven (never
+        // shifted by the parent's text alignment) and margin-inline:auto
+        // already consumed the leftover space in the ml/mr split above
         if w_prop.is_some() {
             let outer = inner_w + pl + pr + bw_h;
-            let centered =
-                saved_align == Align::Center || (margin_auto(c, true) && margin_auto(c, false));
+            let centered = !oof && saved_align == Align::Center && !(ma_l && ma_r);
             if centered && outer < self.avail_w {
                 self.margin_x += ((self.avail_w - outer) / 2.0).max(0.0);
             }
@@ -3917,10 +4238,26 @@ impl<'a> Layouter<'a> {
         // The patch covers the border box (padding included).
         // slots: outer shadows + bg + inset shadows + 4 border edges
         // (+ 1 PushClip when overflow clips, right before the children)
-        let shadows = borderfx::parse_shadows(c, size, bd, st.color);
-        let outline = borderfx::outline(c, size, bd, st.color);
-        let clip = borderfx::clips_overflow(c);
-        let radii = borderfx::radius_spec(c);
+        let shadows = if dm & DM_SHADOW != 0 {
+            borderfx::parse_shadows(c, size, bd, st.color)
+        } else {
+            Vec::new()
+        };
+        let outline = if dm & DM_OUTLINE != 0 {
+            borderfx::outline(c, size, bd, st.color)
+        } else {
+            None
+        };
+        // html/body overflow propagates to the viewport (CSS Overflow
+        // §3.6) — the elements' own boxes keep used value `visible`, so
+        // a `body{overflow:hidden}` page still shows out-of-flow content
+        let clip =
+            dm & DM_CLIP != 0 && borderfx::clips_overflow(c) && !matches!(tag, "html" | "body");
+        let radii = if dm & DM_RADIUS != 0 {
+            borderfx::radius_spec(c)
+        } else {
+            RadiusSpec::default()
+        };
         let mut patch = if bg.is_some()
             || border.is_some()
             || !shadows.is_empty()
@@ -4021,15 +4358,18 @@ impl<'a> Layouter<'a> {
         });
         // %-height children resolve against a definite content height;
         // auto-height boxes pass the nearest definite ancestor through
-        let saved_ph = self.pct_h;
+        let (saved_ph, saved_oh) = (self.pct_h, self.own_h);
         self.pct_h = mh_prop
             .or_else(|| inset_h.map(|ih| ih - pt - pb - bw_v))
             .or(saved_ph);
+        self.own_h = mh_prop.or_else(|| inset_h.map(|ih| ih - pt - pb - bw_v));
         if tag == "hr" {
+            let x = self.line_origin();
+            let w = self.content_width();
             self.items.push(DisplayItem::FillRect {
-                x: self.line_origin(),
+                x,
                 y: self.y + 0.3 * st.size,
-                w: self.content_width(),
+                w,
                 h: 1.5,
                 color: RULE,
             });
@@ -4040,13 +4380,21 @@ impl<'a> Layouter<'a> {
             // flags restore at the end if they went unconsumed
             let prev_fl = self.fl_style.clone();
             let prev_flet = self.flet.clone();
-            let fl_pp = self.ctx.computed_pseudo(node, css::PseudoElem::FirstLine);
+            let fl_pp = if self.pseudo_possible(tag, css::PseudoElem::FirstLine) {
+                self.ctx.computed_pseudo(node, css::PseudoElem::FirstLine)
+            } else {
+                Props::default()
+            };
             if !fl_pp.is_empty() {
                 let mut fst = st.clone();
                 self.apply_computed(&fl_pp, &mut fst);
                 self.fl_style = Some(fst);
             }
-            let flet_pp = self.ctx.computed_pseudo(node, css::PseudoElem::FirstLetter);
+            let flet_pp = if self.pseudo_possible(tag, css::PseudoElem::FirstLetter) {
+                self.ctx.computed_pseudo(node, css::PseudoElem::FirstLetter)
+            } else {
+                Props::default()
+            };
             if !flet_pp.is_empty() {
                 let mut fst = st.clone();
                 self.apply_computed(&flet_pp, &mut fst);
@@ -4088,11 +4436,34 @@ impl<'a> Layouter<'a> {
                 .chain(inset_h.map(|ih| ih - pt - pb - bw_v))
                 .fold(content_top, |b, h| b.max(content_top + h));
             let st_tail = st.clone();
-            match c.get("display").map(String::as_str) {
-                Some("flex") | Some("inline-flex") => self.flex_children(node, c, st),
-                Some("grid") | Some("inline-grid") => self.grid_children(node, c, &st),
-                _ if multicol::multicol_on(c) => self.multicol_children(node, c, st),
-                _ => self.walk_children(node, &st, content_top, sticky_bot),
+            // replaced/form-control elements carry their own payload —
+            // emit it at the content origin in place of the child walk
+            // (an absolutely-positioned <img> or <input> has no children)
+            let payload = match tag {
+                "img" | "svg" | "video" | "canvas" | "iframe" | "object" | "embed" => {
+                    self.replaced_payload(node, tag, c, &st)
+                }
+                "input" | "textarea" | "select" => self.control_payload(node, tag, c, &st),
+                _ => None,
+            };
+            if let Some((pw, ph, items, hits)) = payload {
+                let (tx, ty) = translate_xy(c, pw, ph, size);
+                for it in items {
+                    self.items
+                        .push(offset_item(it, self.margin_x + tx, self.y + ty));
+                }
+                for h in hits {
+                    self.hits
+                        .push(xform::off_hit(h, self.margin_x + tx, self.y + ty));
+                }
+                self.y += ph;
+            } else {
+                match c.get("display").map(String::as_str) {
+                    Some("flex") | Some("inline-flex") => self.flex_children(node, c, st),
+                    Some("grid") | Some("inline-grid") => self.grid_children(node, c, &st),
+                    _ if multicol::multicol_on(c) => self.multicol_children(node, c, st),
+                    _ => self.walk_children(node, &st, content_top, sticky_bot),
+                }
             }
             // display:flow-root establishes a block formatting context:
             // floats inside it extend its own height (margin-collapsing is
@@ -4139,6 +4510,7 @@ impl<'a> Layouter<'a> {
         }
         self.backdrop = saved_bd;
         self.pct_h = saved_ph;
+        self.own_h = saved_oh;
         // positioned box with `top`+`bottom` (e.g. `inset:0`): the box is
         // exactly the containing height minus insets — overflowing content
         // spills rather than stretching it. The inset extent is a
@@ -4172,7 +4544,7 @@ impl<'a> Layouter<'a> {
         // post-layout visual offset; flow position is unaffected. Elements
         // with a non-translate transform compose it into a matrix instead —
         // wrap_span emits PushTransform around their whole span.
-        let (mut tx, mut ty) = if xform::has_matrix(c) {
+        let (mut tx, mut ty) = if xf_wrap {
             (0.0, 0.0)
         } else {
             translate_xy(
@@ -4282,19 +4654,24 @@ impl<'a> Layouter<'a> {
         let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
         let [_t, mr, _b, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
+        let dm = self.deco_mask(node);
         let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
-        let border = borderfx::borders(c, size, st.color).map(|mut b| {
-            for col in b.color.iter_mut() {
-                *col = over(*col, bg.unwrap_or(bd));
-            }
-            b
-        });
+        let border = if dm & DM_BORDER != 0 {
+            borderfx::borders(c, size, st.color).map(|mut b| {
+                for col in b.color.iter_mut() {
+                    *col = over(*col, bg.unwrap_or(bd));
+                }
+                b
+            })
+        } else {
+            None
+        };
         st.inline_bg = None;
         let [bw_t, bw_r, bw_b, bw_l] = border.map(|b| b.w).unwrap_or([0.0; 4]);
         let bw_h = bw_l + bw_r;
         let bw_v = bw_t + bw_b;
         let right = c.get("float").is_some_and(|v| v.trim() == "right");
-        let bgl = if self.canvas_bg_node == Some(node) {
+        let bgl = if dm & DM_BGIMG == 0 || self.canvas_bg_node == Some(node) {
             None
         } else {
             bgimg::parse_box(
@@ -4418,10 +4795,22 @@ impl<'a> Layouter<'a> {
             self.line_x += st.indent;
         }
 
-        let shadows = borderfx::parse_shadows(c, size, bd, st.color);
-        let outline = borderfx::outline(c, size, bd, st.color);
-        let clip = borderfx::clips_overflow(c);
-        let radii = borderfx::radius_spec(c);
+        let shadows = if dm & DM_SHADOW != 0 {
+            borderfx::parse_shadows(c, size, bd, st.color)
+        } else {
+            Vec::new()
+        };
+        let outline = if dm & DM_OUTLINE != 0 {
+            borderfx::outline(c, size, bd, st.color)
+        } else {
+            None
+        };
+        let clip = dm & DM_CLIP != 0 && borderfx::clips_overflow(c);
+        let radii = if dm & DM_RADIUS != 0 {
+            borderfx::radius_spec(c)
+        } else {
+            RadiusSpec::default()
+        };
         let patch = if bg.is_some()
             || border.is_some()
             || !shadows.is_empty()
@@ -4567,6 +4956,7 @@ impl<'a> Layouter<'a> {
             top,
             bottom,
         });
+        self.floats_gen += 1;
     }
 
     /// `display:inline-block`: a box sitting on the text line like a word.
@@ -4590,11 +4980,7 @@ impl<'a> Layouter<'a> {
         if self.pending_space && !self.line.is_empty() {
             let space_w = self
                 .resolve_font(&st)
-                .and_then(|f| {
-                    self.fonts.font(f).map(|f| {
-                        f.advance_units(f.glyph_id(' ')) as f32 * st.size / f.units_per_em() as f32
-                    })
-                })
+                .map(|f| self.space_w(f, &st))
                 .unwrap_or(st.size * 0.3);
             self.line_x += space_w;
             if let Some(last) = self.line.last_mut() {
@@ -4650,13 +5036,18 @@ impl<'a> Layouter<'a> {
         let size = st.size;
         let [mt, _mr, mb, ml] = box_sides(c, "margin", self.avail_w, size);
         let bd = self.backdrop;
+        let dm = self.deco_mask(node);
         let bg = self.bg_of(node, c, Some(st.color)).map(|col| over(col, bd));
-        let border = borderfx::borders(c, size, st.color).map(|mut b| {
-            for col in b.color.iter_mut() {
-                *col = over(*col, bg.unwrap_or(bd));
-            }
-            b
-        });
+        let border = if dm & DM_BORDER != 0 {
+            borderfx::borders(c, size, st.color).map(|mut b| {
+                for col in b.color.iter_mut() {
+                    *col = over(*col, bg.unwrap_or(bd));
+                }
+                b
+            })
+        } else {
+            None
+        };
         st.inline_bg = None;
         if let Some(b) = bg {
             if let Some(col) = c
@@ -4819,12 +5210,24 @@ impl<'a> Layouter<'a> {
             }
         }
 
-        let shadows = borderfx::parse_shadows(c, size, bd, st.color);
-        let outline = borderfx::outline(c, size, bd, st.color);
-        let clip = borderfx::clips_overflow(c);
-        let radii = borderfx::radius_spec(c);
+        let shadows = if dm & DM_SHADOW != 0 {
+            borderfx::parse_shadows(c, size, bd, st.color)
+        } else {
+            Vec::new()
+        };
+        let outline = if dm & DM_OUTLINE != 0 {
+            borderfx::outline(c, size, bd, st.color)
+        } else {
+            None
+        };
+        let clip = dm & DM_CLIP != 0 && borderfx::clips_overflow(c);
+        let radii = if dm & DM_RADIUS != 0 {
+            borderfx::radius_spec(c)
+        } else {
+            RadiusSpec::default()
+        };
         let tpad = box_sides(c, "padding", self.avail_w, size).map(|v| v.max(0.0));
-        let tbgl = if self.canvas_bg_node == Some(node) {
+        let tbgl = if dm & DM_BGIMG == 0 || self.canvas_bg_node == Some(node) {
             None
         } else {
             bgimg::parse_box(
@@ -4983,11 +5386,15 @@ impl<'a> Layouter<'a> {
                         .max(0.0),
                     _ => 0.0,
                 };
-                for it in &ci.items {
-                    self.items.push(offset_item(it.clone(), cx, row_y + dy));
+                // the cell's captured emission moves into the outer stream —
+                // it isn't reused after this pass, so no clone
+                let items = std::mem::take(&mut grid.infos[ti].items);
+                let hits = std::mem::take(&mut grid.infos[ti].hits);
+                for it in items {
+                    self.items.push(offset_item(it, cx, row_y + dy));
                 }
-                for h in &ci.hits {
-                    self.push_hit(xform::off_hit(*h, cx, row_y + dy));
+                for h in hits {
+                    self.push_hit(xform::off_hit(h, cx, row_y + dy));
                 }
             }
             row_y += row_h[r] + sp_y;
@@ -5191,14 +5598,18 @@ impl<'a> Layouter<'a> {
                     pad = [cp.max(0.0); 4];
                 }
             }
-            let cborder = borderfx::borders(&cs, cst.size, cst.color)
-                .or(attr_border)
-                .map(|mut b| {
-                    for col in b.color.iter_mut() {
-                        *col = over(*col, bg.unwrap_or(bd));
-                    }
-                    b
-                });
+            let cborder = if self.deco_mask(tc.node) & DM_BORDER != 0 {
+                borderfx::borders(&cs, cst.size, cst.color)
+            } else {
+                None
+            }
+            .or(attr_border)
+            .map(|mut b| {
+                for col in b.color.iter_mut() {
+                    *col = over(*col, bg.unwrap_or(bd));
+                }
+                b
+            });
             let [_, cbw_r, _, cbw_l] = cborder.map(|b| b.w).unwrap_or([0.0; 4]);
             let cbw_h = cbw_l + cbw_r;
             let cbg = cs
@@ -5933,21 +6344,38 @@ impl<'a> Layouter<'a> {
             let m = box_sides(&cc, "margin", avail, cst.size);
             let p = box_sides(&cc, "padding", avail, cst.size).map(|v| v.max(0.0));
             let bd = self.backdrop;
+            let dm = self.deco_mask(ch);
             let bb = border_box(&cc);
             let bg = self
                 .bg_of(ch, &cc, Some(cst.color))
                 .map(|col| over(col, bd));
-            let border = borderfx::borders(&cc, cst.size, cst.color).map(|mut b| {
-                for col in b.color.iter_mut() {
-                    *col = over(*col, bg.unwrap_or(bd));
-                }
-                b
-            });
+            let border = if dm & DM_BORDER != 0 {
+                borderfx::borders(&cc, cst.size, cst.color).map(|mut b| {
+                    for col in b.color.iter_mut() {
+                        *col = over(*col, bg.unwrap_or(bd));
+                    }
+                    b
+                })
+            } else {
+                None
+            };
             let bw = border.map(|b| b.w).unwrap_or([0.0; 4]);
-            let radius = borderfx::radius_spec(&cc);
-            let shadows = borderfx::parse_shadows(&cc, cst.size, bd, cst.color);
-            let outline = borderfx::outline(&cc, cst.size, bd, cst.color);
-            let clip = borderfx::clips_overflow(&cc);
+            let radius = if dm & DM_RADIUS != 0 {
+                borderfx::radius_spec(&cc)
+            } else {
+                RadiusSpec::default()
+            };
+            let shadows = if dm & DM_SHADOW != 0 {
+                borderfx::parse_shadows(&cc, cst.size, bd, cst.color)
+            } else {
+                Vec::new()
+            };
+            let outline = if dm & DM_OUTLINE != 0 {
+                borderfx::outline(&cc, cst.size, bd, cst.color)
+            } else {
+                None
+            };
+            let clip = dm & DM_CLIP != 0 && borderfx::clips_overflow(&cc);
             let w_prop = dim(&cc, "width", avail, cst.size).map(|w| {
                 let mut w = w;
                 if let Some(mx) = cc
@@ -6237,7 +6665,7 @@ impl<'a> Layouter<'a> {
             }
             // %-height descendants resolve against the item's definite
             // content height (`height`/`size`, or aspect-ratio from width)
-            let saved_ph = self.pct_h;
+            let (saved_ph, saved_oh) = (self.pct_h, self.own_h);
             self.pct_h = it
                 .h_prop
                 .or_else(|| {
@@ -6250,6 +6678,15 @@ impl<'a> Layouter<'a> {
                     })
                 })
                 .or(saved_ph);
+            self.own_h = it.h_prop.or_else(|| {
+                it.ratio.map(|r| {
+                    if it.bb {
+                        box_w / r - it.p[0] - it.p[2] - it.bw[0] - it.bw[2]
+                    } else {
+                        content_w / r
+                    }
+                })
+            });
             let (laid, bottom, nhits) = self.nest(
                 it.id,
                 &it.st,
@@ -6260,6 +6697,7 @@ impl<'a> Layouter<'a> {
             );
             self.backdrop = saved_bd;
             self.pct_h = saved_ph;
+            self.own_h = saved_oh;
             it.laid = laid;
             it.hits = nhits;
             let content_h = bottom + it.p[2] + it.bw[2]; // border-box height
@@ -6505,7 +6943,11 @@ impl<'a> Layouter<'a> {
                 };
             // translate/transform + position:relative shift the painted
             // box + its hit rects; a matrix transform wraps the emitted span
-            let gspec = xform::spec(&it.cc, it.st.size);
+            let gspec = if self.deco_mask(it.id) & DM_XFORM != 0 {
+                xform::spec(&it.cc, it.st.size)
+            } else {
+                None
+            };
             let wrapping = gspec.as_ref().is_some_and(|s| s.wrap);
             let gi0 = self.items.len();
             let (i0, h0) = (gi0, self.hits.len());
@@ -6595,7 +7037,14 @@ impl<'a> Layouter<'a> {
             }
             self.hits.extend(hv);
         }
-        stacking::reorder(&mut self.items, &mut self.hits, &gsegs);
+        stacking::reorder(
+            &mut self.items,
+            &mut self.hits,
+            &gsegs,
+            &mut self.order_scratch,
+            &mut self.seg_items,
+            &mut self.seg_hits,
+        );
 
         // the container consumes max(content, declared height) in flow
         self.y = y0 + tracks_h.max(cont_h.unwrap_or(0.0));
@@ -6613,8 +7062,13 @@ impl<'a> Layouter<'a> {
     ) -> (Vec<DisplayItem>, f32, Vec<Hit>) {
         let saved_items = std::mem::take(&mut self.items);
         let saved_hits = std::mem::take(&mut self.hits);
-        let saved_line = std::mem::take(&mut self.line);
-        let saved_floats = std::mem::take(&mut self.floats);
+        // detached emission writes into the warm spare buffers; on restore
+        // they come back so the next nest doesn't reallocate
+        let saved_line =
+            std::mem::replace(&mut self.line, std::mem::take(&mut self.spare_line));
+        let saved_floats =
+            std::mem::replace(&mut self.floats, std::mem::take(&mut self.spare_floats));
+        self.floats_gen += 1;
         // box interiors aren't part of an enclosing inline's transform run
         let saved_xf = self.cur_xf.take();
         let saved = (
@@ -6737,11 +7191,12 @@ impl<'a> Layouter<'a> {
         self.rtl = saved.7;
         self.clamp_left = saved.8;
         self.clamping = saved.9;
-        self.line = saved_line;
+        self.spare_line = std::mem::replace(&mut self.line, saved_line);
         self.line_x = saved_lx;
         self.pending_space = saved_ps;
         self.pending_gap = saved_pg;
-        self.floats = saved_floats;
+        self.spare_floats = std::mem::replace(&mut self.floats, saved_floats);
+        self.floats_gen += 1;
         self.cur_xf = saved_xf;
         (items, bottom, hits)
     }
@@ -6803,20 +7258,22 @@ impl<'a> Layouter<'a> {
                 ));
             }
         }
-        if let Some(items) = w.items {
+        if let Some(payload) = w.payload {
             // inline-block vertical-align: default bottom-on-baseline;
             // line-box keywords anchor to the line box edges
             let dy = match w.va {
                 Va::Top => line_top,
                 Va::Middle => line_top + line_h / 2.0 - w.box_h / 2.0,
                 Va::Bottom => line_top + line_h - w.box_h,
-                Va::Shift(f) => baseline - w.box_h - f * w.size,
-                Va::Baseline => baseline - w.box_h,
+                Va::Shift(f) => baseline - w.ascent - f * w.size,
+                // `ascent` is the box's own baseline when it has one
+                // (control text / first line), else the bottom margin edge
+                Va::Baseline => baseline - w.ascent,
             };
-            for it in items {
+            for it in payload.items {
                 self.items.push(offset_item(it, x, dy));
             }
-            for h in w.hits {
+            for h in payload.hits {
                 let mut h = xform::off_hit(h, x, dy);
                 if let Some(m) = m {
                     h.5 = m.mul(&h.5);
@@ -6868,6 +7325,23 @@ impl<'a> Layouter<'a> {
                     self.items.push(DisplayItem::PopEffect);
                 }
             }
+            if let Some(ci) = self.pstate.caret {
+                // text caret inside a focused <input>/<textarea> value —
+                // the control emits its value as one word, so the caret
+                // offset is a char prefix measure of that word
+                if w.owner == self.pstate.focused {
+                    let prefix: String = w.text.chars().take(ci).collect();
+                    let cw = self.measure(w.font, &prefix, w.size).unwrap_or(0.0)
+                        + w.ls * prefix.chars().count() as f32;
+                    self.items.push(DisplayItem::FillRect {
+                        x: x + cw,
+                        y: baseline - w.ascent,
+                        w: (w.size / 14.0).max(1.0),
+                        h: w.ascent + w.size * 0.3,
+                        color: w.color,
+                    });
+                }
+            }
             self.items.push(DisplayItem::Text {
                 x,
                 baseline,
@@ -6877,7 +7351,7 @@ impl<'a> Layouter<'a> {
                 color: w.color,
                 deco: w.deco,
                 ls: w.ls,
-                href: w.href,
+                href: w.href.map(|h| h.to_string()),
                 sel: w.sel,
             });
         }
@@ -6902,21 +7376,105 @@ impl<'a> Layouter<'a> {
         }
     }
 
+    /// Intrinsic-measurement key: `shrink_width`/`min_content_w`/
+    /// `max_content_width` read only `st`'s measure-relevant fields (font
+    /// selection + size) plus `avail_w`/`pct_h` for %-length resolution —
+    /// everything else in `Style` (colors, deco, alignment, spacing)
+    /// cannot change the result, so it stays out of the key.
+    fn intr_key(&self, node: NodeId, st: &Style) -> IntrKey {
+        let flags = (st.italic as u16)
+            | ((st.small_caps as u16) << 1)
+            | ((st.transform as u16) << 2)
+            | ((st.break_word as u16) << 4)
+            | ((st.nowrap as u16) << 5)
+            | ((st.hyphens_none as u16) << 6)
+            | ((st.pre as u16) << 7)
+            | ((st.pre_line as u16) << 8)
+            | ((st.rtl as u16) << 9);
+        (
+            node,
+            st.size.to_bits(),
+            st.weight,
+            st.stretch,
+            flags,
+            Rc::clone(&st.family),
+            self.avail_w.to_bits(),
+            self.pct_h.map_or(u32::MAX, |h| h.to_bits()),
+        )
+    }
+
+    /// `deco_mask` memoized per node: the box paths probe ~30 deco
+    /// properties unconditionally — one scan of the computed props tells
+    /// which parser groups are even relevant.
+    fn deco_mask(&mut self, node: NodeId) -> u32 {
+        if let Some(&m) = self.deco_memo.get(&node) {
+            return m;
+        }
+        let c = self.style(node);
+        let mut m = 0u32;
+        for k in c.keys() {
+            let k = k.as_str();
+            if let Some(rest) = k.strip_prefix("border") {
+                if !matches!(rest, "-collapse" | "-spacing") {
+                    m |= DM_BORDER;
+                }
+                if rest.contains("radius") {
+                    m |= DM_RADIUS;
+                }
+            } else {
+                match k {
+                    "box-shadow" => m |= DM_SHADOW,
+                    "transform" | "translate" | "rotate" | "scale" => m |= DM_XFORM,
+                    "filter" | "clip-path" | "mix-blend-mode" | "backdrop-filter"
+                    | "mask-image" | "-webkit-mask-image" => m |= DM_FX,
+                    "counter-reset" | "counter-set" | "counter-increment" => {
+                        m |= DM_COUNTERS
+                    }
+                    _ => {
+                        if k.starts_with("outline") {
+                            m |= DM_OUTLINE;
+                        } else if k.starts_with("overflow") {
+                            m |= DM_CLIP;
+                        } else if k.starts_with("background") {
+                            m |= DM_BGIMG;
+                        }
+                    }
+                }
+            }
+        }
+        self.deco_memo.insert(node, m);
+        m
+    }
+
     /// min-content width approximation: the longest word inside `node`
     /// measured in the current font (or a default for textless content).
     /// Explicit `width`, nested flex rows, and fixed-track grids contribute
     /// their own geometry rather than text width.
     fn shrink_width(&mut self, node: NodeId, st: &Style) -> f32 {
+        let key = self.intr_key(node, st);
+        if let Some(&w) = self.shrink_memo.get(&key) {
+            return w;
+        }
+        let w = self.shrink_width_uncached(node, st);
+        self.shrink_memo.insert(key, w);
+        w
+    }
+
+    fn shrink_width_uncached(&mut self, node: NodeId, st: &Style) -> f32 {
         let mut w = 0.0f32;
         let doc = self.doc;
-        if let Some(fi) = self.resolve_font(st) {
-            if let Some(f) = self.fonts.font(fi) {
-                Self::each_text(doc, node, &mut |t| {
-                    for word in t.split_whitespace() {
-                        w = w.max(f.measure(word, st.size));
-                    }
-                });
-            }
+        if self.resolve_font(st).is_some() {
+            Self::each_text(doc, node, &mut |t| {
+                for word in t.split_whitespace() {
+                    // per-word fallback, same as emission — a covering font
+                    // can advance wider than the primary face
+                    let m = self
+                        .resolve_font_covering(word, st)
+                        .and_then(|f| self.measure(f, word, st.size))
+                        .unwrap_or(0.0);
+                    w = w.max(m);
+                }
+            });
         }
         // layout-aware: nested containers out-measure their text
         let c = self.style(node);
@@ -6994,16 +7552,30 @@ impl<'a> Layouter<'a> {
     /// `min-width:auto` floors and min-content/fit-content tracks where
     /// the 4em empty-content default would be wrong.
     fn min_content_w(&mut self, node: NodeId, st: &Style) -> f32 {
+        let key = self.intr_key(node, st);
+        if let Some(&w) = self.minc_memo.get(&key) {
+            return w;
+        }
+        let w = self.min_content_w_uncached(node, st);
+        self.minc_memo.insert(key, w);
+        w
+    }
+
+    fn min_content_w_uncached(&mut self, node: NodeId, st: &Style) -> f32 {
         let mut w = 0.0f32;
         let doc = self.doc;
-        if let Some(fi) = self.resolve_font(st) {
-            if let Some(f) = self.fonts.font(fi) {
-                Self::each_text(doc, node, &mut |t| {
-                    for word in t.split_whitespace() {
-                        w = w.max(f.measure(word, st.size));
-                    }
-                });
-            }
+        if self.resolve_font(st).is_some() {
+            Self::each_text(doc, node, &mut |t| {
+                for word in t.split_whitespace() {
+                    // per-word fallback, same as emission — a covering font
+                    // can advance wider than the primary face
+                    let m = self
+                        .resolve_font_covering(word, st)
+                        .and_then(|f| self.measure(f, word, st.size))
+                        .unwrap_or(0.0);
+                    w = w.max(m);
+                }
+            });
         }
         let c = self.style(node);
         if let Some(ew) = dim_intrinsic(&c, "width", self.avail_w, st.size) {
@@ -7047,6 +7619,16 @@ impl<'a> Layouter<'a> {
     /// items base their size on this — shrink-to-fit min-content would wrap
     /// labels to one word per line.
     fn max_content_width(&mut self, node: NodeId, st: &Style) -> f32 {
+        let key = self.intr_key(node, st);
+        if let Some(&w) = self.maxc_memo.get(&key) {
+            return w;
+        }
+        let w = self.max_content_width_uncached(node, st);
+        self.maxc_memo.insert(key, w);
+        w
+    }
+
+    fn max_content_width_uncached(&mut self, node: NodeId, st: &Style) -> f32 {
         let c = self.style(node);
         if let Some(ew) = dim_intrinsic(&c, "width", self.avail_w, st.size) {
             return if border_box(&c) {
@@ -7062,6 +7644,24 @@ impl<'a> Layouter<'a> {
             Some("flex") | Some("inline-flex")
         ) {
             return self.flex_maxc_width(node, &c, st);
+        }
+        // replaced elements size from their box (the <img> width attribute
+        // etc.) — they have no measurable inline content; `replaced_size`
+        // is enough — building the payload would rasterize every <svg>
+        // the probe touches (table cells measure each twice)
+        if let Some(tag) = self.doc.tag(node) {
+            let w = match tag {
+                "img" | "svg" | "video" | "canvas" | "iframe" | "object" | "embed" => {
+                    self.replaced_size(node, tag, &c, st).map(|(w, _)| w)
+                }
+                "input" | "textarea" | "select" => self
+                    .control_payload(node, tag, &c, st)
+                    .map(|(w, _h, _i, _hits)| w),
+                _ => None,
+            };
+            if let Some(w) = w {
+                return w.max(1.0);
+            }
         }
         let (mut line, mut best) = (0.0f32, 0.0f32);
         self.maxc_inline(node, st, &mut line, &mut best);
@@ -7094,14 +7694,12 @@ impl<'a> Layouter<'a> {
         for &ch in self.doc.children(node) {
             if let NodeKind::Text(t) = self.doc.kind(ch) {
                 if let Some(fi) = self.resolve_font(st) {
-                    if let Some(f) = self.fonts.font(fi) {
-                        let tw =
-                            f.measure(&t.split_whitespace().collect::<Vec<_>>().join(" "), st.size);
-                        if col_dir {
-                            w = w.max(tw);
-                        } else {
-                            w += tw;
-                        }
+                    let joined = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let tw = self.measure(fi, &joined, st.size).unwrap_or(0.0);
+                    if col_dir {
+                        w = w.max(tw);
+                    } else {
+                        w += tw;
                     }
                 }
                 continue;
@@ -7150,15 +7748,20 @@ impl<'a> Layouter<'a> {
             match self.doc.kind(ch) {
                 NodeKind::Text(t) => {
                     if let Some(fi) = self.resolve_font(st) {
-                        if let Some(f) = self.fonts.font(fi) {
-                            for word in t.split_whitespace() {
-                                let sp = if *line > 0.0 {
-                                    f.measure(" ", st.size)
-                                } else {
-                                    0.0
-                                };
-                                *line += sp + f.measure(word, st.size);
-                            }
+                        for word in t.split_whitespace() {
+                            let sp = if *line > 0.0 {
+                                self.space_w(fi, st)
+                            } else {
+                                0.0
+                            };
+                            // per-word fallback, same as emission — a CJK
+                            // word resolves to a covering font which can
+                            // advance wider than the primary face
+                            let m = self
+                                .resolve_font_covering(word, st)
+                                .and_then(|f| self.measure(f, word, st.size))
+                                .unwrap_or(0.0);
+                            *line += sp + m;
                         }
                     }
                 }
@@ -7262,14 +7865,12 @@ impl<'a> Layouter<'a> {
         for &ch in self.doc.children(node) {
             if let NodeKind::Text(t) = self.doc.kind(ch) {
                 if let Some(fi) = self.resolve_font(st) {
-                    if let Some(f) = self.fonts.font(fi) {
-                        let tw =
-                            f.measure(&t.split_whitespace().collect::<Vec<_>>().join(" "), st.size);
-                        if wrap {
-                            w = w.max(tw);
-                        } else {
-                            w += tw;
-                        }
+                    let joined = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let tw = self.measure(fi, &joined, st.size).unwrap_or(0.0);
+                    if wrap {
+                        w = w.max(tw);
+                    } else {
+                        w += tw;
                     }
                 }
                 continue;
@@ -7353,8 +7954,7 @@ impl<'a> Layouter<'a> {
             line_h: 0.0,
             href: None,
             bg: None,
-            items: None,
-            hits: Vec::new(),
+            payload: None,
             box_h: 0.0,
             dx: 0.0,
             dy: 0.0,
@@ -7398,8 +7998,7 @@ impl<'a> Layouter<'a> {
             line_h: h + mb,
             href: None,
             bg: None,
-            items: Some(items),
-            hits,
+            payload: Some(Box::new(WordPayload { items, hits })),
             box_h: h,
             dx: rel.0,
             dy: rel.1,
@@ -7470,16 +8069,243 @@ impl<'a> Layouter<'a> {
         n
     }
 
-    /// Replaced-element payload: box size + items in box-local coords +
-    /// hit rects. Shared by the block-flow path (own row) and the flex-item
-    /// path (a word on the line, so justify/align still apply).
-    fn replaced_payload(
+    /// Form-control payload — like `replaced_payload` but the box
+    /// contains the control's value/placeholder text (plus the editing
+    /// caret when focused). The whole box is one hit rect so even an
+    /// empty input is clickable.
+    fn control_payload(
         &mut self,
         node: NodeId,
         tag: &str,
         c: &Props,
         st: &Style,
     ) -> Option<(f32, f32, Vec<DisplayItem>, Vec<Hit>)> {
+        let itype = self
+            .doc
+            .attr(node, "type")
+            .map(|t| t.to_ascii_lowercase())
+            .unwrap_or_else(|| "text".to_string());
+        let bd = self.backdrop;
+        if tag == "input" && itype == "hidden" {
+            return None; // belt & braces — the UA sheet display:nones it
+        }
+        let font = self.resolve_font(st)?;
+        let (ch_w, ascent, line_h) = {
+            let w = self.measure(font, "0", st.size)?;
+            let f = self.fonts.font(font)?;
+            let upem = f.units_per_em() as f32;
+            (w, f.ascender as f32 * st.size / upem, f.line_height(st.size))
+        };
+        let border = borderfx::borders(c, st.size, st.color);
+        let bw = border.map(|b| b.w).unwrap_or([0.0; 4]);
+        let [pt, pr, pb, pl] = box_sides(c, "padding", self.avail_w, st.size);
+
+        // ---- text content + horizontal space it needs ----
+        let (text, ph) = self.control_text(node, tag, &itype, st);
+        let text_w = self.measure(font, &text, st.size)?;
+        let checky = tag == "input" && matches!(itype.as_str(), "checkbox" | "radio");
+        let buttonish = tag == "input" && matches!(itype.as_str(), "submit" | "button" | "reset");
+
+        // ---- box size: CSS wins, then sizing attrs, then text/default ----
+        // border-box lengths already include padding+border → strip them
+        // before the generic `content + padding + border` assembly below
+        let bb = border_box(c);
+        let hrel = self.pct_h.unwrap_or(self.avail_w);
+        let content_w = dim(c, "width", self.avail_w, st.size)
+            .map(|w| {
+                if bb {
+                    w - bw[1] - bw[3] - pl - pr
+                } else {
+                    w
+                }
+            })
+            .unwrap_or_else(|| {
+                if checky {
+                    13.0 - bw[1] - bw[3] - pl - pr
+                } else if buttonish {
+                    text_w // shrink-wrap to the label
+                } else {
+                    let cols = self
+                        .doc
+                        .attr(node, "size")
+                        .or_else(|| self.doc.attr(node, "cols"))
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                        .unwrap_or(20.0);
+                    cols * ch_w
+                }
+            });
+        let content_h = if checky {
+            content_w // square checkboxes
+        } else {
+            hdim_pct(c, "height", hrel, st.size, self.pct_h)
+                .map(|h| {
+                    if bb {
+                        h - bw[0] - bw[2] - pt - pb
+                    } else {
+                        h
+                    }
+                })
+                .unwrap_or_else(|| {
+                    let rows = if tag == "textarea" {
+                        self.doc
+                            .attr(node, "rows")
+                            .and_then(|v| v.trim().parse::<f32>().ok())
+                            .unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
+                    rows * line_h
+                })
+            };
+        let w = (bw[1] + bw[3] + pl + pr + content_w).max(1.0);
+        let h = (bw[0] + bw[2] + pt + pb + content_h).max(1.0);
+
+        // ---- items in box-local coords ----
+        let radii = borderfx::radius_spec(c).resolve(w, h, st.size);
+        let mut items = Vec::new();
+        let mut clip_items: Vec<DisplayItem> = Vec::new();
+        if let Some(bg) = self.bg_of(node, c, Some(st.color)) {
+            items.push(borderfx::bg_item(0.0, 0.0, w, h, bg, &radii));
+        }
+        if let Some(b) = &border {
+            borderfx::emit_borders(&mut items, 0.0, 0.0, w, h, b);
+        }
+        if let Some(o) = borderfx::outline(c, st.size, bd, st.color) {
+            borderfx::emit_outline(&mut items, 0.0, 0.0, w, h, &o);
+        }
+        if checky && self.doc.attr(node, "checked").is_some() {
+            // checkmark approximation: filled inner box
+            let m = 3.0 + (bw[0] + bw[3]) * 0.5;
+            items.push(DisplayItem::FillRect {
+                x: m,
+                y: m,
+                w: (w - 2.0 * m).max(1.0),
+                h: (h - 2.0 * m).max(1.0),
+                color: st.color,
+            });
+        }
+        if !text.is_empty() && !checky {
+            let tx = bw[3] + pl;
+            let avail_tw = (w - tx - pr - bw[1]).max(1.0);
+            let baseline = ((h - line_h) * 0.5 + ascent).max(ascent);
+            // clip value text to the padding box — long input values
+            // must not spill over the control's right edge
+            clip_items.push(DisplayItem::PushClip {
+                x: tx,
+                y: bw[0],
+                w: avail_tw,
+                h: h - bw[0] - bw[2],
+                radii: [[0.0; 2]; 4],
+            });
+            let color = if ph {
+                let pp = if self.pseudo_possible(tag, css::PseudoElem::Placeholder) {
+                    self.ctx.computed_pseudo(node, css::PseudoElem::Placeholder)
+                } else {
+                    Props::default()
+                };
+                pp.get("color")
+                    .and_then(|v| parse_color_ctx(v, Some(st.color)))
+                    .unwrap_or(st.color)
+            } else {
+                st.color
+            };
+            clip_items.push(DisplayItem::Text {
+                x: tx,
+                baseline,
+                text: text.clone(),
+                font,
+                size: st.size,
+                color,
+                deco: TextDeco::NONE,
+                sel: false,
+                ls: st.ls,
+                href: None,
+            });
+            // editing caret at the focus char index
+            if self.pstate.focused == Some(node) {
+                if let Some(ci) = self.pstate.caret {
+                    let prefix: String = text.chars().take(ci).collect();
+                    let cw = self.measure(font, &prefix, st.size)? + st.ls * ci as f32;
+                    clip_items.push(DisplayItem::FillRect {
+                        x: tx + cw.min(avail_tw - 1.0),
+                        y: baseline - ascent,
+                        w: (st.size / 14.0).max(1.0),
+                        h: ascent + st.size * 0.25,
+                        color,
+                    });
+                }
+            }
+            clip_items.push(DisplayItem::PopClip);
+        }
+        items.extend(clip_items);
+        Some((
+            w,
+            h,
+            items,
+            vec![(0.0, 0.0, w, h, node, xform::Mat::IDENTITY)],
+        ))
+    }
+
+    /// The text a control displays: `value`, else `placeholder` (flagged
+    /// for ::placeholder color), a <select>'s chosen option, a
+    /// <textarea>'s child text, or a submit button's default caption.
+    fn control_text(
+        &mut self,
+        node: NodeId,
+        tag: &str,
+        itype: &str,
+        st: &Style,
+    ) -> (String, bool) {
+        let _ = st;
+        match self.doc.attr(node, "value") {
+            Some(v) if !v.is_empty() => (v.to_string(), false),
+            _ => {
+                if let Some(p) = self.doc.attr(node, "placeholder") {
+                    return (p.to_string(), true);
+                }
+                match tag {
+                    "select" => {
+                        let opts: Vec<NodeId> = self
+                            .doc
+                            .descendants(node)
+                            .filter(|&n| self.doc.tag(n) == Some("option"))
+                            .collect();
+                        let chosen = opts
+                            .iter()
+                            .find(|&&n| self.doc.attr(n, "selected").is_some())
+                            .or(opts.first());
+                        match chosen {
+                            Some(&o) => (
+                                self.doc
+                                    .attr(o, "value")
+                                    .map(String::from)
+                                    .unwrap_or_else(|| {
+                                        self.doc.text_content(o).trim().to_string()
+                                    }),
+                                false,
+                            ),
+                            None => (String::new(), false),
+                        }
+                    }
+                    "textarea" => (self.doc.text_content(node), false),
+                    "input" if itype == "submit" => ("Submit".to_string(), false),
+                    "input" if itype == "reset" => ("Reset".to_string(), false),
+                    _ => (String::new(), false),
+                }
+            }
+        }
+    }
+
+    /// Box size of a replaced element — the payload-free half of
+    /// `replaced_payload`. Intrinsic-width probes only need the geometry,
+    /// so they skip item building and (especially) `<svg>` rasterization.
+    fn replaced_size(
+        &mut self,
+        node: NodeId,
+        tag: &str,
+        c: &Props,
+        st: &Style,
+    ) -> Option<(f32, f32)> {
         // % heights resolve against the definite containing height
         let hrel = self.pct_h.unwrap_or(self.avail_w);
         match tag {
@@ -7501,38 +8327,14 @@ impl<'a> Layouter<'a> {
                     })
                     .or_else(|| aspect_ratio(c).map(|r| w / r))
                     .unwrap_or(150.0f32);
-                let items = self
-                    .doc
-                    .attr(node, "poster")
-                    .map(|src| vec![self.fit_image_item(c, st.size, w, h, src)])
-                    .unwrap_or_default();
-                Some((
-                    w,
-                    h,
-                    items,
-                    vec![(0.0, 0.0, w, h, node, xform::Mat::IDENTITY)],
-                ))
+                Some((w, h))
             }
             "svg" => {
                 let w = dim(c, "width", self.avail_w, st.size)
                     .or_else(|| hdim_pct(c, "height", hrel, st.size, self.pct_h))
                     .unwrap_or(24.0);
                 let h = hdim_pct(c, "height", hrel, st.size, self.pct_h).unwrap_or(w);
-                let color = st.color;
-                let pixels =
-                    svg::render(self.doc, node, w.max(1.0) as u32, h.max(1.0) as u32, color);
-                Some((
-                    w,
-                    h,
-                    vec![DisplayItem::Raster {
-                        x: 0.0,
-                        y: 0.0,
-                        w,
-                        h,
-                        pixels,
-                    }],
-                    vec![(0.0, 0.0, w, h, node, xform::Mat::IDENTITY)],
-                ))
+                Some((w, h))
             }
             "img" => {
                 // CSS width/height beat the attributes (inline style and
@@ -7558,19 +8360,57 @@ impl<'a> Layouter<'a> {
                     })
                     .or_else(|| aspect_ratio(c).map(|r| w / r))
                     .unwrap_or(w.min(48.0).max(16.0));
-                let items = self
-                    .img_src(node, w)
-                    .map(|src| vec![self.fit_image_item(c, st.size, w, h, &src)])
-                    .unwrap_or_default();
-                Some((
-                    w,
-                    h,
-                    items,
-                    vec![(0.0, 0.0, w, h, node, xform::Mat::IDENTITY)],
-                ))
+                Some((w, h))
             }
             _ => None,
         }
+    }
+
+    /// Replaced-element payload: box size + items in box-local coords +
+    /// hit rects. Shared by the block-flow path (own row) and the flex-item
+    /// path (a word on the line, so justify/align still apply).
+    fn replaced_payload(
+        &mut self,
+        node: NodeId,
+        tag: &str,
+        c: &Props,
+        st: &Style,
+    ) -> Option<(f32, f32, Vec<DisplayItem>, Vec<Hit>)> {
+        let (w, h) = self.replaced_size(node, tag, c, st)?;
+        let items = match tag {
+            "video" => self
+                .doc
+                .attr(node, "poster")
+                .map(|src| vec![self.fit_image_item(c, st.size, w, h, src)])
+                .unwrap_or_default(),
+            "svg" => {
+                let pixels = svg::render(
+                    self.doc,
+                    node,
+                    w.max(1.0) as u32,
+                    h.max(1.0) as u32,
+                    st.color,
+                );
+                vec![DisplayItem::Raster {
+                    x: 0.0,
+                    y: 0.0,
+                    w,
+                    h,
+                    pixels,
+                }]
+            }
+            "img" => self
+                .img_src(node, w)
+                .map(|src| vec![self.fit_image_item(c, st.size, w, h, &src)])
+                .unwrap_or_default(),
+            _ => return None,
+        };
+        Some((
+            w,
+            h,
+            items,
+            vec![(0.0, 0.0, w, h, node, xform::Mat::IDENTITY)],
+        ))
     }
 
     /// `srcset` candidate picker: `w` descriptors resolve against the
@@ -7690,7 +8530,7 @@ impl<'a> Layouter<'a> {
 
     fn inline(&mut self, node: NodeId, tag: &str, c: &Props, mut st: Style) {
         if tag == "a" {
-            st.href = self.doc.attr(node, "href").map(String::from);
+            st.href = self.doc.attr(node, "href").map(Rc::from);
         }
         // position:relative on an inline box shifts its painted runs only —
         // the offset rides each emitted word; flow geometry is unaffected
@@ -7713,7 +8553,11 @@ impl<'a> Layouter<'a> {
                     // svg|img are always `direct` in walk — a wrapping
                     // transform wraps the span there; here just gate the
                     // translate fast path
-                    let sp = xform::spec(c, st.size);
+                    let sp = if self.deco_mask(node) & DM_XFORM != 0 {
+                        xform::spec(c, st.size)
+                    } else {
+                        None
+                    };
                     let (tx, ty) = if sp.as_ref().is_some_and(|s| s.wrap) {
                         (0.0, 0.0)
                     } else {
@@ -7732,22 +8576,22 @@ impl<'a> Layouter<'a> {
                 }
             }
             "input" | "textarea" | "select" => {
-                // Childless controls: show their value/placeholder, else a
-                // generic control label. ::placeholder styles the hint.
-                let (label, ph) = match self.doc.attr(node, "value") {
-                    Some(v) => (v, false),
-                    None => match self.doc.attr(node, "placeholder") {
-                        Some(p) => (p, true),
-                        None => ("[control]", false),
-                    },
-                };
-                if ph {
-                    let pp = self.ctx.computed_pseudo(node, css::PseudoElem::Placeholder);
-                    let mut pst = st.clone();
-                    self.apply_computed(&pp, &mut pst);
-                    self.word(label, &pst);
-                } else {
-                    self.word(label, &st);
+                // Replaced-style box: own border/bg/padding, value text
+                // inside, hit rect over the whole box so empty controls
+                // are still clickable/focusable.
+                if let Some((w, h, items, hits)) = self.control_payload(node, tag, c, &st) {
+                    let lh = self.eff_line_h(&st);
+                    let ascent = (h - lh * 0.5).max(0.0).min(h);
+                    self.push_box(
+                        w,
+                        h,
+                        items,
+                        hits,
+                        0.0,
+                        self.rel_offset(c, st.size),
+                        ascent,
+                        Some(node),
+                    );
                 }
             }
             _ => {
@@ -7774,7 +8618,14 @@ impl<'a> Layouter<'a> {
                 if i > 0 {
                     self.flush_line();
                 }
-                let seg = seg.replace('\t', &" ".repeat(st.tab.round() as usize));
+                // \t expands to tab-size spaces — only alloc on hit
+                let owned;
+                let seg = if seg.contains('\t') {
+                    owned = seg.replace('\t', &" ".repeat(st.tab.round() as usize));
+                    owned.as_str()
+                } else {
+                    seg
+                };
                 let mut first = i == 0;
                 for word in seg.split(' ') {
                     if word.is_empty() {
@@ -7826,11 +8677,80 @@ impl<'a> Layouter<'a> {
             self.word_with_space(word, st);
             first = false;
         }
-        self.pending_space = text.chars().last().is_some_and(|c| c.is_whitespace());
+        self.pending_space = text
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_whitespace());
     }
 
     fn resolve_font(&mut self, st: &Style) -> Option<usize> {
         self.resolve_font_ch(st, None)
+    }
+
+    /// `f.measure(text, px)` memoized per (font, size, text) — the same
+    /// words are re-measured by intrinsic-width probes (shrink/flex/
+    /// table cells) and wrap retries within a pass.
+    fn measure(&mut self, font: usize, text: &str, size: f32) -> Option<f32> {
+        let key = (font as u32, size.to_bits());
+        // words ≤7 bytes (the common case — "the", "of", "and"…) pack into
+        // a u64 with their length: one flat probe, no nested-map walk and
+        // no Box<str> key alloc on insert
+        if !text.is_empty() && text.len() <= 7 {
+            let mut b = [0u8; 8];
+            b[..text.len()].copy_from_slice(text.as_bytes());
+            b[7] = text.len() as u8;
+            let k = (key.0, key.1, u64::from_le_bytes(b));
+            if let Some(&w) = self.measure_short.get(&k) {
+                return Some(w);
+            }
+            let w = self.fonts.font(font)?.measure(text, size);
+            self.measure_short.insert(k, w);
+            return Some(w);
+        }
+        if let Some(&w) = self.measure_memo.get(&key).and_then(|m| m.get(text)) {
+            return Some(w);
+        }
+        let w = self.fonts.font(font)?.measure(text, size);
+        self.measure_memo
+            .entry(key)
+            .or_default()
+            .insert(text.into(), w);
+        Some(w)
+    }
+
+    /// (advance, ascent, line-height) of `text` in `font` at `size` —
+    /// the word-metrics triple every text-run push needs; the advance
+    /// leg runs through the measure memo.
+    fn measure_run(
+        &mut self,
+        font: usize,
+        text: &str,
+        size: f32,
+        line_h: Option<LineH>,
+    ) -> Option<(f32, f32, f32)> {
+        let w = self.measure(font, text, size)?;
+        // (ascent, default line-height) memoized per (font, size) — the
+        // font hit is the same whatever line-height override applies,
+        // so one map probe serves every word
+        let key = (font as u32, size.to_bits());
+        let (a, flh) = match self.run_memo.get(&key) {
+            Some(&v) => v,
+            None => {
+                let f = self.fonts.font(font)?;
+                let v = (f.ascent(size), f.line_height(size));
+                self.run_memo.insert(key, v);
+                v
+            }
+        };
+        Some((
+            w,
+            a,
+            match line_h {
+                Some(LineH::Mul(m)) => size * m,
+                Some(LineH::Px(p)) => p,
+                None => flh,
+            },
+        ))
     }
 
     /// Font resolution with the run's first char for unicode-range gating
@@ -7838,39 +8758,92 @@ impl<'a> Layouter<'a> {
     /// `ch` None resolves purely on family/weight/stretch/style.
     fn resolve_font_ch(&mut self, st: &Style, ch: Option<char>) -> Option<usize> {
         // FontCache::resolve scans every installed face; memoize per
-        // (family, weight, italic, first char). u32::MAX = resolved-none.
-        let key = (
-            st.family.clone(),
-            st.weight,
-            st.italic,
-            ch.map_or(0, |c| c as u32),
-        );
-        if let Some(&v) = self.font_memo.get(&key) {
-            return if v == u32::MAX {
-                None
-            } else {
-                Some(v as usize)
-            };
+        // (family, weight, stretch, italic, first char). u32::MAX =
+        // resolved-none. last_font is a single-entry cache in front of
+        // the map — words in a run share the family's Rc allocation.
+        let ck = (st.weight, st.stretch, st.italic, ch.map_or(0, |c| c as u32));
+        if let Some((f, k, v)) = &self.last_font {
+            if *k == ck && Rc::ptr_eq(f, &st.family) {
+                return if *v == u32::MAX {
+                    None
+                } else {
+                    Some(*v as usize)
+                };
+            }
         }
-        let r = self
-            .fonts
-            .resolve_face(&st.family, st.weight, st.stretch, st.italic, ch)
-            .or_else(|| self.fonts.resolve("liberation sans", false, false));
-        self.font_memo
-            .insert(key, r.map(|i| i as u32).unwrap_or(u32::MAX));
-        r
+        let hit = self
+            .font_memo
+            .get(&*st.family)
+            .and_then(|m| m.get(&ck))
+            .copied();
+        let v = if let Some(v) = hit {
+            v
+        } else {
+            let r = self
+                .fonts
+                .resolve_face(&st.family, st.weight, st.stretch, st.italic, ch)
+                .or_else(|| self.fonts.resolve("liberation sans", false, false));
+            let v = r.map(|i| i as u32).unwrap_or(u32::MAX);
+            self.font_memo
+                .entry(Rc::clone(&st.family))
+                .or_default()
+                .insert(ck, v);
+            self.last_font = Some((Rc::clone(&st.family), ck, v));
+            return r;
+        };
+        self.last_font = Some((Rc::clone(&st.family), ck, v));
+        if v == u32::MAX {
+            None
+        } else {
+            Some(v as usize)
+        }
+    }
+
+    /// `word` is fully covered by font `idx` — per-char coverage memoized
+    /// (the cmap lookup per char is the expensive part). All-ASCII words
+    /// test against a 128-bit mask per font: one map hit per word.
+    fn font_covers(&mut self, idx: usize, w: &str) -> bool {
+        if w.is_ascii() {
+            let mask = match self.last_cov {
+                Some((i, m)) if i == idx as u32 => m,
+                _ => {
+                    let m = match self.ascii_cov.get(&(idx as u32)) {
+                        Some(&m) => m,
+                        None => {
+                            let mut m = 0u128;
+                            if let Some(f) = self.fonts.font(idx) {
+                                for i in 0..128u32 {
+                                    // 0..128 is always a valid char
+                                    if f.glyph_id(char::from_u32(i).unwrap()) != 0 {
+                                        m |= 1u128 << i;
+                                    }
+                                }
+                            }
+                            self.ascii_cov.insert(idx as u32, m);
+                            m
+                        }
+                    };
+                    self.last_cov = Some((idx as u32, m));
+                    m
+                }
+            };
+            return w.bytes().all(|b| mask & (1u128 << b) != 0);
+        }
+        w.chars().all(|c| {
+            if let Some(&b) = self.glyph_cov.get(&(idx as u32, c as u32)) {
+                return b;
+            }
+            let b = self.fonts.font(idx).is_some_and(|f| f.glyph_id(c) != 0);
+            self.glyph_cov.insert((idx as u32, c as u32), b);
+            b
+        })
     }
 
     /// Like resolve_font, but for `word` containing chars the primary font
     /// lacks — fall back through symbol-capable families.
     fn resolve_font_covering(&mut self, word: &str, st: &Style) -> Option<usize> {
-        let covers = |fonts: &mut FontCache, idx: usize, w: &str| {
-            fonts
-                .font(idx)
-                .is_some_and(|f| w.chars().all(|c| f.glyph_id(c) != 0))
-        };
         let primary = self.resolve_font_ch(st, word.chars().next())?;
-        if covers(&mut self.fonts, primary, word) {
+        if self.font_covers(primary, word) {
             return Some(primary);
         }
         const ALT: &[&str] = &[
@@ -7878,12 +8851,34 @@ impl<'a> Layouter<'a> {
             "noto sans symbols",
             "noto sans math",
             "symbola",
+            // script coverage — a word the primary font can't draw gets a
+            // script-matched face (substring match, so "noto sans cjk jp"
+            // also satisfies SC/KR installs); latin fallbacks last
+            "noto sans cjk jp",
+            "noto sans cjk sc",
+            "noto sans cjk kr",
+            "noto serif cjk",
+            "noto sans arabic",
+            "noto naskh arabic",
+            "noto sans hebrew",
+            "noto sans devanagari",
+            "noto sans bengali",
+            "noto sans tamil",
+            "noto sans thai",
+            "noto sans armenian",
+            "noto sans georgian",
+            "noto sans ethiopic",
+            "noto sans hangul",
+            "wenquanyi",
+            "ipa",
+            "takao",
+            "droid sans fallback",
             "dejavu sans",
             "noto sans",
         ];
         for fam in ALT {
             if let Some(idx) = self.fonts.resolve(fam, st.bold, st.italic) {
-                if covers(&mut self.fonts, idx, word) {
+                if self.font_covers(idx, word) {
                     return Some(idx);
                 }
             }
@@ -7893,10 +8888,29 @@ impl<'a> Layouter<'a> {
 
     /// advance of one space in this font+size
     fn space_w(&mut self, font: usize, st: &Style) -> f32 {
-        self.fonts
+        let key = (font as u32, st.size.to_bits());
+        if let Some(&w) = self.space_memo.get(&key) {
+            return w;
+        }
+        let w = self
+            .fonts
             .font(font)
             .map(|f| f.advance_units(f.glyph_id(' ')) as f32 * st.size / f.units_per_em() as f32)
-            .unwrap_or(st.size * 0.3)
+            .unwrap_or(st.size * 0.3);
+        self.space_memo.insert(key, w);
+        w
+    }
+
+    /// Could any sheet rule produce `kind` for this element tag? A miss
+    /// means `computed_pseudo` would return an empty map — skip the
+    /// cascade.
+    fn pseudo_possible(&self, tag: &str, kind: css::PseudoElem) -> bool {
+        let bit = 1u8 << (kind as u8);
+        self.pseudo_any & bit != 0
+            || self
+                .pseudo_tags
+                .get(tag)
+                .is_some_and(|m| m & bit != 0)
     }
 
     /// Take the pending whitespace gap — stamped on the next pushed word
@@ -7924,21 +8938,10 @@ impl<'a> Layouter<'a> {
     /// reduced size, uppercase-source runs at full size
     fn push_case_run(&mut self, run: &str, st: &Style, font: usize, small: bool) {
         let size = st.size * if small { 0.78 } else { 1.0 };
-        let (w, ascent, line_h) = {
-            let Some(f) = self.fonts.font(font) else {
-                return;
-            };
-            let upem = f.units_per_em() as f32;
-            (
-                f.measure(run, size) + st.ls * run.chars().count() as f32,
-                f.ascender as f32 * size / upem,
-                match st.line_h {
-                    Some(LineH::Mul(m)) => size * m,
-                    Some(LineH::Px(p)) => p,
-                    None => f.line_height(size),
-                },
-            )
+        let Some((mw, ascent, line_h)) = self.measure_run(font, run, size, st.line_h) else {
+            return;
         };
+        let w = mw + st.ls * run.chars().count() as f32;
         if !st.nowrap && self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             self.flush_line_wrap();
         }
@@ -7959,8 +8962,7 @@ impl<'a> Layouter<'a> {
             ascent,
             line_h,
             bg: st.inline_bg,
-            items: None,
-            hits: Vec::new(),
+            payload: None,
             box_h: 0.0,
             dx: st.rel_x,
             dy: st.rel_y,
@@ -8014,20 +9016,10 @@ impl<'a> Layouter<'a> {
                 Some(fc) => {
                     let fcs = fc.to_string();
                     if let Some(ffont) = self.resolve_font_covering(&fcs, &fst) {
-                        let (fw, fascent, flh) = {
-                            let Some(f) = self.fonts.font(ffont) else {
-                                return;
-                            };
-                            let upem = f.units_per_em() as f32;
-                            (
-                                f.measure(&fcs, fst.size),
-                                f.ascender as f32 * fst.size / upem,
-                                match fst.line_h {
-                                    Some(LineH::Mul(m)) => fst.size * m,
-                                    Some(LineH::Px(p)) => p,
-                                    None => f.line_height(fst.size),
-                                },
-                            )
+                        let Some((fw, fascent, flh)) =
+                            self.measure_run(ffont, &fcs, fst.size, fst.line_h)
+                        else {
+                            return;
                         };
                         if !st.nowrap
                             && self.line_x + fw > self.content_width() + 0.5
@@ -8052,8 +9044,7 @@ impl<'a> Layouter<'a> {
                             ascent: fascent,
                             line_h: flh,
                             bg: fst.inline_bg,
-                            items: None,
-                            hits: Vec::new(),
+                            payload: None,
                             box_h: 0.0,
                             dx: 0.0,
                             dy: 0.0,
@@ -8117,21 +9108,10 @@ impl<'a> Layouter<'a> {
             }
             return;
         }
-        let (w, ascent, line_h) = {
-            let Some(f) = self.fonts.font(font) else {
-                return;
-            };
-            let upem = f.units_per_em() as f32;
-            (
-                f.measure(word, st.size) + st.ls * word.chars().count() as f32,
-                f.ascender as f32 * st.size / upem,
-                match st.line_h {
-                    Some(LineH::Mul(m)) => st.size * m,
-                    Some(LineH::Px(p)) => p,
-                    None => f.line_height(st.size),
-                },
-            )
+        let Some((mw, ascent, line_h)) = self.measure_run(font, word, st.size, st.line_h) else {
+            return;
         };
+        let w = mw + st.ls * word.chars().count() as f32;
         if !st.nowrap && self.line_x + w > self.content_width() + 0.5 && !self.line.is_empty() {
             // &shy; split first: last opportunity that fits earns a hyphen
             if !st.hyphens_none && raw.contains('\u{ad}') {
@@ -8144,11 +9124,7 @@ impl<'a> Layouter<'a> {
                         }
                         let mut t = frag.clone();
                         t.push('-');
-                        let fw = self
-                            .fonts
-                            .font(font)
-                            .map(|f| f.measure(&t, st.size))
-                            .unwrap_or(0.0)
+                        let fw = self.measure(font, &t, st.size).unwrap_or(0.0)
                             + st.ls * t.chars().count() as f32;
                         if self.line_x + fw <= self.content_width() + 0.5 {
                             cut = Some(bi);
@@ -8185,7 +9161,8 @@ impl<'a> Layouter<'a> {
                 if cw + fw > self.content_width() + 0.5 && !chunk.is_empty() {
                     let gap = self.take_gap();
                     self.line.push(Word {
-                        text: chunk.clone(),
+                        // take, not clone — chunk is cleared right after
+                        text: std::mem::take(&mut chunk),
                         font,
                         size: st.size,
                         color: st.color,
@@ -8200,8 +9177,7 @@ impl<'a> Layouter<'a> {
                         ascent,
                         line_h,
                         bg: st.inline_bg,
-                        items: None,
-                        hits: Vec::new(),
+                        payload: None,
                         box_h: 0.0,
                         dx: st.rel_x,
                         dy: st.rel_y,
@@ -8233,8 +9209,7 @@ impl<'a> Layouter<'a> {
                     ascent,
                     line_h,
                     bg: st.inline_bg,
-                    items: None,
-                    hits: Vec::new(),
+                    payload: None,
                     box_h: 0.0,
                     dx: st.rel_x,
                     dy: st.rel_y,
@@ -8262,8 +9237,7 @@ impl<'a> Layouter<'a> {
             ascent,
             line_h,
             bg: st.inline_bg,
-            items: None,
-            hits: Vec::new(),
+            payload: None,
             box_h: 0.0,
             dx: st.rel_x,
             dy: st.rel_y,
@@ -8295,16 +9269,17 @@ impl<'a> Layouter<'a> {
         if let Some(fst) = self.fl_style.take() {
             let mut line = std::mem::take(&mut self.line);
             for w in line.iter_mut() {
-                if w.text.is_empty() || w.items.is_some() {
+                if w.text.is_empty() || w.payload.is_some() {
                     continue;
                 }
                 let Some(fi) = self.resolve_font_covering(&w.text, &fst) else {
                     continue;
                 };
-                let Some(f) = self.fonts.font(fi) else {
+                let Some((mw, ascent, lh)) =
+                    self.measure_run(fi, &w.text, fst.size, fst.line_h)
+                else {
                     continue;
                 };
-                let upem = f.units_per_em() as f32;
                 w.font = fi;
                 w.size = fst.size;
                 w.color = fst.color;
@@ -8312,13 +9287,9 @@ impl<'a> Layouter<'a> {
                 w.va = fst.va;
                 w.ls = fst.ls;
                 w.shadow = fst.shadow.clone();
-                w.width = f.measure(&w.text, fst.size);
-                w.ascent = f.ascender as f32 * fst.size / upem;
-                w.line_h = match fst.line_h {
-                    Some(LineH::Mul(m)) => fst.size * m,
-                    Some(LineH::Px(p)) => p,
-                    None => f.line_height(fst.size),
-                };
+                w.width = mw;
+                w.ascent = ascent;
+                w.line_h = lh;
                 if fst.inline_bg.is_some() {
                     w.bg = fst.inline_bg;
                 }
@@ -8354,11 +9325,18 @@ impl<'a> Layouter<'a> {
                 used -= w.gap_before + w.width;
             }
             if used > clip + 0.5 {
-                if let Some(w) = self.line.last_mut() {
+                // measure the ellipsis before borrowing the last word —
+                // the memoized measure needs &mut self
+                let (wf, ws) = self
+                    .line
+                    .last()
+                    .map(|w| (w.font, w.size))
+                    .unwrap_or((usize::MAX, 0.0));
+                let ew = self.measure(wf, "\u{2026}", ws);
+                if let (Some(ew), Some(w)) = (ew, self.line.last_mut()) {
                     let _ = limit;
                     let avail = (clip - w.gap_before).max(0.0);
-                    if let Some(f) = self.fonts.font(w.font) {
-                        let ew = f.measure("\u{2026}", w.size);
+                    if let Some(f) = self.fonts.font(wf) {
                         let mut keep = 0usize;
                         let mut acc = 0.0f32;
                         for (i, c) in w.text.char_indices() {
@@ -8413,43 +9391,48 @@ impl<'a> Layouter<'a> {
         };
         let mut x = self.line_origin() + off + std::mem::take(&mut self.indent_pending);
         // per-word x positions on this line — gap_before lands *before*
-        // the word, widened by justify_extra
+        // the word, widened by justify_extra. direction:rtl lands words
+        // right-to-left (the last word gets the leftmost x); emission
+        // below still walks index order with these precomputed xs.
         let n = self.line.len();
-        let mut xs = vec![0.0; n];
-        // direction:rtl emits words right-to-left — the first word lands
-        // at the line's right edge
-        let emit_order: Vec<usize> = if self.rtl {
-            (0..n).rev().collect()
-        } else {
-            (0..n).collect()
-        };
-        for &k in &emit_order {
-            let w = &self.line[k];
-            x += w.gap_before
-                + if w.gap_before > 0.0 {
-                    justify_extra
-                } else {
-                    0.0
-                };
-            xs[k] = x;
-            x += w.width;
+        self.line_xs.clear();
+        self.line_xs.resize(n, 0.0);
+        {
+            let xs = &mut self.line_xs;
+            let mut place = |k: usize, x: &mut f32| {
+                let w = &self.line[k];
+                *x += w.gap_before
+                    + if w.gap_before > 0.0 {
+                        justify_extra
+                    } else {
+                        0.0
+                    };
+                xs[k] = *x;
+                *x += w.width;
+            };
+            if self.rtl {
+                for k in (0..n).rev() {
+                    place(k, &mut x);
+                }
+            } else {
+                for k in 0..n {
+                    place(k, &mut x);
+                }
+            }
         }
         // a consecutive run of words sharing one transform spec wraps in
         // PushTransform/PopTransform — the run's extent is the element's
         // box (transform-origin anchors there)
-        let mut line: Vec<Option<Word>> = std::mem::take(&mut self.line)
-            .into_iter()
-            .map(Some)
-            .collect();
+        let mut line = std::mem::take(&mut self.line);
+        // the buffer goes back to self.line at the end — keeps its
+        // capacity for the next line instead of reallocating per line
         let mut i = 0;
         while i < n {
-            let end = match &line[i].as_ref().unwrap().xf {
+            let end = match &line[i].xf {
                 Some(sp) => {
                     let mut j = i + 1;
                     while j < n
                         && line[j]
-                            .as_ref()
-                            .unwrap()
                             .xf
                             .as_ref()
                             .is_some_and(|o| Rc::ptr_eq(o, sp))
@@ -8461,19 +9444,21 @@ impl<'a> Layouter<'a> {
                 None => i + 1,
             };
             let m = line[i]
-                .as_ref()
-                .unwrap()
                 .xf
                 .as_ref()
                 .map(|sp| {
                     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                     for k in i..end {
-                        let w = line[k].as_ref().unwrap();
-                        let (wx, wy, wh) = if w.items.is_some() {
-                            (xs[k] + w.dx, baseline + w.dy - w.box_h, w.box_h)
+                        let w = &line[k];
+                        let (wx, wy, wh) = if w.payload.is_some() {
+                            (
+                                self.line_xs[k] + w.dx,
+                                baseline + w.dy - w.box_h,
+                                w.box_h,
+                            )
                         } else {
                             (
-                                xs[k] + w.dx,
+                                self.line_xs[k] + w.dx,
                                 baseline + w.dy - w.ascent,
                                 w.ascent + w.size * 0.3,
                             )
@@ -8490,11 +9475,11 @@ impl<'a> Layouter<'a> {
                 self.items.push(DisplayItem::PushTransform { m });
             }
             for k in i..end {
-                let w = line[k].take().unwrap();
+                let w = std::mem::replace(&mut line[k], Word::ph());
                 let (dx, dy) = (w.dx, w.dy);
                 self.emit_word(
                     w,
-                    xs[k] + dx,
+                    self.line_xs[k] + dx,
                     baseline + dy,
                     self.y + dy,
                     line_h,
@@ -8506,6 +9491,10 @@ impl<'a> Layouter<'a> {
             }
             i = end;
         }
+        // words were moved out via Word::ph() placeholders — clear them
+        // and recycle the allocation for the next line
+        line.clear();
+        self.line = line;
         self.y += line_h;
         self.line_x = 0.0;
         self.pending_space = false;
@@ -8541,23 +9530,25 @@ impl<'a> Layouter<'a> {
     /// none/normal → no box.
     fn emit_pseudo(&mut self, node: NodeId, kind: css::PseudoElem, ec: &Props, st: &Style) {
         // replaced elements can't host generated content
+        let tag = self.doc.tag(node).unwrap_or("");
         if matches!(
-            self.doc.tag(node),
-            Some(
-                "img"
-                    | "svg"
-                    | "input"
-                    | "select"
-                    | "textarea"
-                    | "video"
-                    | "canvas"
-                    | "iframe"
-                    | "object"
-                    | "embed"
-                    | "br"
-                    | "hr"
-            )
+            tag,
+            "img"
+                | "svg"
+                | "input"
+                | "select"
+                | "textarea"
+                | "video"
+                | "canvas"
+                | "iframe"
+                | "object"
+                | "embed"
+                | "br"
+                | "hr"
         ) {
+            return;
+        }
+        if !self.pseudo_possible(tag, kind) {
             return;
         }
         let mut pp = self.ctx.computed_pseudo(node, kind);
@@ -8575,6 +9566,43 @@ impl<'a> Layouter<'a> {
         let txt = generated::content_text(self.doc, node, &pp, &self.counters, &mut depth);
         self.quote_depth = depth;
         let Some(txt) = txt else { return };
+        // `opacity` folds into emitted items for real elements (see the
+        // opacity fade in `block`); generated text bypasses that path,
+        // so fold it into the text color here — an opacity:0 pseudo
+        // (hidden hover overlays) must not paint at all.
+        let op = pp
+            .get("opacity")
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        if op <= 0.0 {
+            return;
+        }
+        if op < 1.0 {
+            let a = ((pst.color >> 24) as f32 * op) as u32;
+            pst.color = (pst.color & 0x00ff_ffff) | (a << 24);
+        }
+        // `position:absolute|fixed` generated content leaves the flow —
+        // emitting it inline stacks a phantom copy at the pen. Emit it
+        // on a detached line beginning at the pen instead: `inset:0`
+        // overlays (glitch layers, positioned glyph icons) land on the
+        // element's own text position and other offsets degrade to the
+        // pen rather than a wrong in-flow spot.
+        if matches!(
+            pp.get("position").map(String::as_str),
+            Some("absolute") | Some("fixed")
+        ) {
+            let line = std::mem::take(&mut self.line);
+            let (lx, y, pg, ps) = (self.line_x, self.y, self.pending_gap, self.pending_space);
+            self.text(&txt, &pst);
+            self.flush_line();
+            self.line = line;
+            self.line_x = lx;
+            self.y = y;
+            self.pending_gap = pg;
+            self.pending_space = ps;
+            return;
+        }
         // a block-level pseudo box gets its own line
         let blockish = matches!(
             pp.get("display").map(String::as_str),
@@ -8700,7 +9728,12 @@ impl<'a> Layouter<'a> {
             return None;
         };
         let mut mst = st.clone();
-        let mp = self.ctx.computed_pseudo(node, css::PseudoElem::Marker);
+        let tag = self.doc.tag(node).unwrap_or("");
+        let mp = if self.pseudo_possible(tag, css::PseudoElem::Marker) {
+            self.ctx.computed_pseudo(node, css::PseudoElem::Marker)
+        } else {
+            Props::default()
+        };
         if !mp.is_empty() {
             self.apply_computed(&mp, &mut mst);
             // ::marker{content:...} overrides the list glyph
@@ -8735,10 +9768,9 @@ impl<'a> Layouter<'a> {
         let Some(font) = self.resolve_font_covering(m, mst) else {
             return;
         };
-        let Some(f) = self.fonts.font(font) else {
+        let Some(w) = self.measure(font, m, mst.size) else {
             return;
         };
-        let w = f.measure(m, mst.size);
         // right-align ending ~0.4em left of the content edge
         let x = content_mx - w - 0.4 * mst.size;
         self.items.push(DisplayItem::Text {
@@ -8763,6 +9795,11 @@ impl<'a> Layouter<'a> {
         let mut sheets: Vec<&css::StyleSheet> = vec![ua_sheet()];
         sheets.extend(external.iter());
         sheets.extend(author.iter());
+        let (sel_any, sel_tags) = pseudo_mask(&sheets);
+        let sel_bit = 1u8 << (css::PseudoElem::Selection as u8);
+        if sel_any & sel_bit == 0 && !sel_tags.values().any(|m| m & sel_bit != 0) {
+            return None; // no ::selection rule at all
+        }
         let mut ctx = css::StyleCtx::new(doc, &sheets);
         for &el in doc.children(doc.root) {
             if doc.tag(el) == Some("html") {

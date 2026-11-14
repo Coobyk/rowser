@@ -86,41 +86,57 @@ pub fn child_layer(c: &Props) -> Option<i64> {
 /// (items_start, hits_start, key) markers — each segment ends where the
 /// next begins (the last runs to the vec ends). Stable sort: equal keys
 /// keep DOM order.
+/// `order`/`items_out`/`hits_out` are caller-owned scratch — kept on the
+/// Layouter so every block doesn't reallocate them.
 pub fn reorder(
     items: &mut Vec<DisplayItem>,
     hits: &mut Vec<crate::Hit>,
     segs: &[(usize, usize, i64)],
+    order: &mut Vec<usize>,
+    items_out: &mut Vec<DisplayItem>,
+    hits_out: &mut Vec<crate::Hit>,
 ) {
     let n = segs.len();
     if n <= 1 {
         return;
     }
-    let mut order: Vec<usize> = (0..n).collect();
+    order.clear();
+    order.extend(0..n);
     order.sort_by_key(|&i| segs[i].2);
     if order.iter().copied().eq(0..n) {
+        order.clear();
         return; // already in paint order
     }
+    let (ilen, hlen) = (items.len(), hits.len());
     let seg_range = |i: usize| -> (usize, usize, usize, usize) {
         let i0 = segs[i].0;
-        let i1 = if i + 1 < n {
-            segs[i + 1].0
-        } else {
-            items.len()
-        };
+        let i1 = if i + 1 < n { segs[i + 1].0 } else { ilen };
         let h0 = segs[i].1;
-        let h1 = if i + 1 < n { segs[i + 1].1 } else { hits.len() };
+        let h1 = if i + 1 < n { segs[i + 1].1 } else { hlen };
         (i0, i1, h0, h1)
     };
-    let mut items_out: Vec<DisplayItem> = Vec::new();
-    let mut hits_out: Vec<crate::Hit> = Vec::new();
-    for &i in &order {
+    items_out.clear();
+    hits_out.clear();
+    items_out.reserve(ilen.saturating_sub(segs[0].0));
+    hits_out.reserve(hlen.saturating_sub(segs[0].1));
+    // move each item into the scratch (dummy `PopClip` placeholders get
+    // dropped by `truncate` below) — cloning here meant a String alloc
+    // per `DisplayItem::Text` in every reordered block
+    for &i in order.iter() {
         let (i0, i1, h0, h1) = seg_range(i);
-        items_out.extend_from_slice(&items[i0..i1]);
+        items_out.extend(
+            items[i0..i1]
+                .iter_mut()
+                .map(|it| std::mem::replace(it, DisplayItem::PopClip)),
+        );
         hits_out.extend_from_slice(&hits[h0..h1]);
     }
     let (i0, _, h0, _) = seg_range(0);
-    items.splice(i0.., items_out);
-    hits.splice(h0.., hits_out);
+    items.truncate(i0);
+    items.extend(items_out.drain(..));
+    hits.truncate(h0);
+    hits.extend(hits_out.drain(..));
+    order.clear();
 }
 
 /// `inset` shorthand + `top|right|bottom|left` + logical aliases
@@ -134,12 +150,9 @@ pub fn inset_sides(c: &Props, em: f32, w: f32, h: f32) -> [Option<f32>; 4] {
     let axis = |name: &str, rel: f32| -> [Option<f32>; 2] {
         match c.get(name) {
             Some(v) => {
-                let vals: Vec<Option<f32>> = v
-                    .split_whitespace()
-                    .map(|t| parse_len(t, rel, em))
-                    .collect();
-                let s = vals.first().copied().flatten();
-                [s, vals.get(1).copied().flatten().or(s)]
+                let mut it = v.split_whitespace();
+                let s = it.next().and_then(|t| parse_len(t, rel, em));
+                [s, it.next().and_then(|t| parse_len(t, rel, em)).or(s)]
             }
             None => [None; 2],
         }

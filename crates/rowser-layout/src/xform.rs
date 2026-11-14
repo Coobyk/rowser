@@ -244,12 +244,38 @@ fn num(s: &str) -> Option<f32> {
     s.trim().parse::<f32>().ok()
 }
 
+/// Whitespace-split keeping `fn(...)` groups whole — `calc(1/2 * -100%)`
+/// is one token even with spaces inside the parens.
+fn ws_tokens(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut st = 0usize;
+    let b = s.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            c if c.is_ascii_whitespace() && depth <= 0 => {
+                if st < i {
+                    out.push(&s[st..i]);
+                }
+                st = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if st < b.len() {
+        out.push(&s[st..]);
+    }
+    out
+}
+
 /// Function args: comma-separated, else whitespace-separated.
 fn fn_args(s: &str) -> Vec<&str> {
     if s.contains(',') {
         s.split(',').map(str::trim).collect()
     } else {
-        s.split_whitespace().collect()
+        ws_tokens(s)
     }
 }
 
@@ -259,7 +285,7 @@ fn len(v: &str, rel: f32, em: f32) -> f32 {
 
 /// `translate: x y [z]` — %s resolve against the element's own box.
 fn translate_prop_mat(v: &str, w: f32, h: f32, em: f32) -> Mat {
-    let mut it = v.split_whitespace();
+    let mut it = ws_tokens(v).into_iter();
     let x = it.next().map(|t| len(t, w, em)).unwrap_or(0.0);
     let y = it.next().map(|t| len(t, h, em)).unwrap_or(0.0);
     Mat::translate(x, y)
@@ -268,7 +294,7 @@ fn translate_prop_mat(v: &str, w: f32, h: f32, em: f32) -> Mat {
 /// `rotate: <angle> | [x|y|z|x y z] <angle>` — 2D keeps the z-axis case:
 /// a bare angle, `z <angle>` or `0 0 1 <angle>`; other axes are ignored.
 fn rotate_prop_angle(v: &str) -> Option<f32> {
-    let toks: Vec<&str> = v.split_whitespace().collect();
+    let toks: Vec<&str> = ws_tokens(v);
     let (axis, a) = match toks.as_slice() {
         [a] => ("z", *a),
         [axis, a] => (*axis, *a),
@@ -295,7 +321,7 @@ fn rotate_prop_angle(v: &str) -> Option<f32> {
 
 /// `scale: s | x y [z]` — z ignored.
 fn scale_prop_mat(v: &str) -> Mat {
-    let toks: Vec<f32> = v.split_whitespace().filter_map(num).collect();
+    let toks: Vec<f32> = ws_tokens(v).into_iter().filter_map(num).collect();
     match toks.as_slice() {
         [s] => Mat::scale(*s, *s),
         [x, y, ..] => Mat::scale(*x, *y),
@@ -453,7 +479,7 @@ fn origin_xy(v: Option<&str>, w: f32, h: f32, em: f32) -> (f32, f32) {
     let mut ykey: Option<f32> = None;
     let mut lens: Vec<f32> = Vec::new();
     if let Some(v) = v {
-        for t in v.to_lowercase().split_whitespace().take(2) {
+        for t in ws_tokens(&v.to_lowercase()).into_iter().take(2) {
             match t {
                 "left" => xkey = Some(0.0),
                 "right" => xkey = Some(w),
@@ -617,5 +643,22 @@ mod tests {
             (x - 20.0).abs() < 0.01 && (y - 10.0).abs() < 0.01,
             "({x},{y})"
         );
+    }
+}
+
+#[cfg(test)]
+mod calc_tests {
+    use super::*;
+    use rowser_css::StrMap;
+
+    #[test]
+    fn translate_prop_calc() {
+        // `translate: calc(1/2 * -100%) 0` (Tailwind's -translate-x-1/2):
+        // the calc must tokenize whole despite its inner spaces
+        let mut p: Props = StrMap::default();
+        p.insert("translate".to_string(), "calc(1/2 * -100%) 0".to_string());
+        let sp = spec(&p, 16.0).unwrap();
+        let (x, _) = sp.matrix((0.0, 0.0, 200.0, 50.0)).apply(100.0, 0.0);
+        assert!(x.abs() < 0.01, "{x}");
     }
 }

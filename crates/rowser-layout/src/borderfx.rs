@@ -455,26 +455,35 @@ pub fn outline(c: &Props, size: f32, bd: Color, def: Color) -> Option<Outline> {
         color: def,
         offset: 0.0,
     };
-    let (mut found, mut w_set) = (false, false);
+    let mut w_set = false;
+    // Visibility is decided by outline-style alone: with the initial
+    // `none`, outline-width/-color/-offset change nothing (per CSS the
+    // outline only paints when the style is not none). `outline-style`
+    // may carry shorthand tokens after `each_decl` expansion.
+    let styled = match c.get("outline-style") {
+        Some(v) => {
+            let t = v.trim();
+            t == "auto" || style_kw(t).is_some() || border_parts(t, size).style.is_some()
+        }
+        None => false,
+    };
+    if !styled {
+        return None;
+    }
+    if let Some(v) = c.get("outline-style") {
+        let t = v.trim();
+        if let Some(s) = style_kw(t).or_else(|| border_parts(t, size).style) {
+            o.style = s;
+        }
+    }
     if let Some(v) = c.get("outline-width") {
         let t = v.trim();
         if t == "auto" {
             o.w = 3.0;
             w_set = true;
-            found = true;
         } else if let Some(w) = width_val(t, size).or_else(|| border_parts(t, size).w) {
             o.w = w;
             w_set = true;
-            found = true;
-        }
-    }
-    if let Some(v) = c.get("outline-style") {
-        let t = v.trim();
-        if t == "auto" {
-            found = true;
-        } else if let Some(s) = style_kw(t).or_else(|| border_parts(t, size).style) {
-            o.style = s;
-            found = true;
         }
     }
     if let Some(v) = c.get("outline-color") {
@@ -484,20 +493,13 @@ pub fn outline(c: &Props, size: f32, bd: Color, def: Color) -> Option<Outline> {
                 parse_color_ctx(t, Some(def)).or_else(|| parts_color(&border_parts(t, size), def))
             {
                 o.color = over(col, bd);
-                found = true;
             }
-        } else {
-            found = true;
         }
     }
     if let Some(v) = c.get("outline-offset") {
         if let Some(n) = parse_len(v, size, size) {
             o.offset = n;
-            found = true;
         }
-    }
-    if !found {
-        return None;
     }
     if !w_set {
         o.w = 3.0;
@@ -747,4 +749,53 @@ pub fn emit_box(
     emit_deco(out, x, y, w, h, bg, border, radii, shadows, clip, layers);
     out.extend(inner);
     emit_tail(out, x, y, w, h, clip, outline);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props(kvs: &[(&str, &str)]) -> Props {
+        kvs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn outline_requires_style() {
+        // a lone outline-color/-width paints nothing — per CSS the
+        // outline exists only when outline-style is not none
+        assert!(outline(&props(&[("outline-color", "red")]), 16.0, BLACK, BLACK).is_none());
+        assert!(
+            outline(
+                &props(&[("outline-color", "red"), ("outline-width", "2px")]),
+                16.0,
+                BLACK,
+                BLACK
+            )
+            .is_none()
+        );
+        assert!(
+            outline(&props(&[("outline-style", "solid")]), 16.0, BLACK, BLACK).is_some()
+        );
+        assert!(
+            outline(
+                &props(&[("outline-style", "none"), ("outline-color", "red")]),
+                16.0,
+                BLACK,
+                BLACK
+            )
+            .is_none()
+        );
+        // shorthand tokens riding a longhand after each_decl expansion
+        assert!(
+            outline(
+                &props(&[("outline-style", "2px dashed red")]),
+                16.0,
+                BLACK,
+                BLACK
+            )
+            .is_some()
+        );
+    }
 }
