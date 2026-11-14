@@ -189,7 +189,8 @@ fn main() {
         pass as f64 / (pass + fail).max(1) as f64 * 100.0);
     let show: usize = std::env::var("SHOW_FAILS").unwrap_or_else(|_| "0".into()).parse().unwrap_or(0);
     for f in fails.iter().take(show) { println!("FAIL {f}"); }
-    std::fs::write("/tmp/t262_fails.txt", fails.join("\n")).ok();
+    let out = std::env::var("T262_FAILS_OUT").unwrap_or_else(|_| "/tmp/t262_fails.txt".into());
+    std::fs::write(&out, fails.join("\n")).ok();
 }
 
 fn res_is_syntax_err(_body: &str) -> bool { false }
