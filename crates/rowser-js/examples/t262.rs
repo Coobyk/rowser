@@ -165,9 +165,14 @@ fn main() {
         ctx.interp.arm_deadline(std::time::Duration::from_secs(3));
         let res = ctx.eval(&body);
         let ok = match (&m.negative_phase, res) {
-            (Some(p), _) if p == "parse" || p == "early" || p == "resolution" => {
-                // expect a parse error (or an early SyntaxError at eval)
-                match res2_parse(&body) { Err(_) => true, Ok(()) => res_is_syntax_err(&body) }
+            (Some(p), _) if p == "parse" => {
+                // real parse pass — expect a syntax error
+                rowser_js::parser::parse(&src).is_err()
+            }
+            (Some(p), _) if p == "early" || p == "resolution" => {
+                // early/resolution SyntaxErrors — our parser doesn't do
+                // static error checks, so count via eval-failure heuristic
+                res2_parse(&body).is_err() || res_is_syntax_err(&body)
             }
             (Some(_), Err(e)) => {
                 // runtime negative: error name must match
