@@ -4865,4 +4865,73 @@ mod tests {
         assert_eq!(s(&mut dc, "fired"), "1");
         assert_eq!(s(&mut dc, "qtxt"), "hi");
     }
+
+    #[test]
+    fn scroll_event_updates_window_and_reaches_listeners() {
+        let mut dc = ctx("<html><body><div id='x'></div></body></html>");
+        run(
+            &mut dc,
+            r#"
+            var hits = [];
+            window.addEventListener('scroll', function() {
+                document.getElementById('x').setAttribute('data-s', '' + window.scrollY);
+                hits.push('w');
+            });
+            document.addEventListener('scroll', function() { hits.push('d'); });
+            "#,
+        );
+        dc.scroll_pumped(250.0, std::time::Duration::from_secs(1));
+        assert_eq!(s(&mut dc, "window.scrollY"), "250");
+        assert_eq!(s(&mut dc, "window.pageYOffset"), "250");
+        assert_eq!(s(&mut dc, "hits.join(',')"), "d,w");
+        // the mutation is visible through the conditional snapshot too
+        let doc = dc.snapshot_if_mutated().expect("mutated");
+        let x = doc
+            .descendants(doc.root)
+            .find(|&n| doc.attr(n, "id") == Some("x"))
+            .unwrap();
+        assert_eq!(doc.attr(x, "data-s"), Some("250"));
+        // and a clean turn reports no mutation
+        assert!(dc.snapshot_if_mutated().is_none());
+    }
+
+    #[test]
+    fn anchor_url_components() {
+        let mut dc = DomContext::new(
+            rowser_html::parse(
+                "<html><body><a id='a' href='/p?q=1#frag'></a><a id='b' href='#about'></a></body></html>",
+            ),
+            "http://example.com/dir/page.html",
+        );
+        assert_eq!(s(&mut dc, "document.getElementById('a').hash"), "#frag");
+        assert_eq!(s(&mut dc, "document.getElementById('a').search"), "?q=1");
+        assert_eq!(s(&mut dc, "document.getElementById('a').pathname"), "/p");
+        assert_eq!(s(&mut dc, "document.getElementById('a').hostname"), "example.com");
+        assert_eq!(s(&mut dc, "document.getElementById('b').hash"), "#about");
+        assert_eq!(
+            s(&mut dc, "document.getElementById('b').pathname"),
+            "/dir/page.html"
+        );
+    }
+
+    #[test]
+    fn intersection_observer_reports_entries() {
+        let mut dc = ctx("<html><body><div id='r'></div></body></html>");
+        run(
+            &mut dc,
+            r#"
+            var seen = [];
+            var io = new IntersectionObserver(function(entries, obs) {
+                for (var e of entries) {
+                    if (e.isIntersecting) e.target.classList.add('in-view');
+                    seen.push(e.intersectionRatio);
+                }
+            });
+            io.observe(document.getElementById('r'));
+            "#,
+        );
+        dc.drain_microtasks();
+        assert_eq!(s(&mut dc, "seen.join(',')"), "1");
+        assert_eq!(s(&mut dc, "document.getElementById('r').className"), "in-view");
+    }
 }
