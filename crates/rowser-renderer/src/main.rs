@@ -64,6 +64,9 @@ fn main() {
     let mut fonts = FontCache::new();
     let mut page = Page::new();
     let mut pending: std::collections::VecDeque<ToRenderer> = std::collections::VecDeque::new();
+    /// URL we last reached via a noscript meta-refresh fallback — if the
+    /// target ALSO mounts nothing and offers another, don't bounce (A→B→A).
+    let mut last_noscript_nav: Option<String> = None;
 
     loop {
         // cheap every iteration — a busy input stream must not starve a
@@ -145,10 +148,11 @@ fn main() {
                 // JS: run page scripts against the parsed DOM (SPAs build
                 // their UI this way). Errors are logged, never fatal.
                 let t_js = std::time::Instant::now();
-                let (doc, js_logs, js) = if js_enabled() {
+                let meta_nav = meta_refresh(&doc, &effective);
+                let (doc, js_logs, js_nav, js) = if js_enabled() {
                     run_page_scripts(doc, &effective, page.viewport)
                 } else {
-                    (doc, Vec::new(), None)
+                    (doc, Vec::new(), None, None)
                 };
                 if !js_logs.is_empty() {
                     pt!(
@@ -165,7 +169,8 @@ fn main() {
                     .map(|t| doc.text_content(t))
                     .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| effective.clone());
-                page.load(doc, effective, title.clone());
+                let looks_empty = page_looks_empty(&doc);
+                page.load(doc, effective.clone(), title.clone());
                 page.js = js;
                 load_web_fonts(&page, &mut fonts);
                 page.state.target_frag = if frag.is_empty() {
@@ -183,6 +188,26 @@ fn main() {
                 let _ = send(&mut output, &ToBrowser::Title(title));
                 send_frame(&mut output, &mut page);
                 let _ = send(&mut output, &ToBrowser::LoadDone);
+                // A script redirected during load (location.replace /
+                // assign) or an instant <meta refresh> — defer to the
+                // browser to navigate.
+                let nav = js_nav.or(meta_nav).or_else(|| {
+                    // The JS app mounted nothing and the page offers a
+                    // no-JS endpoint (DDG's SPA → /html/?q=): take it.
+                    // Skip when we just ARRIVED via such a fallback and
+                    // it still looks empty — that's a bounce loop.
+                    (last_noscript_nav.as_deref() != Some(effective.as_str())
+                        && looks_empty)
+                    .then(|| noscript_meta_refresh(&html, &effective))
+                    .flatten()
+                    .map(|u| {
+                        last_noscript_nav = Some(u.clone());
+                        u
+                    })
+                });
+                if let Some(u) = nav {
+                    let _ = send(&mut output, &ToBrowser::NavigationRequest(u));
+                }
             }
             ToRenderer::ResizeViewport { width, height } => {
                 page.viewport = (width.max(1), height.max(1));
@@ -338,7 +363,14 @@ fn main() {
                 // the navigation it triggers instead).
                 if let Some(url) = found {
                     page.clear_sel();
-                    let _ = send(&mut output, &ToBrowser::NavigationRequest(url));
+                    // hrefs are raw attribute values — resolve against the
+                    // page URL so relative links, //host/path, ?query and
+                    // #frag all navigate correctly.
+                    let abs = rowser_net::Url::parse(&page.cur_url)
+                        .and_then(|b| b.resolve(&url))
+                        .map(|u| u.to_string())
+                        .unwrap_or(url);
+                    let _ = send(&mut output, &ToBrowser::NavigationRequest(abs));
                 } else {
                     // Dispatch a synthetic click into the live JS context:
                     // hit-test picks the deepest (smallest) element box,
@@ -401,6 +433,14 @@ fn main() {
                                     page.repaint(&mut fonts);
                                     send_frame(&mut output, &mut page);
                                     let _ = send(&mut output, &ToBrowser::SelText(String::new()));
+                                    // The click handler redirected —
+                                    // hand the URL to the browser.
+                                    if let Some(u) = rep.nav {
+                                        let _ = send(
+                                            &mut output,
+                                            &ToBrowser::NavigationRequest(u),
+                                        );
+                                    }
                                 }
                                 Err(_) => {
                                     page.js = None; // interpreter thread died
@@ -569,6 +609,9 @@ fn poll_js_scroll(page: &mut Page, fonts: &mut FontCache, w: &mut impl Write) {
                 page.repaint(fonts);
                 send_frame(w, page);
             }
+            if let Some(u) = rep.nav {
+                let _ = send(w, &ToBrowser::NavigationRequest(u));
+            }
             // trailing edge — the position moved on while JS worked
             if page.js_scroll_wanted != sent {
                 if let Some(js) = &page.js {
@@ -630,6 +673,8 @@ struct JsReply {
     /// renderer then skips the doc swap and relayout entirely).
     doc: Option<rowser_dom::Document>,
     logs: Vec<String>,
+    /// URL a script asked to navigate to (location.assign/replace).
+    nav: Option<String>,
 }
 
 /// Outcome of a `ToRenderer::Key` press.
@@ -2824,6 +2869,7 @@ fn run_page_scripts(
 ) -> (
     rowser_dom::Document,
     Vec<String>,
+    Option<String>,
     Option<std::sync::mpsc::Sender<JsJob>>,
 ) {
     struct Script {
@@ -2864,7 +2910,7 @@ fn run_page_scripts(
         scripts.push(Script { src, body });
     }
     if scripts.is_empty() {
-        return (doc, Vec::new(), None);
+        return (doc, Vec::new(), None, None);
     }
     // Resolve + fetch external bodies in parallel (same pool/deadline as CSS).
     let resolved: Vec<String> = scripts
@@ -2896,7 +2942,8 @@ fn run_page_scripts(
     // reports an initial snapshot after scripts run, then services DOM
     // event jobs (clicks) until the channel closes.
     let (job_tx, job_rx) = std::sync::mpsc::channel::<JsJob>();
-    let (init_tx, init_rx) = std::sync::mpsc::channel::<(rowser_dom::Document, Vec<String>)>();
+    let (init_tx, init_rx) =
+        std::sync::mpsc::channel::<(rowser_dom::Document, Vec<String>, Option<String>)>();
     let (vw, vh) = (viewport.0 as f64, viewport.1 as f64);
     let url = page_url.to_string();
     let spawned = std::thread::Builder::new()
@@ -2925,7 +2972,10 @@ fn run_page_scripts(
             for line in dc.ctx.take_output() {
                 logs.push(format!("[js console] {line}"));
             }
-            if init_tx.send((dc.snapshot_document(), logs)).is_err() {
+            if init_tx
+                .send((dc.snapshot_document(), logs, dc.take_nav()))
+                .is_err()
+            {
                 return;
             }
             // Event loop: each job dispatches a DOM event into the live
@@ -2963,6 +3013,7 @@ fn run_page_scripts(
                             .send(JsReply {
                                 doc: Some(dc.snapshot_document()),
                                 logs,
+                                nav: dc.take_nav(),
                             })
                             .is_err()
                         {
@@ -2987,6 +3038,7 @@ fn run_page_scripts(
                             .send(JsReply {
                                 doc: dc.snapshot_if_mutated(),
                                 logs,
+                                nav: dc.take_nav(),
                             })
                             .is_err()
                         {
@@ -2998,10 +3050,11 @@ fn run_page_scripts(
         });
     match spawned {
         Ok(_) => match init_rx.recv() {
-            Ok((doc, logs)) => (doc, logs, Some(job_tx)),
+            Ok((doc, logs, nav)) => (doc, logs, nav, Some(job_tx)),
             Err(_) => (
                 rowser_html::parse("<html><body></body></html>"),
                 vec!["[js] interpreter thread died before initial snapshot".to_string()],
+                None,
                 None,
             ),
         },
@@ -3009,6 +3062,7 @@ fn run_page_scripts(
             // doc moved into the (failed) spawn — render a fallback
             rowser_html::parse("<html><body></body></html>"),
             vec![format!("[js] could not spawn interpreter thread: {e}")],
+            None,
             None,
         ),
     }
@@ -3039,6 +3093,112 @@ fn test_pattern(width: u32, height: u32) -> Vec<u8> {
         }
     }
     px
+}
+
+/// `<meta http-equiv="refresh" content="0;url=...">` — honor immediate
+/// (0-second) refreshes; delayed ones would need a timer we don't run.
+/// Returns the resolved target URL.
+fn meta_refresh(doc: &rowser_dom::Document, base: &str) -> Option<String> {
+    for id in doc.descendants(doc.root) {
+        if doc.tag(id) != Some("meta") {
+            continue;
+        }
+        if !doc
+            .attr(id, "http-equiv")
+            .is_some_and(|v| v.eq_ignore_ascii_case("refresh"))
+        {
+            continue;
+        }
+        let Some(content) = doc.attr(id, "content") else {
+            continue;
+        };
+        // content = "delay[;url=target]" — only instant refreshes.
+        let target = match content.split_once(';') {
+            Some((d, rest)) => {
+                if d.trim().parse::<f64>().ok()? > 0.0 {
+                    return None;
+                }
+                rest.trim()
+                    .strip_prefix("url=")
+                    .or_else(|| rest.trim().strip_prefix("URL="))
+                    .unwrap_or(rest.trim())
+            }
+            None => {
+                if content.trim().parse::<f64>().is_ok() {
+                    return None; // bare delay reloads the same page
+                }
+                content.trim()
+            }
+        };
+        if target.is_empty() {
+            continue;
+        }
+        return rowser_net::Url::parse(base)
+            .and_then(|b| b.resolve(target))
+            .ok()
+            .map(|u| u.to_string());
+    }
+    None
+}
+
+/// `<noscript><meta http-equiv=refresh …></noscript>` — invisible to the
+/// DOM scan when scripting is on (noscript contents are raw text), so
+/// pull it straight out of the raw HTML. Sites that can't hydrate under
+/// us (DDG's SPA, etc.) offer this as their own no-JS escape hatch; we
+/// follow it only when the page also renders nearly empty.
+fn noscript_meta_refresh(html: &str, base: &str) -> Option<String> {
+    let lc = html.to_ascii_lowercase();
+    let mut at = 0;
+    while let Some(open) = lc[at..].find("<noscript") {
+        let start = at + open;
+        let gt = lc[start..].find('>')? + start;
+        let Some(close) = lc[gt..].find("</noscript") else {
+            break;
+        };
+        let inner = &html[gt + 1..gt + close];
+        if lc[gt + 1..gt + close].contains("http-equiv")
+            && lc[gt + 1..gt + close].contains("refresh")
+        {
+            let frag = rowser_html::parse(inner);
+            if let Some(u) = meta_refresh(&frag, base) {
+                return Some(u);
+            }
+        }
+        at = gt + close;
+    }
+    None
+}
+
+/// Heuristic for "the JS app failed to mount": very few real elements
+/// and almost no visible text outside script/style/noscript.
+fn page_looks_empty(doc: &rowser_dom::Document) -> bool {
+    let mut elems = 0u32;
+    let mut text = 0usize;
+    for id in doc.descendants(doc.root) {
+        match doc.tag(id) {
+            Some("script") | Some("style") | Some("noscript") | Some("template") => {}
+            Some(_) => elems += 1,
+            None => {
+                if let Some(t) = doc.text(id) {
+                    // script/style/noscript children are raw-text nodes —
+                    // their tag is None, so check the parent's instead
+                    let inert = doc
+                        .parent(id)
+                        .and_then(|p| doc.tag(p))
+                        .is_some_and(|t| {
+                            matches!(t, "script" | "style" | "noscript" | "template")
+                        });
+                    if !inert {
+                        text += t.trim().len();
+                    }
+                }
+            }
+        }
+        if elems >= 80 || text >= 200 {
+            return false;
+        }
+    }
+    elems < 80 && text < 200
 }
 
 fn dom_dump(doc: &rowser_dom::Document) -> String {

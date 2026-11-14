@@ -142,6 +142,9 @@ pub struct DomState {
     storage_session: Vec<(String, String)>,
     focused: Option<(u32, NodeId)>,
     location: Option<ObjRef>,
+    /// URL queued by `location.assign/replace` — the host navigates after
+    /// the current JS turn drains.
+    nav: Option<String>,
     /// Live `style`/`dataset` wrapper objects — synced back into document
     /// attributes by `sync_dom_side_effects` without scanning every node.
     styled_objs: Vec<ObjRef>,
@@ -2210,6 +2213,33 @@ fn noop(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
     Ok(Value::Und)
 }
 
+/// `location.assign(url)` / `location.replace(url)` — queue a navigation
+/// for the host to perform once the JS turn ends. `assign` vs `replace`
+/// differ only in history handling, which lives browser-side.
+fn loc_nav(i: &mut Interp, _t: &Value, a: &[Value]) -> NR {
+    if let Some(u) = a.first() {
+        let target = i.to_str(u)?;
+        with_ds(i, |ds| {
+            ds.nav = Some(
+                rowser_net::Url::parse(&ds.url)
+                    .and_then(|b| b.resolve(&target))
+                    .map(|r| r.to_string())
+                    .unwrap_or(target),
+            );
+        });
+    }
+    Ok(Value::Und)
+}
+
+/// `location.href = url` — same navigation as `assign`.
+fn loc_href_set(i: &mut Interp, _t: &Value, a: &[Value]) -> NR {
+    loc_nav(i, &Value::Und, a)
+}
+
+fn loc_href_get(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
+    Ok(Value::Str(Rc::from(with_ds(i, |ds| ds.url.clone()))))
+}
+
 // -- classList ----------------------------------------------------------------
 
 fn classlist_obj(i: &mut Interp, el: &Value, el_o: &ObjRef) -> Value {
@@ -3056,7 +3086,6 @@ fn location_obj(i: &mut Interp) -> Value {
         format!("{protocol}//{host}")
     };
     for (k, v) in [
-        ("href", url.as_str()),
         ("origin", origin.as_str()),
         ("protocol", protocol.as_str()),
         ("host", host.as_str()),
@@ -3068,7 +3097,12 @@ fn location_obj(i: &mut Interp) -> Value {
     ] {
         set_bk(&o, k, Value::Str(Rc::from(v)));
     }
-    for m in ["assign", "replace", "reload", "toString"] {
+    // href is an accessor — assigning it navigates (like assign).
+    acc(i, &o, "href", Some(loc_href_get), Some(loc_href_set));
+    for m in ["assign", "replace"] {
+        set_bk(&o, m, i.native(m, loc_nav));
+    }
+    for m in ["reload", "toString"] {
         set_bk(&o, m, i.native(m, noop));
     }
     with_ds(i, |ds| ds.location = Some(o.clone()));
@@ -3524,6 +3558,7 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         storage_session: Vec::new(),
         focused: None,
         location: None,
+        nav: None,
         styled_objs: Vec::new(),
         dataset_objs: Vec::new(),
     }));
@@ -4432,6 +4467,12 @@ impl DomContext {
         })
     }
 
+    /// URL queued by `location.assign/replace` during the last turn, if
+    /// any — the host navigates to it.
+    pub fn take_nav(&mut self) -> Option<String> {
+        with_ds(&mut self.ctx.interp, |ds| ds.nav.take())
+    }
+
     /// Update `window.scrollY`/`pageYOffset` and fire a `scroll` event
     /// that bubbles document → window, then run the scheduler (bounded).
     /// Sites with scrolled-nav / reveal-on-scroll depend on this.
@@ -4769,6 +4810,34 @@ mod tests {
         assert_eq!(s(&mut dc, "document.readyState"), "complete");
         assert_eq!(s(&mut dc, "window === self && self === globalThis"), "true");
         assert_eq!(s(&mut dc, "document.defaultView === window"), "true");
+    }
+
+    #[test]
+    fn location_navigation() {
+        let mut dc = DomContext::new(
+            rowser_html::parse("<html><body></body></html>"),
+            "https://duckduckgo.com/l/?uddg=x",
+        );
+        assert_eq!(dc.take_nav(), None);
+        // replace/assign resolve against the page URL
+        run(&mut dc, "location.replace('//example.com/a?b=1')");
+        assert_eq!(dc.take_nav().as_deref(), Some("https://example.com/a?b=1"));
+        run(&mut dc, "location.assign('/rel/path')");
+        assert_eq!(
+            dc.take_nav().as_deref(),
+            Some("https://duckduckgo.com/rel/path")
+        );
+        // location.href = url navigates too; reading it still works
+        run(&mut dc, "location.href = 'https://rust-lang.org/'");
+        assert_eq!(dc.take_nav().as_deref(), Some("https://rust-lang.org/"));
+        assert_eq!(
+            s(&mut dc, "location.href"),
+            "https://duckduckgo.com/l/?uddg=x"
+        );
+        // window.parent.location reaches the same object (DDG's
+        // interstitial pattern)
+        run(&mut dc, "window.parent.location.replace('https://t.co/')");
+        assert_eq!(dc.take_nav().as_deref(), Some("https://t.co/"));
     }
 
     #[test]
