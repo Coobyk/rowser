@@ -86,12 +86,11 @@ fn scripts_ctx(
             },
             None => s.body.clone(),
         };
-        if let Err(e) = dc.eval(&src) {
+        if let Err(e) = dc.eval_bounded(&src, std::time::Duration::from_secs(30)) {
             eprintln!("[js] {e}");
         }
     }
-    dc.flush_raf();
-    dc.run_timers();
+    dc.pump_bounded(std::time::Duration::from_secs(20));
     for e in &dc.errors {
         eprintln!("[js] {e}");
     }
@@ -149,13 +148,19 @@ fn dump_tree(d: &rowser_dom::Document, n: rowser_dom::NodeId, depth: usize, max:
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "dump".into());
-    let url = "https://goonchess.com/";
+    let url = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "https://goonchess.com/".into());
     let (w, h) = (1280.0f32, 800.0f32);
+    eprintln!("[goonplay] fetching {url}");
     let mut session = rowser_net::Session::with_google_consent();
-    let (body, cs) = fetch(url, &mut session).expect("fetch");
+    let (body, cs) = fetch(&url, &mut session).expect("fetch");
+    eprintln!("[goonplay] fetched {} bytes", body.len());
     let html = rowser_html::decode(&body, cs.as_deref());
     let doc = rowser_html::parse_scripting(&html);
-    let mut dc = scripts_ctx(doc, url, w, h, &mut session);
+    eprintln!("[goonplay] parsed, running scripts");
+    let mut dc = scripts_ctx(doc, &url, w, h, &mut session);
+    eprintln!("[goonplay] scripts done");
 
     if mode == "dump" {
         let d = dc.snapshot_document();
@@ -188,19 +193,49 @@ fn main() {
     let before = piece_map(&doc, &squares);
     eprintln!("pieces before: {:?}", &before[..8.min(before.len())]);
 
-    // e2 (white pawn) -> e4. Board index: rank 8-file a = 0, so
-    // e2 = row 6 col 4 = 52, e4 = row 4 col 4 = 36.
-    for (name, idx) in [("e2", 52usize), ("e4", 36usize)] {
-        let nid = squares[idx];
-        match dc.dispatch_event(nid, "click", (400.0, 400.0)) {
-            Ok(prevented) => eprintln!("click {name} dispatched (defaultPrevented={:?})", !prevented),
-            Err(e) => eprintln!("click {name} error"),
-        }
-        dc.flush_raf();
-        dc.run_timers();
+    // Play real moves: click the source square to select, then click the
+    // legal-move indicator inside the destination square, pump the
+    // scheduler, and verify the DOM reflects the move.
+    // Board index: rank 8-file a = 0 → e2=52, e4=36, e7=12, e5=28.
+    for &(from, to, name) in [(52usize, 36usize, "e2-e4"), (12, 28, "e7-e5")].iter() {
+        make_move(&mut dc, &squares, from, to, name);
+        let d = dc.snapshot_document();
+        eprint_occupancy(&d, &squares);
     }
+
+    let mid = dc.snapshot_document();
+    let mmap = piece_map(&mid, &squares);
+    let moved: Vec<usize> = (0..64).filter(|&i| before.get(i) != mmap.get(i)).collect();
+    eprintln!("[goonplay] squares changed vs start: {moved:?}");
+    eprintln!("[goonplay] collecting snapshot");
     for e in &dc.errors {
         eprintln!("[js] {e}");
+    }
+    // Where was the interpreter when the budget tripped?
+    if let Some(site) = &dc.ctx.interp.interrupt_site {
+        eprintln!("interrupt site: {site}");
+    }
+    let tr: Vec<String> = dc.ctx.interp.call_trace.iter().cloned().collect();
+    eprintln!("call_trace ({}):", tr.len());
+    // Find the repeating cycle: detect the shortest period in the tail.
+    if tr.len() > 100 {
+        let tail = &tr[tr.len() - 100..];
+        for period in 1..=50usize {
+            if tail.windows(period).all(|w| w == &tail[..period]) {
+                eprintln!("repeating cycle of {period}:");
+                for t in &tail[..period] {
+                    eprintln!("    | {t}");
+                }
+                break;
+            }
+        }
+    }
+    for t in tr.iter().take(30) {
+        eprintln!("    {t}");
+    }
+    eprintln!("    ...");
+    for t in tr.iter().skip(tr.len().saturating_sub(20)) {
+        eprintln!("    {t}");
     }
     for line in dc.ctx.take_output() {
         eprintln!("[js console] {line}");
@@ -212,6 +247,7 @@ fn main() {
         .filter(|&i| before.get(i) != amap.get(i))
         .collect();
     eprintln!("changed squares: {moved:?}");
+    eprint_occupancy(&after, &squares);
     // move list / status text search
     for id in after.descendants(after.root) {
         let t = after.text_content(id);
@@ -222,6 +258,83 @@ fn main() {
             }
             eprintln!("  text-node cand: {:?} {:?}", after.tag(id), &t[..t.len().min(80)]);
         }
+    }
+}
+
+/// Click `from` to select, then click the legal-move dot inside `to`,
+/// then pump the scheduler in 1s slices until queues drain (max ~8s).
+fn make_move(
+    dc: &mut rowser_js::dom_bridge::DomContext,
+    squares: &[rowser_dom::NodeId],
+    from: usize,
+    to: usize,
+    name: &str,
+) {
+    match dc.dispatch_event_pumped(squares[from], "click", (400.0, 400.0), std::time::Duration::from_secs(10)) {
+        Ok(p) => eprintln!("[move {name}] select click ok (defaultPrevented={p})"),
+        Err(e) => {
+            eprintln!("[move {name}] select click err: {}", dc.ctx.interp.inspect(&e, 0));
+            return;
+        }
+    }
+    // Legal-move indicator: the dot (or capture ring) child on `to`.
+    let mid = dc.snapshot_document();
+    let dot = mid
+        .descendants(squares[to])
+        .find(|&n| {
+            mid.attr(n, "class")
+                .map(|c| c.contains("rounded-full") || c.contains("z-20"))
+                .unwrap_or(false)
+        });
+    let target = match dot {
+        Some(d) => d,
+        None => {
+            eprintln!("[move {name}] no legal-move dot on {to} — clicking square directly");
+            squares[to]
+        }
+    };
+    match dc.dispatch_event_pumped(target, "click", (400.0, 400.0), std::time::Duration::from_secs(10)) {
+        Ok(p) => eprintln!("[move {name}] dest click ok (defaultPrevented={p})"),
+        Err(e) => {
+            eprintln!("[move {name}] dest click err: {}", dc.ctx.interp.inspect(&e, 0));
+            return;
+        }
+    }
+    for slice in 0..8 {
+        let c = dc.pending_counts();
+        if c.0 == 0 && c.1 == 0 && c.2 == 0 && c.3 == 0 {
+            break;
+        }
+        dc.pump_bounded(std::time::Duration::from_secs(1));
+        for e in dc.errors.drain(..) {
+            eprintln!("    [js] {e}");
+        }
+        eprintln!("  pump {slice}: mt={} timers={} ports={} raf={} steps={}", c.0, c.1, c.2, c.3, c.4);
+    }
+    eprintln!("[move {name}] done");
+}
+
+/// Print an 8x8 occupancy map of piece img srcs (wP/bK/... or `.`).
+fn eprint_occupancy(d: &rowser_dom::Document, squares: &[rowser_dom::NodeId]) {
+    for r in 0..8 {
+        let mut row = String::new();
+        for c in 0..8 {
+            let i = r * 8 + c;
+            let mut mark = ".  ".to_string();
+            for n in d.descendants(squares[i]) {
+                if d.tag(n) == Some("img") {
+                    if let Some(src) = d.attr(n, "src") {
+                        if let Some(name) =
+                            src.rsplit('/').next().and_then(|s| s.strip_suffix(".svg"))
+                        {
+                            mark = format!("{name:3}");
+                        }
+                    }
+                }
+            }
+            row.push_str(&mark);
+        }
+        eprintln!("  r{r}: {row}");
     }
 }
 
