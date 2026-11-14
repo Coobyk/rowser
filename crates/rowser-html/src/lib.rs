@@ -16,6 +16,124 @@ pub fn parse(html: &str) -> Document {
     Parser::new(html).run()
 }
 
+/// Parse with scripting enabled: `<noscript>` contents become inert raw
+/// text (a single text child) so a `<style>`/`<meta>` inside can never
+/// become an element. Use for pages whose scripts will actually run.
+pub fn parse_scripting(html: &str) -> Document {
+    let mut p = Parser::new(html);
+    p.scripting = true;
+    p.run()
+}
+
+/// Decode an HTTP body to text: the `charset` hint (from the
+/// Content-Type header) wins, else a `<meta charset>` prescan of the
+/// first 1 KiB, else UTF-8. Per spec, the iso-8859-1/latin1/us-ascii
+/// labels all decode as windows-1252.
+pub fn decode(body: &[u8], charset_hint: Option<&str>) -> String {
+    let label = charset_hint
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .or_else(|| meta_charset(body));
+    decode_as(body, label.as_deref())
+}
+
+/// `<meta charset=x>` / `<meta content="...;charset=x">` prescan over the
+/// first 1024 bytes (WHATWG §13.4.2's pragmatic subset).
+fn meta_charset(body: &[u8]) -> Option<String> {
+    let scan = &body[..body.len().min(1024)];
+    let mut i = 0;
+    while let Some(off) = find_ci(&scan[i..], b"<meta") {
+        let t = i + off;
+        let end = scan[t..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|p| t + p)
+            .unwrap_or(scan.len());
+        let tag = &scan[t..end];
+        if let Some(coff) = find_ci(tag, b"charset") {
+            let mut v = &tag[coff + 7..];
+            while matches!(v.first(), Some(b' ' | b'\t')) {
+                v = &v[1..];
+            }
+            if v.first() == Some(&b'=') {
+                v = &v[1..];
+                while matches!(v.first(), Some(b' ' | b'\t')) {
+                    v = &v[1..];
+                }
+                let v = match v.first() {
+                    Some(&q @ (b'"' | b'\'')) => {
+                        let inner = &v[1..];
+                        &inner[..inner.iter().position(|&b| b == q).unwrap_or(inner.len())]
+                    }
+                    _ => {
+                        let end = v
+                            .iter()
+                            .position(|&b| {
+                                matches!(b, b' ' | b'\t' | b';' | b'/' | b'>' | b'"' | b'\'')
+                            })
+                            .unwrap_or(v.len());
+                        &v[..end]
+                    }
+                };
+                if !v.is_empty() {
+                    return String::from_utf8(v.to_ascii_lowercase()).ok();
+                }
+            }
+        }
+        i = end;
+    }
+    None
+}
+
+fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn decode_as(body: &[u8], label: Option<&str>) -> String {
+    match label.unwrap_or("utf-8") {
+        "utf-8" | "utf8" | "unicode-1-1-utf-8" => {
+            String::from_utf8_lossy(body).into_owned()
+        }
+        // the single-byte labels all map to windows-1252 per the Encoding
+        // spec — iso-8859-1 is never actually latin-1 on the web
+        "iso-8859-1" | "latin1" | "latin-1" | "l1" | "ascii" | "us-ascii" | "windows-1252"
+        | "cp1252" | "iso8859-1" | "iso_8859-1" | "iso-ir-100" | "csisolatin1" => {
+            windows_1252(body)
+        }
+        "utf-16le" | "utf-16" | "utf-16be" => {
+            let be = label == Some("utf-16be");
+            let v: Vec<u16> = body
+                .chunks_exact(2)
+                .map(|c| {
+                    if be {
+                        u16::from_be_bytes([c[0], c[1]])
+                    } else {
+                        u16::from_le_bytes([c[0], c[1]])
+                    }
+                })
+                .collect();
+            String::from_utf16_lossy(&v)
+        }
+        _ => String::from_utf8_lossy(body).into_owned(),
+    }
+}
+
+/// Byte-per-codepoint windows-1252 decode (0x80–0x9F through the table).
+fn windows_1252(body: &[u8]) -> String {
+    body.iter()
+        .map(|&b| {
+            let cp = if (0x80..=0x9f).contains(&b) {
+                WINDOWS_1252[b as usize - 0x80]
+            } else {
+                b as u32
+            };
+            char::from_u32(cp).unwrap_or('\u{fffd}')
+        })
+        .collect()
+}
+
 // ---------- tokenizer ----------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -681,6 +799,8 @@ struct Parser<'a> {
     doc: Document,
     stack: Vec<NodeId>,
     mode: Mode,
+    /// Scripting flag — when set, `<noscript>` parses as raw text.
+    scripting: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -690,6 +810,7 @@ impl<'a> Parser<'a> {
             doc: Document::new(),
             stack: Vec::new(),
             mode: Mode::BeforeHtml,
+            scripting: false,
         }
     }
 
@@ -832,12 +953,14 @@ impl<'a> Parser<'a> {
             },
             Mode::InHead => match token {
                 Token::Text(t) => {
-                    // Raw-text content (script/style/title) lands inside the
-                    // current element; other text pushes us out of the head.
-                    if self
-                        .current_tag()
-                        .is_some_and(|c| KEEP_RAW.contains(&c) || c == "head")
-                    {
+                    // Raw-text content (script/style/title, and noscript
+                    // when scripting) lands inside the current element;
+                    // other text pushes us out of the head.
+                    if self.current_tag().is_some_and(|c| {
+                        KEEP_RAW.contains(&c)
+                            || c == "head"
+                            || (c == "noscript" && self.scripting)
+                    }) {
                         self.insert_text(&t);
                         None
                     } else {
@@ -851,7 +974,8 @@ impl<'a> Parser<'a> {
                     attrs,
                     self_closing,
                 } if HEAD_TAGS.contains(&name.as_str()) => {
-                    let raw = RAW_TEXT.contains(&name.as_str());
+                    let raw = RAW_TEXT.contains(&name.as_str())
+                        || (name == "noscript" && self.scripting);
                     if VOID.contains(&name.as_str()) || self_closing {
                         self.insert_element(&name, attrs);
                     } else {
@@ -991,7 +1115,9 @@ impl<'a> Parser<'a> {
                         self.push_element(&name, attrs);
                         None
                     }
-                    _ if RAW_TEXT.contains(&name.as_str()) => {
+                    _ if RAW_TEXT.contains(&name.as_str())
+                        || (name == "noscript" && self.scripting) =>
+                    {
                         self.push_element(&name, attrs);
                         if !self_closing {
                             self.tok.enter_raw_text(&name);
@@ -1108,6 +1234,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_single_byte_labels() {
+        // iso-8859-1 on the wire means windows-1252 — \xdc is Ü, \x93 a
+        // curly quote, not a control char
+        let body = b"<p>\xdcber \x93ok\x94</p>";
+        assert_eq!(decode(body, Some("iso-8859-1")), "<p>Über “ok”</p>");
+        assert_eq!(decode(body, Some("windows-1252")), "<p>Über “ok”</p>");
+    }
+
+    #[test]
+    fn decode_meta_prescan() {
+        // header hint wins; otherwise <meta charset> is picked up
+        let body = b"<head><meta charset=windows-1252></head><p>\xdc</p>";
+        assert_eq!(decode(body, None), "<head><meta charset=windows-1252></head><p>Ü</p>");
+        assert_eq!(decode(body, Some("utf-8")), "<head><meta charset=windows-1252></head><p>�</p>");
+        let meta_content =
+            b"<meta http-equiv=Content-Type content=\"text/html; charset=iso-8859-1\"><p>\xdc</p>";
+        assert!(decode(meta_content, None).ends_with("Ü</p>"));
+    }
+
+    #[test]
     fn raw_script() {
         let doc = parse("<body><script>if (a<b) { x(); }</script><p>ok</p>");
         let script = doc.find_deep(doc.root, "script").unwrap();
@@ -1127,6 +1273,27 @@ mod tests {
             .filter(|&&c| doc.tag(c) == Some("li"))
             .collect();
         assert_eq!(lis.len(), 3);
+    }
+
+    #[test]
+    fn noscript_scripting_modes() {
+        // Scripting enabled: contents are inert text, no element children
+        // (a <style> inside must never apply — DDG ships one this way).
+        let doc = parse_scripting(
+            "<body><noscript><style>body{display:none}</style><b>x</b></noscript><p>ok</p>",
+        );
+        let ns = doc.find_deep(doc.root, "noscript").unwrap();
+        assert!(doc.find_deep(ns, "style").is_none());
+        assert!(doc.find_deep(doc.root, "b").is_none());
+        assert!(doc
+            .children(ns)
+            .iter()
+            .all(|&c| doc.tag(c).is_none()));
+        assert_eq!(doc.text_content(doc.find_deep(doc.root, "p").unwrap()), "ok");
+
+        // Scripting disabled: contents parse as real elements.
+        let doc = parse("<body><noscript><b>x</b></noscript>");
+        assert!(doc.find_deep(doc.root, "b").is_some());
     }
 
     #[test]
