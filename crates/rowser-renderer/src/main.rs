@@ -69,7 +69,24 @@ fn main() {
         let msg = if let Some(m) = pending.pop_front() {
             m
         } else {
-            let Ok(payload) = rx.recv() else { break }; // parent hung up
+            // An in-flight scroll→JS turn can't wait for the next input
+            // event — cap the recv so its reply is applied promptly.
+            let payload = if page.js_scroll.is_some() {
+                match rx.recv_timeout(std::time::Duration::from_millis(150)) {
+                    Ok(p) => Some(p),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(p) => Some(p),
+                    Err(_) => break,
+                }
+            };
+            let Some(payload) = payload else {
+                poll_js_scroll(&mut page, &mut fonts, &mut output);
+                continue;
+            };
             match ToRenderer::decode(&payload) {
                 Ok(m) => m,
                 Err(e) => {
@@ -357,7 +374,9 @@ fn main() {
                             match rrx.recv() {
                                 Ok(rep) => {
                                     dispatched = true;
-                                    page.doc = Some(rep.doc);
+                                    if let Some(d) = rep.doc {
+                                        page.doc = Some(d);
+                                    }
                                     // The fresh DOM may carry new <style>
                                     // rules — relearn what layout depends
                                     // on before reusing anything.
@@ -488,6 +507,25 @@ fn main() {
                         if let Some(m) = msg {
                             let _ = send(&mut output, &m);
                         }
+                        // Hand the new position to page JS — scrolled
+                        // navs, reveal-on-scroll and progress bars live
+                        // behind `scroll` listeners. One job in flight
+                        // at a time; the newest position wins.
+                        if let Some(js) = &page.js {
+                            page.js_scroll_wanted = new as f64;
+                            if page.js_scroll.is_none() {
+                                let (rtx, rrx) = std::sync::mpsc::channel();
+                                if js
+                                    .send(JsJob::Scroll {
+                                        y: new as f64,
+                                        reply: rtx,
+                                    })
+                                    .is_ok()
+                                {
+                                    page.js_scroll = Some((rrx, new as f64));
+                                }
+                            }
+                        }
                     }
                     // Unchanged offset: the chrome's stored frame is
                     // already correct — send nothing at all.
@@ -505,6 +543,52 @@ fn main() {
 
 fn send(w: &mut impl Write, msg: &ToBrowser) -> io::Result<()> {
     write_frame(w, &msg.encode())
+}
+
+/// Drain a finished scroll→JS turn: forward logs, swap in the mutated
+/// DOM (skipping the swap + relayout when nothing changed), repaint,
+/// and resend the newest scroll position if the user kept scrolling
+/// while the job ran.
+fn poll_js_scroll(page: &mut Page, fonts: &mut FontCache, w: &mut impl Write) {
+    let Some((rrx, sent)) = page.js_scroll.take() else {
+        return;
+    };
+    match rrx.try_recv() {
+        Ok(rep) => {
+            for l in rep.logs {
+                let _ = send(w, &ToBrowser::Log(l));
+            }
+            if let Some(d) = rep.doc {
+                page.doc = Some(d);
+                page.layout_dirty = true;
+                page.pseudo_mask = page.detect_pseudo_mask();
+                page.scroll_pinned = page.detect_scroll_pinned();
+                page.repaint(fonts);
+                send_frame(w, page);
+            }
+            // trailing edge — the position moved on while JS worked
+            if page.js_scroll_wanted != sent {
+                if let Some(js) = &page.js {
+                    let (rtx, rrx) = std::sync::mpsc::channel();
+                    if js
+                        .send(JsJob::Scroll {
+                            y: page.js_scroll_wanted,
+                            reply: rtx,
+                        })
+                        .is_ok()
+                    {
+                        page.js_scroll = Some((rrx, page.js_scroll_wanted));
+                    }
+                }
+            }
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            page.js_scroll = Some((rrx, sent));
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            page.js = None; // interpreter thread died
+        }
+    }
 }
 
 /// Background image pipeline messages. Fetch workers report raw bodies
@@ -529,10 +613,19 @@ enum JsJob {
         client: (f64, f64),
         reply: std::sync::mpsc::Sender<JsReply>,
     },
+    /// Viewport scroll position — updates window.scrollY and fires
+    /// `scroll` listeners (scrolled navs, reveal-on-scroll, progress
+    /// bars). `doc` in the reply is None when the turn didn't mutate.
+    Scroll {
+        y: f64,
+        reply: std::sync::mpsc::Sender<JsReply>,
+    },
 }
 
 struct JsReply {
-    doc: rowser_dom::Document,
+    /// Mutated DOM snapshot — None when the turn changed nothing (the
+    /// renderer then skips the doc swap and relayout entirely).
+    doc: Option<rowser_dom::Document>,
     logs: Vec<String>,
 }
 
@@ -583,6 +676,12 @@ struct Page {
     /// Live page-JS job channel — the interpreter thread owns the real
     /// document; `doc` is a snapshot refreshed after each dispatched event.
     js: Option<std::sync::mpsc::Sender<JsJob>>,
+    /// In-flight scroll→JS turn: (reply channel, scroll-y sent). At most
+    /// one — a trailing-edge send delivers the newest position when the
+    /// job returns so scroll bursts don't queue interpreter turns.
+    js_scroll: Option<(std::sync::mpsc::Receiver<JsReply>, f64)>,
+    /// Newest scroll-y to deliver to JS — refreshed on every scroll.
+    js_scroll_wanted: f64,
     /// Element border boxes (x, y, w, h, node, transform) for click
     /// hit-testing — the rect is in pre-transform space; the matrix maps
     /// it to painted position (inverse-mapped against click points).
@@ -678,6 +777,8 @@ impl Page {
         Self {
             doc: None,
             js: None,
+            js_scroll: None,
+            js_scroll_wanted: 0.0,
             hits: Vec::new(),
             viewport: (800, 600),
             scroll: 0.0,
@@ -722,6 +823,8 @@ impl Page {
     fn load(&mut self, doc: rowser_dom::Document, url: String, _title: String) {
         self.doc = Some(doc);
         self.js = None; // dropping the channel ends the old JS thread
+        self.js_scroll = None;
+        self.js_scroll_wanted = 0.0;
         self.hits.clear();
         self.url_base = url.clone();
         self.cur_url = url;
@@ -2855,7 +2958,31 @@ fn run_page_scripts(
                         }
                         if reply
                             .send(JsReply {
-                                doc: dc.snapshot_document(),
+                                doc: Some(dc.snapshot_document()),
+                                logs,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    JsJob::Scroll { y, reply } => {
+                        let mut logs = Vec::new();
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            // shorter budget than input events — a
+                            // pathological scroll handler must not stall
+                            // scrolling for long
+                            dc.scroll_pumped(y, std::time::Duration::from_millis(800));
+                        }));
+                        for e in dc.errors.drain(..) {
+                            logs.push(format!("[js] {e}"));
+                        }
+                        for line in dc.ctx.take_output() {
+                            logs.push(format!("[js console] {line}"));
+                        }
+                        if reply
+                            .send(JsReply {
+                                doc: dc.snapshot_if_mutated(),
                                 logs,
                             })
                             .is_err()

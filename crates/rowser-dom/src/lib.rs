@@ -92,6 +92,10 @@ pub struct Node {
 pub struct Document {
     pub nodes: Vec<Node>,
     pub root: NodeId,
+    /// Set by JS-driven mutations (attr/structure/text writes) — lets the
+    /// embedder skip DOM snapshots + relayouts for turns that changed
+    /// nothing. Cleared when a snapshot is taken.
+    pub mutated: bool,
 }
 
 impl Default for Document {
@@ -110,6 +114,7 @@ impl Document {
                 sibling_index: 0,
             }],
             root: 0,
+            mutated: false,
         }
     }
 
@@ -151,6 +156,7 @@ impl Document {
 
     /// Append `child` under `parent`, fixing parent/sibling links.
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
+        self.mutated = true;
         // detach if it had a parent
         if let Some(p) = self.nodes[child].parent {
             self.nodes[p].children.retain(|&c| c != child);

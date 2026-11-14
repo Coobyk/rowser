@@ -6,6 +6,104 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+// ---------------------------------------------------------------------------
+// Fast hasher (rustc-hash/FxHash style) — SipHash is overkill for the
+// short identifier/property keys that dominate interpreter lookups.
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Clone)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(FX_SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+    #[inline]
+    fn write(&mut self, mut b: &[u8]) {
+        while b.len() >= 8 {
+            self.add(u64::from_le_bytes(b[..8].try_into().unwrap()));
+            b = &b[8..];
+        }
+        if b.len() >= 4 {
+            self.add(u32::from_le_bytes(b[..4].try_into().unwrap()) as u64);
+            b = &b[4..];
+        }
+        if b.len() >= 2 {
+            self.add(u16::from_le_bytes(b[..2].try_into().unwrap()) as u64);
+            b = &b[2..];
+        }
+        if !b.is_empty() {
+            self.add(b[0] as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, n: u8) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_u16(&mut self, n: u16) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    #[inline]
+    fn write_u128(&mut self, n: u128) {
+        self.add(n as u64);
+        self.add((n >> 64) as u64);
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_i8(&mut self, n: i8) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_i16(&mut self, n: i16) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_i32(&mut self, n: i32) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_i64(&mut self, n: i64) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_i128(&mut self, n: i128) {
+        self.add(n as u64);
+        self.add((n >> 64) as u64);
+    }
+    #[inline]
+    fn write_isize(&mut self, n: isize) {
+        self.add(n as u64);
+    }
+}
+
+pub type FxBuild = std::hash::BuildHasherDefault<FxHasher>;
+pub type FxMap<K, V> = HashMap<K, V, FxBuild>;
+pub type FxSet<T> = HashSet<T, FxBuild>;
+
 pub const SYM_ITERATOR: u64 = 1;
 pub const SYM_TOPRIMITIVE: u64 = 2;
 pub const SYM_TOSTRINGTAG: u64 = 3;
@@ -94,9 +192,15 @@ impl Prop {
 }
 
 /// Insertion-ordered property map (JS preserves key insertion order).
+///
+/// String keys live in `map` (keyed by `Rc<str>`) so lookups can borrow
+/// `&str` directly — `get_str` hits the map with NO `Rc` allocation, which
+/// is what every `obj.prop` member access uses. Symbol keys are rare and
+/// live in a separate side map; `order` still holds both kinds.
 #[derive(Default)]
 pub struct PropMap {
-    map: HashMap<PropKey, Prop>,
+    map: FxMap<Rc<str>, Prop>,
+    syms: FxMap<u64, Prop>,
     order: Vec<PropKey>,
 }
 
@@ -105,44 +209,113 @@ impl PropMap {
         PropMap::default()
     }
     pub fn get(&self, k: &PropKey) -> Option<&Prop> {
+        match k {
+            PropKey::S(s) => self.map.get(s.as_ref()),
+            PropKey::Sym(id) => self.syms.get(id),
+        }
+    }
+    /// borrowed lookup by string key — no key allocation
+    #[inline]
+    pub fn get_str(&self, k: &str) -> Option<&Prop> {
         self.map.get(k)
     }
-    pub fn get_mut(&mut self, k: &PropKey) -> Option<&mut Prop> {
+    #[inline]
+    pub fn get_str_mut(&mut self, k: &str) -> Option<&mut Prop> {
         self.map.get_mut(k)
     }
-    pub fn insert(&mut self, k: PropKey, p: Prop) {
-        if !self.map.contains_key(&k) {
-            self.order.push(k.clone());
+    pub fn get_mut(&mut self, k: &PropKey) -> Option<&mut Prop> {
+        match k {
+            PropKey::S(s) => self.map.get_mut(s.as_ref()),
+            PropKey::Sym(id) => self.syms.get_mut(id),
         }
-        self.map.insert(k, p);
+    }
+    pub fn insert(&mut self, k: PropKey, p: Prop) {
+        match k {
+            PropKey::S(s) => {
+                if !self.map.contains_key(s.as_ref()) {
+                    self.order.push(PropKey::S(s.clone()));
+                }
+                self.map.insert(s, p);
+            }
+            PropKey::Sym(id) => {
+                if !self.syms.contains_key(&id) {
+                    self.order.push(PropKey::Sym(id));
+                }
+                self.syms.insert(id, p);
+            }
+        }
+    }
+    /// insert by string key — allocates the key only when newly inserted
+    pub fn insert_str(&mut self, s: &str, p: Prop) {
+        if let Some(e) = self.map.get_mut(s) {
+            *e = p;
+            return;
+        }
+        self.order.push(PropKey::from_str(s));
+        self.map.insert(Rc::from(s), p);
+    }
+    /// insert with an owned (e.g. interned) string key — one Rc clone
+    pub fn insert_str_rc(&mut self, s: Rc<str>, p: Prop) {
+        if !self.map.contains_key(s.as_ref()) {
+            self.order.push(PropKey::S(s.clone()));
+        }
+        self.map.insert(s, p);
     }
     pub fn remove(&mut self, k: &PropKey) -> Option<Prop> {
-        let r = self.map.remove(k);
+        let r = match k {
+            PropKey::S(s) => self.map.remove(s.as_ref()),
+            PropKey::Sym(id) => self.syms.remove(id),
+        };
         if r.is_some() {
             self.order.retain(|x| x != k);
         }
         r
     }
+    pub fn remove_str(&mut self, k: &str) -> Option<Prop> {
+        let r = self.map.remove(k);
+        if r.is_some() {
+            self.order
+                .retain(|x| !matches!(x, PropKey::S(s) if s.as_ref() == k));
+        }
+        r
+    }
     pub fn contains_key(&self, k: &PropKey) -> bool {
+        match k {
+            PropKey::S(s) => self.map.contains_key(s.as_ref()),
+            PropKey::Sym(id) => self.syms.contains_key(id),
+        }
+    }
+    #[inline]
+    pub fn contains_str(&self, k: &str) -> bool {
         self.map.contains_key(k)
     }
     /// iteration in insertion order
     pub fn iter(&self) -> impl Iterator<Item = (&PropKey, &Prop)> + '_ {
         self.order
             .iter()
-            .filter_map(move |k| self.map.get_key_value(k))
+            .filter_map(move |k| self.get(k).map(|p| (k, p)))
     }
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Prop> + '_ {
-        self.map.values_mut()
+        self.map.values_mut().chain(self.syms.values_mut())
     }
     pub fn or_insert_with(&mut self, k: PropKey, f: impl FnOnce() -> Prop) -> &mut Prop {
-        if !self.map.contains_key(&k) {
-            self.order.push(k.clone());
+        match k {
+            PropKey::S(s) => {
+                if !self.map.contains_key(s.as_ref()) {
+                    self.order.push(PropKey::S(s.clone()));
+                }
+                self.map.entry(s).or_insert_with(f)
+            }
+            PropKey::Sym(id) => {
+                if !self.syms.contains_key(&id) {
+                    self.order.push(PropKey::Sym(id));
+                }
+                self.syms.entry(id).or_insert_with(f)
+            }
         }
-        self.map.entry(k).or_insert_with(f)
     }
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.len() + self.syms.len()
     }
 }
 
@@ -307,17 +480,16 @@ pub fn buffer_bytes(o: &ObjRef) -> Option<Rc<RefCell<Vec<u8>>>> {
 /// Virtual own-props for array/binary kinds: `length`/`byteLength`/
 /// `byteOffset`/`buffer` and integer-indexed reads. Returns `Some` when
 /// `key` resolves on the object kind itself (before stored props).
-fn view_own_prop(o: &ObjRef, key: &PropKey) -> Option<Value> {
+/// `&str` version so literal member lookups never build a `PropKey`.
+fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
     let b = o.borrow();
     match &b.kind {
         ObjKind::Arr(items) => {
-            if let PropKey::S(s) = key {
-                if s.as_ref() == "length" {
-                    return Some(Value::Num(items.len() as f64));
-                }
-                if let Some(i) = arr_index(s) {
-                    return Some(items.get(i).cloned().unwrap_or(Value::Und));
-                }
+            if key == "length" {
+                return Some(Value::Num(items.len() as f64));
+            }
+            if let Some(i) = arr_index(key) {
+                return Some(items.get(i).cloned().unwrap_or(Value::Und));
             }
             None
         }
@@ -327,47 +499,48 @@ fn view_own_prop(o: &ObjRef, key: &PropKey) -> Option<Value> {
             len,
             kind,
         } => {
-            if let PropKey::S(s) = key {
-                match s.as_ref() {
-                    "length" => return Some(Value::Num(*len as f64)),
-                    "byteLength" => return Some(Value::Num((*len * kind.size()) as f64)),
-                    "byteOffset" => return Some(Value::Num(*off as f64)),
-                    "buffer" => return Some(Value::Obj(buf.clone())),
-                    _ => {}
-                }
-                if let Some(idx) = arr_index(s) {
-                    if idx >= *len {
-                        return Some(Value::Und);
-                    }
-                    if let Some(bytes) = buffer_bytes(buf) {
-                        let bb = bytes.borrow();
-                        return Some(Value::Num(kind.read(&bb, *off + idx * kind.size())));
-                    }
+            match key {
+                "length" => return Some(Value::Num(*len as f64)),
+                "byteLength" => return Some(Value::Num((*len * kind.size()) as f64)),
+                "byteOffset" => return Some(Value::Num(*off as f64)),
+                "buffer" => return Some(Value::Obj(buf.clone())),
+                _ => {}
+            }
+            if let Some(idx) = arr_index(key) {
+                if idx >= *len {
                     return Some(Value::Und);
                 }
+                if let Some(bytes) = buffer_bytes(buf) {
+                    let bb = bytes.borrow();
+                    return Some(Value::Num(kind.read(&bb, *off + idx * kind.size())));
+                }
+                return Some(Value::Und);
             }
             None
         }
         ObjKind::Bytes(bytes) => {
-            if let PropKey::S(s) = key {
-                if s.as_ref() == "byteLength" {
-                    return Some(Value::Num(bytes.borrow().len() as f64));
-                }
+            if key == "byteLength" {
+                return Some(Value::Num(bytes.borrow().len() as f64));
             }
             None
         }
         ObjKind::View { buf, off, len } => {
-            if let PropKey::S(s) = key {
-                match s.as_ref() {
-                    "byteLength" => return Some(Value::Num(*len as f64)),
-                    "byteOffset" => return Some(Value::Num(*off as f64)),
-                    "buffer" => return Some(Value::Obj(buf.clone())),
-                    _ => {}
-                }
+            match key {
+                "byteLength" => return Some(Value::Num(*len as f64)),
+                "byteOffset" => return Some(Value::Num(*off as f64)),
+                "buffer" => return Some(Value::Obj(buf.clone())),
+                _ => {}
             }
             None
         }
         _ => None,
+    }
+}
+
+fn view_own_prop(o: &ObjRef, key: &PropKey) -> Option<Value> {
+    match key {
+        PropKey::S(s) => view_own_prop_str(o, s),
+        PropKey::Sym(_) => None,
     }
 }
 
@@ -401,7 +574,7 @@ pub struct Binding {
 }
 
 pub struct Scope {
-    pub vars: RefCell<HashMap<Rc<str>, Binding>>,
+    pub vars: RefCell<FxMap<Rc<str>, Binding>>,
     pub parent: Option<EnvRef>,
     /// function scope: `this`/arguments/new.target/super boundary
     pub is_fn: bool,
@@ -422,7 +595,7 @@ pub type EnvRef = Rc<Scope>;
 impl Scope {
     pub fn new(parent: Option<EnvRef>, is_fn: bool) -> EnvRef {
         Rc::new(Scope {
-            vars: RefCell::new(HashMap::new()),
+            vars: RefCell::new(FxMap::default()),
             parent,
             is_fn,
             var_boundary: std::cell::Cell::new(is_fn),
@@ -455,6 +628,15 @@ pub type ERes = Result<Value, Value>;
 // ---------------------------------------------------------------------------
 // Interpreter
 // ---------------------------------------------------------------------------
+
+/// Precomputed per-body hoisting scan: `var` names to predeclare, function
+/// decls to bind, and whether the body (or its params) mentions
+/// `arguments` — which decides if the `arguments` object must be built.
+struct Hoisted {
+    fns: Vec<Rc<FnDef>>,
+    vars: Vec<Rc<str>>,
+    uses_arguments: bool,
+}
 
 pub struct Protos {
     pub obj: ObjRef,
@@ -509,6 +691,25 @@ pub struct Interp {
     pub deadline: Option<std::time::Instant>,
     /// stmt being executed when the interrupt tripped (triage aid)
     pub interrupt_site: Option<String>,
+    /// opt-in call tracing (set `ROWSER_CALL_TRACE=1`): when on, each call
+    /// pushes a cheap callee tag into `call_trace`; when off the hot call
+    /// path costs one branch and the trace stays empty
+    pub trace_calls: bool,
+    /// Rc<str> interner for identifier-shaped strings (binding names,
+    /// string literals) — turns per-eval/per-binding Rc allocations into
+    /// refcount bumps. Only program-source strings are interned, so the
+    /// set stays bounded by source size.
+    interned: FxSet<Rc<str>>,
+    /// per-function-def hoist+`arguments` scan results, keyed by the
+    /// `Rc<FnDef>` pointer. The stored `Rc<FnDef>` pins the def so its
+    /// address can never be reused while an entry exists — the key is
+    /// always unique and the cache needs no invalidation.
+    fn_hoist: FxMap<usize, (Rc<FnDef>, Rc<Hoisted>)>,
+    /// hoist scan results for `&[Stmt]` slices, keyed by (ptr, len) and
+    /// cleared at the start of every `run`. Only slices owned by the
+    /// parsed AST (blocks, try/catch/finally bodies) go through here —
+    /// they live for the whole run; function bodies use `fn_hoist`.
+    slice_hoist: FxMap<(usize, usize), Rc<Hoisted>>,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -562,7 +763,22 @@ impl Interp {
             interrupted: false,
             deadline: None,
             interrupt_site: None,
+            trace_calls: std::env::var_os("ROWSER_CALL_TRACE").is_some(),
+            interned: FxSet::default(),
+            fn_hoist: FxMap::default(),
+            slice_hoist: FxMap::default(),
         }
+    }
+
+    /// Intern a string so repeated `Rc<str>` key/name uses become cheap
+    /// refcount bumps instead of fresh allocations.
+    pub fn intern(&mut self, s: &str) -> Rc<str> {
+        if let Some(r) = self.interned.get(s).cloned() {
+            return r;
+        }
+        let r: Rc<str> = Rc::from(s);
+        self.interned.insert(r.clone());
+        r
     }
 
     /// Poll the execution budget. Called once per statement: cheap while
@@ -651,36 +867,48 @@ impl Interp {
     }
 
     // -- env ops ------------------------------------------------------------
+    /// Walk the scope chain by reference — no `Rc` clone per hop. Only the
+    /// hit/miss results clone values.
     pub fn env_lookup(&self, env: &EnvRef, name: &str) -> Option<Value> {
-        let mut cur = Some(env.clone());
-        while let Some(e) = cur {
-            if let Some(b) = e.vars.borrow().get(name) {
+        let mut cur: &EnvRef = env;
+        loop {
+            if let Some(b) = cur.vars.borrow().get(name) {
                 return Some(b.val.clone());
             }
-            cur = e.parent.clone();
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
         }
         // fall back to global object properties (globalThis.x = …)
-        if let Some(v) = self.obj_get_raw(&self.p.global.clone(), &PropKey::from_str(name)) {
-            return Some(v);
-        }
-        None
+        self.obj_get_raw_str(&self.p.global, name)
     }
 
     pub fn env_assign(&mut self, env: &EnvRef, name: &str, v: Value) -> Result<(), Value> {
-        let mut cur = Some(env.clone());
-        while let Some(e) = cur {
-            if let Some(b) = e.vars.borrow_mut().get_mut(name) {
-                if !b.mutable {
-                    return Err(self.type_err(format!("Assignment to constant variable '{name}'")));
+        let mut cur: &EnvRef = env;
+        loop {
+            {
+                let mut vars = cur.vars.borrow_mut();
+                if let Some(b) = vars.get_mut(name) {
+                    if !b.mutable {
+                        drop(vars);
+                        return Err(
+                            self.type_err(format!("Assignment to constant variable '{name}'"))
+                        );
+                    }
+                    b.val = v;
+                    return Ok(());
                 }
-                b.val = v;
-                return Ok(());
             }
-            cur = e.parent.clone();
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
         }
         // sloppy: create global; mirror onto global object
+        let k = self.intern(name);
         self.global.vars.borrow_mut().insert(
-            Rc::from(name),
+            k.clone(),
             Binding {
                 val: v.clone(),
                 mutable: true,
@@ -690,14 +918,50 @@ impl Interp {
             .global
             .borrow_mut()
             .props
-            .insert(PropKey::from_str(name), Prop::data(v));
+            .insert(PropKey::S(k), Prop::data(v));
         Ok(())
+    }
+
+    /// `ident++`/`ident--` fast path: update a numeric binding in one scope
+    /// walk. Returns `(old, new)`; `None` → fall back to generic
+    /// eval+assign (binding miss or non-numeric value).
+    fn env_update_num(
+        &mut self,
+        env: &EnvRef,
+        name: &str,
+        delta: f64,
+    ) -> Option<Result<(f64, f64), Value>> {
+        let mut cur: &EnvRef = env;
+        loop {
+            {
+                let mut vars = cur.vars.borrow_mut();
+                if let Some(b) = vars.get_mut(name) {
+                    if !b.mutable {
+                        drop(vars);
+                        return Some(Err(
+                            self.type_err(format!("Assignment to constant variable '{name}'"))
+                        ));
+                    }
+                    if let Value::Num(n) = b.val {
+                        let new = n + delta;
+                        b.val = Value::Num(new);
+                        return Some(Ok((n, new)));
+                    }
+                    return None;
+                }
+            }
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => return None,
+            }
+        }
     }
 
     /// declare in the given scope (let/const/block fns)
     pub fn declare(&mut self, env: &EnvRef, name: &str, v: Value, mutable: bool) {
+        let k = self.intern(name);
         env.vars.borrow_mut().insert(
-            Rc::from(name),
+            k.clone(),
             Binding {
                 val: v.clone(),
                 mutable,
@@ -708,12 +972,18 @@ impl Interp {
                 .global
                 .borrow_mut()
                 .props
-                .insert(PropKey::from_str(name), Prop::data(v));
+                .insert(PropKey::S(k), Prop::data(v));
         }
     }
 
     /// `var` — walks to nearest function scope.
     pub fn declare_var(&mut self, env: &EnvRef, name: &str, v: Value) {
+        let k = self.intern(name);
+        self.declare_var_rc(env, &k, v);
+    }
+
+    /// `declare_var` with a pre-interned key (hoist cache reuse).
+    fn declare_var_rc(&mut self, env: &EnvRef, name: &Rc<str>, v: Value) {
         let mut cur = env.clone();
         loop {
             if cur.var_boundary.get() || cur.parent.is_none() {
@@ -722,50 +992,56 @@ impl Interp {
             let next = cur.parent.clone().unwrap();
             cur = next;
         }
-        let exists = cur.vars.borrow().contains_key(name);
+        let exists = cur.vars.borrow().contains_key(name.as_ref());
         if !exists {
             cur.vars.borrow_mut().insert(
-                Rc::from(name),
+                name.clone(),
                 Binding {
                     val: v.clone(),
                     mutable: true,
                 },
             );
         } else if !matches!(v, Value::Und) {
-            cur.vars.borrow_mut().get_mut(name).unwrap().val = v.clone();
+            cur.vars
+                .borrow_mut()
+                .get_mut(name.as_ref())
+                .unwrap()
+                .val = v.clone();
         }
         if Rc::ptr_eq(&cur, &self.global) {
             self.p
                 .global
                 .borrow_mut()
                 .props
-                .insert(PropKey::from_str(name), Prop::data(v));
+                .insert(PropKey::S(name.clone()), Prop::data(v));
         }
     }
 
     fn find_fn_scope(&self, env: &EnvRef) -> EnvRef {
-        let mut cur = env.clone();
+        let mut cur: &EnvRef = env;
         loop {
             if cur.is_fn || cur.parent.is_none() {
-                return cur;
+                return cur.clone();
             }
-            let next = cur.parent.clone().unwrap();
+            let next = cur.parent.as_ref().unwrap();
             cur = next;
         }
     }
 
     fn find_home(&self, env: &EnvRef) -> Option<(EnvRef, ObjRef)> {
-        let mut cur = Some(env.clone());
-        while let Some(e) = cur {
-            if let Some(h) = e.home.borrow().clone() {
-                return Some((e.clone(), h));
+        let mut cur: &EnvRef = env;
+        loop {
+            if let Some(h) = cur.home.borrow().clone() {
+                return Some((cur.clone(), h));
             }
-            if e.is_fn {
+            if cur.is_fn {
                 return None;
             }
-            cur = e.parent.clone();
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => return None,
+            }
         }
-        None
     }
 
     // -- object helpers -------------------------------------------------------
@@ -827,6 +1103,14 @@ impl Interp {
             return Some(v);
         }
         o.borrow().props.get(key).map(|p| p.val.clone())
+    }
+
+    /// `obj_get_raw` by borrowed string key — no key allocation.
+    pub fn obj_get_raw_str(&self, o: &ObjRef, key: &str) -> Option<Value> {
+        if let Some(v) = view_own_prop_str(o, key) {
+            return Some(v);
+        }
+        o.borrow().props.get_str(key).map(|p| p.val.clone())
     }
 
     pub fn is_callable(&self, v: &Value) -> bool {
@@ -893,6 +1177,60 @@ impl Interp {
         }
     }
 
+    /// `get_prop` by borrowed string key — the `obj.name` fast path that
+    /// avoids building a `PropKey`/interning an `Rc` per member access.
+    pub fn get_prop_str(&mut self, base: &Value, key: &str) -> ERes {
+        match base {
+            Value::Und | Value::Null => Err(self.type_err(format!(
+                "Cannot read properties of {} (reading '{key}')",
+                if matches!(base, Value::Und) {
+                    "undefined"
+                } else {
+                    "null"
+                }
+            ))),
+            Value::Obj(o) => {
+                let r = self.obj_get_str(o, key, base);
+                // debug hook: watch $$typeof reads to triage element-type errors
+                if key == "$$typeof" {
+                    let got = match &r {
+                        Ok(v) => self.inspect(v, 0),
+                        Err(_e) => "<throw>".to_string(),
+                    };
+                    let obj_desc = self.inspect(base, 0);
+                    self.typeof_reads.push(format!("{got} <- {obj_desc:.160}"));
+                }
+                r
+            }
+            Value::Str(s) => {
+                if key == "length" {
+                    return Ok(Value::Num(s.chars().count() as f64));
+                }
+                if let Some(i) = arr_index(key) {
+                    return Ok(s
+                        .chars()
+                        .nth(i)
+                        .map(|c| Value::Str(Rc::from(c.to_string().as_str())))
+                        .unwrap_or(Value::Und));
+                }
+                let p = self.p.string.clone();
+                self.obj_get_str(&p, key, base)
+            }
+            Value::Num(_) => {
+                let p = self.p.number.clone();
+                self.obj_get_str(&p, key, base)
+            }
+            Value::Bool(_) => {
+                let p = self.p.boolean.clone();
+                self.obj_get_str(&p, key, base)
+            }
+            Value::Sym(..) => {
+                let p = self.p.symbol.clone();
+                self.obj_get_str(&p, key, base)
+            }
+        }
+    }
+
     /// proto-chain walk; `receiver` is the `this` for getters.
     fn obj_get(&mut self, o: &ObjRef, key: &PropKey, receiver: &Value) -> ERes {
         let mut cur = Some(o.clone());
@@ -903,6 +1241,35 @@ impl Interp {
                 }
                 let b = c.borrow();
                 if let Some(p) = b.props.get(key) {
+                    if p.is_accessor() {
+                        match &p.get {
+                            Some(g) => {
+                                let g = g.clone();
+                                drop(b);
+                                return self.call(&g, receiver.clone(), Vec::new());
+                            }
+                            None => return Ok(Value::Und),
+                        }
+                    }
+                    return Ok(p.val.clone());
+                }
+            }
+            let next = c.borrow().proto.clone();
+            cur = next;
+        }
+        Ok(Value::Und)
+    }
+
+    /// `obj_get` by borrowed string key.
+    fn obj_get_str(&mut self, o: &ObjRef, key: &str, receiver: &Value) -> ERes {
+        let mut cur = Some(o.clone());
+        while let Some(c) = cur {
+            {
+                if let Some(v) = view_own_prop_str(&c, key) {
+                    return Ok(v);
+                }
+                let b = c.borrow();
+                if let Some(p) = b.props.get_str(key) {
                     if p.is_accessor() {
                         match &p.get {
                             Some(g) => {
@@ -1076,6 +1443,157 @@ impl Interp {
         Ok(())
     }
 
+    /// `set_prop` by borrowed string key — `obj.name = v` fast path.
+    pub fn set_prop_str(&mut self, base: &Value, key: &str, v: Value) -> Result<(), Value> {
+        match base {
+            Value::Und | Value::Null => Err(self.type_err(format!(
+                "Cannot set properties of {} (setting '{key}')",
+                if matches!(base, Value::Und) {
+                    "undefined"
+                } else {
+                    "null"
+                }
+            ))),
+            Value::Obj(o) => self.obj_set_str(o, key, v, base),
+            _ => {
+                // primitive — check proto chain for setter, else silently ignore
+                let proto = match base {
+                    Value::Str(_) => Some(self.p.string.clone()),
+                    Value::Num(_) => Some(self.p.number.clone()),
+                    Value::Bool(_) => Some(self.p.boolean.clone()),
+                    Value::Sym(..) => Some(self.p.symbol.clone()),
+                    _ => None,
+                };
+                let mut cur = proto;
+                while let Some(c) = cur {
+                    if let Some(p) = c.borrow().props.get_str(key) {
+                        if let Some(s) = &p.set {
+                            let s = s.clone();
+                            return self.call(&s, base.clone(), vec![v]).map(|_| ());
+                        }
+                        return Ok(()); // non-setter found → sloppy no-op
+                    }
+                    cur = c.borrow().proto.clone();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// `obj_set` by borrowed string key.
+    fn obj_set_str(&mut self, o: &ObjRef, key: &str, v: Value, receiver: &Value) -> Result<(), Value> {
+        // integer-indexed writes + read-only virtuals on binary views
+        {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Typed {
+                    buf,
+                    off,
+                    len,
+                    kind,
+                } => {
+                    if let Some(idx) = arr_index(key) {
+                        let (buf, off, len, kind) = (buf.clone(), *off, *len, *kind);
+                        drop(b);
+                        if idx >= len {
+                            return Ok(()); // OOB write: silently ignored
+                        }
+                        let n = self.to_num(&v)?;
+                        if let Some(bytes) = buffer_bytes(&buf) {
+                            kind.write(&mut bytes.borrow_mut(), off + idx * kind.size(), n);
+                        }
+                        return Ok(());
+                    }
+                    if matches!(key, "length" | "byteLength" | "byteOffset" | "buffer") {
+                        return Ok(()); // accessor-only props: sloppy no-op
+                    }
+                }
+                ObjKind::Bytes(_) => {
+                    if key == "byteLength" {
+                        return Ok(());
+                    }
+                }
+                ObjKind::View { .. } => {
+                    if matches!(key, "byteLength" | "byteOffset" | "buffer") {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+        // walk chain looking for existing prop (setter or data)
+        let mut cur = Some(o.clone());
+        while let Some(c) = cur {
+            let (found_accessor, found_data, is_own) = {
+                let b = c.borrow();
+                match b.props.get_str(key) {
+                    Some(p) if p.is_accessor() => (Some(p.set.clone()), None, false),
+                    Some(p) => (None, Some(p.writable), Rc::ptr_eq(&c, o)),
+                    None => (None, None, false),
+                }
+            };
+            if let Some(setter) = found_accessor {
+                return match setter {
+                    Some(s) => self.call(&s, receiver.clone(), vec![v]).map(|_| ()),
+                    None => Ok(()),
+                };
+            }
+            if let Some(writable) = found_data {
+                if is_own {
+                    // update own prop
+                    let mut b = c.borrow_mut();
+                    if !writable {
+                        return Ok(()); // non-writable: sloppy no-op
+                    }
+                    b.props.get_str_mut(key).unwrap().val = v;
+                    return Ok(());
+                }
+                // prop lives on a proto → shadow with own data prop
+                break;
+            }
+            let next = c.borrow().proto.clone();
+            cur = next;
+        }
+        // define own prop
+        let mut b = o.borrow_mut();
+        if let ObjKind::Arr(items) = &mut b.kind {
+            if let Some(i) = arr_index(key) {
+                if i >= items.len() {
+                    items.resize(i + 1, Value::Und);
+                }
+                items[i] = v;
+                return Ok(());
+            }
+            if key == "length" {
+                if let Value::Num(n) = v {
+                    let n = n.max(0.0) as usize;
+                    items.resize(n, Value::Und);
+                    return Ok(());
+                }
+            }
+        }
+        b.props.insert_str(key, Prop::data(v));
+        Ok(())
+    }
+
+    /// `delete_prop` by borrowed string key.
+    pub fn delete_prop_str(&mut self, base: &Value, key: &str) -> bool {
+        let Value::Obj(o) = base else {
+            return true;
+        };
+        let mut b = o.borrow_mut();
+        if let ObjKind::Arr(items) = &mut b.kind {
+            if let Some(i) = arr_index(key) {
+                if i < items.len() {
+                    items[i] = Value::Und;
+                    return true;
+                }
+            }
+        }
+        b.props.remove_str(key);
+        true
+    }
+
     pub fn has_prop(&mut self, base: &Value, key: &PropKey) -> bool {
         let Value::Obj(o) = base else {
             return false;
@@ -1159,7 +1677,7 @@ impl Interp {
     /// enumerable own + inherited string keys (for..in), deduped
     pub fn enum_keys(&self, base: &Value) -> Vec<String> {
         let mut out = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen: FxSet<String> = FxSet::default();
         if let Value::Str(s) = base {
             for i in 0..s.chars().count() {
                 out.push(i.to_string());
@@ -1559,17 +2077,19 @@ impl Interp {
                 // arrows inherit this/home/new.target lexically — is_fn=false
                 // makes lookups walk through automatically.
                 self.bind_params(&scope, &def.params, &args)?;
-                if !def.is_arrow {
+                let h = self.hoisted_fn(&def);
+                if !def.is_arrow && h.uses_arguments {
                     let arr = self.new_arr(args);
+                    let k = self.intern("arguments");
                     scope.vars.borrow_mut().insert(
-                        Rc::from("arguments"),
+                        k,
                         Binding {
                             val: Value::Obj(arr),
                             mutable: true,
                         },
                     );
                 }
-                self.hoist_body(&def.body, &scope)?;
+                self.apply_hoisted(&h, &scope);
                 if let Some(e) = &def.arrow_expr {
                     // `(x) => expr` — implicit return
                     let e = e.clone();
@@ -1672,15 +2192,19 @@ impl Interp {
                 *scope.new_target.borrow_mut() = nt;
                 *scope.ctor_fn.borrow_mut() = f.clone();
                 self.bind_params(&scope, &def.params, &args)?;
-                let arr = self.new_arr(args);
-                scope.vars.borrow_mut().insert(
-                    Rc::from("arguments"),
-                    Binding {
-                        val: Value::Obj(arr),
-                        mutable: true,
-                    },
-                );
-                self.hoist_body(&def.body, &scope)?;
+                let h = self.hoisted_fn(&def);
+                if h.uses_arguments {
+                    let arr = self.new_arr(args);
+                    let k = self.intern("arguments");
+                    scope.vars.borrow_mut().insert(
+                        k,
+                        Binding {
+                            val: Value::Obj(arr),
+                            mutable: true,
+                        },
+                    );
+                }
+                self.apply_hoisted(&h, &scope);
                 self.depth += 1;
                 let r = self.exec_block(&def.body, &scope);
                 self.depth -= 1;
@@ -1723,8 +2247,9 @@ impl Interp {
             match p {
                 Param::Ident(name) => {
                     let v = args.get(i).cloned().unwrap_or(Value::Und);
+                    let k = self.intern(name);
                     scope.vars.borrow_mut().insert(
-                        Rc::from(name.as_str()),
+                        k,
                         Binding {
                             val: v,
                             mutable: true,
@@ -1991,19 +2516,75 @@ impl Interp {
 
     // -- hoisting ----------------------------------------------------------------
     pub fn hoist_body(&mut self, stmts: &[Stmt], scope: &EnvRef) -> Result<(), Value> {
-        let mut fns: Vec<&Rc<FnDef>> = Vec::new();
-        let mut vars: Vec<&str> = Vec::new();
-        collect_hoisted(stmts, &mut fns, &mut vars);
-        for name in vars {
-            self.declare_var(scope, name, Value::Und);
+        // uncached path — safe for arbitrary caller-owned slices
+        let h = collect_hoisted_owned(stmts);
+        self.apply_hoisted(&h, scope);
+        Ok(())
+    }
+
+    /// declare the precomputed hoisted vars/fns into `scope`'s var boundary.
+    fn apply_hoisted(&mut self, h: &Hoisted, scope: &EnvRef) {
+        for name in &h.vars {
+            self.declare_var_rc(scope, name, Value::Und);
         }
-        for f in fns {
+        for f in &h.fns {
             if let Some(name) = f.name.clone() {
                 let fv = self.make_fn(f.clone(), scope, CtorKind::NotClass);
                 self.declare_var(scope, &name, fv);
             }
         }
+    }
+
+    /// Cached hoist scan for a function body. Called on EVERY function
+    /// call, so the AST walk happens once per `FnDef`, not per call.
+    fn hoisted_fn(&mut self, def: &Rc<FnDef>) -> Rc<Hoisted> {
+        let key = Rc::as_ptr(def) as usize;
+        if let Some((_, h)) = self.fn_hoist.get(&key) {
+            return h.clone();
+        }
+        let mut h = collect_hoisted_owned(&def.body);
+        h.uses_arguments = !def.is_arrow && fndef_uses_arguments(def);
+        let h = Rc::new(h);
+        // store the def Rc alongside the entry: pinning it keeps the
+        // pointer from ever being reused, so the key stays unique forever
+        self.fn_hoist.insert(key, (def.clone(), h.clone()));
+        h
+    }
+
+    /// Cached hoist scan for parsed-AST statement slices (block/try bodies).
+    /// Safe because parsed AST lives for the whole `run` and the cache is
+    /// cleared at run start; function bodies use `hoisted_fn` instead.
+    fn hoisted_slice(&mut self, stmts: &[Stmt]) -> Rc<Hoisted> {
+        let key = (stmts.as_ptr() as usize, stmts.len());
+        if let Some(h) = self.slice_hoist.get(&key) {
+            return h.clone();
+        }
+        let h = Rc::new(collect_hoisted_owned(stmts));
+        self.slice_hoist.insert(key, h.clone());
+        h
+    }
+
+    fn hoist_stmts(&mut self, stmts: &[Stmt], scope: &EnvRef) -> Result<(), Value> {
+        let h = self.hoisted_slice(stmts);
+        self.apply_hoisted(&h, scope);
         Ok(())
+    }
+
+    /// Execute a braced body (block / try / finally). A fresh child scope is
+    /// only needed when the body would declare lexical bindings into it
+    /// (let/const/class, incl. single-statement-position decls like
+    /// `if (c) let y`); `var`/`function` hoisting resolves to the same
+    /// var-boundary scope either way, so decl-free bodies run in `env`.
+    fn exec_hoisted_block(&mut self, stmts: &[Stmt], env: &EnvRef) -> SRes {
+        let needs_scope = stmts.iter().any(stmt_binds_lexically);
+        if needs_scope {
+            let scope = Scope::new(Some(env.clone()), false);
+            self.hoist_stmts(stmts, &scope)?;
+            self.exec_block(stmts, &scope)
+        } else {
+            self.hoist_stmts(stmts, env)?;
+            self.exec_block(stmts, env)
+        }
     }
 
     pub fn make_fn(&mut self, def: Rc<FnDef>, env: &EnvRef, ctor: CtorKind) -> Value {
@@ -2105,11 +2686,7 @@ impl Interp {
                 }
                 Ok(Completion::Empty)
             }
-            Stmt::Block(stmts) => {
-                let scope = Scope::new(Some(env.clone()), false);
-                self.hoist_body(stmts, &scope)?;
-                self.exec_block(stmts, &scope)
-            }
+            Stmt::Block(stmts) => self.exec_hoisted_block(stmts, env),
             Stmt::If { c, t, e } => {
                 let cv = self.eval_expr(c, env)?;
                 if self.to_bool(&cv) {
@@ -2182,38 +2759,52 @@ impl Interp {
                 body,
             } => {
                 let my_label = self.pending_label.take();
-                let scope = Scope::new(Some(env.clone()), false);
+                // `let`/`const` in the init needs a per-loop scope, as does
+                // a lexical decl in single-statement body position; `var`
+                // and expression inits resolve identically on `env`.
+                let loop_scope;
+                let scope: &EnvRef = match init {
+                    Some(ForInit::Var(kind, _)) if *kind != VarKind::Var => {
+                        loop_scope = Scope::new(Some(env.clone()), false);
+                        &loop_scope
+                    }
+                    _ if stmt_binds_lexically(body) => {
+                        loop_scope = Scope::new(Some(env.clone()), false);
+                        &loop_scope
+                    }
+                    _ => env,
+                };
                 if let Some(init) = init {
                     match init {
                         ForInit::Var(kind, decls) => {
                             for (pat, ie) in decls {
                                 let v = match ie {
-                                    Some(e) => self.eval_expr(e, &scope)?,
+                                    Some(e) => self.eval_expr(e, scope)?,
                                     None => Value::Und,
                                 };
                                 match pat {
                                     Pattern::Ident(n) => match kind {
-                                        VarKind::Var => self.declare_var(&scope, n, v),
-                                        _ => self.declare(&scope, n, v, *kind != VarKind::Const),
+                                        VarKind::Var => self.declare_var(scope, n, v),
+                                        _ => self.declare(scope, n, v, *kind != VarKind::Const),
                                     },
-                                    other => self.bind_pattern(&scope, other, v, *kind, true)?,
+                                    other => self.bind_pattern(scope, other, v, *kind, true)?,
                                 }
                             }
                         }
                         ForInit::Expr(e) => {
-                            self.eval_expr(e, &scope)?;
+                            self.eval_expr(e, scope)?;
                         }
                     }
                 }
                 let mut last = Value::Und;
                 loop {
                     if let Some(t) = test {
-                        let tv = self.eval_expr(t, &scope)?;
+                        let tv = self.eval_expr(t, scope)?;
                         if !self.to_bool(&tv) {
                             break;
                         }
                     }
-                    match self.exec_stmt(body, &scope)? {
+                    match self.exec_stmt(body, scope)? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
@@ -2230,7 +2821,7 @@ impl Interp {
                         r => return Ok(r),
                     }
                     if let Some(u) = update {
-                        self.eval_expr(u, &scope)?;
+                        self.eval_expr(u, scope)?;
                     }
                 }
                 Ok(Completion::Normal(last))
@@ -2239,11 +2830,25 @@ impl Interp {
                 let my_label = self.pending_label.take();
                 let rv = self.eval_expr(right, env)?;
                 let keys = self.enum_keys(&rv);
-                let scope = Scope::new(Some(env.clone()), false);
+                // `let`/`const` loop targets need a per-loop scope, as does
+                // a lexical decl in single-statement body position; `var`
+                // and expression targets resolve identically on `env`.
+                let loop_scope;
+                let scope: &EnvRef = match left {
+                    ForTarget::Var(kind, _) if *kind != VarKind::Var => {
+                        loop_scope = Scope::new(Some(env.clone()), false);
+                        &loop_scope
+                    }
+                    _ if stmt_binds_lexically(body) => {
+                        loop_scope = Scope::new(Some(env.clone()), false);
+                        &loop_scope
+                    }
+                    _ => env,
+                };
                 let mut last = Value::Und;
                 for k in keys {
-                    self.bind_for_target(&scope, left, Value::Str(Rc::from(k.as_str())))?;
-                    match self.exec_stmt(body, &scope)? {
+                    self.bind_for_target(scope, left, Value::Str(Rc::from(k.as_str())))?;
+                    match self.exec_stmt(body, scope)? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
@@ -2266,11 +2871,25 @@ impl Interp {
                 let my_label = self.pending_label.take();
                 let rv = self.eval_expr(right, env)?;
                 let items = self.iter_values(&rv)?;
-                let scope = Scope::new(Some(env.clone()), false);
+                // `let`/`const` loop targets need a per-loop scope, as does
+                // a lexical decl in single-statement body position; `var`
+                // and expression targets resolve identically on `env`.
+                let loop_scope;
+                let scope: &EnvRef = match left {
+                    ForTarget::Var(kind, _) if *kind != VarKind::Var => {
+                        loop_scope = Scope::new(Some(env.clone()), false);
+                        &loop_scope
+                    }
+                    _ if stmt_binds_lexically(body) => {
+                        loop_scope = Scope::new(Some(env.clone()), false);
+                        &loop_scope
+                    }
+                    _ => env,
+                };
                 let mut last = Value::Und;
                 for it in items {
-                    self.bind_for_target(&scope, left, it)?;
-                    match self.exec_stmt(body, &scope)? {
+                    self.bind_for_target(scope, left, it)?;
+                    match self.exec_stmt(body, scope)? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
@@ -2351,25 +2970,24 @@ impl Interp {
                 handler,
                 finally,
             } => {
-                let try_scope = Scope::new(Some(env.clone()), false);
-                self.hoist_body(block, &try_scope)?;
-                let mut res = self.exec_block(block, &try_scope);
+                let mut res = self.exec_hoisted_block(block, env);
                 if let Err(exc) = res {
                     if let Some(h) = handler {
-                        let catch_scope = Scope::new(Some(env.clone()), false);
                         if let Some(p) = param {
+                            // `catch (e)` param binds into the catch scope
+                            let catch_scope = Scope::new(Some(env.clone()), false);
                             self.bind_pattern(&catch_scope, p, exc, VarKind::Let, true)?;
+                            self.hoist_stmts(h, &catch_scope)?;
+                            res = self.exec_block(h, &catch_scope);
+                        } else {
+                            res = self.exec_hoisted_block(h, env);
                         }
-                        self.hoist_body(h, &catch_scope)?;
-                        res = self.exec_block(h, &catch_scope);
                     } else {
                         res = Err(exc);
                     }
                 }
                 if let Some(f) = finally {
-                    let fscope = Scope::new(Some(env.clone()), false);
-                    self.hoist_body(f, &fscope)?;
-                    let fres = self.exec_block(f, &fscope);
+                    let fres = self.exec_hoisted_block(f, env);
                     match fres {
                         Err(e) => return Err(e),
                         Ok(Completion::Normal(_)) | Ok(Completion::Empty) => {}
@@ -2438,12 +3056,16 @@ impl Interp {
 
     /// for-of/for-in var targets: assign if resolvable, else declare var.
     fn for_var_assign(&mut self, scope: &EnvRef, name: &str, v: Value) -> Result<(), Value> {
-        let mut cur = Some(scope.clone());
-        while let Some(e) = cur {
-            if e.vars.borrow().contains_key(name) {
+        let mut cur: &EnvRef = scope;
+        loop {
+            let exists = cur.vars.borrow().contains_key(name);
+            if exists {
                 return self.env_assign(scope, name, v);
             }
-            cur = e.parent.clone();
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
         }
         self.declare_var(scope, name, v);
         Ok(())
@@ -2456,8 +3078,9 @@ impl Interp {
                     VarKind::Var => self.for_var_assign(scope, n, v),
                     _ => {
                         // per-iteration binding — redeclare each time
+                        let k = self.intern(n);
                         scope.vars.borrow_mut().insert(
-                            Rc::from(n.as_str()),
+                            k,
                             Binding {
                                 val: v,
                                 mutable: *kind != VarKind::Const,
@@ -2488,8 +3111,9 @@ impl Interp {
                 if kind == VarKind::Var {
                     return self.for_var_assign(scope, n, v);
                 }
+                let k = self.intern(n);
                 scope.vars.borrow_mut().insert(
-                    Rc::from(n.as_str()),
+                    k,
                     Binding {
                         val: v,
                         mutable: kind != VarKind::Const,
@@ -2700,7 +3324,8 @@ impl Interp {
     pub fn eval_expr(&mut self, e: &Expr, env: &EnvRef) -> ERes {
         match e {
             Expr::Num(n) => Ok(Value::Num(*n)),
-            Expr::Str(s) => Ok(Value::Str(Rc::from(s.as_str()))),
+            // interned: string literals become refcount bumps, not allocs
+            Expr::Str(s) => Ok(Value::Str(self.intern(s))),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
             Expr::Ident(name) => {
@@ -2740,7 +3365,7 @@ impl Interp {
                 Ok(Value::Str(Rc::from(s.as_str())))
             }
             Expr::Array(elems) => {
-                let mut items = Vec::new();
+                let mut items = Vec::with_capacity(elems.len());
                 for el in elems {
                     match el {
                         ArrElem::Expr(ex) => items.push(self.eval_expr(ex, env)?),
@@ -2867,6 +3492,14 @@ impl Interp {
                 prefix,
                 target,
             } => {
+                // `i++`/`++i` on a numeric ident binding: single scope walk
+                if let Expr::Ident(name) = &**target {
+                    let delta = if *inc { 1.0 } else { -1.0 };
+                    if let Some(r) = self.env_update_num(env, name, delta) {
+                        let (old, new) = r?;
+                        return Ok(Value::Num(if *prefix { new } else { old }));
+                    }
+                }
                 let cur = self.eval_expr(target, env)?;
                 let n = self.to_num(&cur)?;
                 let new = if *inc { n + 1.0 } else { n - 1.0 };
@@ -2931,6 +3564,11 @@ impl Interp {
                 if *optional && matches!(ov, Value::Und | Value::Null) {
                     return Ok(Value::Und);
                 }
+                // `obj.name` — the parser stores dot-props as `Expr::Str`;
+                // look the name up directly without building a PropKey
+                if let Expr::Str(s) = &**prop {
+                    return self.get_prop_str(&ov, s);
+                }
                 let pv = self.eval_expr(prop, env)?;
                 let key = self.to_propkey(&pv)?;
                 self.get_prop(&ov, &key)
@@ -2958,6 +3596,10 @@ impl Interp {
         let Some(parent) = parent else {
             return Ok(Value::Und);
         };
+        if let Expr::Str(s) = prop {
+            let this = fscope.thisv.borrow().clone();
+            return self.obj_get_str(&parent, s, &this);
+        }
         let pv = self.eval_expr(prop, env)?;
         let key = self.to_propkey(&pv)?;
         let this = fscope.thisv.borrow().clone();
@@ -2965,7 +3607,7 @@ impl Interp {
     }
 
     fn eval_args(&mut self, args: &[Arg], env: &EnvRef) -> Result<Vec<Value>, Value> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(args.len());
         for a in args {
             match a {
                 Arg::Expr(e) => out.push(self.eval_expr(e, env)?),
@@ -2979,11 +3621,13 @@ impl Interp {
     }
 
     fn eval_call(&mut self, callee: &Expr, args: &[Arg], env: &EnvRef) -> ERes {
-        if self.call_trace.len() >= 4096 {
-            self.call_trace.pop_front();
+        // post-mortem debug trace — opt-in; zero cost when off
+        if self.trace_calls {
+            if self.call_trace.len() >= 4096 {
+                self.call_trace.pop_front();
+            }
+            self.call_trace.push_back(callee_tag(callee));
         }
-        self.call_trace
-            .push_back(format!("{:.160}", format!("{callee:?}")));
         // super(args) — derived-class parent ctor call
         if matches!(callee, Expr::Super) {
             let fscope = self.find_fn_scope(env);
@@ -3020,12 +3664,22 @@ impl Interp {
                 if *optional && matches!(ov, Value::Und | Value::Null) {
                     return Ok(Value::Und);
                 }
-                // `a?.()` sentinel
+                // `obj.name(...)` — dot-prop fast path (no PropKey alloc)
                 if let Expr::Str(s) = &**prop {
+                    // `a?.()` sentinel
                     if s == "\u{0}call" {
                         let argv = self.eval_args(args, env)?;
                         return self.call(&ov, Value::Und, argv);
                     }
+                    let f = self.get_prop_str(&ov, s)?;
+                    if !self.is_callable(&f) {
+                        let iv = self.inspect(&f, 0);
+                        return Err(
+                            self.type_err(format!("{s} is not a function (got {iv})"))
+                        );
+                    }
+                    let argv = self.eval_args(args, env)?;
+                    return self.call(&f, ov, argv);
                 }
                 let pv = self.eval_expr(prop, env)?;
                 let key = self.to_propkey(&pv)?;
@@ -3072,12 +3726,16 @@ impl Interp {
                 // `typeof undefinedIdent` must not throw
                 if let Expr::Ident(n) = expr {
                     match self.env_lookup(env, n) {
-                        Some(v) => return Ok(Value::Str(Rc::from(self.type_name(&v)))),
-                        None => return Ok(Value::Str(Rc::from("undefined"))),
+                        Some(v) => {
+                            let tn = self.type_name(&v);
+                            return Ok(Value::Str(self.intern(tn)));
+                        }
+                        None => return Ok(Value::Str(self.intern("undefined"))),
                     }
                 }
                 let v = self.eval_expr(expr, env)?;
-                Ok(Value::Str(Rc::from(self.type_name(&v))))
+                let tn = self.type_name(&v);
+                Ok(Value::Str(self.intern(tn)))
             }
             UnaryOp::Void => {
                 self.eval_expr(expr, env)?;
@@ -3087,6 +3745,9 @@ impl Interp {
             UnaryOp::Delete => match expr {
                 Expr::Member { obj, prop, .. } => {
                     let ov = self.eval_expr(obj, env)?;
+                    if let Expr::Str(s) = &**prop {
+                        return Ok(Value::Bool(self.delete_prop_str(&ov, s)));
+                    }
                     let pv = self.eval_expr(prop, env)?;
                     let key = self.to_propkey(&pv)?;
                     Ok(Value::Bool(self.delete_prop(&ov, &key)))
@@ -3104,14 +3765,19 @@ impl Interp {
         use BinOp::*;
         Ok(match op {
             Add => {
-                let lp = self.to_primitive(&l)?;
-                let rp = self.to_primitive(&r)?;
-                if matches!(lp, Value::Str(_)) || matches!(rp, Value::Str(_)) {
-                    let a = self.to_str(&lp)?;
-                    let b = self.to_str(&rp)?;
-                    Value::Str(Rc::from(format!("{a}{b}").as_str()))
+                // numeric fast path — skips to_primitive/to_num round-trips
+                if let (Value::Num(a), Value::Num(b)) = (&l, &r) {
+                    Value::Num(*a + *b)
                 } else {
-                    Value::Num(self.to_num(&lp)? + self.to_num(&rp)?)
+                    let lp = self.to_primitive(&l)?;
+                    let rp = self.to_primitive(&r)?;
+                    if matches!(lp, Value::Str(_)) || matches!(rp, Value::Str(_)) {
+                        let a = self.to_str(&lp)?;
+                        let b = self.to_str(&rp)?;
+                        Value::Str(Rc::from(format!("{a}{b}").as_str()))
+                    } else {
+                        Value::Num(self.to_num(&lp)? + self.to_num(&rp)?)
+                    }
                 }
             }
             Sub => Value::Num(self.to_num(&l)? - self.to_num(&r)?),
@@ -3128,6 +3794,17 @@ impl Interp {
             StrictEq => Value::Bool(self.strict_eq(&l, &r)),
             StrictNe => Value::Bool(!self.strict_eq(&l, &r)),
             Lt | Le | Gt | Ge => {
+                // numeric fast path (NaN comparisons are false in Rust,
+                // matching the explicit is_nan check in the general path)
+                if let (Value::Num(a), Value::Num(b)) = (&l, &r) {
+                    return Ok(Value::Bool(match op {
+                        Lt => a < b,
+                        Le => a <= b,
+                        Gt => a > b,
+                        Ge => a >= b,
+                        _ => unreachable!(),
+                    }));
+                }
                 let lp = self.to_primitive(&l)?;
                 let rp = self.to_primitive(&r)?;
                 if let (Value::Str(a), Value::Str(b)) = (&lp, &rp) {
@@ -3308,6 +3985,10 @@ impl Interp {
             }
             Expr::Member { obj, prop, .. } => {
                 let ov = self.eval_expr(obj, env)?;
+                if let Expr::Str(s) = &**prop {
+                    self.set_prop_str(&ov, s, v.clone())?;
+                    return Ok(v);
+                }
                 let pv = self.eval_expr(prop, env)?;
                 let key = self.to_propkey(&pv)?;
                 self.set_prop(&ov, key, v.clone())?;
@@ -3328,6 +4009,10 @@ impl Interp {
     // -- top-level ---------------------------------------------------------------
     pub fn run(&mut self, src: &str) -> Result<Value, Error> {
         let stmts = parser::parse(src)?;
+        // slice-hoist keys are raw AST pointers: entries from prior runs
+        // could collide with freshly parsed addresses, so reset per run
+        // (the new AST is fully allocated before this point)
+        self.slice_hoist.clear();
         let g = self.global.clone();
         if let Err(v) = self.hoist_body(&stmts, &g) {
             return Err(self.throw_to_error(v));
@@ -3453,6 +4138,257 @@ fn param_count(params: &[Param]) -> usize {
 fn collect_hoisted<'a>(stmts: &'a [Stmt], fns: &mut Vec<&'a Rc<FnDef>>, vars: &mut Vec<&'a str>) {
     for s in stmts {
         collect_stmt(s, fns, vars);
+    }
+}
+
+/// Owned (cacheable) form of `collect_hoisted`.
+fn collect_hoisted_owned(stmts: &[Stmt]) -> Hoisted {
+    let mut fns: Vec<&Rc<FnDef>> = Vec::new();
+    let mut vars: Vec<&str> = Vec::new();
+    collect_hoisted(stmts, &mut fns, &mut vars);
+    Hoisted {
+        fns: fns.into_iter().cloned().collect(),
+        vars: vars.into_iter().map(|s| Rc::<str>::from(s)).collect(),
+        uses_arguments: false,
+    }
+}
+
+/// Cheap per-call trace tag — replaces the old `format!("{callee:?}")`
+/// which recursively debug-formatted whole expression subtrees.
+fn callee_tag(callee: &Expr) -> String {
+    match callee {
+        Expr::Ident(n) => n.clone(),
+        Expr::Member { prop, .. } => match &**prop {
+            Expr::Str(s) => format!(".{s}"),
+            _ => "<computed>".into(),
+        },
+        Expr::Super => "super".into(),
+        _ => "<expr>".into(),
+    }
+}
+
+// -- conservative `arguments` detection ---------------------------------------
+// `call` only builds the `arguments` object when a function can observe it.
+// Any identifier occurrence OR binding of the name anywhere inside the def
+// (including nested function bodies, param defaults, destructured param
+// names) counts — over-approximation merely falls back to the old
+// always-create behavior, so detection can't change semantics.
+
+fn fndef_uses_arguments(def: &FnDef) -> bool {
+    for p in &def.params {
+        match p {
+            Param::Ident(n) => {
+                if n == "arguments" {
+                    return true;
+                }
+            }
+            Param::Rest(p) => {
+                if pat_uses_arguments(p) {
+                    return true;
+                }
+            }
+            Param::Pattern(p) => {
+                if pat_uses_arguments(p) {
+                    return true;
+                }
+            }
+            Param::Default(p, d) => {
+                if pat_uses_arguments(p) || expr_uses_arguments(d) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(e) = &def.arrow_expr {
+        if expr_uses_arguments(e) {
+            return true;
+        }
+    }
+    def.body.iter().any(stmt_uses_arguments)
+}
+
+fn pat_uses_arguments(p: &Pattern) -> bool {
+    match p {
+        Pattern::Ident(n) => n == "arguments",
+        Pattern::Array(elems) => elems.iter().any(|e| match e {
+            ArrayPatElem::Hole => false,
+            ArrayPatElem::Elem(p) | ArrayPatElem::Rest(p) => pat_uses_arguments(p),
+            ArrayPatElem::Default(p, d) => {
+                pat_uses_arguments(p) || expr_uses_arguments(d)
+            }
+        }),
+        Pattern::Object(elems) => elems.iter().any(|e| {
+            let key_hit = matches!(&e.key, ast::PropKey::Computed(ex) if expr_uses_arguments(ex));
+            let dflt_hit = e.default.as_ref().map_or(false, expr_uses_arguments);
+            key_hit || dflt_hit || pat_uses_arguments(&e.val)
+        }),
+    }
+}
+
+fn expr_uses_arguments(e: &Expr) -> bool {
+    match e {
+        Expr::Ident(n) => n == "arguments",
+        Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::This
+        | Expr::Super
+        | Expr::Regex { .. } => false,
+        Expr::Template(parts) => parts
+            .iter()
+            .any(|p| matches!(p, TemplPart::Expr(e) if expr_uses_arguments(e))),
+        Expr::Array(elems) => elems.iter().any(|el| match el {
+            ArrElem::Expr(e) | ArrElem::Spread(e) => expr_uses_arguments(e),
+            ArrElem::Hole => false,
+        }),
+        Expr::Object(props) => props.iter().any(|p| {
+            if matches!(&p.key, ast::PropKey::Computed(ex) if expr_uses_arguments(ex)) {
+                return true;
+            }
+            match &p.val {
+                PropVal::Expr(e) | PropVal::Spread(e) => expr_uses_arguments(e),
+                PropVal::Method(d) | PropVal::Get(d) | PropVal::Set(d) => {
+                    fndef_uses_arguments(d)
+                }
+            }
+        }),
+        Expr::Fn(def) => fndef_uses_arguments(def),
+        Expr::Class(c) => class_uses_arguments(c),
+        Expr::Unary { expr, .. } => expr_uses_arguments(expr),
+        Expr::Update { target, .. } => expr_uses_arguments(target),
+        Expr::Binary { l, r, .. } | Expr::Logical { l, r, .. } => {
+            expr_uses_arguments(l) || expr_uses_arguments(r)
+        }
+        Expr::Assign { target, value, .. } => {
+            expr_uses_arguments(target) || expr_uses_arguments(value)
+        }
+        Expr::Cond { c, t, f } => {
+            expr_uses_arguments(c) || expr_uses_arguments(t) || expr_uses_arguments(f)
+        }
+        Expr::Call { callee, args } | Expr::New { callee, args } => {
+            expr_uses_arguments(callee)
+                || args.iter().any(|a| match a {
+                    Arg::Expr(e) | Arg::Spread(e) => expr_uses_arguments(e),
+                })
+        }
+        Expr::Member { obj, prop, .. } => {
+            expr_uses_arguments(obj) || expr_uses_arguments(prop)
+        }
+        Expr::Seq(exprs) => exprs.iter().any(expr_uses_arguments),
+    }
+}
+
+fn class_uses_arguments(c: &ClassDef) -> bool {
+    if c.superclass.as_ref().map_or(false, expr_uses_arguments) {
+        return true;
+    }
+    c.members.iter().any(|m| {
+        matches!(&m.key, ast::PropKey::Computed(e) if expr_uses_arguments(e))
+            || fndef_uses_arguments(&m.func)
+    })
+}
+
+/// Would executing this statement bind a lexical (let/const/class)
+/// declaration into `env`? The parser accepts declarations in
+/// single-statement position (`if (c) let y`), which bind into whatever
+/// scope is current — so we look through scope-transparent contexts.
+/// `for`/`for-in`/`for-of` never contribute: they create their own scope
+/// whenever this check says their body needs one. `Block`/`Try`/`Switch`
+/// manage their own scope; `function`/`var` hoisting lands at the same
+/// var-boundary either way.
+fn stmt_binds_lexically(s: &Stmt) -> bool {
+    match s {
+        Stmt::VarDecl { kind, .. } => *kind != VarKind::Var,
+        Stmt::ClassDecl(_) => true,
+        Stmt::If { t, e, .. } => {
+            stmt_binds_lexically(t)
+                || e.as_ref().map_or(false, |s| stmt_binds_lexically(s))
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+            stmt_binds_lexically(body)
+        }
+        Stmt::Labeled(_, inner) => stmt_binds_lexically(inner),
+        Stmt::Export(ExportRec::Decl(inner)) => stmt_binds_lexically(inner),
+        Stmt::Export(ExportRec::Default(_)) => true,
+        _ => false,
+    }
+}
+
+fn stmt_uses_arguments(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) | Stmt::Throw(e) => expr_uses_arguments(e),
+        Stmt::VarDecl { decls, .. } => decls
+            .iter()
+            .any(|(p, i)| pat_uses_arguments(p) || i.as_ref().map_or(false, expr_uses_arguments)),
+        Stmt::FnDecl(f) => fndef_uses_arguments(f),
+        Stmt::ClassDecl(c) => class_uses_arguments(c),
+        Stmt::If { c, t, e } => {
+            expr_uses_arguments(c)
+                || stmt_uses_arguments(t)
+                || e.as_ref().map_or(false, |s| stmt_uses_arguments(s))
+        }
+        Stmt::Block(ss) => ss.iter().any(stmt_uses_arguments),
+        Stmt::Return(e) => e.as_ref().map_or(false, expr_uses_arguments),
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty | Stmt::Import(_) => false,
+        Stmt::While { c, body } | Stmt::DoWhile { body, c } => {
+            expr_uses_arguments(c) || stmt_uses_arguments(body)
+        }
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            init.as_ref().map_or(false, |i| match i {
+                ForInit::Var(_, decls) => decls.iter().any(|(p, e)| {
+                    pat_uses_arguments(p) || e.as_ref().map_or(false, expr_uses_arguments)
+                }),
+                ForInit::Expr(e) => expr_uses_arguments(e),
+            }) || test.as_ref().map_or(false, expr_uses_arguments)
+                || update.as_ref().map_or(false, expr_uses_arguments)
+                || stmt_uses_arguments(body)
+        }
+        Stmt::ForIn {
+            left, right, body, ..
+        }
+        | Stmt::ForOf {
+            left, right, body, ..
+        } => {
+            (match left {
+                ForTarget::Var(_, p) => pat_uses_arguments(p),
+                ForTarget::Expr(e) => expr_uses_arguments(e),
+            }) || expr_uses_arguments(right)
+                || stmt_uses_arguments(body)
+        }
+        Stmt::Switch { disc, cases } => {
+            expr_uses_arguments(disc)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().map_or(false, expr_uses_arguments)
+                        || c.body.iter().any(stmt_uses_arguments)
+                })
+        }
+        Stmt::Try {
+            block,
+            param,
+            handler,
+            finally,
+        } => {
+            block.iter().any(stmt_uses_arguments)
+                || param.as_ref().map_or(false, pat_uses_arguments)
+                || handler
+                    .as_ref()
+                    .map_or(false, |h| h.iter().any(stmt_uses_arguments))
+                || finally
+                    .as_ref()
+                    .map_or(false, |f| f.iter().any(stmt_uses_arguments))
+        }
+        Stmt::Labeled(_, inner) => stmt_uses_arguments(inner),
+        Stmt::Export(rec) => match rec {
+            ExportRec::Decl(inner) => stmt_uses_arguments(inner),
+            ExportRec::Default(e) => expr_uses_arguments(e),
+            _ => false,
+        },
     }
 }
 

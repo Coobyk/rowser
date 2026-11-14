@@ -8,3 +8,4 @@ license.workspace = true
 rowser-dom = { path = "../rowser-dom" }
 rowser-html = { path = "../rowser-html" }
 rowser-css = { path = "../rowser-css" }
+rowser-net = { path = "../rowser-net" }

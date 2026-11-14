@@ -3,9 +3,135 @@
 use crate::interp::*;
 use crate::regexp::{Regex, RxMatch};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 type NResult = Result<Value, Value>;
+
+// -- hot-path helpers ---------------------------------------------------------
+
+/// FNV-1a — plenty for short prop keys; SipHash setup costs more than the
+/// `Rc<str>` allocation this cache avoids.
+#[derive(Clone, Default)]
+struct Fnv(u64);
+
+impl std::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 {
+            0xcbf29ce484222325
+        } else {
+            self.0
+        };
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        self.0 = h;
+    }
+}
+
+thread_local! {
+    static PK_CACHE: RefCell<
+        HashMap<Rc<str>, PropKey, std::hash::BuildHasherDefault<Fnv>>,
+    > = RefCell::new(HashMap::default());
+    static EMPTY_RC: Rc<str> = Rc::from("");
+}
+
+/// `PropKey` for a string key via a small thread-local cache — avoids the
+/// `Rc<str>` allocation `PropKey::from_str` performs on every call. The
+/// cache is bounded; misses past the cap just allocate like before.
+fn pk(s: &str) -> PropKey {
+    PK_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if let Some(k) = m.get(s) {
+            return k.clone();
+        }
+        let k = PropKey::S(Rc::from(s));
+        if m.len() < 8192 {
+            m.insert(Rc::from(s), k.clone());
+        }
+        k
+    })
+}
+
+fn empty_rc() -> Rc<str> {
+    EMPTY_RC.with(|e| e.clone())
+}
+
+/// `PropKey` for an array index — formats into a stack buffer (no `String`
+/// alloc) and hits the `pk` cache so repeated indices share the key `Rc`.
+fn idx_key(k: usize) -> PropKey {
+    let mut buf = [0u8; 20];
+    let mut n = k;
+    let mut len = 0;
+    loop {
+        buf[19 - len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+        if n == 0 {
+            break;
+        }
+    }
+    // SAFETY-free: digits are ASCII
+    pk(std::str::from_utf8(&buf[20 - len..]).unwrap_or("0"))
+}
+
+/// `to_str` that shares the `Rc<str>` for `Value::Str` instead of copying
+/// the whole string.
+fn to_rc(i: &mut Interp, v: &Value) -> Result<Rc<str>, Value> {
+    match v {
+        Value::Str(s) => Ok(s.clone()),
+        _ => Ok(Rc::from(i.to_str(v)?.as_str())),
+    }
+}
+
+/// One-char `Value::Str` without a `String` round-trip.
+fn char_val(c: char) -> Value {
+    let mut b = [0u8; 4];
+    let s: &str = c.encode_utf8(&mut b);
+    Value::Str(Rc::from(s))
+}
+
+/// Enumerable own string-keyed entries in insertion order, matching
+/// `Interp::own_keys` (array/typed-array indices first). `Some(v)` is a
+/// plain data value (no getter needed); `None` marks an accessor or a
+/// virtual index the caller must resolve via `get_prop`.
+fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
+    let Value::Obj(o) = v else {
+        return Vec::new();
+    };
+    let b = o.borrow();
+    let mut out = Vec::with_capacity(b.props.len());
+    match &b.kind {
+        ObjKind::Arr(items) => {
+            out.reserve(items.len());
+            for (k, it) in items.iter().enumerate() {
+                out.push((idx_key(k), Some(it.clone())));
+            }
+        }
+        ObjKind::Typed { len, .. } => {
+            for k in 0..*len {
+                out.push((idx_key(k), None));
+            }
+        }
+        _ => {}
+    }
+    for (k, p) in b.props.iter() {
+        if !p.enumerable || !matches!(k, PropKey::S(_)) {
+            continue;
+        }
+        let val = if p.is_accessor() {
+            None
+        } else {
+            Some(p.val.clone())
+        };
+        out.push((k.clone(), val));
+    }
+    out
+}
 
 fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Und)
@@ -49,11 +175,11 @@ pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
             if let ObjKind::Iter { items, .. } = &o.borrow().kind {
                 return Ok(items.clone());
             }
-            let len = i.get_prop(v, &PropKey::from_str("length"))?;
+            let len = i.get_prop_str(v, "length")?;
             let n = i.to_num(&len)? as usize;
             let mut out = Vec::with_capacity(n.min(1_000_000));
             for k in 0..n {
-                out.push(i.get_prop(v, &PropKey::from_str(&k.to_string()))?);
+                out.push(i.get_prop(v, &idx_key(k))?);
             }
             Ok(out)
         }
@@ -106,7 +232,7 @@ fn install_protos(i: &mut Interp) {
         let get = native(i, "get __proto__", obj_get_proto);
         let set = native(i, "set __proto__", obj_set_proto);
         p.borrow_mut().props.insert(
-            PropKey::from_str("__proto__"),
+            pk("__proto__"),
             Prop::accessor(Some(get), Some(set)),
         );
     }
@@ -156,7 +282,7 @@ fn install_protos(i: &mut Interp) {
         method(i, &p, "entries", arr_entries);
         method(i, &p, "toString", arr_join);
         method(i, &p, "toLocaleString", arr_join);
-        let values_fn = i.obj_get_raw(&p, &PropKey::from_str("values")).unwrap();
+        let values_fn = i.obj_get_raw_str(&p, "values").unwrap();
         p.borrow_mut()
             .props
             .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(values_fn));
@@ -233,7 +359,7 @@ fn install_protos(i: &mut Interp) {
         method(i, &p, "valueOf", sym_value_of);
         let get = native(i, "get description", sym_get_description);
         p.borrow_mut().props.insert(
-            PropKey::from_str("description"),
+            pk("description"),
             Prop::accessor(Some(get), None),
         );
     }
@@ -287,7 +413,7 @@ fn install_protos(i: &mut Interp) {
             let get = native(i, &format!("get {name}"), f);
             p.borrow_mut()
                 .props
-                .insert(PropKey::from_str(name), Prop::accessor(Some(get), None));
+                .insert(pk(name), Prop::accessor(Some(get), None));
         }
         for (sym, name, f) in [
             (SYM_MATCH, "[Symbol.match]", re_sym_match as NativeFn),
@@ -688,13 +814,13 @@ fn install_globals(i: &mut Interp) {
         method(i, &mp, "keys", map_keys);
         method(i, &mp, "values", map_values);
         method(i, &mp, "entries", map_entries);
-        let ent = i.obj_get_raw(&mp, &PropKey::from_str("entries")).unwrap();
+        let ent = i.obj_get_raw_str(&mp, "entries").unwrap();
         mp.borrow_mut()
             .props
             .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(ent));
         let size_g = native(i, "get size", map_size);
         mp.borrow_mut().props.insert(
-            PropKey::from_str("size"),
+            pk("size"),
             Prop::accessor(Some(size_g), None),
         );
         let ctor = make_ctor(i, "Map", map_ctor, mp);
@@ -709,14 +835,14 @@ fn install_globals(i: &mut Interp) {
         method(i, &sp, "keys", set_values);
         method(i, &sp, "values", set_values);
         method(i, &sp, "entries", set_entries);
-        let sv = i.obj_get_raw(&sp, &PropKey::from_str("values")).unwrap();
+        let sv = i.obj_get_raw_str(&sp, "values").unwrap();
         sp.borrow_mut()
             .props
             .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(sv));
         let ssize = native(i, "get size", set_size);
         sp.borrow_mut()
             .props
-            .insert(PropKey::from_str("size"), Prop::accessor(Some(ssize), None));
+            .insert(pk("size"), Prop::accessor(Some(ssize), None));
         let sctor = make_ctor(i, "Set", set_ctor, sp);
         define_global(i, "Set", sctor);
     }
@@ -804,17 +930,28 @@ fn make_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: ObjRef) -> Value {
 fn obj_has_own(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let k = i.to_propkey(&arg(args, 0))?;
     let own = if let Value::Obj(o) = this {
-        if let ObjKind::Arr(items) = &o.borrow().kind {
-            if let PropKey::S(s) = &k {
-                if s.as_ref() == "length" {
-                    return Ok(Value::Bool(true));
-                }
-                if let Some(idx) = arr_index(s) {
-                    return Ok(Value::Bool(idx < items.len()));
+        let b = o.borrow();
+        match &b.kind {
+            ObjKind::Arr(items) => {
+                if let PropKey::S(s) = &k {
+                    if s.as_ref() == "length" {
+                        return Ok(Value::Bool(true));
+                    }
+                    if let Some(idx) = arr_index(s) {
+                        return Ok(Value::Bool(idx < items.len()));
+                    }
                 }
             }
+            ObjKind::Typed { len, .. } => {
+                if let PropKey::S(s) = &k {
+                    if let Some(idx) = arr_index(s) {
+                        return Ok(Value::Bool(idx < *len));
+                    }
+                }
+            }
+            _ => {}
         }
-        o.borrow().props.contains_key(&k)
+        b.props.contains_key(&k)
     } else {
         false
     };
@@ -912,21 +1049,24 @@ fn obj_set_proto(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn obj_keys(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let keys = i.own_keys(&arg(args, 0));
-    Ok(Value::Obj(
-        i.new_arr(
-            keys.into_iter()
-                .map(|k| Value::Str(Rc::from(k.as_str())))
-                .collect(),
-        ),
-    ))
+    let keys = own_enum_entries(&arg(args, 0))
+        .into_iter()
+        .map(|(k, _)| match k {
+            PropKey::S(s) => Value::Str(s),
+            _ => Value::Und,
+        })
+        .collect();
+    Ok(Value::Obj(i.new_arr(keys)))
 }
 
 fn obj_values(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
     let mut out = Vec::new();
-    for k in i.own_keys(&v) {
-        out.push(i.get_prop(&v, &PropKey::from_str(&k))?);
+    for (k, slot) in own_enum_entries(&v) {
+        out.push(match slot {
+            Some(val) => val,
+            None => i.get_prop(&v, &k)?,
+        });
     }
     Ok(Value::Obj(i.new_arr(out)))
 }
@@ -934,11 +1074,16 @@ fn obj_values(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 fn obj_entries(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
     let mut out = Vec::new();
-    for k in i.own_keys(&v) {
-        let val = i.get_prop(&v, &PropKey::from_str(&k))?;
-        out.push(Value::Obj(
-            i.new_arr(vec![Value::Str(Rc::from(k.as_str())), val]),
-        ));
+    for (k, slot) in own_enum_entries(&v) {
+        let val = match slot {
+            Some(val) => val,
+            None => i.get_prop(&v, &k)?,
+        };
+        let ks = match k {
+            PropKey::S(s) => Value::Str(s),
+            _ => Value::Und,
+        };
+        out.push(Value::Obj(i.new_arr(vec![ks, val])));
     }
     Ok(Value::Obj(i.new_arr(out)))
 }
@@ -953,9 +1098,12 @@ fn obj_assign(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             continue;
         }
         // own enumerable string keys
-        for k in i.own_keys(src) {
-            let v = i.get_prop(src, &PropKey::from_str(&k))?;
-            i.set_prop(&target, PropKey::from_str(&k), v)?;
+        for (k, slot) in own_enum_entries(src) {
+            let v = match slot {
+                Some(val) => val,
+                None => i.get_prop(src, &k)?,
+            };
+            i.set_prop(&target, k, v)?;
         }
         // enumerable symbol props
         if let Value::Obj(so) = src {
@@ -977,7 +1125,7 @@ fn obj_assign(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 }
 
 fn read_desc_prop(i: &mut Interp, desc: &Value, name: &str) -> Result<(bool, Value), Value> {
-    let v = i.get_prop(desc, &PropKey::from_str(name))?;
+    let v = i.get_prop_str(desc, name)?;
     Ok((!matches!(v, Value::Und), v))
 }
 
@@ -1049,9 +1197,12 @@ fn obj_define_properties(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
         return Err(i.type_err("Object.defineProperties called on non-object"));
     };
     let descs = arg(args, 1);
-    for k in i.own_keys(&descs) {
-        let d = i.get_prop(&descs, &PropKey::from_str(&k))?;
-        define_prop_from_desc(i, o, PropKey::from_str(&k), &d)?;
+    for (k, slot) in own_enum_entries(&descs) {
+        let d = match slot {
+            Some(v) => v,
+            None => i.get_prop(&descs, &k)?,
+        };
+        define_prop_from_desc(i, o, k, &d)?;
     }
     Ok(target)
 }
@@ -1099,13 +1250,12 @@ fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
 fn obj_get_own_prop_descs(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
     let out = i.new_obj();
-    for k in i.own_keys(&v) {
-        let d = obj_get_own_prop_desc(
-            i,
-            &Value::Und,
-            &[v.clone(), Value::Str(Rc::from(k.as_str()))],
-        )?;
-        i.set_data(&out, &k, d);
+    for (k, _) in own_enum_entries(&v) {
+        if let PropKey::S(s) = &k {
+            let d =
+                obj_get_own_prop_desc(i, &Value::Und, &[v.clone(), Value::Str(s.clone())])?;
+            i.set_data(&out, s, d);
+        }
     }
     Ok(Value::Obj(out))
 }
@@ -1143,9 +1293,12 @@ fn obj_create(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let o = Rc::new(RefCell::new(Obj::new(proto, ObjKind::Ord)));
     let descs = arg(args, 1);
     if let Value::Obj(_) = &descs {
-        for k in i.own_keys(&descs) {
-            let d = i.get_prop(&descs, &PropKey::from_str(&k))?;
-            define_prop_from_desc(i, &o, PropKey::from_str(&k), &d)?;
+        for (k, slot) in own_enum_entries(&descs) {
+            let d = match slot {
+                Some(v) => v,
+                None => i.get_prop(&descs, &k)?,
+            };
+            define_prop_from_desc(i, &o, k, &d)?;
         }
     }
     Ok(Value::Obj(o))
@@ -1160,10 +1313,8 @@ fn obj_freeze(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             p.writable = false;
             p.configurable = false;
         }
-        b.props.insert(
-            PropKey::from_str("$frozen"),
-            Prop::builtin(Value::Bool(true)),
-        );
+        b.props
+            .insert_str("$frozen", Prop::builtin(Value::Bool(true)));
     }
     Ok(v)
 }
@@ -1171,9 +1322,7 @@ fn obj_freeze(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 fn obj_is_frozen(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let _ = i;
     if let Value::Obj(o) = &arg(args, 0) {
-        return Ok(Value::Bool(
-            o.borrow().props.contains_key(&PropKey::from_str("$frozen")),
-        ));
+        return Ok(Value::Bool(o.borrow().props.contains_str("$frozen")));
     }
     Ok(Value::Bool(true))
 }
@@ -1191,8 +1340,8 @@ fn obj_from_entries(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let o = i.new_obj();
     let items = i.iter_values(&arg(args, 0))?;
     for e in items {
-        let k = i.get_prop(&e, &PropKey::from_str("0"))?;
-        let v = i.get_prop(&e, &PropKey::from_str("1"))?;
+        let k = i.get_prop_str(&e, "0")?;
+        let v = i.get_prop_str(&e, "1")?;
         let key = i.to_propkey(&k)?;
         i.set_prop(&Value::Obj(o.clone()), key, v)?;
     }
@@ -1403,6 +1552,30 @@ fn arr_unshift(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // fast path: numeric/absent bounds can't run user code — slice in place
+    // under one borrow instead of snapshotting the whole array.
+    if matches!(arg(args, 0), Value::Num(_) | Value::Und)
+        && matches!(arg(args, 1), Value::Num(_) | Value::Und)
+    {
+        if let Value::Obj(o) = this {
+            let b = o.borrow();
+            if let ObjKind::Arr(items) = &b.kind {
+                let len = items.len();
+                let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
+                let end = match arg(args, 1) {
+                    Value::Und => len,
+                    v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
+                };
+                let out = if start < end {
+                    items[start..end].to_vec()
+                } else {
+                    Vec::new()
+                };
+                return Ok(Value::Obj(i.new_arr(out)));
+            }
+        }
+        return Ok(Value::Obj(i.new_arr(vec![])));
+    }
     let items = arr_clone(this);
     let len = items.len();
     let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
@@ -1465,19 +1638,44 @@ fn arr_join(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         Value::Und => ",".to_string(),
         v => i.to_str(&v)?,
     };
-    let mut parts = Vec::new();
-    for it in arr_clone(this) {
+    // snapshot the items: to_str on an element can run user code that
+    // mutates the array, so we can't hold the borrow across it — but we
+    // can append straight into the output instead of a Vec<String> + join.
+    let items = arr_clone(this);
+    let mut out = String::new();
+    for (k, it) in items.iter().enumerate() {
+        if k > 0 {
+            out.push_str(&sep);
+        }
         match it {
-            Value::Und | Value::Null => parts.push(String::new()),
-            v => parts.push(i.to_str(&v)?),
+            Value::Und | Value::Null => {}
+            Value::Str(s) => out.push_str(s),
+            Value::Num(n) => out.push_str(&js_num_str(*n)),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            v => out.push_str(&i.to_str(v)?),
         }
     }
-    Ok(Value::Str(Rc::from(parts.join(&sep).as_str())))
+    Ok(Value::Str(Rc::from(out.as_str())))
 }
 
 fn arr_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let items = arr_clone(this);
     let needle = arg(args, 0);
+    // numeric/absent fromIndex can't run user code — scan under one borrow
+    if matches!(arg(args, 1), Value::Num(_) | Value::Und) {
+        if let Value::Obj(o) = this {
+            let b = o.borrow();
+            if let ObjKind::Arr(items) = &b.kind {
+                let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), items.len());
+                for (k, v) in items.iter().enumerate().skip(start) {
+                    if strict_val_eq(v, &needle) {
+                        return Ok(Value::Num(k as f64));
+                    }
+                }
+            }
+        }
+        return Ok(Value::Num(-1.0));
+    }
+    let items = arr_clone(this);
     let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), items.len());
     for (k, v) in items.iter().enumerate().skip(start) {
         if strict_val_eq(v, &needle) {
@@ -1488,11 +1686,16 @@ fn arr_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_last_index_of(_i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let items = arr_clone(this);
     let needle = arg(args, 0);
-    for k in (0..items.len()).rev() {
-        if strict_val_eq(&items[k], &needle) {
-            return Ok(Value::Num(k as f64));
+    // no user code runs here — scan in place under one borrow
+    if let Value::Obj(o) = this {
+        let b = o.borrow();
+        if let ObjKind::Arr(items) = &b.kind {
+            for k in (0..items.len()).rev() {
+                if strict_val_eq(&items[k], &needle) {
+                    return Ok(Value::Num(k as f64));
+                }
+            }
         }
     }
     Ok(Value::Num(-1.0))
@@ -1519,11 +1722,12 @@ fn same_value_zero(a: &Value, b: &Value) -> bool {
 
 fn arr_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let _ = i;
-    let items = arr_clone(this);
     let needle = arg(args, 0);
-    for v in &items {
-        if same_value_zero(v, &needle) {
-            return Ok(Value::Bool(true));
+    // no user code runs here — scan in place under one borrow
+    if let Value::Obj(o) = this {
+        let b = o.borrow();
+        if let ObjKind::Arr(items) = &b.kind {
+            return Ok(Value::Bool(items.iter().any(|v| same_value_zero(v, &needle))));
         }
     }
     Ok(Value::Bool(false))
@@ -1856,6 +2060,25 @@ pub(crate) fn merge_sort(
 }
 
 fn arr_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // fast path: a numeric index can't run user code — read under one borrow
+    if matches!(arg(args, 0), Value::Num(_)) {
+        let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
+        if let Value::Obj(o) = this {
+            let b = o.borrow();
+            if let ObjKind::Arr(items) = &b.kind {
+                let idx = if n < 0.0 {
+                    items.len() as i64 + n as i64
+                } else {
+                    n as i64
+                };
+                if idx < 0 || idx >= items.len() as i64 {
+                    return Ok(Value::Und);
+                }
+                return Ok(items[idx as usize].clone());
+            }
+        }
+        return Ok(Value::Und);
+    }
     let items = arr_clone(this);
     let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
     let idx = if n < 0.0 {
@@ -1894,68 +2117,70 @@ fn arr_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 // natives: string
 // ===========================================================================
 
-fn unbox_str(i: &mut Interp, this: &Value) -> Result<String, Value> {
+/// String receiver as `Rc<str>` — zero-copy for `Value::Str` (the common
+/// case); callers slice/iterate instead of getting an owned `String`.
+fn unbox_str(i: &mut Interp, this: &Value) -> Result<Rc<str>, Value> {
     match this {
-        Value::Str(s) => Ok(s.to_string()),
+        Value::Str(s) => Ok(s.clone()),
         Value::Obj(o) => {
-            if let Some(v) = i.obj_get_raw(o, &PropKey::from_str("$value")) {
-                return i.to_str(&v);
+            if let Some(v) = i.obj_get_raw_str(o, "$value") {
+                return to_rc(i, &v);
             }
-            i.to_str(this)
+            to_rc(i, this)
         }
-        other => i.to_str(other),
+        other => to_rc(i, other),
     }
+}
+
+/// Byte offset of char index `idx` in `s` (or `s.len()` when out of range).
+fn char_byte_at(s: &str, idx: usize) -> usize {
+    s.char_indices()
+        .nth(idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
 }
 
 fn str_char_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let idx = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
-    Ok(Value::Str(Rc::from(
-        s.chars()
-            .nth(idx)
-            .map(|c| c.to_string())
-            .unwrap_or_default()
-            .as_str(),
-    )))
+    Ok(match s.chars().nth(idx) {
+        Some(c) => char_val(c),
+        None => Value::Str(empty_rc()),
+    })
 }
 
 fn str_char_code_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let idx = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
-    // UTF-16 code units
-    let units: Vec<u16> = s.encode_utf16().collect();
+    // UTF-16 code units — nth() instead of collecting a Vec<u16>
     Ok(Value::Num(
-        units.get(idx).map(|u| *u as f64).unwrap_or(f64::NAN),
+        s.encode_utf16()
+            .nth(idx)
+            .map(|u| u as f64)
+            .unwrap_or(f64::NAN),
     ))
 }
 
 fn str_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let chars: Vec<char> = s.chars().collect();
     let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let idx = if n < 0.0 {
-        chars.len() as i64 + n as i64
-    } else {
-        n as i64
-    };
-    if idx < 0 || idx >= chars.len() as i64 {
+    let len = s.chars().count() as i64;
+    let idx = if n < 0.0 { len + n as i64 } else { n as i64 };
+    if idx < 0 || idx >= len {
         return Ok(Value::Und);
     }
-    Ok(Value::Str(Rc::from(
-        chars[idx as usize].to_string().as_str(),
-    )))
+    Ok(match s.chars().nth(idx as usize) {
+        Some(c) => char_val(c),
+        None => Value::Und,
+    })
 }
 
 fn str_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let needle = i.to_str(&arg(args, 0))?;
+    let needle = to_rc(i, &arg(args, 0))?;
     let from = i.to_num(&arg(args, 1)).unwrap_or(0.0).max(0.0) as usize;
-    let byte_from = s
-        .char_indices()
-        .nth(from)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len());
-    match s[byte_from..].find(&needle) {
+    let byte_from = char_byte_at(&s, from);
+    match s[byte_from..].find(&*needle) {
         Some(b) => Ok(Value::Num(s[..byte_from + b].chars().count() as f64)),
         None => Ok(Value::Num(-1.0)),
     }
@@ -1972,79 +2197,84 @@ fn str_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn str_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
+    let len = s.chars().count();
     let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
     let end = match arg(args, 1) {
         Value::Und => len,
         v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
     };
-    let out: String = if start < end {
-        chars[start..end].iter().collect()
+    // byte-range slice — no Vec<char> round-trip
+    if start < end {
+        let b0 = char_byte_at(&s, start);
+        let b1 = char_byte_at(&s, end);
+        Ok(Value::Str(Rc::from(&s[b0..b1])))
     } else {
-        String::new()
-    };
-    Ok(Value::Str(Rc::from(out.as_str())))
+        Ok(Value::Str(empty_rc()))
+    }
 }
 
 fn str_substring(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
+    let len = s.chars().count();
     let a = i.to_num(&arg(args, 0)).unwrap_or(0.0).max(0.0) as usize;
     let b = match arg(args, 1) {
         Value::Und => len,
         v => i.to_num(&v).unwrap_or(0.0).max(0.0) as usize,
     };
     let (lo, hi) = (a.min(b).min(len), a.max(b).min(len));
-    Ok(Value::Str(Rc::from(
-        chars[lo..hi].iter().collect::<String>().as_str(),
-    )))
+    let b0 = char_byte_at(&s, lo);
+    let b1 = char_byte_at(&s, hi);
+    Ok(Value::Str(Rc::from(&s[b0..b1])))
 }
 
 fn str_substr(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
+    let len = s.chars().count();
     let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
     let count = match arg(args, 1) {
         Value::Und => len - start,
         v => i.to_num(&v).unwrap_or(0.0).max(0.0) as usize,
     };
-    let end = (start + count).min(len);
-    Ok(Value::Str(Rc::from(
-        chars[start..end].iter().collect::<String>().as_str(),
-    )))
+    let end = start.saturating_add(count).min(len);
+    let b0 = char_byte_at(&s, start);
+    let b1 = char_byte_at(&s, end);
+    Ok(Value::Str(Rc::from(&s[b0..b1])))
+}
+
+/// `Value::Str(orig)` when unchanged, else `Rc` of `t`.
+fn str_or_rc(orig: Rc<str>, t: &str) -> Value {
+    if t == &*orig {
+        Value::Str(orig)
+    } else {
+        Value::Str(Rc::from(t))
+    }
 }
 
 fn str_to_lower(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(
-        unbox_str(i, this)?.to_lowercase().as_str(),
-    )))
+    let s = unbox_str(i, this)?;
+    let t = s.to_lowercase();
+    Ok(str_or_rc(s, &t))
 }
 
 fn str_to_upper(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(
-        unbox_str(i, this)?.to_uppercase().as_str(),
-    )))
+    let s = unbox_str(i, this)?;
+    let t = s.to_uppercase();
+    Ok(str_or_rc(s, &t))
 }
 
 fn str_trim(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(
-        unbox_str(i, this)?.trim().to_string().as_str(),
-    )))
+    let s = unbox_str(i, this)?;
+    Ok(str_or_rc(s.clone(), s.trim()))
 }
 
 fn str_trim_start(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(
-        unbox_str(i, this)?.trim_start().to_string().as_str(),
-    )))
+    let s = unbox_str(i, this)?;
+    Ok(str_or_rc(s.clone(), s.trim_start()))
 }
 
 fn str_trim_end(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(
-        unbox_str(i, this)?.trim_end().to_string().as_str(),
-    )))
+    let s = unbox_str(i, this)?;
+    Ok(str_or_rc(s.clone(), s.trim_end()))
 }
 
 fn str_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -2054,7 +2284,7 @@ fn str_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(_) = &a0 {
         let m = i.get_prop(&a0, &PropKey::Sym(SYM_SPLIT))?;
         if i.is_callable(&m) {
-            let sv = Value::Str(Rc::from(s.as_str()));
+            let sv = Value::Str(s.clone());
             return i.call(&m, a0.clone(), vec![sv, arg(args, 1)]);
         }
     }
@@ -2062,26 +2292,21 @@ fn str_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         Value::Und => usize::MAX,
         v => i.to_num(&v)?.max(0.0) as usize,
     };
-    let parts: Vec<String> = match a0 {
-        Value::Und => vec![s],
+    let parts: Vec<Value> = match a0 {
+        Value::Und => vec![Value::Str(s)],
         v => {
             let sep = i.to_str(&v)?;
             if sep.is_empty() {
-                s.chars().map(|c| c.to_string()).collect()
+                s.chars().take(limit).map(char_val).collect()
             } else {
-                s.split(&sep as &str).map(|p| p.to_string()).collect()
+                s.split(&sep as &str)
+                    .take(limit)
+                    .map(|p| Value::Str(Rc::from(p)))
+                    .collect()
             }
         }
     };
-    Ok(Value::Obj(
-        i.new_arr(
-            parts
-                .into_iter()
-                .take(limit)
-                .map(|p| Value::Str(Rc::from(p.as_str())))
-                .collect(),
-        ),
-    ))
+    Ok(Value::Obj(i.new_arr(parts)))
 }
 
 fn str_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -2091,7 +2316,7 @@ fn str_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(_) = &a0 {
         let m = i.get_prop(&a0, &PropKey::Sym(SYM_REPLACE))?;
         if i.is_callable(&m) {
-            let sv = Value::Str(Rc::from(s.as_str()));
+            let sv = Value::Str(s.clone());
             return i.call(&m, a0.clone(), vec![sv, arg(args, 1)]);
         }
     }
@@ -2107,7 +2332,7 @@ fn str_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                     vec![
                         Value::Str(Rc::from(matched.as_str())),
                         Value::Num(s[..b].chars().count() as f64),
-                        Value::Str(Rc::from(s.as_str())),
+                        Value::Str(s.clone()),
                     ],
                 )?;
                 i.to_str(&r)?
@@ -2119,7 +2344,7 @@ fn str_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             out.push_str(&s[b + needle.len()..]);
             Ok(Value::Str(Rc::from(out.as_str())))
         }
-        None => Ok(Value::Str(Rc::from(s.as_str()))),
+        None => Ok(Value::Str(s)),
     }
 }
 
@@ -2136,13 +2361,13 @@ fn str_replace_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         }
         let m = i.get_prop(&a0, &PropKey::Sym(SYM_REPLACE))?;
         if i.is_callable(&m) {
-            let sv = Value::Str(Rc::from(s.as_str()));
+            let sv = Value::Str(s.clone());
             return i.call(&m, a0.clone(), vec![sv, arg(args, 1)]);
         }
     }
     let needle = i.to_str(&a0)?;
     if needle.is_empty() {
-        return Ok(Value::Str(Rc::from(s.as_str())));
+        return Ok(Value::Str(s));
     }
     let repl_fn = arg(args, 1);
     if i.is_callable(&repl_fn) {
@@ -2156,7 +2381,7 @@ fn str_replace_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 vec![
                     Value::Str(Rc::from(needle.as_str())),
                     Value::Num(s[..b].chars().count() as f64),
-                    Value::Str(Rc::from(s.as_str())),
+                    Value::Str(s.clone()),
                 ],
             )?;
             out.push_str(&i.to_str(&r)?);
@@ -2177,7 +2402,7 @@ fn str_match(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(_) = &a0 {
         let m = i.get_prop(&a0, &PropKey::Sym(SYM_MATCH))?;
         if i.is_callable(&m) {
-            let sv = Value::Str(Rc::from(unbox_str(i, this)?.as_str()));
+            let sv = Value::Str(unbox_str(i, this)?);
             return i.call(&m, a0.clone(), vec![sv]);
         }
     }
@@ -2196,7 +2421,7 @@ fn str_match_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(_) = &a0 {
         let m = i.get_prop(&a0, &PropKey::Sym(SYM_MATCHALL))?;
         if i.is_callable(&m) {
-            let sv = Value::Str(Rc::from(unbox_str(i, this)?.as_str()));
+            let sv = Value::Str(unbox_str(i, this)?);
             return i.call(&m, a0.clone(), vec![sv]);
         }
     }
@@ -2216,7 +2441,7 @@ fn str_search(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(_) = &a0 {
         let m = i.get_prop(&a0, &PropKey::Sym(SYM_SEARCH))?;
         if i.is_callable(&m) {
-            let sv = Value::Str(Rc::from(unbox_str(i, this)?.as_str()));
+            let sv = Value::Str(unbox_str(i, this)?);
             return i.call(&m, a0.clone(), vec![sv]);
         }
     }
@@ -2269,7 +2494,7 @@ fn str_pad_start(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     };
     let cur = s.chars().count();
     if cur >= target || pad.is_empty() {
-        return Ok(Value::Str(Rc::from(s.as_str())));
+        return Ok(Value::Str(s));
     }
     let need = target - cur;
     let mut p = String::new();
@@ -2289,7 +2514,7 @@ fn str_pad_end(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     };
     let cur = s.chars().count();
     if cur >= target || pad.is_empty() {
-        return Ok(Value::Str(Rc::from(s.as_str())));
+        return Ok(Value::Str(s));
     }
     let need = target - cur;
     let mut p = String::new();
@@ -2330,21 +2555,26 @@ fn str_repeat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn str_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let mut s = unbox_str(i, this)?;
+    let s = unbox_str(i, this)?;
+    let mut out = String::with_capacity(s.len() + args.len() * 8);
+    out.push_str(&s);
     for a in args {
-        s.push_str(&i.to_str(a)?);
+        match a {
+            Value::Str(x) => out.push_str(x),
+            _ => out.push_str(&i.to_str(a)?),
+        }
     }
-    Ok(Value::Str(Rc::from(s.as_str())))
+    Ok(Value::Str(Rc::from(out.as_str())))
 }
 
 fn str_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(Rc::from(unbox_str(i, this)?.as_str())))
+    Ok(Value::Str(unbox_str(i, this)?))
 }
 
 fn str_locale_compare(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let o = i.to_str(&arg(args, 0))?;
-    Ok(Value::Num(match s.cmp(&o) {
+    Ok(Value::Num(match (&*s).cmp(o.as_str()) {
         std::cmp::Ordering::Less => -1.0,
         std::cmp::Ordering::Equal => 0.0,
         std::cmp::Ordering::Greater => 1.0,
@@ -2353,12 +2583,7 @@ fn str_locale_compare(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn str_iter(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    Ok(make_iter(
-        i,
-        s.chars()
-            .map(|c| Value::Str(Rc::from(c.to_string().as_str())))
-            .collect(),
-    ))
+    Ok(make_iter(i, s.chars().map(char_val).collect()))
 }
 
 fn string_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -2392,11 +2617,11 @@ fn string_from_char_code(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
 
 fn string_raw(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let strings = arg(args, 0);
-    let len_v = i.get_prop(&strings, &PropKey::from_str("length"))?;
+    let len_v = i.get_prop_str(&strings, "length")?;
     let n = i.to_num(&len_v)? as usize;
     let mut s = String::new();
     for k in 0..n {
-        let seg = i.get_prop(&strings, &PropKey::from_str(&k.to_string()))?;
+        let seg = i.get_prop(&strings, &idx_key(k))?;
         s.push_str(&i.to_str(&seg)?);
         if k + 1 < n {
             if let Some(sub) = args.get(k + 1) {
@@ -2415,7 +2640,7 @@ fn unbox_num(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     match this {
         Value::Num(n) => Ok(*n),
         Value::Obj(o) => {
-            if let Some(v) = i.obj_get_raw(o, &PropKey::from_str("$value")) {
+            if let Some(v) = i.obj_get_raw_str(o, "$value") {
                 return i.to_num(&v);
             }
             Err(i.type_err("Number.prototype method called on incompatible receiver"))
@@ -2556,7 +2781,7 @@ fn unbox_bool(i: &mut Interp, this: &Value) -> Result<bool, Value> {
     match this {
         Value::Bool(b) => Ok(*b),
         Value::Obj(o) => {
-            if let Some(Value::Bool(b)) = i.obj_get_raw(o, &PropKey::from_str("$value")) {
+            if let Some(Value::Bool(b)) = i.obj_get_raw_str(o, "$value") {
                 return Ok(b);
             }
             Err(i.type_err("Boolean.prototype method called on incompatible receiver"))
@@ -2702,11 +2927,11 @@ sub_err_ctor!(ref_error_ctor, ref_error, "ReferenceError");
 fn err_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
         let name = i
-            .obj_get_raw(o, &PropKey::from_str("name"))
+            .obj_get_raw_str(o, "name")
             .map(|v| i.to_str(&v).unwrap_or_else(|_| "Error".into()))
             .unwrap_or_else(|| "Error".into());
         let msg = i
-            .obj_get_raw(o, &PropKey::from_str("message"))
+            .obj_get_raw_str(o, "message")
             .map(|v| i.to_str(&v).unwrap_or_default())
             .unwrap_or_default();
         if msg.is_empty() {
@@ -3005,91 +3230,163 @@ fn json_stringify(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         Value::Str(s) => s.chars().take(10).collect(),
         _ => String::new(),
     };
-    match json_ser(i, &v, &indent, 0)? {
-        Some(s) => Ok(Value::Str(Rc::from(s.as_str()))),
-        None => Ok(Value::Und),
+    let mut out = String::new();
+    if json_ser_into(i, &v, &indent, 0, &mut out)? {
+        Ok(Value::Str(Rc::from(out.as_str())))
+    } else {
+        Ok(Value::Und)
     }
 }
 
-fn json_ser(
+fn json_pad(out: &mut String, indent: &str, level: usize) {
+    for _ in 0..level {
+        out.push_str(indent);
+    }
+}
+
+/// Serialize into `out` — returns false when the value is omitted
+/// (undefined/symbol/function). Writes directly instead of building a
+/// `String` per node plus a `Vec<String>` join per container.
+fn json_ser_into(
     i: &mut Interp,
     v: &Value,
     indent: &str,
     level: usize,
-) -> Result<Option<String>, Value> {
+    out: &mut String,
+) -> Result<bool, Value> {
     // replacer via toJSON
-    let tj = i
-        .get_prop(v, &PropKey::from_str("toJSON"))
-        .unwrap_or(Value::Und);
+    let tj = i.get_prop_str(v, "toJSON").unwrap_or(Value::Und);
     let v2 = if i.is_callable(&tj) {
-        i.call(&tj, v.clone(), vec![Value::Str(Rc::from(""))])?
+        i.call(&tj, v.clone(), vec![Value::Str(empty_rc())])?
     } else {
         v.clone()
     };
     Ok(match &v2 {
-        Value::Und | Value::Sym(..) => None,
-        Value::Null => Some("null".into()),
-        Value::Bool(b) => Some(b.to_string()),
+        Value::Und | Value::Sym(..) => false,
+        Value::Null => {
+            out.push_str("null");
+            true
+        }
+        Value::Bool(b) => {
+            out.push_str(if *b { "true" } else { "false" });
+            true
+        }
         Value::Num(n) => {
             if n.is_finite() {
-                Some(js_num_str(*n))
+                out.push_str(&js_num_str(*n));
             } else {
-                Some("null".into())
+                out.push_str("null");
+            }
+            true
+        }
+        Value::Str(s) => {
+            json_escape_into(s, out);
+            true
+        }
+        Value::Obj(o) => {
+            enum K {
+                Arr(Vec<Value>),
+                Obj,
+                Skip,
+            }
+            // short borrow only — recursion can run getters that mutate this
+            let k = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Arr(items) => K::Arr(items.clone()),
+                    ObjKind::Func(_) | ObjKind::Bound { .. } => K::Skip,
+                    _ => K::Obj,
+                }
+            };
+            match k {
+                K::Skip => false,
+                K::Arr(items) => {
+                    if indent.is_empty() {
+                        out.push('[');
+                        for (n, it) in items.iter().enumerate() {
+                            if n > 0 {
+                                out.push(',');
+                            }
+                            if !json_ser_into(i, it, indent, level + 1, out)? {
+                                out.push_str("null");
+                            }
+                        }
+                        out.push(']');
+                    } else if items.is_empty() {
+                        out.push_str("[]");
+                    } else {
+                        out.push_str("[\n");
+                        json_pad(out, indent, level + 1);
+                        for (n, it) in items.iter().enumerate() {
+                            if n > 0 {
+                                out.push_str(",\n");
+                                json_pad(out, indent, level + 1);
+                            }
+                            if !json_ser_into(i, it, indent, level + 1, out)? {
+                                out.push_str("null");
+                            }
+                        }
+                        out.push('\n');
+                        json_pad(out, indent, level);
+                        out.push(']');
+                    }
+                    true
+                }
+                K::Obj => {
+                    let entries = own_enum_entries(&v2);
+                    let sep_colon: &str = if indent.is_empty() { ":" } else { ": " };
+                    let open_len = out.len();
+                    if indent.is_empty() {
+                        out.push('{');
+                    } else {
+                        out.push_str("{\n");
+                        json_pad(out, indent, level + 1);
+                    }
+                    let mut first = true;
+                    for (key, slot) in entries {
+                        let val = match slot {
+                            Some(val) => val,
+                            None => i.get_prop(&v2, &key)?,
+                        };
+                        // serialize first — skip the key entirely when the
+                        // value is omitted
+                        let mut tmp = String::new();
+                        if json_ser_into(i, &val, indent, level + 1, &mut tmp)? {
+                            if !first {
+                                if indent.is_empty() {
+                                    out.push(',');
+                                } else {
+                                    out.push_str(",\n");
+                                    json_pad(out, indent, level + 1);
+                                }
+                            }
+                            first = false;
+                            if let PropKey::S(s) = &key {
+                                json_escape_into(s, out);
+                            }
+                            out.push_str(sep_colon);
+                            out.push_str(&tmp);
+                        }
+                    }
+                    if indent.is_empty() {
+                        out.push('}');
+                    } else if first {
+                        // nothing written (empty obj or all values omitted) → {}
+                        out.truncate(open_len);
+                        out.push_str("{}");
+                    } else {
+                        out.push('\n');
+                        json_pad(out, indent, level);
+                        out.push('}');
+                    }
+                    true
+                }
             }
         }
-        Value::Str(s) => Some(json_escape(s)),
-        Value::Obj(o) => match &o.borrow().kind {
-            ObjKind::Arr(items) => {
-                let items = items.clone();
-                let mut parts = Vec::new();
-                for it in &items {
-                    parts
-                        .push(json_ser(i, it, indent, level + 1)?.unwrap_or_else(|| "null".into()));
-                }
-                Some(if indent.is_empty() {
-                    format!("[{}]", parts.join(","))
-                } else {
-                    let pad = indent.repeat(level + 1);
-                    format!(
-                        "[\n{}{}\n{}]",
-                        pad,
-                        parts.join(&format!(",\n{pad}")),
-                        indent.repeat(level)
-                    )
-                })
-            }
-            ObjKind::Func(_) | ObjKind::Bound { .. } => None,
-            _ => {
-                let mut parts = Vec::new();
-                for k in i.own_keys(&v2) {
-                    let val = i.get_prop(&v2, &PropKey::from_str(&k))?;
-                    if let Some(s) = json_ser(i, &val, indent, level + 1)? {
-                        let kv = format!(
-                            "{}:{}",
-                            json_escape(&k),
-                            if indent.is_empty() { "" } else { " " }
-                        );
-                        parts.push(format!("{kv}{s}"));
-                    }
-                }
-                Some(if indent.is_empty() {
-                    format!("{{{}}}", parts.join(","))
-                } else {
-                    let pad = indent.repeat(level + 1);
-                    format!(
-                        "{{\n{}{}\n{}}}",
-                        pad,
-                        parts.join(&format!(",\n{pad}")),
-                        indent.repeat(level)
-                    )
-                })
-            }
-        },
     })
 }
 
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+fn json_escape_into(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -3100,12 +3397,17 @@ fn json_escape(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let u = c as usize;
+                out.push_str("\\u00");
+                out.push(HEX[(u >> 4) & 15] as char);
+                out.push(HEX[u & 15] as char);
+            }
             c => out.push(c),
         }
     }
     out.push('"');
-    out
 }
 
 // ===========================================================================
@@ -3113,11 +3415,14 @@ fn json_escape(s: &str) -> String {
 // ===========================================================================
 
 fn console_log(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let mut parts = Vec::new();
-    for a in args {
-        parts.push(i.inspect(a, 0));
+    let mut line = String::new();
+    for (k, a) in args.iter().enumerate() {
+        if k > 0 {
+            line.push(' ');
+        }
+        line.push_str(&i.inspect(a, 0));
     }
-    i.output.push(parts.join(" "));
+    i.output.push(line);
     Ok(Value::Und)
 }
 
@@ -3190,7 +3495,7 @@ fn promise_resolve_inner(i: &mut Interp, this: &Value, args: &[Value]) -> NResul
                     }
                     ObjKind::Promise(PromiseState::Pending) => {
                         // forward via then
-                        let then = i.get_prop(&arg(args, 0), &PropKey::from_str("then"))?;
+                        let then = i.get_prop_str(&arg(args, 0), "then")?;
                         let pv = Value::Obj(p.clone());
                         let res_fn = i.native("resolve", promise_resolve_inner);
                         let rej_fn = i.native("reject", promise_reject_inner);
@@ -3254,7 +3559,7 @@ fn handlers_of(i: &mut Interp, p: &ObjRef) -> Vec<Value> {
     if let Some(Value::Obj(h)) = p
         .borrow()
         .props
-        .get(&PropKey::from_str("$handlers"))
+        .get_str("$handlers")
         .map(|pr| pr.val.clone())
     {
         if let ObjKind::Arr(items) = &h.borrow().kind {
@@ -3275,7 +3580,7 @@ fn run_handlers(i: &mut Interp, p: &ObjRef) -> NResult {
         let getf = |name: &str| {
             ho.borrow()
                 .props
-                .get(&PropKey::from_str(name))
+                .get_str(name)
                 .map(|p| p.val.clone())
                 .unwrap_or(Value::Und)
         };
@@ -3321,7 +3626,7 @@ fn run_handlers(i: &mut Interp, p: &ObjRef) -> NResult {
     if let Some(Value::Obj(h)) = p
         .borrow()
         .props
-        .get(&PropKey::from_str("$handlers"))
+        .get_str("$handlers")
         .map(|pr| pr.val.clone())
     {
         h.borrow_mut().kind = ObjKind::Arr(Vec::new());
@@ -3365,7 +3670,7 @@ fn promise_then(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Some(Value::Obj(h)) = p
         .borrow()
         .props
-        .get(&PropKey::from_str("$handlers"))
+        .get_str("$handlers")
         .map(|pr| pr.val.clone())
     {
         if let ObjKind::Arr(items) = &mut h.borrow_mut().kind {
@@ -3434,7 +3739,7 @@ fn promise_finally(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             if let Some(Value::Obj(h)) = p
                 .borrow()
                 .props
-                .get(&PropKey::from_str("$handlers"))
+                .get_str("$handlers")
                 .map(|pr| pr.val.clone())
             {
                 if let ObjKind::Arr(items) = &mut h.borrow_mut().kind {
@@ -3560,7 +3865,7 @@ fn date_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn date_get_time(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
-        if let Some(v) = i.obj_get_raw(o, &PropKey::from_str("$ms")) {
+        if let Some(v) = i.obj_get_raw_str(o, "$ms") {
             return Ok(v);
         }
     }
@@ -3569,7 +3874,7 @@ fn date_get_time(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 
 fn date_ms(i: &mut Interp, this: &Value) -> f64 {
     if let Value::Obj(o) = this {
-        i.obj_get_raw(o, &PropKey::from_str("$ms"))
+        i.obj_get_raw_str(o, "$ms")
             .and_then(|v| match v {
                 Value::Num(n) => Some(n),
                 _ => None,
@@ -3794,8 +4099,8 @@ fn map_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         Value::Und | Value::Null => {}
         v => {
             for e in i.iter_values(&v)? {
-                let k = i.get_prop(&e, &PropKey::from_str("0"))?;
-                let val = i.get_prop(&e, &PropKey::from_str("1"))?;
+                let k = i.get_prop_str(&e, "0")?;
+                let val = i.get_prop_str(&e, "1")?;
                 if let ObjKind::Map(items) = &mut m.borrow_mut().kind {
                     if let Some(slot) = items.iter_mut().find(|(k2, _)| same_value_zero(k2, &k)) {
                         slot.1 = val;
@@ -4439,7 +4744,7 @@ fn regexp_run(
 ) -> Result<Option<RxMatch>, Value> {
     let use_last = re.global || re.sticky;
     let start = if use_last {
-        let lv = i.get_prop(this, &PropKey::from_str("lastIndex"))?;
+        let lv = i.get_prop_str(this, "lastIndex")?;
         let n = i.to_num(&lv)?;
         if n.is_finite() && n >= 0.0 {
             n as usize
@@ -4455,7 +4760,7 @@ fn regexp_run(
             Some(mm) => Value::Num(mm.end as f64),
             None => Value::Num(0.0),
         };
-        i.set_prop(this, PropKey::from_str("lastIndex"), v)?;
+        i.set_prop_str(this, "lastIndex", v)?;
     }
     Ok(m)
 }
@@ -4526,8 +4831,8 @@ fn re_test(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn re_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let Some(re) = re_of(this) else {
         // spec: generic — read .source/.flags
-        let src = i.get_prop(this, &PropKey::from_str("source"))?;
-        let fl = i.get_prop(this, &PropKey::from_str("flags"))?;
+        let src = i.get_prop_str(this, "source")?;
+        let fl = i.get_prop_str(this, "flags")?;
         let s = format!("/{}/{}", i.to_str(&src)?, i.to_str(&fl)?);
         return Ok(Value::Str(Rc::from(s.as_str())));
     };
@@ -4623,7 +4928,7 @@ fn re_sym_match(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let chars: Vec<char> = s.chars().collect();
     if re.global {
         // collect all via lastIndex-driven exec
-        i.set_prop(this, PropKey::from_str("lastIndex"), Value::Num(0.0))?;
+        i.set_prop_str(this, "lastIndex", Value::Num(0.0))?;
         let mut out = Vec::new();
         loop {
             match regexp_run(i, this, &re, &chars)? {
@@ -4631,9 +4936,9 @@ fn re_sym_match(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                     let empty = m.end == m.start;
                     out.push(chars_str(&chars, m.start, m.end));
                     if empty {
-                        let _ = i.set_prop(
+                        let _ = i.set_prop_str(
                             this,
-                            PropKey::from_str("lastIndex"),
+                            "lastIndex",
                             Value::Num(m.end as f64 + 1.0),
                         );
                     }
@@ -4682,7 +4987,7 @@ fn re_sym_search(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     };
     let s = i.to_str(&arg(args, 0))?;
     let chars: Vec<char> = s.chars().collect();
-    i.set_prop(this, PropKey::from_str("lastIndex"), Value::Num(0.0))?;
+    i.set_prop_str(this, "lastIndex", Value::Num(0.0))?;
     match re.find(&chars, 0) {
         Some(m) => Ok(Value::Num(m.start as f64)),
         None => Ok(Value::Num(-1.0)),

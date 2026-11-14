@@ -4680,6 +4680,7 @@ dependencies = [
  "rowser-css",
  "rowser-dom",
  "rowser-html",
+ "rowser-net",
 ]
 
 [[package]]

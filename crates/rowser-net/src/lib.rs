@@ -14,4 +14,4 @@ pub use cookies::{CookieJar, Session};
 pub use http::request_over;
 pub use http::{Exchange, Response, exchange, fetch, http_get, request_over_with};
 pub use rowser_deflate::{InflateError, inflate, inflate_gzip, inflate_zlib};
-pub use url::{Url, UrlError, percent_decode};
+pub use url::{Url, UrlError, default_port, percent_decode};

@@ -41,8 +41,53 @@ const K_STOP: &str = "\u{0}sp";
 const K_STOPIMM: &str = "\u{0}si";
 const K_NS: &str = "\u{0}ns";
 
-fn pk(s: &str) -> PropKey {
-    PropKey::from_str(s)
+// -- hot-path helpers ---------------------------------------------------------
+
+thread_local! {
+    static EMPTY_RC: Rc<str> = Rc::from("");
+    /// interned `PropKey`s for the prefilled `STYLE_PROPS` set — built once.
+    static STYLE_PROP_KEYS: RefCell<Vec<Rc<str>>> = RefCell::new(Vec::new());
+}
+
+fn empty_rc() -> Rc<str> {
+    EMPTY_RC.with(|e| e.clone())
+}
+
+/// Own-prop read without `i.obj_get_raw`'s `view_own_prop` check or any
+/// key allocation — only for keys that can never be virtual ("length"/
+/// "byteLength"/"byteOffset"/"buffer" or numeric strings). All `"\u{0}…"`
+/// hidden props qualify.
+fn raw_prop(o: &ObjRef, k: &str) -> Option<Value> {
+    o.borrow().props.get_str(k).map(|p| p.val.clone())
+}
+
+/// `i.set_builtin` minus the `PropKey`/`Rc` allocation — `insert_str`
+/// borrows the key and only allocates when the prop is newly inserted.
+fn set_bk(o: &ObjRef, key: &str, v: Value) {
+    o.borrow_mut().props.insert_str(key, Prop::builtin(v));
+}
+
+fn set_dt(o: &ObjRef, key: &str, v: Value) {
+    o.borrow_mut().props.insert_str(key, Prop::data(v));
+}
+
+/// `to_str` that shares the `Rc<str>` for `Value::Str` instead of copying
+/// the whole string.
+fn to_rc(i: &mut Interp, v: &Value) -> Result<Rc<str>, Value> {
+    match v {
+        Value::Str(s) => Ok(s.clone()),
+        _ => Ok(Rc::from(i.to_str(v)?.as_str())),
+    }
+}
+
+/// ASCII fast-path for `to_lowercase` — zero-copy `Rc` clone when the
+/// input is already lowercase ASCII (the common attr-name case).
+fn lower_rc(s: &Rc<str>) -> Rc<str> {
+    if s.is_ascii() && !s.bytes().any(|b| b.is_ascii_uppercase()) {
+        s.clone()
+    } else {
+        Rc::from(s.to_lowercase().as_str())
+    }
 }
 
 fn arg(args: &[Value], n: usize) -> Value {
@@ -97,6 +142,10 @@ pub struct DomState {
     storage_session: Vec<(String, String)>,
     focused: Option<(u32, NodeId)>,
     location: Option<ObjRef>,
+    /// Live `style`/`dataset` wrapper objects — synced back into document
+    /// attributes by `sync_dom_side_effects` without scanning every node.
+    styled_objs: Vec<ObjRef>,
+    dataset_objs: Vec<ObjRef>,
 }
 
 /// Run `f` with the `DomState` out of `interp.ext`. `f` must not call back
@@ -119,10 +168,12 @@ fn with_ds<R>(i: &mut Interp, f: impl FnOnce(&mut DomState) -> R) -> R {
 // ---------------------------------------------------------------------------
 
 /// The (doc-index, node) a wrapper points at, if it is a DOM wrapper.
-fn node_ref(i: &Interp, v: &Value) -> Option<(u32, NodeId)> {
+/// One shared borrow + two allocation-free string lookups.
+fn node_ref(_i: &Interp, v: &Value) -> Option<(u32, NodeId)> {
     let Value::Obj(o) = v else { return None };
-    let d = i.obj_get_raw(o, &pk(K_DID));
-    let n = i.obj_get_raw(o, &pk(K_NID));
+    let b = o.borrow();
+    let d = b.props.get_str(K_DID).map(|p| p.val.clone());
+    let n = b.props.get_str(K_NID).map(|p| p.val.clone());
     match (d, n) {
         (Some(Value::Num(d)), Some(Value::Num(n))) => Some((d as u32, n as usize)),
         _ => None,
@@ -133,42 +184,61 @@ fn node_ref(i: &Interp, v: &Value) -> Option<(u32, NodeId)> {
 /// (or SVGElement.prototype for svg/NS-created nodes) → Element → Node → Object.
 fn proto_for(ds: &mut DomState, did: u32, nid: NodeId) -> ObjRef {
     let doc = &ds.docs[did as usize];
-    let Some(tag) = doc.tag(nid).map(|t| t.to_string()) else {
+    let Some(tag) = doc.tag(nid) else {
         return ds.p_char.clone();
     };
     if tag == FRAG_TAG {
         return ds.p_frag.clone();
     }
     let svg = tag == "svg" || ds.svg_nodes.contains(&(did, nid));
+    if let Some(p) = ds.tag_protos.get(tag) {
+        return p.clone();
+    }
     let base = if svg {
         ds.p_svg.clone()
     } else {
         ds.p_html.clone()
     };
-    if let Some(p) = ds.tag_protos.get(&tag) {
-        return p.clone();
-    }
     let p = obj(Some(base));
-    ds.tag_protos.insert(tag, p.clone());
+    ds.tag_protos.insert(tag.to_string(), p.clone());
     p
 }
 
-/// Identity-preserving wrapper: same node → same JS object.
+/// Identity-preserving wrapper: same node → same JS object. One `with_ds`
+/// on both hit and miss paths (was three + a NodeKind clone on every call).
 fn wrap_node(i: &mut Interp, did: u32, nid: NodeId) -> Value {
-    if let NodeKind::Document = with_ds(i, |ds| ds.docs[did as usize].kind(nid).clone()) {
-        return doc_obj(i, did);
+    enum W {
+        Doc,
+        Hit(ObjRef),
+        Miss(ObjRef),
     }
-    if let Some(o) = with_ds(i, |ds| ds.nodes.get(&(did, nid)).cloned()) {
-        return Value::Obj(o);
-    }
-    let proto = with_ds(i, |ds| proto_for(ds, did, nid));
-    let o = obj(Some(proto));
-    i.set_builtin(&o, K_DID, Value::Num(did as f64));
-    i.set_builtin(&o, K_NID, Value::Num(nid as f64));
-    with_ds(i, |ds| {
-        ds.nodes.insert((did, nid), o.clone());
+    let w = with_ds(i, |ds| {
+        if matches!(ds.docs[did as usize].kind(nid), NodeKind::Document) {
+            W::Doc
+        } else if let Some(o) = ds.nodes.get(&(did, nid)) {
+            W::Hit(o.clone())
+        } else {
+            W::Miss(proto_for(ds, did, nid))
+        }
     });
-    Value::Obj(o)
+    match w {
+        W::Doc => doc_obj(i, did),
+        W::Hit(o) => Value::Obj(o),
+        W::Miss(proto) => {
+            let o = obj(Some(proto));
+            {
+                let mut b = o.borrow_mut();
+                b.props
+                    .insert_str(K_DID, Prop::builtin(Value::Num(did as f64)));
+                b.props
+                    .insert_str(K_NID, Prop::builtin(Value::Num(nid as f64)));
+            }
+            with_ds(i, |ds| {
+                ds.nodes.insert((did, nid), o.clone());
+            });
+            Value::Obj(o)
+        }
+    }
 }
 
 /// The `document` object for doc `did`.
@@ -176,26 +246,30 @@ fn doc_obj(i: &mut Interp, did: u32) -> Value {
     if let Some(o) = with_ds(i, |ds| ds.doc_objs.get(&did).cloned()) {
         return Value::Obj(o);
     }
-    let (proto, root) = with_ds(i, |ds| (ds.p_doc.clone(), ds.docs[did as usize].root));
+    let (proto, root, url) = with_ds(i, |ds| {
+        (ds.p_doc.clone(), ds.docs[did as usize].root, ds.url.clone())
+    });
     let o = obj(Some(proto));
-    i.set_builtin(&o, K_DID, Value::Num(did as f64));
-    i.set_builtin(&o, K_NID, Value::Num(root as f64));
-    i.set_builtin(&o, "readyState", Value::Str(Rc::from("complete")));
-    i.set_builtin(&o, "compatMode", Value::Str(Rc::from("CSS1Compat")));
-    i.set_builtin(&o, "characterSet", Value::Str(Rc::from("UTF-8")));
-    i.set_builtin(&o, "charset", Value::Str(Rc::from("UTF-8")));
-    i.set_builtin(&o, "contentType", Value::Str(Rc::from("text/html")));
-    i.set_builtin(&o, "designMode", Value::Str(Rc::from("off")));
-    let url = with_ds(i, |ds| ds.url.clone());
-    i.set_builtin(&o, "URL", Value::Str(Rc::from(url.as_str())));
-    i.set_builtin(&o, "documentURI", Value::Str(Rc::from(url.as_str())));
-    i.set_builtin(&o, "cookie", Value::Str(Rc::from("")));
-    i.set_builtin(&o, "referrer", Value::Str(Rc::from("")));
-    let g = Value::Obj(i.p.global.clone());
-    i.set_builtin(&o, "defaultView", g);
+    {
+        let mut b = o.borrow_mut();
+        let p = &mut b.props;
+        p.insert_str(K_DID, Prop::builtin(Value::Num(did as f64)));
+        p.insert_str(K_NID, Prop::builtin(Value::Num(root as f64)));
+        p.insert_str("readyState", Prop::builtin(Value::Str(Rc::from("complete"))));
+        p.insert_str("compatMode", Prop::builtin(Value::Str(Rc::from("CSS1Compat"))));
+        p.insert_str("characterSet", Prop::builtin(Value::Str(Rc::from("UTF-8"))));
+        p.insert_str("charset", Prop::builtin(Value::Str(Rc::from("UTF-8"))));
+        p.insert_str("contentType", Prop::builtin(Value::Str(Rc::from("text/html"))));
+        p.insert_str("designMode", Prop::builtin(Value::Str(Rc::from("off"))));
+        p.insert_str("URL", Prop::builtin(Value::Str(Rc::from(url.as_str()))));
+        p.insert_str("documentURI", Prop::builtin(Value::Str(Rc::from(url.as_str()))));
+        p.insert_str("cookie", Prop::builtin(Value::Str(empty_rc())));
+        p.insert_str("referrer", Prop::builtin(Value::Str(empty_rc())));
+        p.insert_str("defaultView", Prop::builtin(Value::Obj(i.p.global.clone())));
+        p.insert_str("doctype", Prop::builtin(Value::Null));
+    }
     let loc = location_obj(i);
-    i.set_builtin(&o, "location", loc);
-    i.set_builtin(&o, "doctype", Value::Null);
+    set_bk(&o, "location", loc);
     // registration maps — let wrap_node(root) resolve here too
     with_ds(i, |ds| {
         ds.doc_objs.insert(did, o.clone());
@@ -216,6 +290,7 @@ fn fix_siblings(doc: &mut Document, parent: NodeId) {
 }
 
 fn detach(doc: &mut Document, id: NodeId) {
+    doc.mutated = true;
     if let Some(p) = doc.nodes[id].parent {
         doc.nodes[p].children.retain(|&c| c != id);
         fix_siblings(doc, p);
@@ -226,6 +301,7 @@ fn detach(doc: &mut Document, id: NodeId) {
 
 /// Insert `child` under `parent` at `pos` (detaching it first).
 fn insert_at(doc: &mut Document, parent: NodeId, child: NodeId, pos: usize) {
+    doc.mutated = true;
     detach(doc, child);
     let pos = pos.min(doc.nodes[parent].children.len());
     doc.nodes[parent].children.insert(pos, child);
@@ -255,6 +331,7 @@ fn insert_maybe_frag(doc: &mut Document, parent: NodeId, child: NodeId, pos: usi
 }
 
 fn remove_children(doc: &mut Document, id: NodeId) {
+    doc.mutated = true;
     let kids = std::mem::take(&mut doc.nodes[id].children);
     for c in kids {
         doc.nodes[c].parent = None;
@@ -297,12 +374,20 @@ fn clone_subtree_inplace(doc: &mut Document, id: NodeId) -> NodeId {
 }
 
 fn attr_set(doc: &mut Document, id: NodeId, name: &str, val: &str) {
+    doc.mutated = true;
     if let NodeKind::Element { attrs, .. } = &mut doc.nodes[id].kind {
-        attrs.insert(name.to_string(), val.to_string());
+        // setAttribute overwrites far more often than it inserts — reuse
+        // the existing key/value allocations when present.
+        if let Some(v) = attrs.get_mut(name) {
+            *v = val.to_string();
+        } else {
+            attrs.insert(name.to_string(), val.to_string());
+        }
     }
 }
 
 fn attr_remove(doc: &mut Document, id: NodeId, name: &str) {
+    doc.mutated = true;
     if let NodeKind::Element { attrs, .. } = &mut doc.nodes[id].kind {
         attrs.remove(name);
     }
@@ -419,14 +504,14 @@ fn graft_node(doc: &mut Document, parsed: &Document, id: NodeId) -> NodeId {
 
 /// `__lsn` map on an object: {"type": [bubble fns], "\u{1}type": [capture fns]}.
 fn listeners(i: &mut Interp, o: &ObjRef, create: bool) -> Option<ObjRef> {
-    if let Some(Value::Obj(m)) = i.obj_get_raw(o, &pk(K_LISTEN)) {
+    if let Some(Value::Obj(m)) = raw_prop(o, K_LISTEN) {
         return Some(m);
     }
     if !create {
         return None;
     }
     let m = i.new_obj();
-    i.set_builtin(o, K_LISTEN, Value::Obj(m.clone()));
+    set_bk(o, K_LISTEN, Value::Obj(m.clone()));
     Some(m)
 }
 
@@ -434,12 +519,15 @@ fn listener_fns(i: &mut Interp, o: &ObjRef, ty: &str, capture: bool) -> Vec<Valu
     let Some(m) = listeners(i, o, false) else {
         return Vec::new();
     };
-    let key = if capture {
-        format!("\u{1}{ty}")
-    } else {
-        ty.to_string()
-    };
-    if let Some(Value::Obj(a)) = i.obj_get_raw(&m, &pk(&key)) {
+    if capture {
+        // the listeners map is an ordinary object — a "\u{1}"-prefixed key
+        // can never hit a virtual prop
+        if let Some(Value::Obj(a)) = raw_prop(&m, &format!("\u{1}{ty}")) {
+            if let ObjKind::Arr(items) = &a.borrow().kind {
+                return items.clone();
+            }
+        }
+    } else if let Some(Value::Obj(a)) = raw_prop(&m, ty) {
         if let ObjKind::Arr(items) = &a.borrow().kind {
             return items.clone();
         }
@@ -451,7 +539,7 @@ fn el_add_event_listener(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Value::Obj(o) = this else {
         return Ok(Value::Und);
     };
-    let ty = i.to_str(&arg(args, 0))?;
+    let ty = to_rc(i, &arg(args, 0))?;
     let f = arg(args, 1);
     if !i.is_callable(&f) {
         return Ok(Value::Und);
@@ -465,11 +553,11 @@ fn el_add_event_listener(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     } else {
         ty.to_string()
     };
-    let arr = match i.obj_get_raw(&m, &pk(&key)) {
+    let arr = match raw_prop(&m, &key) {
         Some(Value::Obj(a)) => a,
         _ => {
             let a = i.new_arr(Vec::new());
-            i.set_builtin(&m, &key, Value::Obj(a.clone()));
+            set_bk(&m, &key, Value::Obj(a.clone()));
             a
         }
     };
@@ -483,7 +571,7 @@ fn el_remove_event_listener(i: &mut Interp, this: &Value, args: &[Value]) -> NR 
     let Value::Obj(o) = this else {
         return Ok(Value::Und);
     };
-    let ty = i.to_str(&arg(args, 0))?;
+    let ty = to_rc(i, &arg(args, 0))?;
     let f = arg(args, 1);
     let capture = i.to_bool(&arg(args, 2));
     let Some(m) = listeners(i, o, false) else {
@@ -494,7 +582,7 @@ fn el_remove_event_listener(i: &mut Interp, this: &Value, args: &[Value]) -> NR 
     } else {
         ty.to_string()
     };
-    if let Some(Value::Obj(a)) = i.obj_get_raw(&m, &pk(&key)) {
+    if let Some(Value::Obj(a)) = raw_prop(&m, &key) {
         if let ObjKind::Arr(items) = &mut a.borrow_mut().kind {
             // find first equal fn
             let mut rm = None;
@@ -517,16 +605,16 @@ fn el_dispatch_event(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     if !matches!(ev, Value::Obj(_)) {
         return Err(i.type_err("dispatchEvent: argument is not an Event"));
     }
-    let tyv = i.get_prop(&ev, &pk("type"))?;
-    let ty = i.to_str(&tyv)?;
+    let tyv = i.get_prop_str(&ev, "type")?;
+    let ty = to_rc(i, &tyv)?;
     if ty.is_empty() {
         return Err(i.type_err("dispatchEvent: event has no type"));
     }
     // seed target/srcElement
-    let cur_target = i.get_prop(&ev, &pk("target"))?;
+    let cur_target = i.get_prop_str(&ev, "target")?;
     if matches!(cur_target, Value::Und | Value::Null) {
-        i.set_prop(&ev, pk("target"), this.clone())?;
-        i.set_prop(&ev, pk("srcElement"), this.clone())?;
+        i.set_prop_str(&ev, "target", this.clone())?;
+        i.set_prop_str(&ev, "srcElement", this.clone())?;
     }
     run_event_path(i, &this, &ev)
 }
@@ -535,9 +623,9 @@ fn el_dispatch_event(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 /// embedder-driven events (clicks). Returns `false` when the event was
 /// cancelled (preventDefault).
 fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
-    let tyv = i.get_prop(ev, &pk("type"))?;
-    let ty = i.to_str(&tyv)?;
-    let bv = i.get_prop(&ev, &pk("bubbles"))?;
+    let tyv = i.get_prop_str(ev, "type")?;
+    let ty = to_rc(i, &tyv)?;
+    let bv = i.get_prop_str(&ev, "bubbles")?;
     let bubbles = i.to_bool(&bv);
 
     // path: target → ancestors → document → window
@@ -566,8 +654,8 @@ fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
         if let Value::Obj(o) = target {
             let fns = listener_fns(i, o, &ty, true);
             if !fns.is_empty() {
-                i.set_prop(&ev, pk("eventPhase"), Value::Num(1.0))?;
-                i.set_prop(&ev, pk("currentTarget"), target.clone())?;
+                i.set_prop_str(&ev, "eventPhase", Value::Num(1.0))?;
+                i.set_prop_str(&ev, "currentTarget", target.clone())?;
                 for h in fns {
                     i.call(&h, target.clone(), vec![ev.clone()])?;
                     if ev_flag(&ev, K_STOPIMM) {
@@ -577,9 +665,9 @@ fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
             }
         }
         if ev_flag(&ev, K_STOP) || ev_flag(&ev, K_STOPIMM) {
-            i.set_prop(&ev, pk("eventPhase"), Value::Num(0.0))?;
-            i.set_prop(&ev, pk("currentTarget"), Value::Null)?;
-            let dp = i.get_prop(&ev, &pk("defaultPrevented"))?;
+            i.set_prop_str(&ev, "eventPhase", Value::Num(0.0))?;
+            i.set_prop_str(&ev, "currentTarget", Value::Null)?;
+            let dp = i.get_prop_str(&ev, "defaultPrevented")?;
             return Ok(Value::Bool(!i.to_bool(&dp)));
         }
     }
@@ -592,8 +680,8 @@ fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
             let fns = listener_fns(i, o, &ty, false);
             if !fns.is_empty() {
                 let phase = if idx == 0 { 2.0 } else { 3.0 };
-                i.set_prop(&ev, pk("eventPhase"), Value::Num(phase))?;
-                i.set_prop(&ev, pk("currentTarget"), target.clone())?;
+                i.set_prop_str(&ev, "eventPhase", Value::Num(phase))?;
+                i.set_prop_str(&ev, "currentTarget", target.clone())?;
                 for h in fns {
                     i.call(&h, target.clone(), vec![ev.clone()])?;
                     if ev_flag(&ev, K_STOPIMM) {
@@ -606,9 +694,9 @@ fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
             break;
         }
     }
-    i.set_prop(&ev, pk("eventPhase"), Value::Num(0.0))?;
-    i.set_prop(&ev, pk("currentTarget"), Value::Null)?;
-    let dp = i.get_prop(&ev, &pk("defaultPrevented"))?;
+    i.set_prop_str(&ev, "eventPhase", Value::Num(0.0))?;
+    i.set_prop_str(&ev, "currentTarget", Value::Null)?;
+    let dp = i.get_prop_str(&ev, "defaultPrevented")?;
     Ok(Value::Bool(!i.to_bool(&dp)))
 }
 
@@ -616,7 +704,7 @@ fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
 fn ev_flag(ev: &Value, key: &str) -> bool {
     let Value::Obj(o) = ev else { return false };
     matches!(
-        o.borrow().props.get(&pk(key)).map(|p| p.val.clone()),
+        o.borrow().props.get_str(key).map(|p| p.val.clone()),
         Some(Value::Bool(true))
     )
 }
@@ -647,10 +735,10 @@ fn doc_get_element_by_id(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, _)) = node_ref(i, this) else {
         return Ok(Value::Null);
     };
-    let want = i.to_str(&arg(args, 0))?;
+    let want = to_rc(i, &arg(args, 0))?;
     let found = with_ds(i, |ds| {
         let root = ds.docs[did as usize].root;
-        collect_elems(ds, did, root, |d, n| d.attr(n, "id") == Some(want.as_str()))
+        collect_elems(ds, did, root, |d, n| d.attr(n, "id") == Some(&*want))
             .into_iter()
             .next()
     });
@@ -664,10 +752,10 @@ fn get_by_tag(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Obj(i.new_arr(vec![])));
     };
-    let want = i.to_str(&arg(args, 0))?.to_lowercase();
+    let want = lower_rc(&to_rc(i, &arg(args, 0))?);
     let ids = with_ds(i, |ds| {
         collect_elems(ds, did, nid, |d, n| {
-            want == "*" || d.tag(n) == Some(want.as_str())
+            &*want == "*" || d.tag(n) == Some(&*want)
         })
     });
     Ok(wrap_list(i, did, ids))
@@ -677,7 +765,7 @@ fn get_by_class(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Obj(i.new_arr(vec![])));
     };
-    let want = i.to_str(&arg(args, 0))?;
+    let want = to_rc(i, &arg(args, 0))?;
     let ids = with_ds(i, |ds| {
         collect_elems(ds, did, nid, |d, n| {
             d.attr(n, "class").is_some_and(|v| {
@@ -693,11 +781,9 @@ fn get_by_name(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Obj(i.new_arr(vec![])));
     };
-    let want = i.to_str(&arg(args, 0))?;
+    let want = to_rc(i, &arg(args, 0))?;
     let ids = with_ds(i, |ds| {
-        collect_elems(ds, did, nid, |d, n| {
-            d.attr(n, "name") == Some(want.as_str())
-        })
+        collect_elems(ds, did, nid, |d, n| d.attr(n, "name") == Some(&*want))
     });
     Ok(wrap_list(i, did, ids))
 }
@@ -728,7 +814,7 @@ fn query_selector(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Null);
     };
-    let s = i.to_str(&arg(args, 0))?;
+    let s = to_rc(i, &arg(args, 0))?;
     let found = with_ds(i, |ds| {
         parse_sel_list(&s).and_then(|sels| {
             collect_elems(ds, did, nid, |d, n| {
@@ -748,7 +834,7 @@ fn query_selector_all(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Obj(i.new_arr(vec![])));
     };
-    let s = i.to_str(&arg(args, 0))?;
+    let s = to_rc(i, &arg(args, 0))?;
     let ids = with_ds(i, |ds| {
         parse_sel_list(&s)
             .map(|sels| collect_elems(ds, did, nid, |_d, n| sel_matches(ds, did, n, &sels)))
@@ -761,7 +847,7 @@ fn el_matches(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Bool(false));
     };
-    let s = i.to_str(&arg(args, 0))?;
+    let s = to_rc(i, &arg(args, 0))?;
     Ok(Value::Bool(with_ds(i, |ds| {
         parse_sel_list(&s).is_some_and(|sels| sel_matches(ds, did, nid, &sels))
     })))
@@ -771,7 +857,7 @@ fn el_closest(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Null);
     };
-    let s = i.to_str(&arg(args, 0))?;
+    let s = to_rc(i, &arg(args, 0))?;
     let found = with_ds(i, |ds| {
         let sels = parse_sel_list(&s)?;
         let mut cur = Some(nid);
@@ -793,7 +879,7 @@ fn doc_create_element(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, _)) = node_ref(i, this) else {
         return Err(i.type_err("createElement called on non-document"));
     };
-    let tag = i.to_str(&arg(args, 0))?.to_lowercase();
+    let tag = lower_rc(&to_rc(i, &arg(args, 0))?);
     let nid = with_ds(i, |ds| ds.docs[did as usize].create_element(&tag, vec![]));
     Ok(wrap_node(i, did, nid))
 }
@@ -802,8 +888,8 @@ fn doc_create_element_ns(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, _)) = node_ref(i, this) else {
         return Err(i.type_err("createElementNS called on non-document"));
     };
-    let ns = i.to_str(&arg(args, 0))?;
-    let tag = i.to_str(&arg(args, 1))?.to_lowercase();
+    let ns = to_rc(i, &arg(args, 0))?;
+    let tag = lower_rc(&to_rc(i, &arg(args, 1))?);
     let nid = with_ds(i, |ds| {
         let n = ds.docs[did as usize].create_element(&tag, vec![]);
         if ns.contains("svg") {
@@ -813,7 +899,7 @@ fn doc_create_element_ns(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     });
     let v = wrap_node(i, did, nid);
     if let Value::Obj(o) = &v {
-        i.set_builtin(o, K_NS, Value::Str(Rc::from(ns.as_str())));
+        set_bk(o, K_NS, Value::Str(ns));
     }
     Ok(v)
 }
@@ -822,7 +908,7 @@ fn doc_create_text_node(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, _)) = node_ref(i, this) else {
         return Err(i.type_err("createTextNode called on non-document"));
     };
-    let t = i.to_str(&arg(args, 0))?;
+    let t = to_rc(i, &arg(args, 0))?;
     let nid = with_ds(i, |ds| ds.docs[did as usize].create_text(&t));
     Ok(wrap_node(i, did, nid))
 }
@@ -831,7 +917,7 @@ fn doc_create_comment(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, _)) = node_ref(i, this) else {
         return Err(i.type_err("createComment called on non-document"));
     };
-    let t = i.to_str(&arg(args, 0))?;
+    let t = to_rc(i, &arg(args, 0))?;
     let nid = with_ds(i, |ds| ds.docs[did as usize].create_comment(&t));
     Ok(wrap_node(i, did, nid))
 }
@@ -848,12 +934,12 @@ fn doc_create_fragment(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn doc_create_attribute(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
-    let name = i.to_str(&arg(args, 0))?;
+    let name = to_rc(i, &arg(args, 0))?;
     let o = i.new_obj();
-    i.set_data(&o, "name", Value::Str(Rc::from(name.as_str())));
-    i.set_data(&o, "nodeName", Value::Str(Rc::from(name.as_str())));
-    i.set_data(&o, "value", Value::Str(Rc::from("")));
-    i.set_data(&o, "nodeValue", Value::Str(Rc::from("")));
+    set_dt(&o, "name", Value::Str(name.clone()));
+    set_dt(&o, "nodeName", Value::Str(name));
+    set_dt(&o, "value", Value::Str(empty_rc()));
+    set_dt(&o, "nodeValue", Value::Str(empty_rc()));
     Ok(Value::Obj(o))
 }
 
@@ -905,7 +991,7 @@ fn doc_get_docel(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 
 fn doc_get_title(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((did, _)) = node_ref(i, this) else {
-        return Ok(Value::Str(Rc::from("")));
+        return Ok(Value::Str(empty_rc()));
     };
     Ok(Value::Str(Rc::from(
         with_ds(i, |ds| {
@@ -922,7 +1008,7 @@ fn doc_set_title(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, _)) = node_ref(i, this) else {
         return Ok(Value::Und);
     };
-    let t = i.to_str(&arg(args, 0))?;
+    let t = to_rc(i, &arg(args, 0))?;
     with_ds(i, |ds| {
         let d = &mut ds.docs[did as usize];
         let title = match d.find_deep(d.root, "title") {
@@ -1020,10 +1106,10 @@ fn doc_create_range(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
         "deleteContents",
         "detach",
     ] {
-        i.set_builtin(&o, m, i.native(m, noop));
+        set_bk(&o, m, i.native(m, noop));
     }
-    i.set_data(&o, "collapsed", Value::Bool(true));
-    i.set_data(&o, "commonAncestorContainer", Value::Null);
+    set_dt(&o, "collapsed", Value::Bool(true));
+    set_dt(&o, "commonAncestorContainer", Value::Null);
     Ok(Value::Obj(o))
 }
 
@@ -1256,7 +1342,7 @@ fn js_to_node(i: &mut Interp, did: u32, v: &Value) -> Result<Option<NodeId>, Val
     match v {
         Value::Und | Value::Null => Ok(None),
         _ => {
-            let s = i.to_str(v)?;
+            let s = to_rc(i, v)?;
             Ok(Some(with_ds(i, |ds| ds.docs[did as usize].create_text(&s))))
         }
     }
@@ -1543,9 +1629,13 @@ fn node_node_value_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let v = i.to_str(&arg(args, 0))?;
     if let Some((did, nid)) = node_ref(i, this) {
         with_ds(i, |ds| {
-            let k = &mut ds.docs[did as usize].nodes[nid].kind;
+            let doc = &mut ds.docs[did as usize];
+            let k = &mut doc.nodes[nid].kind;
             match k {
-                NodeKind::Text(t) | NodeKind::Comment(t) => *t = v,
+                NodeKind::Text(t) | NodeKind::Comment(t) => {
+                    *t = v;
+                    doc.mutated = true;
+                }
                 _ => {}
             }
         });
@@ -1573,6 +1663,7 @@ fn node_text_content_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
                 NodeKind::Text(_) | NodeKind::Comment(_) => {
                     if let NodeKind::Text(t) | NodeKind::Comment(t) = &mut doc.nodes[nid].kind {
                         *t = v;
+                        doc.mutated = true;
                     }
                 }
                 NodeKind::Document => {}
@@ -1636,7 +1727,7 @@ fn el_namespace_uri(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
         return Ok(Value::Null);
     };
     let ns_prop = match this {
-        Value::Obj(o) => i.obj_get_raw(o, &pk(K_NS)),
+        Value::Obj(o) => raw_prop(o, K_NS),
         _ => None,
     };
     let is_svg = with_ds(i, |ds| {
@@ -1657,7 +1748,7 @@ fn el_get_attribute(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Null);
     };
-    let name = i.to_str(&arg(args, 0))?.to_lowercase();
+    let name = lower_rc(&to_rc(i, &arg(args, 0))?);
     Ok(with_ds(i, |ds| {
         match ds.docs[did as usize].attr(nid, &name) {
             Some(v) => Value::Str(Rc::from(v)),
@@ -1683,8 +1774,8 @@ fn el_set_attribute(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Und);
     };
-    let name = i.to_str(&arg(args, 0))?.to_lowercase();
-    let v = i.to_str(&arg(args, 1))?;
+    let name = lower_rc(&to_rc(i, &arg(args, 0))?);
+    let v = to_rc(i, &arg(args, 1))?;
     with_ds(i, |ds| attr_set(&mut ds.docs[did as usize], nid, &name, &v));
     Ok(Value::Und)
 }
@@ -1697,7 +1788,7 @@ fn el_remove_attribute(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Und);
     };
-    let name = i.to_str(&arg(args, 0))?.to_lowercase();
+    let name = lower_rc(&to_rc(i, &arg(args, 0))?);
     with_ds(i, |ds| attr_remove(&mut ds.docs[did as usize], nid, &name));
     Ok(Value::Und)
 }
@@ -1710,7 +1801,7 @@ fn el_has_attribute(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Bool(false));
     };
-    let name = i.to_str(&arg(args, 0))?.to_lowercase();
+    let name = lower_rc(&to_rc(i, &arg(args, 0))?);
     Ok(Value::Bool(with_ds(i, |ds| {
         ds.docs[did as usize].attr(nid, &name).is_some()
     })))
@@ -1724,7 +1815,7 @@ fn el_toggle_attribute(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Bool(false));
     };
-    let name = i.to_str(&arg(args, 0))?.to_lowercase();
+    let name = lower_rc(&to_rc(i, &arg(args, 0))?);
     let force = arg(args, 1);
     let has = with_ds(i, |ds| ds.docs[did as usize].attr(nid, &name).is_some());
     let want = if matches!(force, Value::Und) {
@@ -1775,16 +1866,16 @@ fn el_attributes(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
         .into_iter()
         .map(|(k, v)| {
             let o = i.new_obj();
-            i.set_data(&o, "name", Value::Str(Rc::from(k.as_str())));
-            i.set_data(&o, "nodeName", Value::Str(Rc::from(k.as_str())));
-            i.set_data(&o, "value", Value::Str(Rc::from(v.as_str())));
-            i.set_data(&o, "nodeValue", Value::Str(Rc::from(v.as_str())));
-            i.set_data(&o, "specified", Value::Bool(true));
+            set_dt(&o, "name", Value::Str(Rc::from(k.as_str())));
+            set_dt(&o, "nodeName", Value::Str(Rc::from(k.as_str())));
+            set_dt(&o, "value", Value::Str(Rc::from(v.as_str())));
+            set_dt(&o, "nodeValue", Value::Str(Rc::from(v.as_str())));
+            set_dt(&o, "specified", Value::Bool(true));
             Value::Obj(o)
         })
         .collect();
     let arr = i.new_arr(items);
-    i.set_builtin(&arr, "item", i.native("item", list_item));
+    set_bk(&arr, "item", i.native("item", list_item));
     Ok(Value::Obj(arr))
 }
 
@@ -1800,21 +1891,15 @@ fn list_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn el_id_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
-        return Ok(Value::Str(Rc::from("")));
+        return Ok(Value::Str(empty_rc()));
     };
-    Ok(Value::Str(Rc::from(
-        with_ds(i, |ds| {
-            ds.docs[did as usize]
-                .attr(nid, "id")
-                .unwrap_or("")
-                .to_string()
-        })
-        .as_str(),
-    )))
+    Ok(with_ds(i, |ds| {
+        Value::Str(Rc::from(ds.docs[did as usize].attr(nid, "id").unwrap_or("")))
+    }))
 }
 
 fn el_id_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let v = i.to_str(&arg(args, 0))?;
+    let v = to_rc(i, &arg(args, 0))?;
     if let Some((did, nid)) = node_ref(i, this) {
         with_ds(i, |ds| attr_set(&mut ds.docs[did as usize], nid, "id", &v));
     }
@@ -1823,21 +1908,17 @@ fn el_id_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn el_classname_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
-        return Ok(Value::Str(Rc::from("")));
+        return Ok(Value::Str(empty_rc()));
     };
-    Ok(Value::Str(Rc::from(
-        with_ds(i, |ds| {
-            ds.docs[did as usize]
-                .attr(nid, "class")
-                .unwrap_or("")
-                .to_string()
-        })
-        .as_str(),
-    )))
+    Ok(with_ds(i, |ds| {
+        Value::Str(Rc::from(
+            ds.docs[did as usize].attr(nid, "class").unwrap_or(""),
+        ))
+    }))
 }
 
 fn el_classname_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let v = i.to_str(&arg(args, 0))?;
+    let v = to_rc(i, &arg(args, 0))?;
     if let Some((did, nid)) = node_ref(i, this) {
         with_ds(i, |ds| {
             attr_set(&mut ds.docs[did as usize], nid, "class", &v)
@@ -1851,20 +1932,14 @@ macro_rules! reflect_str {
     ($get:ident, $set:ident, $attr:literal) => {
         fn $get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
             let Some((did, nid)) = node_ref(i, this) else {
-                return Ok(Value::Str(Rc::from("")));
+                return Ok(Value::Str(empty_rc()));
             };
-            Ok(Value::Str(Rc::from(
-                with_ds(i, |ds| {
-                    ds.docs[did as usize]
-                        .attr(nid, $attr)
-                        .unwrap_or("")
-                        .to_string()
-                })
-                .as_str(),
-            )))
+            Ok(with_ds(i, |ds| {
+                Value::Str(Rc::from(ds.docs[did as usize].attr(nid, $attr).unwrap_or("")))
+            }))
         }
         fn $set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-            let v = i.to_str(&arg(args, 0))?;
+            let v = to_rc(i, &arg(args, 0))?;
             if let Some((did, nid)) = node_ref(i, this) {
                 with_ds(i, |ds| attr_set(&mut ds.docs[did as usize], nid, $attr, &v));
             }
@@ -1933,6 +2008,66 @@ fn tab_index_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     })))
 }
 
+// -- HTMLHyperlinkElementUtils (a/area URL components) ------------------------
+
+/// Resolve `this` element's `href` attribute against the document URL.
+/// `None` when there is no href or it fails to resolve — per spec the
+/// component getters then return "".
+fn link_url(i: &mut Interp, this: &Value) -> Option<rowser_net::Url> {
+    let (did, nid) = node_ref(i, this)?;
+    let (href, base) = with_ds(i, |ds| {
+        (
+            ds.docs[did as usize]
+                .attr(nid, "href")
+                .unwrap_or("")
+                .to_string(),
+            ds.url.clone(),
+        )
+    });
+    rowser_net::Url::parse(&base).ok()?.resolve(&href).ok()
+}
+
+macro_rules! link_prop {
+    ($name:ident, $f:expr) => {
+        fn $name(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+            let f: fn(&rowser_net::Url) -> String = $f;
+            Ok(Value::Str(Rc::from(
+                link_url(i, this).map(|u| f(&u)).unwrap_or_default(),
+            )))
+        }
+    };
+}
+
+fn link_host_port(u: &rowser_net::Url) -> String {
+    match rowser_net::default_port(&u.scheme) {
+        Some(d) if d == u.port => u.host.clone(),
+        _ => format!("{}:{}", u.host, u.port),
+    }
+}
+
+link_prop!(link_host_get, |u| link_host_port(u));
+link_prop!(link_hostname_get, |u| u.host.clone());
+link_prop!(
+    link_origin_get,
+    |u| format!("{}://{}", u.scheme, link_host_port(u))
+);
+link_prop!(link_pathname_get, |u| u.path.clone());
+link_prop!(link_port_get, |u| match rowser_net::default_port(&u.scheme) {
+    Some(d) if d == u.port => String::new(),
+    _ => u.port.to_string(),
+});
+link_prop!(link_protocol_get, |u| format!("{}:", u.scheme));
+link_prop!(link_search_get, |u| u
+    .query
+    .as_ref()
+    .map(|q| format!("?{q}"))
+    .unwrap_or_default());
+link_prop!(link_hash_get, |u| u
+    .fragment
+    .as_ref()
+    .map(|f| format!("#{f}"))
+    .unwrap_or_default());
+
 fn tab_index_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let v = i.to_num(&arg(args, 0))?;
     if let Some((did, nid)) = node_ref(i, this) {
@@ -1945,7 +2080,7 @@ fn tab_index_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn el_inner_html_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
-        return Ok(Value::Str(Rc::from("")));
+        return Ok(Value::Str(empty_rc()));
     };
     let s = with_ds(i, |ds| {
         let mut out = String::new();
@@ -1956,7 +2091,7 @@ fn el_inner_html_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 }
 
 fn el_inner_html_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let v = i.to_str(&arg(args, 0))?;
+    let v = to_rc(i, &arg(args, 0))?;
     if let Some((did, nid)) = node_ref(i, this) {
         with_ds(i, |ds| set_inner_html(ds, did, nid, &v));
     }
@@ -1965,7 +2100,7 @@ fn el_inner_html_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn el_outer_html_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
-        return Ok(Value::Str(Rc::from("")));
+        return Ok(Value::Str(empty_rc()));
     };
     let s = with_ds(i, |ds| {
         let mut out = String::new();
@@ -1976,7 +2111,7 @@ fn el_outer_html_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 }
 
 fn el_outer_html_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let v = i.to_str(&arg(args, 0))?;
+    let v = to_rc(i, &arg(args, 0))?;
     if let Some((did, nid)) = node_ref(i, this) {
         with_ds(i, |ds| {
             // parse replacement into a fragment, then swap it in
@@ -1998,15 +2133,15 @@ fn el_insert_adjacent_html(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Some((did, nid)) = node_ref(i, this) else {
         return Ok(Value::Und);
     };
-    let pos = i.to_str(&arg(args, 0))?.to_lowercase();
-    let html = i.to_str(&arg(args, 1))?;
+    let pos = lower_rc(&to_rc(i, &arg(args, 0))?);
+    let html = to_rc(i, &arg(args, 1))?;
     with_ds(i, |ds| {
         let parsed = rowser_html::parse(&html);
         let src = parsed.find_deep(parsed.root, "body").unwrap_or(parsed.root);
         let frag = ds.docs[did as usize].create_element(FRAG_TAG, vec![]);
         graft_children(&mut ds.docs[did as usize], &parsed, src, frag);
         let doc = &mut ds.docs[did as usize];
-        match pos.as_str() {
+        match &*pos {
             "beforebegin" => {
                 if let Some((p, at)) = pos_in_parent(doc, nid) {
                     insert_maybe_frag(doc, p, frag, at);
@@ -2056,7 +2191,7 @@ fn el_get_rect(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
     for k in [
         "x", "y", "top", "left", "right", "bottom", "width", "height",
     ] {
-        i.set_data(&o, k, Value::Num(0.0));
+        set_dt(&o, k, Value::Num(0.0));
     }
     Ok(Value::Obj(o))
 }
@@ -2078,19 +2213,21 @@ fn noop(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
 // -- classList ----------------------------------------------------------------
 
 fn classlist_obj(i: &mut Interp, el: &Value, el_o: &ObjRef) -> Value {
-    if let Some(v) = i.obj_get_raw(el_o, &pk(K_CLASSLIST)) {
+    if let Some(v) = raw_prop(el_o, K_CLASSLIST) {
         return v;
     }
     let proto = with_ds(i, |ds| ds.p_classlist.clone());
     let o = obj(Some(proto));
-    i.set_builtin(&o, K_EL, el.clone());
-    i.set_builtin(el_o, K_CLASSLIST, Value::Obj(o.clone()));
+    set_bk(&o, K_EL, el.clone());
+    set_bk(el_o, K_CLASSLIST, Value::Obj(o.clone()));
     Value::Obj(o)
 }
 
-fn cl_tokens(i: &mut Interp, this: &Value) -> Option<(u32, NodeId, Vec<String>)> {
+/// `(did, nid, class-attr text)` for a classList wrapper — keeps the raw
+/// attr string; natives scan `split_whitespace()` instead of a Vec<String>.
+fn cl_el(i: &mut Interp, this: &Value) -> Option<(u32, NodeId, String)> {
     let Value::Obj(o) = this else { return None };
-    let el = i.obj_get_raw(o, &pk(K_EL))?;
+    let el = raw_prop(o, K_EL)?;
     let (did, nid) = node_ref(i, &el)?;
     let cur = with_ds(i, |ds| {
         ds.docs[did as usize]
@@ -2098,86 +2235,130 @@ fn cl_tokens(i: &mut Interp, this: &Value) -> Option<(u32, NodeId, Vec<String>)>
             .unwrap_or("")
             .to_string()
     });
-    Some((
-        did,
-        nid,
-        cur.split_whitespace().map(|s| s.to_string()).collect(),
-    ))
+    Some((did, nid, cur))
 }
 
-fn cl_set(i: &mut Interp, did: u32, nid: NodeId, toks: &[String]) {
+fn cl_set(i: &mut Interp, did: u32, nid: NodeId, joined: &str) {
     with_ds(i, |ds| {
-        attr_set(&mut ds.docs[did as usize], nid, "class", &toks.join(" "))
+        attr_set(&mut ds.docs[did as usize], nid, "class", joined)
     });
 }
 
 fn cl_add(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let Some((did, nid, mut toks)) = cl_tokens(i, this) else {
+    let Some((did, nid, cur)) = cl_el(i, this) else {
         return Ok(Value::Und);
     };
+    let mut extra: Vec<String> = Vec::new();
     for a in args {
         let s = i.to_str(a)?;
-        if !s.is_empty() && !toks.iter().any(|t| *t == s) {
-            toks.push(s);
+        if !s.is_empty()
+            && !cur.split_whitespace().any(|t| t == s)
+            && !extra.iter().any(|t| *t == s)
+        {
+            extra.push(s);
         }
     }
-    cl_set(i, did, nid, &toks);
+    let mut out =
+        String::with_capacity(cur.len() + extra.iter().map(|e| e.len() + 1).sum::<usize>());
+    let mut first = true;
+    for t in cur.split_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(t);
+        first = false;
+    }
+    for e in &extra {
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(e);
+        first = false;
+    }
+    cl_set(i, did, nid, &out);
     Ok(Value::Und)
 }
 
 fn cl_remove(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let Some((did, nid, mut toks)) = cl_tokens(i, this) else {
+    let Some((did, nid, cur)) = cl_el(i, this) else {
         return Ok(Value::Und);
     };
+    let mut rms = Vec::with_capacity(args.len());
     for a in args {
-        let s = i.to_str(a)?;
-        toks.retain(|t| *t != s);
+        rms.push(i.to_str(a)?);
     }
-    cl_set(i, did, nid, &toks);
+    let mut out = String::with_capacity(cur.len());
+    let mut first = true;
+    for t in cur.split_whitespace() {
+        if rms.iter().any(|r| r == t) {
+            continue;
+        }
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(t);
+        first = false;
+    }
+    cl_set(i, did, nid, &out);
     Ok(Value::Und)
 }
 
 fn cl_toggle(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let Some((did, nid, mut toks)) = cl_tokens(i, this) else {
+    let Some((did, nid, cur)) = cl_el(i, this) else {
         return Ok(Value::Bool(false));
     };
-    let s = i.to_str(&arg(args, 0))?;
-    let has = toks.iter().any(|t| *t == s);
+    let s = to_rc(i, &arg(args, 0))?;
+    let has = cur.split_whitespace().any(|t| t == &*s);
     let force = arg(args, 1);
     let want = if matches!(force, Value::Und) {
         !has
     } else {
         i.to_bool(&force)
     };
-    match (has, want) {
-        (false, true) => toks.push(s),
-        (true, false) => toks.retain(|t| *t != s),
-        _ => {}
+    // the attr is rewritten (normalizing whitespace) even on no-ops —
+    // same observable behavior as before.
+    let mut out = String::with_capacity(cur.len() + s.len() + 1);
+    let mut first = true;
+    for t in cur.split_whitespace() {
+        if has && !want && t == &*s {
+            continue;
+        }
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(t);
+        first = false;
     }
-    cl_set(i, did, nid, &toks);
+    if !has && want {
+        if !first {
+            out.push(' ');
+        }
+        out.push_str(&s);
+    }
+    cl_set(i, did, nid, &out);
     Ok(Value::Bool(want))
 }
 
 fn cl_contains(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let Some((_, _, toks)) = cl_tokens(i, this) else {
+    let Some((_, _, cur)) = cl_el(i, this) else {
         return Ok(Value::Bool(false));
     };
-    let s = i.to_str(&arg(args, 0))?;
-    Ok(Value::Bool(toks.iter().any(|t| *t == s)))
+    let s = to_rc(i, &arg(args, 0))?;
+    Ok(Value::Bool(cur.split_whitespace().any(|t| t == &*s)))
 }
 
 fn cl_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let Some((_, _, toks)) = cl_tokens(i, this) else {
-        return Ok(Value::Str(Rc::from("")));
+    let Some((_, _, cur)) = cl_el(i, this) else {
+        return Ok(Value::Str(empty_rc()));
     };
-    Ok(Value::Str(Rc::from(toks.join(" ").as_str())))
+    Ok(Value::Str(Rc::from(cur.split_whitespace().collect::<Vec<_>>().join(" ").as_str())))
 }
 
 fn cl_length(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let Some((_, _, toks)) = cl_tokens(i, this) else {
+    let Some((_, _, cur)) = cl_el(i, this) else {
         return Ok(Value::Num(0.0));
     };
-    Ok(Value::Num(toks.len() as f64))
+    Ok(Value::Num(cur.split_whitespace().count() as f64))
 }
 
 // -- style --------------------------------------------------------------------
@@ -2295,13 +2476,23 @@ const STYLE_PROPS: &[&str] = &[
 
 /// fresh CSS-style declaration object for `el` (`el` must be a wrapped node).
 fn style_obj(i: &mut Interp, el: &Value, proto: ObjRef) -> ObjRef {
+    let decls = i.new_obj();
     let o = obj(Some(proto));
-    i.set_builtin(&o, K_EL, el.clone());
-    i.set_builtin(&o, K_DECLS, Value::Obj(i.new_obj()));
-    for k in STYLE_PROPS {
-        o.borrow_mut()
-            .props
-            .insert(pk(k), Prop::data(Value::Str(Rc::from(""))));
+    {
+        let mut b = o.borrow_mut();
+        b.props.insert_str(K_EL, Prop::builtin(el.clone()));
+        b.props.insert_str(K_DECLS, Prop::builtin(Value::Obj(decls)));
+        // interned prop names + shared empty string — one Rc clone per prop
+        let empty = Value::Str(empty_rc());
+        STYLE_PROP_KEYS.with(|c| {
+            let mut m = c.borrow_mut();
+            if m.is_empty() {
+                m.extend(STYLE_PROPS.iter().map(|k| Rc::from(*k)));
+            }
+            for k in m.iter() {
+                b.props.insert_str_rc(k.clone(), Prop::data(empty.clone()));
+            }
+        });
     }
     o
 }
@@ -2310,18 +2501,19 @@ fn style_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Value::Obj(el_o) = this else {
         return Ok(Value::Und);
     };
-    if let Some(v) = i.obj_get_raw(el_o, &pk(K_STYLE)) {
+    if let Some(v) = raw_prop(el_o, K_STYLE) {
         return Ok(v);
     }
     let proto = with_ds(i, |ds| ds.p_style.clone());
     let o = style_obj(i, this, proto);
-    i.set_builtin(el_o, K_STYLE, Value::Obj(o.clone()));
+    set_bk(el_o, K_STYLE, Value::Obj(o.clone()));
+    with_ds(i, |ds| ds.styled_objs.push(o.clone()));
     Ok(Value::Obj(o))
 }
 
 /// the `__decls` obj of a style object
-fn decls_of(i: &Interp, style: &ObjRef) -> Option<ObjRef> {
-    match i.obj_get_raw(style, &pk(K_DECLS)) {
+fn decls_of(_i: &Interp, style: &ObjRef) -> Option<ObjRef> {
+    match raw_prop(style, K_DECLS) {
         Some(Value::Obj(d)) => Some(d),
         _ => None,
     }
@@ -2329,7 +2521,7 @@ fn decls_of(i: &Interp, style: &ObjRef) -> Option<ObjRef> {
 
 /// merge `__decls` + direct camelCase props + `cssText` → `style` attr
 fn sync_style_attr(i: &Interp, style: &ObjRef) -> Option<(u32, NodeId, String)> {
-    let el = i.obj_get_raw(style, &pk(K_EL))?;
+    let el = raw_prop(style, K_EL)?;
     let (did, nid) = node_ref(i, &el)?;
     let b = style.borrow();
     let mut parts: Vec<(String, String)> = Vec::new();
@@ -2383,10 +2575,10 @@ fn style_set_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Value::Obj(o) = this else {
         return Ok(Value::Und);
     };
-    let k = i.to_str(&arg(args, 0))?;
-    let v = i.to_str(&arg(args, 1))?;
+    let k = to_rc(i, &arg(args, 0))?;
+    let v = to_rc(i, &arg(args, 1))?;
     if let Some(d) = decls_of(i, o) {
-        i.set_data(&d, &k, Value::Str(Rc::from(v.as_str())));
+        set_dt(&d, &k, Value::Str(v));
     }
     // reflect immediately to the attr
     if let Some((did, nid, css)) = sync_style_attr(i, o) {
@@ -2399,23 +2591,23 @@ fn style_set_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn style_get_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Value::Obj(o) = this else {
-        return Ok(Value::Str(Rc::from("")));
+        return Ok(Value::Str(empty_rc()));
     };
-    let k = i.to_str(&arg(args, 0))?;
+    let k = to_rc(i, &arg(args, 0))?;
     // decls first
     if let Some(d) = decls_of(i, o) {
-        if let Some(Value::Str(v)) = i.obj_get_raw(&d, &pk(&k)) {
+        if let Some(Value::Str(v)) = raw_prop(&d, &k) {
             return Ok(Value::Str(v));
         }
     }
     // own prop (camelCase writes land here)
-    if let Some(v) = i.obj_get_raw(o, &pk(&k)) {
+    if let Some(v) = raw_prop(o, &k) {
         if matches!(v, Value::Str(_) | Value::Num(_)) {
             return Ok(v);
         }
     }
     // fall back to parsing the style attr
-    if let Some(el) = i.obj_get_raw(o, &pk(K_EL)) {
+    if let Some(el) = raw_prop(o, K_EL) {
         if let Some((did, nid)) = node_ref(i, &el) {
             let v = with_ds(i, |ds| {
                 ds.docs[did as usize]
@@ -2423,7 +2615,7 @@ fn style_get_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
                     .unwrap_or("")
                     .split(';')
                     .filter_map(|d| d.split_once(':'))
-                    .find(|(pk, _)| pk.trim() == k)
+                    .find(|(pk, _)| pk.trim() == &*k)
                     .map(|(_, v)| v.trim().to_string())
             });
             if let Some(v) = v {
@@ -2431,34 +2623,35 @@ fn style_get_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             }
         }
     }
-    Ok(Value::Str(Rc::from("")))
+    Ok(Value::Str(empty_rc()))
 }
 
 fn style_remove_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Value::Obj(o) = this else {
-        return Ok(Value::Str(Rc::from("")));
+        return Ok(Value::Str(empty_rc()));
     };
-    let k = i.to_str(&arg(args, 0))?;
+    let k = to_rc(i, &arg(args, 0))?;
     if let Some(d) = decls_of(i, o) {
-        d.borrow_mut().props.remove(&pk(&k));
+        d.borrow_mut().props.remove_str(&k);
     }
     if let Some((did, nid, css)) = sync_style_attr(i, o) {
         with_ds(i, |ds| {
             attr_set(&mut ds.docs[did as usize], nid, "style", &css)
         });
     }
-    Ok(Value::Str(Rc::from("")))
+    Ok(Value::Str(empty_rc()))
 }
 
 // -- dataset ------------------------------------------------------------------
 
 fn dataset_obj(i: &mut Interp, el: &Value, el_o: &ObjRef) -> Value {
-    if let Some(v) = i.obj_get_raw(el_o, &pk(K_DATASET)) {
+    if let Some(v) = raw_prop(el_o, K_DATASET) {
         return v;
     }
     let o = i.new_obj();
-    i.set_builtin(&o, K_EL, el.clone());
-    i.set_builtin(el_o, K_DATASET, Value::Obj(o.clone()));
+    set_bk(&o, K_EL, el.clone());
+    set_bk(el_o, K_DATASET, Value::Obj(o.clone()));
+    with_ds(i, |ds| ds.dataset_objs.push(o.clone()));
     // populate from data-* attrs
     if let Some((did, nid)) = node_ref(i, el) {
         let attrs = with_ds(i, |ds| match ds.docs[did as usize].kind(nid) {
@@ -2470,7 +2663,7 @@ fn dataset_obj(i: &mut Interp, el: &Value, el_o: &ObjRef) -> Value {
         });
         for (k, v) in attrs {
             let ck = datakey_to_camel(&k);
-            i.set_data(&o, &ck, Value::Str(Rc::from(v.as_str())));
+            set_dt(&o, &ck, Value::Str(Rc::from(v.as_str())));
         }
     }
     Value::Obj(o)
@@ -2509,28 +2702,31 @@ fn classlist_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 /// push JS-side prop writes (style props, dataset entries) back into attrs;
 /// called before the Document is handed back to the pipeline.
 fn sync_dom_side_effects(i: &mut Interp) {
-    let objs = with_ds(i, |ds| ds.nodes.values().cloned().collect::<Vec<_>>());
+    // only sync wrappers that were actually materialized — style/dataset
+    // getters register their objects in DomState, so we don't have to scan
+    // every cached node wrapper.
+    let (styles, datasets) = with_ds(i, |ds| {
+        (ds.styled_objs.clone(), ds.dataset_objs.clone())
+    });
     let mut style_writes: Vec<(u32, NodeId, String)> = Vec::new();
     let mut data_writes: Vec<(u32, NodeId, Vec<(String, String)>)> = Vec::new();
-    for o in &objs {
-        if let Some(Value::Obj(so)) = i.obj_get_raw(o, &pk(K_STYLE)) {
-            if let Some(w) = sync_style_attr(i, &so) {
-                style_writes.push(w);
-            }
+    for so in &styles {
+        if let Some(w) = sync_style_attr(i, so) {
+            style_writes.push(w);
         }
-        if let Some(Value::Obj(dso)) = i.obj_get_raw(o, &pk(K_DATASET)) {
-            if let Some(el) = i.obj_get_raw(&dso, &pk(K_EL)) {
-                if let Some((did, nid)) = node_ref(i, &el) {
-                    let mut pairs = Vec::new();
-                    for (k, p) in dso.borrow().props.iter() {
-                        if let (PropKey::S(ks), Value::Str(v)) = (k, &p.val) {
-                            if !ks.starts_with('\u{0}') {
-                                pairs.push((format!("data-{}", kebab(ks)), v.to_string()));
-                            }
+    }
+    for dso in &datasets {
+        if let Some(el) = raw_prop(dso, K_EL) {
+            if let Some((did, nid)) = node_ref(i, &el) {
+                let mut pairs = Vec::new();
+                for (k, p) in dso.borrow().props.iter() {
+                    if let (PropKey::S(ks), Value::Str(v)) = (k, &p.val) {
+                        if !ks.starts_with('\u{0}') {
+                            pairs.push((format!("data-{}", kebab(ks)), v.to_string()));
                         }
                     }
-                    data_writes.push((did, nid, pairs));
                 }
+                data_writes.push((did, nid, pairs));
             }
         }
     }
@@ -2603,56 +2799,63 @@ fn text_split(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 // ---------------------------------------------------------------------------
 
 fn make_event(i: &mut Interp, ty: &str, bubbles: bool, cancelable: bool) -> Value {
-    let proto = with_ds(i, |ds| ds.p_event.clone());
+    let (proto, ms) = with_ds(i, |ds| {
+        (ds.p_event.clone(), ds.t0.elapsed().as_secs_f64() * 1000.0)
+    });
     let o = obj(Some(proto));
-    i.set_builtin(&o, "type", Value::Str(Rc::from(ty)));
-    i.set_builtin(&o, "bubbles", Value::Bool(bubbles));
-    i.set_builtin(&o, "cancelable", Value::Bool(cancelable));
-    i.set_builtin(&o, "composed", Value::Bool(false));
-    i.set_builtin(&o, "defaultPrevented", Value::Bool(false));
-    i.set_builtin(&o, "isTrusted", Value::Bool(false));
-    i.set_builtin(&o, "eventPhase", Value::Num(0.0));
-    i.set_builtin(&o, "target", Value::Null);
-    i.set_builtin(&o, "srcElement", Value::Null);
-    i.set_builtin(&o, "currentTarget", Value::Null);
-    i.set_builtin(&o, K_STOP, Value::Bool(false));
-    i.set_builtin(&o, K_STOPIMM, Value::Bool(false));
-    let ms = with_ds(i, |ds| ds.t0.elapsed().as_secs_f64() * 1000.0);
-    i.set_builtin(&o, "timeStamp", Value::Num(ms));
-    i.set_builtin(&o, "detail", Value::Null);
+    {
+        let mut b = o.borrow_mut();
+        let p = &mut b.props;
+        p.insert_str("type", Prop::builtin(Value::Str(Rc::from(ty))));
+        p.insert_str("bubbles", Prop::builtin(Value::Bool(bubbles)));
+        p.insert_str("cancelable", Prop::builtin(Value::Bool(cancelable)));
+        p.insert_str("composed", Prop::builtin(Value::Bool(false)));
+        p.insert_str("defaultPrevented", Prop::builtin(Value::Bool(false)));
+        p.insert_str("isTrusted", Prop::builtin(Value::Bool(false)));
+        p.insert_str("eventPhase", Prop::builtin(Value::Num(0.0)));
+        p.insert_str("target", Prop::builtin(Value::Null));
+        p.insert_str("srcElement", Prop::builtin(Value::Null));
+        p.insert_str("currentTarget", Prop::builtin(Value::Null));
+        p.insert_str(K_STOP, Prop::builtin(Value::Bool(false)));
+        p.insert_str(K_STOPIMM, Prop::builtin(Value::Bool(false)));
+        p.insert_str("timeStamp", Prop::builtin(Value::Num(ms)));
+        p.insert_str("detail", Prop::builtin(Value::Null));
+    }
     Value::Obj(o)
 }
 
 fn event_init_from(i: &mut Interp, this: &Value, args: &[Value], custom: bool) -> NR {
-    let ty = i.to_str(&arg(args, 0))?;
-    i.set_builtin(
+    let ty = to_rc(i, &arg(args, 0))?;
+    set_bk(
         match this {
             Value::Obj(o) => o,
             _ => return Ok(Value::Und),
         },
         "type",
-        Value::Str(Rc::from(ty.as_str())),
+        Value::Str(ty),
     );
     if let Value::Obj(o) = this {
         let init = arg(args, 1);
         for k in ["bubbles", "cancelable", "composed"] {
-            let v = i.get_prop(&init, &pk(k))?;
+            let v = i.get_prop_str(&init, k)?;
             if !matches!(v, Value::Und) {
-                i.set_builtin(o, k, Value::Bool(i.to_bool(&v)));
+                set_bk(o, k, Value::Bool(i.to_bool(&v)));
             }
         }
         if custom {
-            let d = i.get_prop(&init, &pk("detail"))?;
-            i.set_builtin(o, "detail", d);
+            let d = i.get_prop_str(&init, "detail")?;
+            set_bk(o, "detail", d);
         }
-        i.set_builtin(o, "defaultPrevented", Value::Bool(false));
-        i.set_builtin(o, "isTrusted", Value::Bool(false));
-        i.set_builtin(o, "target", Value::Null);
-        i.set_builtin(o, "currentTarget", Value::Null);
-        i.set_builtin(o, K_STOP, Value::Bool(false));
-        i.set_builtin(o, K_STOPIMM, Value::Bool(false));
         let ms = with_ds(i, |ds| ds.t0.elapsed().as_secs_f64() * 1000.0);
-        i.set_builtin(o, "timeStamp", Value::Num(ms));
+        let mut b = o.borrow_mut();
+        let p = &mut b.props;
+        p.insert_str("defaultPrevented", Prop::builtin(Value::Bool(false)));
+        p.insert_str("isTrusted", Prop::builtin(Value::Bool(false)));
+        p.insert_str("target", Prop::builtin(Value::Null));
+        p.insert_str("currentTarget", Prop::builtin(Value::Null));
+        p.insert_str(K_STOP, Prop::builtin(Value::Bool(false)));
+        p.insert_str(K_STOPIMM, Prop::builtin(Value::Bool(false)));
+        p.insert_str("timeStamp", Prop::builtin(Value::Num(ms)));
     }
     Ok(Value::Und)
 }
@@ -2667,11 +2870,8 @@ fn custom_event_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn event_prevent_default(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     if let Value::Obj(o) = this {
-        if i.to_bool(
-            &i.obj_get_raw(o, &pk("cancelable"))
-                .unwrap_or(Value::Bool(true)),
-        ) {
-            i.set_builtin(o, "defaultPrevented", Value::Bool(true));
+        if i.to_bool(&raw_prop(o, "cancelable").unwrap_or(Value::Bool(true))) {
+            set_bk(o, "defaultPrevented", Value::Bool(true));
         }
     }
     Ok(Value::Und)
@@ -2679,32 +2879,38 @@ fn event_prevent_default(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 
 fn event_stop_prop(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     if let Value::Obj(o) = this {
-        i.set_builtin(o, K_STOP, Value::Bool(true));
+        set_bk(o, K_STOP, Value::Bool(true));
     }
     Ok(Value::Und)
 }
 
 fn event_stop_imm(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     if let Value::Obj(o) = this {
-        i.set_builtin(o, K_STOP, Value::Bool(true));
-        i.set_builtin(o, K_STOPIMM, Value::Bool(true));
+        let mut b = o.borrow_mut();
+        b.props.insert_str(K_STOP, Prop::builtin(Value::Bool(true)));
+        b.props.insert_str(K_STOPIMM, Prop::builtin(Value::Bool(true)));
     }
     Ok(Value::Und)
 }
 
 fn event_init_event(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     if let Value::Obj(o) = this {
-        let ty = i.to_str(&arg(args, 0))?;
-        i.set_builtin(o, "type", Value::Str(Rc::from(ty.as_str())));
-        i.set_builtin(o, "bubbles", Value::Bool(i.to_bool(&arg(args, 1))));
-        i.set_builtin(o, "cancelable", Value::Bool(i.to_bool(&arg(args, 2))));
+        let ty = to_rc(i, &arg(args, 0))?;
+        let mut b = o.borrow_mut();
+        let p = &mut b.props;
+        p.insert_str("type", Prop::builtin(Value::Str(ty)));
+        p.insert_str("bubbles", Prop::builtin(Value::Bool(i.to_bool(&arg(args, 1)))));
+        p.insert_str(
+            "cancelable",
+            Prop::builtin(Value::Bool(i.to_bool(&arg(args, 2)))),
+        );
     }
     Ok(Value::Und)
 }
 
 fn event_composed_path(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     // target + propagation chain
-    let target = i.get_prop(this, &pk("target"))?;
+    let target = i.get_prop_str(this, "target")?;
     let mut out = Vec::new();
     if let Some((did, nid)) = node_ref(i, &target) {
         out.push(target.clone());
@@ -2729,28 +2935,29 @@ fn event_composed_path(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 // storage
 // ---------------------------------------------------------------------------
 
-fn store_map<'m>(ds: &'m mut DomState, which: &str) -> &'m mut Vec<(String, String)> {
-    if which == "session" {
+fn store_map<'m>(ds: &'m mut DomState, session: bool) -> &'m mut Vec<(String, String)> {
+    if session {
         &mut ds.storage_session
     } else {
         &mut ds.storage_local
     }
 }
 
-fn store_which(i: &Interp, this: &Value) -> String {
+/// `true` → sessionStorage, `false` → localStorage (no String alloc/cmp).
+fn store_session(_i: &Interp, this: &Value) -> bool {
     if let Value::Obj(o) = this {
-        if let Some(Value::Str(s)) = i.obj_get_raw(o, &pk(K_STORE)) {
-            return s.to_string();
+        if let Some(Value::Str(s)) = raw_prop(o, K_STORE) {
+            return s.as_ref() == "session";
         }
     }
-    "local".into()
+    false
 }
 
 fn st_get_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let k = i.to_str(&arg(args, 0))?;
-    let w = store_which(i, this);
+    let k = to_rc(i, &arg(args, 0))?;
+    let sess = store_session(i, this);
     Ok(with_ds(i, |ds| {
-        match store_map(ds, &w).iter().find(|(k2, _)| *k2 == k) {
+        match store_map(ds, sess).iter().find(|(k2, _)| k2.as_str() == &*k) {
             Some((_, v)) => Value::Str(Rc::from(v.as_str())),
             None => Value::Null,
         }
@@ -2758,45 +2965,45 @@ fn st_get_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn st_set_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let k = i.to_str(&arg(args, 0))?;
+    let k = to_rc(i, &arg(args, 0))?;
     let v = i.to_str(&arg(args, 1))?;
-    let w = store_which(i, this);
+    let sess = store_session(i, this);
     with_ds(i, |ds| {
-        let m = store_map(ds, &w);
-        if let Some(e) = m.iter_mut().find(|(k2, _)| *k2 == k) {
+        let m = store_map(ds, sess);
+        if let Some(e) = m.iter_mut().find(|(k2, _)| k2.as_str() == &*k) {
             e.1 = v;
         } else {
-            m.push((k, v));
+            m.push((k.to_string(), v));
         }
     });
     Ok(Value::Und)
 }
 
 fn st_remove_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let k = i.to_str(&arg(args, 0))?;
-    let w = store_which(i, this);
-    with_ds(i, |ds| store_map(ds, &w).retain(|(k2, _)| *k2 != k));
+    let k = to_rc(i, &arg(args, 0))?;
+    let sess = store_session(i, this);
+    with_ds(i, |ds| store_map(ds, sess).retain(|(k2, _)| k2.as_str() != &*k));
     Ok(Value::Und)
 }
 
 fn st_clear(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let w = store_which(i, this);
-    with_ds(i, |ds| store_map(ds, &w).clear());
+    let sess = store_session(i, this);
+    with_ds(i, |ds| store_map(ds, sess).clear());
     Ok(Value::Und)
 }
 
 fn st_key(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let n = i.to_num(&arg(args, 0))? as usize;
-    let w = store_which(i, this);
-    Ok(with_ds(i, |ds| match store_map(ds, &w).get(n) {
+    let sess = store_session(i, this);
+    Ok(with_ds(i, |ds| match store_map(ds, sess).get(n) {
         Some((k, _)) => Value::Str(Rc::from(k.as_str())),
         None => Value::Null,
     }))
 }
 
 fn st_length(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let w = store_which(i, this);
-    Ok(Value::Num(with_ds(i, |ds| store_map(ds, &w).len()) as f64))
+    let sess = store_session(i, this);
+    Ok(Value::Num(with_ds(i, |ds| store_map(ds, sess).len()) as f64))
 }
 
 // ---------------------------------------------------------------------------
@@ -2859,10 +3066,10 @@ fn location_obj(i: &mut Interp) -> Value {
         ("search", search.as_str()),
         ("hash", hash.as_str()),
     ] {
-        i.set_builtin(&o, k, Value::Str(Rc::from(v)));
+        set_bk(&o, k, Value::Str(Rc::from(v)));
     }
     for m in ["assign", "replace", "reload", "toString"] {
-        i.set_builtin(&o, m, i.native(m, noop));
+        set_bk(&o, m, i.native(m, noop));
     }
     with_ds(i, |ds| ds.location = Some(o.clone()));
     Value::Obj(o)
@@ -2937,8 +3144,8 @@ fn g_queue_microtask(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
 fn g_idle_cb(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
     let cb = arg(args, 0);
     let deadline = i.new_obj();
-    i.set_data(&deadline, "didTimeout", Value::Bool(false));
-    i.set_builtin(
+    set_dt(&deadline, "didTimeout", Value::Bool(false));
+    set_bk(
         &deadline,
         "timeRemaining",
         i.native("timeRemaining", idle_time),
@@ -2961,11 +3168,11 @@ fn idle_time(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
 }
 
 fn g_match_media(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
-    let q = i.to_str(&arg(args, 0))?;
+    let q = to_rc(i, &arg(args, 0))?;
     let o = i.new_obj();
-    i.set_data(&o, "matches", Value::Bool(false));
-    i.set_data(&o, "media", Value::Str(Rc::from(q.as_str())));
-    i.set_data(&o, "onchange", Value::Null);
+    set_dt(&o, "matches", Value::Bool(false));
+    set_dt(&o, "media", Value::Str(q));
+    set_dt(&o, "onchange", Value::Null);
     for m in [
         "addEventListener",
         "removeEventListener",
@@ -2973,7 +3180,7 @@ fn g_match_media(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
         "removeListener",
         "dispatchEvent",
     ] {
-        i.set_builtin(&o, m, i.native(m, noop));
+        set_bk(&o, m, i.native(m, noop));
     }
     Ok(Value::Obj(o))
 }
@@ -2982,16 +3189,16 @@ fn g_get_computed_style(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
     let el = arg(args, 0);
     let proto = with_ds(i, |ds| ds.p_compstyle.clone());
     let o = obj(Some(proto));
-    i.set_builtin(&o, K_EL, el);
+    set_bk(&o, K_EL, el);
     Ok(Value::Obj(o))
 }
 
 fn cs_get_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Value::Obj(o) = this else {
-        return Ok(Value::Str(Rc::from("")));
+        return Ok(Value::Str(empty_rc()));
     };
-    let k = i.to_str(&arg(args, 0))?;
-    if let Some(el) = i.obj_get_raw(o, &pk(K_EL)) {
+    let k = to_rc(i, &arg(args, 0))?;
+    if let Some(el) = raw_prop(o, K_EL) {
         if let Some((did, nid)) = node_ref(i, &el) {
             let v = with_ds(i, |ds| {
                 ds.docs[did as usize]
@@ -2999,7 +3206,7 @@ fn cs_get_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
                     .unwrap_or("")
                     .split(';')
                     .filter_map(|d| d.split_once(':'))
-                    .find(|(pk, _)| pk.trim() == k)
+                    .find(|(pk, _)| pk.trim() == &*k)
                     .map(|(_, v)| v.trim().to_string())
             });
             if let Some(v) = v {
@@ -3007,7 +3214,7 @@ fn cs_get_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             }
         }
     }
-    Ok(Value::Str(Rc::from("")))
+    Ok(Value::Str(empty_rc()))
 }
 
 fn g_fetch(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
@@ -3026,12 +3233,12 @@ fn g_get_selection(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
         "empty",
         "setPosition",
     ] {
-        i.set_builtin(&o, m, i.native(m, noop));
+        set_bk(&o, m, i.native(m, noop));
     }
-    i.set_data(&o, "rangeCount", Value::Num(0.0));
-    i.set_data(&o, "anchorNode", Value::Null);
-    i.set_data(&o, "focusNode", Value::Null);
-    i.set_data(&o, "isCollapsed", Value::Bool(true));
+    set_dt(&o, "rangeCount", Value::Num(0.0));
+    set_dt(&o, "anchorNode", Value::Null);
+    set_dt(&o, "focusNode", Value::Null);
+    set_dt(&o, "isCollapsed", Value::Bool(true));
     Ok(Value::Obj(o))
 }
 
@@ -3039,7 +3246,7 @@ fn g_get_selection(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
 
 fn mo_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     if let Value::Obj(o) = this {
-        i.set_builtin(o, K_CB, arg(args, 0));
+        set_bk(o, K_CB, arg(args, 0));
     }
     Ok(Value::Und)
 }
@@ -3050,13 +3257,51 @@ fn mo_observe(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Value::Obj(o) = this else {
         return Ok(Value::Und);
     };
-    let cb = i.obj_get_raw(o, &pk(K_CB)).unwrap_or(Value::Und);
+    let cb = raw_prop(o, K_CB).unwrap_or(Value::Und);
     if i.is_callable(&cb) {
         let records = Value::Obj(i.new_arr(vec![]));
         with_ds(i, |ds| {
             ds.microtasks.push_back((cb, vec![records, this.clone()]))
         });
     }
+    Ok(Value::Und)
+}
+
+/// IntersectionObserver.observe — report the element as intersecting on
+/// the next microtask. Layout rects aren't threaded into the JS thread,
+/// and visibility-optimistic entries keep reveal-on-scroll sites from
+/// leaving `.reveal`-style content invisible forever.
+fn io_observe(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let Value::Obj(o) = this else {
+        return Ok(Value::Und);
+    };
+    let cb = raw_prop(o, K_CB).unwrap_or(Value::Und);
+    if !i.is_callable(&cb) {
+        return Ok(Value::Und);
+    }
+    let rect = {
+        let r = i.new_obj();
+        for k in [
+            "x", "y", "top", "left", "right", "bottom", "width", "height",
+        ] {
+            set_dt(&r, k, Value::Num(0.0));
+        }
+        Value::Obj(r)
+    };
+    let entry = i.new_obj();
+    set_dt(&entry, "target", arg(args, 0));
+    set_dt(&entry, "isIntersecting", Value::Bool(true));
+    set_dt(&entry, "isVisible", Value::Bool(true));
+    set_dt(&entry, "intersectionRatio", Value::Num(1.0));
+    let time = with_ds(i, |ds| ds.t0.elapsed().as_secs_f64() * 1000.0);
+    set_dt(&entry, "time", Value::Num(time));
+    set_dt(&entry, "boundingClientRect", rect.clone());
+    set_dt(&entry, "intersectionRect", rect);
+    set_dt(&entry, "rootBounds", Value::Null);
+    let entries = Value::Obj(i.new_arr(vec![Value::Obj(entry)]));
+    with_ds(i, |ds| {
+        ds.microtasks.push_back((cb, vec![entries, this.clone()]))
+    });
     Ok(Value::Und)
 }
 
@@ -3071,7 +3316,7 @@ fn domparser_ctor(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
 }
 
 fn domparser_parse(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
-    let s = i.to_str(&arg(args, 0))?;
+    let s = to_rc(i, &arg(args, 0))?;
     let did = with_ds(i, |ds| {
         ds.docs.push(rowser_html::parse(&s));
         (ds.docs.len() - 1) as u32
@@ -3088,29 +3333,29 @@ fn mc_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     let mk = |i: &mut Interp| -> ObjRef {
         let p = i.new_obj();
-        i.set_builtin(&p, "postMessage", i.native("postMessage", mc_post));
-        i.set_builtin(&p, "start", i.native("start", noop));
-        i.set_builtin(&p, "close", i.native("close", noop));
-        i.set_builtin(
+        set_bk(&p, "postMessage", i.native("postMessage", mc_post));
+        set_bk(&p, "start", i.native("start", noop));
+        set_bk(&p, "close", i.native("close", noop));
+        set_bk(
             &p,
             "addEventListener",
             i.native("addEventListener", el_add_event_listener),
         );
-        i.set_builtin(
+        set_bk(
             &p,
             "removeEventListener",
             i.native("removeEventListener", el_remove_event_listener),
         );
-        i.set_builtin(&p, "onmessage", Value::Null);
-        i.set_builtin(&p, "onmessageerror", Value::Null);
+        set_bk(&p, "onmessage", Value::Null);
+        set_bk(&p, "onmessageerror", Value::Null);
         p
     };
     let p1 = mk(i);
     let p2 = mk(i);
-    i.set_builtin(&p1, K_PEER, Value::Obj(p2.clone()));
-    i.set_builtin(&p2, K_PEER, Value::Obj(p1.clone()));
-    i.set_builtin(o, "port1", Value::Obj(p1));
-    i.set_builtin(o, "port2", Value::Obj(p2));
+    set_bk(&p1, K_PEER, Value::Obj(p2.clone()));
+    set_bk(&p2, K_PEER, Value::Obj(p1.clone()));
+    set_bk(o, "port1", Value::Obj(p1));
+    set_bk(o, "port2", Value::Obj(p2));
     Ok(Value::Und)
 }
 
@@ -3119,7 +3364,7 @@ fn mc_post(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         return Ok(Value::Und);
     };
     let msg = arg(args, 0);
-    if let Some(Value::Obj(peer)) = i.obj_get_raw(o, &pk(K_PEER)) {
+    if let Some(Value::Obj(peer)) = raw_prop(o, K_PEER) {
         with_ds(i, |ds| ds.port_msgs.push_back((peer, msg)));
     }
     // listeners registered via addEventListener('message', …) also fire —
@@ -3134,42 +3379,37 @@ fn ac_ctor(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
         return Ok(Value::Und);
     };
     let sig = i.new_obj();
-    i.set_builtin(&sig, "aborted", Value::Bool(false));
-    i.set_builtin(&sig, "reason", Value::Und);
-    i.set_builtin(
+    set_bk(&sig, "aborted", Value::Bool(false));
+    set_bk(&sig, "reason", Value::Und);
+    set_bk(
         &sig,
         "addEventListener",
         i.native("addEventListener", el_add_event_listener),
     );
-    i.set_builtin(
+    set_bk(
         &sig,
         "removeEventListener",
         i.native("removeEventListener", el_remove_event_listener),
     );
-    i.set_builtin(
+    set_bk(
         &sig,
         "dispatchEvent",
         i.native("dispatchEvent", el_dispatch_event),
     );
-    i.set_builtin(
+    set_bk(
         &sig,
         "throwIfAborted",
         i.native("throwIfAborted", sig_throw),
     );
-    i.set_builtin(&sig, "onabort", Value::Null);
-    i.set_builtin(o, "signal", Value::Obj(sig));
+    set_bk(&sig, "onabort", Value::Null);
+    set_bk(o, "signal", Value::Obj(sig));
     Ok(Value::Und)
 }
 
 fn sig_throw(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     if let Value::Obj(o) = this {
-        if i.to_bool(
-            &i.obj_get_raw(o, &pk("aborted"))
-                .unwrap_or(Value::Bool(false)),
-        ) {
-            let r = i
-                .obj_get_raw(o, &pk("reason"))
-                .unwrap_or_else(|| i.plain_err("AbortError"));
+        if i.to_bool(&raw_prop(o, "aborted").unwrap_or(Value::Bool(false))) {
+            let r = raw_prop(o, "reason").unwrap_or_else(|| i.plain_err("AbortError"));
             return Err(r);
         }
     }
@@ -3181,19 +3421,19 @@ fn ac_abort(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         return Ok(Value::Und);
     };
     let reason = arg(args, 0);
-    if let Some(Value::Obj(sig)) = i.obj_get_raw(o, &pk("signal")) {
-        i.set_builtin(&sig, "aborted", Value::Bool(true));
+    if let Some(Value::Obj(sig)) = raw_prop(o, "signal") {
+        set_bk(&sig, "aborted", Value::Bool(true));
         let r = if matches!(reason, Value::Und) {
             i.plain_err("AbortError: signal aborted")
         } else {
             reason
         };
-        i.set_builtin(&sig, "reason", r);
+        set_bk(&sig, "reason", r);
         // fire 'abort' listeners synchronously
         let fns = listener_fns(i, &sig, "abort", false);
         let ev = make_event(i, "abort", false, false);
         let sv = Value::Obj(sig.clone());
-        i.set_prop(&ev, pk("target"), sv.clone())?;
+        i.set_prop_str(&ev, "target", sv.clone())?;
         for f in fns {
             i.call(&f, sv.clone(), vec![ev.clone()])?;
         }
@@ -3206,13 +3446,15 @@ fn ac_abort(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 // ---------------------------------------------------------------------------
 
 fn met(i: &Interp, o: &ObjRef, name: &str, f: NativeFn) {
-    i.set_builtin(o, name, i.native(name, f));
+    set_bk(o, name, i.native(name, f));
 }
 
 fn acc(i: &Interp, o: &ObjRef, name: &str, get: Option<NativeFn>, set: Option<NativeFn>) {
     let g = get.map(|f| i.native(&format!("get {name}"), f));
     let s = set.map(|f| i.native(&format!("set {name}"), f));
-    o.borrow_mut().props.insert(pk(name), Prop::accessor(g, s));
+    o.borrow_mut()
+        .props
+        .insert_str(name, Prop::accessor(g, s));
 }
 
 fn gdef(i: &mut Interp, name: &str, v: Value) {
@@ -3228,9 +3470,9 @@ fn dom_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef) -> Value {
             f,
         }),
     )));
-    i.set_builtin(&o, "name", Value::Str(Rc::from(name)));
-    i.set_builtin(&o, "prototype", Value::Obj(proto.clone()));
-    i.set_builtin(proto, "constructor", Value::Obj(o.clone()));
+    set_bk(&o, "name", Value::Str(Rc::from(name)));
+    set_bk(&o, "prototype", Value::Obj(proto.clone()));
+    set_bk(proto, "constructor", Value::Obj(o.clone()));
     Value::Obj(o)
 }
 
@@ -3282,6 +3524,8 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         storage_session: Vec::new(),
         focused: None,
         location: None,
+        styled_objs: Vec::new(),
+        dataset_objs: Vec::new(),
     }));
 
     // ---- Node.prototype ----
@@ -3418,6 +3662,16 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     // reflected attrs
     acc(i, &p_elem, "value", Some(val_get), Some(val_set));
     acc(i, &p_elem, "href", Some(href_get), Some(href_set));
+    // HTMLHyperlinkElementUtils — URL components resolved against the
+    // document URL (spec puts them on a/area only; harmless elsewhere).
+    acc(i, &p_elem, "hash", Some(link_hash_get), None);
+    acc(i, &p_elem, "host", Some(link_host_get), None);
+    acc(i, &p_elem, "hostname", Some(link_hostname_get), None);
+    acc(i, &p_elem, "origin", Some(link_origin_get), None);
+    acc(i, &p_elem, "pathname", Some(link_pathname_get), None);
+    acc(i, &p_elem, "port", Some(link_port_get), None);
+    acc(i, &p_elem, "protocol", Some(link_protocol_get), None);
+    acc(i, &p_elem, "search", Some(link_search_get), None);
     acc(i, &p_elem, "src", Some(src_get), Some(src_set));
     acc(i, &p_elem, "alt", Some(alt_get), Some(alt_set));
     acc(i, &p_elem, "name", Some(name_get), Some(name_set));
@@ -3497,8 +3751,8 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     for k in ["scrollTop", "scrollLeft"] {
         acc(i, &p_elem, k, Some(zero), Some(noop));
     }
-    i.set_builtin(&p_elem, "offsetParent", Value::Null);
-    i.set_builtin(&p_elem, "slot", Value::Str(Rc::from("")));
+    set_bk(&p_elem, "offsetParent", Value::Null);
+    set_bk(&p_elem, "slot", Value::Str(empty_rc()));
 
     // ---- character-data prototype (Text/Comment) ----
     acc(i, &p_char, "data", Some(char_data_get), Some(char_data_set));
@@ -3551,9 +3805,9 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     acc(i, &p_doc, "images", Some(doc_images), None);
     acc(i, &p_doc, "scripts", Some(doc_scripts), None);
     acc(i, &p_doc, "children", Some(node_children), None);
-    i.set_builtin(&p_doc, "hidden", Value::Bool(false));
-    i.set_builtin(&p_doc, "visibilityState", Value::Str(Rc::from("visible")));
-    i.set_builtin(&p_doc, "fullscreenElement", Value::Null);
+    set_bk(&p_doc, "hidden", Value::Bool(false));
+    set_bk(&p_doc, "visibilityState", Value::Str(Rc::from("visible")));
+    set_bk(&p_doc, "fullscreenElement", Value::Null);
 
     // ---- Event.prototype ----
     met(i, &p_event, "preventDefault", event_prevent_default);
@@ -3588,11 +3842,11 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     met(i, &p_compstyle, "setProperty", noop);
     met(i, &p_compstyle, "removeProperty", noop);
     for k in STYLE_PROPS {
-        if !p_compstyle.borrow().props.contains_key(&pk(k)) {
+        if !p_compstyle.borrow().props.contains_str(k) {
             p_compstyle
                 .borrow_mut()
                 .props
-                .insert(pk(k), Prop::data(Value::Str(Rc::from(""))));
+                .insert_str(k, Prop::data(Value::Str(empty_rc())));
         }
     }
 
@@ -3611,7 +3865,7 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         ("DOCUMENT_FRAGMENT_NODE", 11.0),
     ] {
         if let Value::Obj(o) = &node_ctor {
-            i.set_builtin(o, k, Value::Num(v));
+            set_bk(o, k, Value::Num(v));
         }
     }
     gdef(i, "Node", node_ctor);
@@ -3654,7 +3908,11 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         let p = observer_proto(i);
         let v = dom_ctor(i, "ResizeObserver", mo_ctor, &p);
         gdef(i, "ResizeObserver", v);
-        let p = observer_proto(i);
+        let p = obj(Some(i.p.obj.clone()));
+        met(i, &p, "observe", io_observe);
+        met(i, &p, "unobserve", noop);
+        met(i, &p, "disconnect", noop);
+        met(i, &p, "takeRecords", mo_take_records);
         let v = dom_ctor(i, "IntersectionObserver", mo_ctor, &p);
         gdef(i, "IntersectionObserver", v);
     }
@@ -3745,31 +4003,31 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
     // window.* props live on the global object
     {
         let go = i.p.global.clone();
-        i.set_builtin(&go, "document", docv);
-        i.set_builtin(&go, "innerWidth", Value::Num(vw));
-        i.set_builtin(&go, "innerHeight", Value::Num(vh));
-        i.set_builtin(&go, "outerWidth", Value::Num(vw));
-        i.set_builtin(&go, "outerHeight", Value::Num(vh));
-        i.set_builtin(&go, "devicePixelRatio", Value::Num(1.0));
-        i.set_builtin(&go, "scrollX", Value::Num(0.0));
-        i.set_builtin(&go, "scrollY", Value::Num(0.0));
-        i.set_builtin(&go, "pageXOffset", Value::Num(0.0));
-        i.set_builtin(&go, "pageYOffset", Value::Num(0.0));
-        i.set_builtin(&go, "screenX", Value::Num(0.0));
-        i.set_builtin(&go, "screenY", Value::Num(0.0));
-        i.set_builtin(&go, "screenLeft", Value::Num(0.0));
-        i.set_builtin(&go, "screenTop", Value::Num(0.0));
-        i.set_builtin(
+        set_bk(&go, "document", docv);
+        set_bk(&go, "innerWidth", Value::Num(vw));
+        set_bk(&go, "innerHeight", Value::Num(vh));
+        set_bk(&go, "outerWidth", Value::Num(vw));
+        set_bk(&go, "outerHeight", Value::Num(vh));
+        set_bk(&go, "devicePixelRatio", Value::Num(1.0));
+        set_bk(&go, "scrollX", Value::Num(0.0));
+        set_bk(&go, "scrollY", Value::Num(0.0));
+        set_bk(&go, "pageXOffset", Value::Num(0.0));
+        set_bk(&go, "pageYOffset", Value::Num(0.0));
+        set_bk(&go, "screenX", Value::Num(0.0));
+        set_bk(&go, "screenY", Value::Num(0.0));
+        set_bk(&go, "screenLeft", Value::Num(0.0));
+        set_bk(&go, "screenTop", Value::Num(0.0));
+        set_bk(
             &go,
             "addEventListener",
             i.native("addEventListener", el_add_event_listener),
         );
-        i.set_builtin(
+        set_bk(
             &go,
             "removeEventListener",
             i.native("removeEventListener", el_remove_event_listener),
         );
-        i.set_builtin(
+        set_bk(
             &go,
             "dispatchEvent",
             i.native("dispatchEvent", el_dispatch_event),
@@ -3778,42 +4036,42 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
             "scroll", "scrollTo", "scrollBy", "alert", "confirm", "prompt", "print", "blur",
             "focus", "close", "stop", "open",
         ] {
-            i.set_builtin(&go, m, i.native(m, noop));
+            set_bk(&go, m, i.native(m, noop));
         }
-        i.set_builtin(
+        set_bk(
             &go,
             "getComputedStyle",
             i.native("getComputedStyle", g_get_computed_style),
         );
-        i.set_builtin(&go, "matchMedia", i.native("matchMedia", g_match_media));
-        i.set_builtin(&go, "fetch", i.native("fetch", g_fetch));
-        i.set_builtin(
+        set_bk(&go, "matchMedia", i.native("matchMedia", g_match_media));
+        set_bk(&go, "fetch", i.native("fetch", g_fetch));
+        set_bk(
             &go,
             "getSelection",
             i.native("getSelection", g_get_selection),
         );
-        i.set_builtin(&go, "hasFocus", i.native("hasFocus", doc_has_focus));
+        set_bk(&go, "hasFocus", i.native("hasFocus", doc_has_focus));
     }
 
     // navigator / screen / history / performance / storage
     let nav = i.new_obj();
-    i.set_builtin(
+    set_bk(
         &nav,
         "userAgent",
         Value::Str(Rc::from("Mozilla/5.0 (rowser) rowser-js")),
     );
-    i.set_builtin(&nav, "appName", Value::Str(Rc::from("Netscape")));
-    i.set_builtin(&nav, "appVersion", Value::Str(Rc::from("5.0 (rowser)")));
-    i.set_builtin(&nav, "platform", Value::Str(Rc::from("Linux x86_64")));
-    i.set_builtin(&nav, "language", Value::Str(Rc::from("en-US")));
-    i.set_builtin(&nav, "vendor", Value::Str(Rc::from("rowser")));
-    i.set_builtin(&nav, "product", Value::Str(Rc::from("Gecko")));
-    i.set_builtin(&nav, "productSub", Value::Str(Rc::from("20100101")));
-    i.set_builtin(&nav, "onLine", Value::Bool(true));
-    i.set_builtin(&nav, "cookieEnabled", Value::Bool(true));
-    i.set_builtin(&nav, "hardwareConcurrency", Value::Num(4.0));
-    i.set_builtin(&nav, "maxTouchPoints", Value::Num(0.0));
-    i.set_builtin(
+    set_bk(&nav, "appName", Value::Str(Rc::from("Netscape")));
+    set_bk(&nav, "appVersion", Value::Str(Rc::from("5.0 (rowser)")));
+    set_bk(&nav, "platform", Value::Str(Rc::from("Linux x86_64")));
+    set_bk(&nav, "language", Value::Str(Rc::from("en-US")));
+    set_bk(&nav, "vendor", Value::Str(Rc::from("rowser")));
+    set_bk(&nav, "product", Value::Str(Rc::from("Gecko")));
+    set_bk(&nav, "productSub", Value::Str(Rc::from("20100101")));
+    set_bk(&nav, "onLine", Value::Bool(true));
+    set_bk(&nav, "cookieEnabled", Value::Bool(true));
+    set_bk(&nav, "hardwareConcurrency", Value::Num(4.0));
+    set_bk(&nav, "maxTouchPoints", Value::Num(0.0));
+    set_bk(
         &nav,
         "languages",
         Value::Obj(i.new_arr(vec![Value::Str(Rc::from("en-US"))])),
@@ -3829,31 +4087,31 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         ("colorDepth", 24.0),
         ("pixelDepth", 24.0),
     ] {
-        i.set_builtin(&screen, k, Value::Num(v));
+        set_bk(&screen, k, Value::Num(v));
     }
     gdef(i, "screen", Value::Obj(screen));
 
     let hist = i.new_obj();
-    i.set_builtin(&hist, "length", Value::Num(1.0));
-    i.set_builtin(&hist, "state", Value::Null);
-    i.set_builtin(&hist, "scrollRestoration", Value::Str(Rc::from("auto")));
+    set_bk(&hist, "length", Value::Num(1.0));
+    set_bk(&hist, "state", Value::Null);
+    set_bk(&hist, "scrollRestoration", Value::Str(Rc::from("auto")));
     for m in ["pushState", "replaceState", "back", "forward", "go"] {
-        i.set_builtin(&hist, m, i.native(m, noop));
+        set_bk(&hist, m, i.native(m, noop));
     }
     gdef(i, "history", Value::Obj(hist));
 
     let perf = i.new_obj();
-    i.set_builtin(&perf, "now", i.native("now", perf_now));
-    i.set_builtin(&perf, "timeOrigin", Value::Num(0.0));
-    i.set_builtin(&perf, "mark", i.native("mark", noop));
-    i.set_builtin(&perf, "measure", i.native("measure", noop));
-    i.set_builtin(&perf, "getEntries", i.native("getEntries", mo_take_records));
-    i.set_builtin(
+    set_bk(&perf, "now", i.native("now", perf_now));
+    set_bk(&perf, "timeOrigin", Value::Num(0.0));
+    set_bk(&perf, "mark", i.native("mark", noop));
+    set_bk(&perf, "measure", i.native("measure", noop));
+    set_bk(&perf, "getEntries", i.native("getEntries", mo_take_records));
+    set_bk(
         &perf,
         "getEntriesByType",
         i.native("getEntriesByType", mo_take_records),
     );
-    i.set_builtin(
+    set_bk(
         &perf,
         "getEntriesByName",
         i.native("getEntriesByName", mo_take_records),
@@ -3865,7 +4123,7 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         let mk = |i: &mut Interp, which: &str| -> Value {
             let proto = with_ds(i, |ds| ds.p_storage.clone());
             let o = obj(Some(proto));
-            i.set_builtin(&o, K_STORE, Value::Str(Rc::from(which)));
+            set_bk(&o, K_STORE, Value::Str(Rc::from(which)));
             Value::Obj(o)
         };
         (mk(i, "local"), mk(i, "session"))
@@ -3916,11 +4174,11 @@ fn observer_proto(i: &mut Interp) -> ObjRef {
 
 fn cl_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let n = i.to_num(&arg(args, 0))? as usize;
-    let Some((_, _, toks)) = cl_tokens(i, this) else {
+    let Some((_, _, joined)) = cl_el(i, this) else {
         return Ok(Value::Null);
     };
-    Ok(match toks.get(n) {
-        Some(t) => Value::Str(Rc::from(t.as_str())),
+    Ok(match joined.split_whitespace().nth(n) {
+        Some(t) => Value::Str(Rc::from(t)),
         None => Value::Null,
     })
 }
@@ -4094,12 +4352,12 @@ impl DomContext {
         for (peer, msg) in msgs {
             let pv = Value::Obj(peer.clone());
             // onmessage handler
-            if let Some(onm) = i.obj_get_raw(&peer, &pk("onmessage")) {
+            if let Some(onm) = raw_prop(&peer, "onmessage") {
                 if i.is_callable(&onm) {
                     let ev = i.new_obj();
-                    i.set_builtin(&ev, "data", msg.clone());
-                    i.set_builtin(&ev, "type", Value::Str(Rc::from("message")));
-                    i.set_builtin(&ev, "target", pv.clone());
+                    set_bk(&ev, "data", msg.clone());
+                    set_bk(&ev, "type", Value::Str(Rc::from("message")));
+                    set_bk(&ev, "target", pv.clone());
                     if let Err(e) = i.call(&onm, pv.clone(), vec![Value::Obj(ev)]) {
                         let m = i.inspect(&e, 0);
                         self.errors
@@ -4110,9 +4368,9 @@ impl DomContext {
             // 'message' listeners
             for f in listener_fns(i, &peer, "message", false) {
                 let ev = i.new_obj();
-                i.set_builtin(&ev, "data", msg.clone());
-                i.set_builtin(&ev, "type", Value::Str(Rc::from("message")));
-                i.set_builtin(&ev, "target", pv.clone());
+                set_bk(&ev, "data", msg.clone());
+                set_bk(&ev, "type", Value::Str(Rc::from("message")));
+                set_bk(&ev, "target", pv.clone());
                 if let Err(e) = i.call(&f, pv.clone(), vec![Value::Obj(ev)]) {
                     let m = i.inspect(&e, 0);
                     self.errors.push(format!("Uncaught (in port listener) {m}"));
@@ -4153,7 +4411,50 @@ impl DomContext {
     /// dispatched event.
     pub fn snapshot_document(&mut self) -> Document {
         sync_dom_side_effects(&mut self.ctx.interp);
-        with_ds(&mut self.ctx.interp, |ds| ds.docs[0].clone())
+        with_ds(&mut self.ctx.interp, |ds| {
+            ds.docs[0].mutated = false;
+            ds.docs[0].clone()
+        })
+    }
+
+    /// Snapshot only when JS mutated the document since the last
+    /// snapshot — turns that changed nothing (most scrolls, reads-only
+    /// handlers) skip the DOM clone and the renderer's relayout.
+    pub fn snapshot_if_mutated(&mut self) -> Option<Document> {
+        sync_dom_side_effects(&mut self.ctx.interp);
+        with_ds(&mut self.ctx.interp, |ds| {
+            if ds.docs[0].mutated {
+                ds.docs[0].mutated = false;
+                Some(ds.docs[0].clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Update `window.scrollY`/`pageYOffset` and fire a `scroll` event
+    /// that bubbles document → window, then run the scheduler (bounded).
+    /// Sites with scrolled-nav / reveal-on-scroll depend on this.
+    pub fn scroll_pumped(&mut self, y: f64, budget: std::time::Duration) {
+        {
+            let i = &mut self.ctx.interp;
+            i.arm_deadline(budget);
+            let go = i.p.global.clone();
+            set_bk(&go, "scrollY", Value::Num(y));
+            set_bk(&go, "pageYOffset", Value::Num(y));
+        }
+        // scroll targets the document; the event path terminates at the
+        // global object so window listeners fire too.
+        let root = ds_root(&mut self.ctx.interp);
+        let _ = self.dispatch_event(root, "scroll", (0.0, 0.0));
+        self.flush_raf();
+        self.run_timers();
+        let i = &mut self.ctx.interp;
+        if i.interrupted {
+            self.errors
+                .push("scroll: execution budget exceeded".to_string());
+        }
+        i.disarm_deadline();
     }
 
     /// Embedder-driven event: fire `ty` (e.g. "click") at the element
@@ -4178,17 +4479,17 @@ impl DomContext {
             wrap_node(i, 0, root)
         };
         let ev = make_event(i, ty, true, true);
-        i.set_prop(&ev, pk("target"), target.clone())?;
-        i.set_prop(&ev, pk("srcElement"), target.clone())?;
-        i.set_prop(&ev, pk("clientX"), Value::Num(client.0))?;
-        i.set_prop(&ev, pk("clientY"), Value::Num(client.1))?;
-        i.set_prop(&ev, pk("pageX"), Value::Num(client.0))?;
-        i.set_prop(&ev, pk("pageY"), Value::Num(client.1))?;
-        i.set_prop(&ev, pk("screenX"), Value::Num(client.0))?;
-        i.set_prop(&ev, pk("screenY"), Value::Num(client.1))?;
-        i.set_prop(&ev, pk("button"), Value::Num(0.0))?;
-        i.set_prop(&ev, pk("buttons"), Value::Num(1.0))?;
-        i.set_prop(&ev, pk("detail"), Value::Num(1.0))?;
+        i.set_prop_str(&ev, "target", target.clone())?;
+        i.set_prop_str(&ev, "srcElement", target.clone())?;
+        i.set_prop_str(&ev, "clientX", Value::Num(client.0))?;
+        i.set_prop_str(&ev, "clientY", Value::Num(client.1))?;
+        i.set_prop_str(&ev, "pageX", Value::Num(client.0))?;
+        i.set_prop_str(&ev, "pageY", Value::Num(client.1))?;
+        i.set_prop_str(&ev, "screenX", Value::Num(client.0))?;
+        i.set_prop_str(&ev, "screenY", Value::Num(client.1))?;
+        i.set_prop_str(&ev, "button", Value::Num(0.0))?;
+        i.set_prop_str(&ev, "buttons", Value::Num(1.0))?;
+        i.set_prop_str(&ev, "detail", Value::Num(1.0))?;
         let r = run_event_path(i, &target, &ev)?;
         Ok(matches!(r, Value::Bool(true)))
     }

@@ -174,7 +174,7 @@ impl fmt::Display for Url {
 }
 
 /// Well-known default ports; `None` for schemes we don't know.
-pub(crate) fn default_port(scheme: &str) -> Option<u16> {
+pub fn default_port(scheme: &str) -> Option<u16> {
     match scheme {
         "http" | "ws" => Some(80),
         "https" | "wss" => Some(443),
