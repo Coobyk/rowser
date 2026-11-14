@@ -2937,6 +2937,15 @@ pub struct Layouter<'a> {
     /// `pointer-events:none` is in effect on the current walk path — hit
     /// pushes are dropped while set (an `auto` descendant re-enables).
     pe_blocked: bool,
+    /// `position:fixed` subtrees deferred from `walk` — (node, parent
+    /// style, y, margin_x, avail_w, z-index). CSS puts fixed elements in
+    /// the root stacking context anchored to the viewport; emitting them
+    /// inside their DOM parent's paint run would trap them under later
+    /// in-flow siblings. Flushed at end of layout in z order.
+    deferred: Vec<(NodeId, Style, f32, f32, f32, i64)>,
+    /// set while flushing `deferred` — nested fixed children emit in
+    /// place (they're inside the parent's stacking context anyway)
+    fixed_flush: bool,
 }
 
 impl<'a> Layouter<'a> {
@@ -3057,6 +3066,8 @@ impl<'a> Layouter<'a> {
             quote_depth: 0,
             pstate: pstate.clone(),
             pe_blocked: false,
+            deferred: Vec::new(),
+            fixed_flush: false,
         };
         l.ctx.set_state(pstate.clone());
         l.preresolve_styles();
@@ -3115,6 +3126,26 @@ impl<'a> Layouter<'a> {
             }
         }
         l.walk(doc.root, &base_style());
+        l.flush_line();
+        // `position:fixed` subtrees deferred during walk — emit at the
+        // root stacking level sorted by z-index so they layer above
+        // scrolled content (a fixed nav inside a static <header> would
+        // otherwise paint under later sections).
+        l.deferred.sort_by_key(|d| d.5);
+        l.fixed_flush = true;
+        let mut di = 0;
+        while di < l.deferred.len() {
+            let (node, pst, y, mx, aw, _) = l.deferred[di].clone();
+            di += 1;
+            let saved = (l.y, l.margin_x, l.avail_w);
+            l.y = y;
+            l.margin_x = mx;
+            l.avail_w = aw;
+            l.walk(node, &pst);
+            (l.y, l.margin_x, l.avail_w) = saved;
+        }
+        l.deferred.clear();
+        l.fixed_flush = false;
         l.flush_line();
         // floats don't consume vertical space at their site; make sure the
         // document is at least as tall as the deepest float
@@ -3388,6 +3419,29 @@ impl<'a> Layouter<'a> {
                 let c = self.style(node);
                 let mut st = style.clone();
                 self.apply_computed(&c, &mut st);
+                // `position:fixed` defers to a root-level flush (see
+                // layout_vh_st): its containing block is the viewport and
+                // it layers in the root stacking context — emitting it
+                // inside the DOM parent's run traps it in that parent's
+                // paint layer, letting later content cover it.
+                if !self.fixed_flush
+                    && !self.clamping
+                    && c.get("position").map(String::as_str) == Some("fixed")
+                {
+                    let z = c
+                        .get("z-index")
+                        .and_then(|v| v.trim().parse::<i64>().ok())
+                        .unwrap_or(0);
+                    self.deferred.push((
+                        node,
+                        style.clone(),
+                        self.y,
+                        self.margin_x,
+                        self.avail_w,
+                        z,
+                    ));
+                    return;
+                }
                 if let Some(id) = self.doc.attr(node, "id") {
                     if !id.is_empty() {
                         // scroll-margin-top shifts the anchor's scroll target
