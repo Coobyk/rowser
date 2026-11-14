@@ -276,7 +276,7 @@ pub(crate) fn feed(acc: &mut Acc, prop: &str, value: &str, key: WinKey) -> bool 
         }
         return true;
     }
-    if shorthand_sides(prop).is_some() && has_fn(value) {
+    if is_shorthand(prop) && has_fn(value) {
         // The shorthand name itself still lands in `out` (layout's
         // `sides()` fallback); its longhands are resolved later.
         merge(&mut acc.out, prop, value, key);
@@ -307,27 +307,35 @@ pub(crate) fn shorthand_sides(prop: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-/// Distribute 1–4 (TRBL) or 1–2 (start,end) resolved tokens over `prop`'s
-/// longhands — the same cycling `each_decl` uses for static values.
-fn assign_sides<'v>(prop: &str, toks: &[&'v str], mut f: impl FnMut(&'static str, &'v str)) {
-    let Some(sides) = shorthand_sides(prop) else {
-        return;
-    };
-    if sides.len() == 4 {
-        let t = toks.first().copied().unwrap_or("0");
-        let r = toks.get(1).copied().unwrap_or(t);
-        let b = toks.get(2).copied().unwrap_or(t);
-        let l = toks.get(3).copied().unwrap_or(r);
-        f(sides[0], t);
-        f(sides[1], r);
-        f(sides[2], b);
-        f(sides[3], l);
-    } else {
-        let a = toks.first().copied().unwrap_or("0");
-        let b = toks.get(1).copied().unwrap_or(a);
-        f(sides[0], a);
-        f(sides[1], b);
-    }
+/// Every prop `each_decl`/`each_physical` expands (shorthand or logical
+/// alias) — `var()`/`env()`-bearing declarations of these defer their
+/// expansion until the node's custom properties resolve, so component
+/// parsers see substituted values instead of a raw `var(--x)` token.
+fn is_shorthand(prop: &str) -> bool {
+    shorthand_sides(prop).is_some()
+        || matches!(
+            prop,
+            "flex" | "font" | "border" | "border-top" | "border-right"
+                | "border-bottom" | "border-left" | "border-width" | "border-style"
+                | "border-color" | "border-radius" | "outline" | "overflow"
+                | "text-decoration" | "gap" | "place-items" | "place-content"
+                | "place-self" | "grid-template" | "grid" | "list-style" | "mask"
+                | "border-inline" | "border-block"
+                | "border-inline-color" | "border-block-color"
+                | "border-inline-width" | "border-block-width"
+                // single-target logical aliases
+                | "padding-inline-start" | "padding-inline-end"
+                | "padding-block-start" | "padding-block-end"
+                | "margin-inline-start" | "margin-inline-end"
+                | "margin-block-start" | "margin-block-end"
+                | "inset-inline-start" | "inset-inline-end"
+                | "inset-block-start" | "inset-block-end"
+                | "inline-size" | "block-size"
+                | "min-inline-size" | "max-inline-size"
+                | "min-block-size" | "max-block-size"
+                | "border-start-start-radius" | "border-start-end-radius"
+                | "border-end-start-radius" | "border-end-end-radius"
+        )
 }
 
 /// Split on whitespace at paren depth 0 — `calc(1px + 2px)` and
@@ -500,7 +508,19 @@ impl<'a, S: CustomSrc + ?Sized> VarResolver<'a, S> {
             }
             let inner = out[open + 1..end - 1].trim().to_string();
             let rep = if out[start..open].eq_ignore_ascii_case("env") {
-                "0px".to_string()
+                // safe-area-inset-* are all zero for us; unknown env names
+                // resolve to the fallback (or invalid → drop the decl)
+                let (name, fb) = split_first_comma(&inner);
+                if name.trim().starts_with("safe-area-inset-") {
+                    "0px".to_string()
+                } else if let Some(fb) = fb {
+                    self.depth += 1;
+                    let r = self.subst(fb.trim());
+                    self.depth -= 1;
+                    r?
+                } else {
+                    return None;
+                }
             } else {
                 let (name, fb) = split_first_comma(&inner);
                 let name = name.trim();
@@ -963,14 +983,13 @@ impl<'a> StyleCtx<'a> {
                         if css_wide(&d.value).is_some() {
                             take_best(&mut best, &d.value, nk);
                         }
-                    } else if shorthand_sides(&d.prop).is_some() && has_fn(&d.value) {
-                        // var()-shorthand → resolve and pick `prop`'s side
+                    } else if is_shorthand(&d.prop) && has_fn(&d.value) {
+                        // var()-shorthand → resolve, expand, pick `prop`
                         let mut r = VarResolver::from_src(eff);
                         if let Some(rv) = r.subst(&d.value) {
-                            let toks = split_ws_parens(&rv);
-                            assign_sides(&d.prop, &toks, |sp, tv| {
-                                if sp == prop {
-                                    take_best(&mut best, tv, nk);
+                            each_decl(&d.prop, &rv, |p, v| {
+                                if p == prop {
+                                    take_best(&mut best, v, nk);
                                 }
                             });
                         }
@@ -1208,8 +1227,7 @@ impl<'a> StyleCtx<'a> {
             let mut r = VarResolver::from_src(&eff);
             for (prop, value, key) in &acc.pending {
                 let Some(rv) = r.subst(value) else { continue };
-                let toks = split_ws_parens(&rv);
-                assign_sides(prop, &toks, |sp, tv| {
+                each_decl(prop, &rv, |sp, tv| {
                     // `all` outranks a losing shorthand decl
                     let (val, k2) = match all_kw {
                         Some((w, ak)) if decl_wins(ak, *key) => (w.as_str(), ak),

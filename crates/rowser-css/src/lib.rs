@@ -1259,7 +1259,14 @@ impl<'a> CssParser<'a> {
                     self.pos += 1;
                 }
                 _ => {
-                    let prop = self.ident().to_lowercase();
+                    // custom property names are case-sensitive per spec;
+                    // everything else folds to lowercase
+                    let raw_prop = self.ident();
+                    let prop = if raw_prop.starts_with("--") {
+                        raw_prop
+                    } else {
+                        raw_prop.to_lowercase()
+                    };
                     if prop.is_empty() {
                         // garbage — skip to ; or }
                         while !self.eof() && !matches!(self.peek(), Some(b';') | Some(b'}')) {
@@ -2410,6 +2417,26 @@ fn each_decl(prop: &str, value: &str, mut f: impl FnMut(&str, &str)) {
         expand_background(value, &mut f);
         return;
     }
+    // logical 1–2 value shorthands split start/end (LTR): second token
+    // defaults to the first — each_physical's identity fan-out would
+    // otherwise feed the whole "3px 5px" to both longhands
+    let dual = match prop {
+        "margin-inline" => Some(("margin-left", "margin-right")),
+        "margin-block" => Some(("margin-top", "margin-bottom")),
+        "padding-inline" => Some(("padding-left", "padding-right")),
+        "padding-block" => Some(("padding-top", "padding-bottom")),
+        "inset-inline" => Some(("left", "right")),
+        "inset-block" => Some(("top", "bottom")),
+        _ => None,
+    };
+    if let Some((a, b)) = dual {
+        let mut it = cascade::split_ws_parens(value).into_iter();
+        let av = it.next().unwrap_or("0");
+        let bv = it.next().unwrap_or(av);
+        expand_decl(a, av, &mut f);
+        expand_decl(b, bv, &mut f);
+        return;
+    }
     each_physical(prop, |p| expand_decl(p, value, &mut f));
 }
 
@@ -2857,7 +2884,12 @@ fn inline_decls(style: &str) -> Vec<Decl> {
             } else {
                 false
             };
-            let prop = p.trim().to_lowercase();
+            let p = p.trim();
+            let prop = if p.starts_with("--") {
+                p.to_string()
+            } else {
+                p.to_lowercase()
+            };
             if !prop.is_empty() && !value.is_empty() {
                 out.push(Decl {
                     prop,
