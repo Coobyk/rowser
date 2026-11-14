@@ -66,6 +66,9 @@ fn main() {
     let mut pending: std::collections::VecDeque<ToRenderer> = std::collections::VecDeque::new();
 
     loop {
+        // cheap every iteration — a busy input stream must not starve a
+        // finished scroll→JS turn waiting for a recv lull
+        poll_js_scroll(&mut page, &mut fonts, &mut output);
         let msg = if let Some(m) = pending.pop_front() {
             m
         } else {
