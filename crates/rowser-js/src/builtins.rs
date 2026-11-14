@@ -1204,7 +1204,7 @@ fn install_globals(i: &mut Interp) {
         method(i, &dp, "valueOf", date_get_time);
         method(i, &dp, "toString", date_to_string);
         method(i, &dp, "toISOString", date_to_iso);
-        method(i, &dp, "toJSON", date_to_iso);
+        method(i, &dp, "toJSON", date_to_json);
         method(i, &dp, "toUTCString", date_to_utc);
         method(i, &dp, "toGMTString", date_to_utc);
         method(i, &dp, "toDateString", date_to_datestr);
@@ -1261,6 +1261,56 @@ fn install_globals(i: &mut Interp) {
             date_getter(i, t, |d| d.7 as f64)
         });
         method(i, &dp, "getTimezoneOffset", |_i, _t, _| Ok(Value::Num(0.0)));
+        // setters — UTC-only engine: local == UTC. slots = y,mo,d,h,mi,s,ms
+        method(i, &dp, "setTime", date_set_time);
+        method(i, &dp, "setMilliseconds", |i, t, a| {
+            date_set(i, t, a, &[6], false)
+        });
+        method(i, &dp, "setSeconds", |i, t, a| {
+            date_set(i, t, a, &[5, 6], false)
+        });
+        method(i, &dp, "setMinutes", |i, t, a| {
+            date_set(i, t, a, &[4, 5, 6], false)
+        });
+        method(i, &dp, "setHours", |i, t, a| {
+            date_set(i, t, a, &[3, 4, 5, 6], false)
+        });
+        method(i, &dp, "setDate", |i, t, a| {
+            date_set(i, t, a, &[2], false)
+        });
+        method(i, &dp, "setMonth", |i, t, a| {
+            date_set(i, t, a, &[1, 2], false)
+        });
+        method(i, &dp, "setFullYear", |i, t, a| {
+            date_set(i, t, a, &[0, 1, 2], true)
+        });
+        method(i, &dp, "setYear", date_set_year);
+        method(i, &dp, "setUTCMilliseconds", |i, t, a| {
+            date_set(i, t, a, &[6], false)
+        });
+        method(i, &dp, "setUTCSeconds", |i, t, a| {
+            date_set(i, t, a, &[5, 6], false)
+        });
+        method(i, &dp, "setUTCMinutes", |i, t, a| {
+            date_set(i, t, a, &[4, 5, 6], false)
+        });
+        method(i, &dp, "setUTCHours", |i, t, a| {
+            date_set(i, t, a, &[3, 4, 5, 6], false)
+        });
+        method(i, &dp, "setUTCDate", |i, t, a| {
+            date_set(i, t, a, &[2], false)
+        });
+        method(i, &dp, "setUTCMonth", |i, t, a| {
+            date_set(i, t, a, &[1, 2], false)
+        });
+        method(i, &dp, "setUTCFullYear", |i, t, a| {
+            date_set(i, t, a, &[0, 1, 2], true)
+        });
+        // Date.prototype[@@toPrimitive]
+        let stp = native(i, "[Symbol.toPrimitive]", date_to_primitive);
+        dp.borrow_mut()
+            .props
+            .insert(PropKey::Sym(SYM_TOPRIMITIVE), Prop::builtin(stp));
         let ctor = make_ctor(i, "Date", date_ctor, dp.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         i.set_builtin(o, "now", native(i, "now", date_now));
@@ -4681,6 +4731,15 @@ fn date_now(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Num(now_millis()))
 }
 
+/// spec TimeClip: |v| > 8.64e15 or NaN → NaN; else integer part.
+fn time_clip(n: f64) -> f64 {
+    if !n.is_finite() || n.abs() > 8.64e15 {
+        f64::NAN
+    } else {
+        n.trunc()
+    }
+}
+
 fn date_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !matches!(this, Value::Obj(_)) {
         // Date() called as function → string
@@ -4688,17 +4747,53 @@ fn date_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             format!("{} (rowser-js date)", now_millis()).as_str(),
         )));
     }
-    let ms = match arg(args, 0) {
-        Value::Und => now_millis(),
-        Value::Num(n) => n,
-        Value::Str(_) => {
-            let v = arg(args, 0);
-            match date_parse(i, &Value::Und, &[v]) {
-                Ok(Value::Num(n)) => n,
-                _ => f64::NAN,
+    let ms = if args.len() >= 2 {
+        // multi-arg ctor: MakeDate(MakeDay(y,m,d), MakeTime(h,mi,s,ms))
+        // — coerce every arg via ToNumber first (missing = spec defaults)
+        let mut n = |k: usize, d: f64| -> Result<f64, Value> {
+            match args.get(k) {
+                Some(v) => Ok(i.to_num(v)?),
+                None => Ok(d),
             }
+        };
+        let mut y = n(0, 0.0)?.trunc();
+        if (0.0..=99.0).contains(&y) {
+            y += 1900.0;
         }
-        v => i.to_num(&v).unwrap_or(f64::NAN),
+        let mo = n(1, 0.0)?.trunc();
+        let d = n(2, 1.0)?.trunc();
+        let h = n(3, 0.0)?.trunc();
+        let mi = n(4, 0.0)?.trunc();
+        let s = n(5, 0.0)?.trunc();
+        let ms = n(6, 0.0)?.trunc();
+        if [y, mo, d, h, mi, s, ms].iter().any(|v| v.is_nan()) {
+            f64::NAN
+        } else {
+            let y_adj = y + (mo / 12.0).floor();
+            let mo_adj = mo.rem_euclid(12.0);
+            let day = days_from_civil(y_adj as i64, (mo_adj + 1.0) as u32, 1)
+                + d as i64 - 1;
+            time_clip(
+                day as f64 * 86_400_000.0
+                    + h * 3_600_000.0
+                    + mi * 60_000.0
+                    + s * 1000.0
+                    + ms,
+            )
+        }
+    } else {
+        match arg(args, 0) {
+            Value::Und => now_millis(),
+            Value::Num(n) => time_clip(n),
+            Value::Str(_) => {
+                let v = arg(args, 0);
+                match date_parse(i, &Value::Und, &[v]) {
+                    Ok(Value::Num(n)) => time_clip(n),
+                    _ => f64::NAN,
+                }
+            }
+            v => time_clip(i.to_num(&v).unwrap_or(f64::NAN)),
+        }
     };
     if let Value::Obj(o) = this {
         i.set_builtin(o, "$ms", Value::Num(ms));
@@ -4777,6 +4872,125 @@ fn date_getter(
     Ok(Value::Num(f(date_parts(ms))))
 }
 
+fn date_store(i: &mut Interp, this: &Value, ms: f64) -> Value {
+    if let Value::Obj(o) = this {
+        i.set_builtin(o, "$ms", Value::Num(ms));
+    }
+    Value::Num(ms)
+}
+
+/// Date setter core. `slots` = which of the 7 components (y,mo,d,h,mi,s,ms)
+/// the args occupy, left to right; `zero_base` = setFullYear's NaN→+0 rule.
+fn date_set(
+    i: &mut Interp,
+    this: &Value,
+    args: &[Value],
+    slots: &[usize],
+    zero_base: bool,
+) -> NResult {
+    // coerce all provided args first — ToNumber order matters
+    let mut given: Vec<f64> = Vec::with_capacity(args.len());
+    for a in args.iter().take(slots.len()) {
+        given.push(i.to_num(a)?);
+    }
+    let cur = date_ms(i, this);
+    if given.iter().any(|v| v.is_nan()) || (!cur.is_finite() && !zero_base) {
+        return Ok(date_store(i, this, f64::NAN));
+    }
+    let base = if cur.is_finite() {
+        date_parts(cur)
+    } else {
+        date_parts(0.0)
+    };
+    let (mut y, mut mo, mut d, mut h, mut mi, mut s, mut msec) = (
+        base.0 as f64,
+        (base.1 - 1) as f64,
+        base.2 as f64,
+        base.4 as f64,
+        base.5 as f64,
+        base.6 as f64,
+        base.7 as f64,
+    );
+    for (k, v) in given.iter().enumerate() {
+        match slots[k] {
+            0 => y = v.trunc(),
+            1 => mo = v.trunc(),
+            2 => d = v.trunc(),
+            3 => h = v.trunc(),
+            4 => mi = v.trunc(),
+            5 => s = v.trunc(),
+            _ => msec = v.trunc(),
+        }
+    }
+    let y_adj = y + (mo / 12.0).floor();
+    let mo_adj = mo.rem_euclid(12.0);
+    let day = days_from_civil(y_adj as i64, (mo_adj + 1.0) as u32, 1) + d as i64 - 1;
+    let ms = time_clip(
+        day as f64 * 86_400_000.0
+            + h * 3_600_000.0
+            + mi * 60_000.0
+            + s * 1000.0
+            + msec,
+    );
+    Ok(date_store(i, this, ms))
+}
+
+fn date_set_time(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let v = i.to_num(&arg(args, 0))?;
+    Ok(date_store(i, this, time_clip(v)))
+}
+
+/// legacy setYear: 0-99 → 1900+y (already full years otherwise)
+fn date_set_year(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let mut y = i.to_num(&arg(args, 0))?;
+    if (0.0..=99.0).contains(&y) {
+        y += 1900.0;
+    }
+    date_set(i, this, &[Value::Num(y)], &[0], true)
+}
+
+/// spec Date.prototype.toJSON: ToPrimitive(number) → non-finite → null;
+/// else invoke this.toISOString()
+fn date_to_json(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let tv = i.to_primitive(this)?;
+    if let Value::Num(n) = tv {
+        if !n.is_finite() {
+            return Ok(Value::Null);
+        }
+    }
+    let f = i.get_prop_str(this, "toISOString")?;
+    if !i.is_callable(&f) {
+        return Err(i.type_err("this.toISOString is not a function"));
+    }
+    i.call(&f, this.clone(), vec![])
+}
+
+/// spec Date.prototype[@@toPrimitive](hint): "default"→"string";
+/// OrdinaryToPrimitive with the resolved hint.
+fn date_to_primitive(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let hint = match arg(args, 0) {
+        Value::Str(s) => s.to_string(),
+        _ => String::new(),
+    };
+    let order: [&str; 2] = match hint.as_str() {
+        "number" => ["valueOf", "toString"],
+        "string" | "default" => ["toString", "valueOf"],
+        _ => {
+            return Err(i.type_err("invalid hint"))
+        }
+    };
+    for name in order {
+        let m = i.get_prop_str(this, name)?;
+        if i.is_callable(&m) {
+            let r = i.call(&m, this.clone(), vec![])?;
+            if !matches!(r, Value::Obj(_)) {
+                return Ok(r);
+            }
+        }
+    }
+    Err(i.type_err("Cannot convert object to primitive value"))
+}
+
 fn date_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let ms = date_ms(i, this);
     if !ms.is_finite() {
@@ -4830,7 +5044,7 @@ fn date_to_utc(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 fn date_to_iso(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let ms = date_ms(i, this);
     if !ms.is_finite() {
-        return Ok(Value::Str(Rc::from("Invalid Date")));
+        return Err(i.range_err("Invalid time value"));
     }
     let (y, m, d, _, h, mi, s, msec) = date_parts(ms);
     Ok(Value::Str(Rc::from(
