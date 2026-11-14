@@ -42,9 +42,6 @@ const IMG_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2
 const MAX_IMAGES_PER_LOAD: usize = 64;
 /// Cap on the cross-navigation decoded-image cache (url → Image).
 const MAX_IMG_CACHE: usize = 1024;
-/// Per-socket read/write timeout — covers TLS handshake and response reads
-/// (otherwise a stalled server hangs the fetch forever).
-const FETCH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn main() {
     let stdout = io::stdout();
@@ -94,9 +91,13 @@ fn main() {
                 let same_page = !page.cur_url.is_empty()
                     && (base == page.cur_url || (base.is_empty() && !frag.is_empty()));
                 if same_page && !frag.is_empty() {
-                    // :target styles may change layout — full repaint, then
-                    // scroll to the (freshly laid-out) anchor
+                    // :target styles may change layout — relayout only
+                    // when a sheet could match, then scroll to the
+                    // (freshly laid-out) anchor
                     page.state.target_frag = Some(frag.to_string());
+                    if page.pseudo_mask & P_TARGET != 0 {
+                        page.layout_dirty = true;
+                    }
                     page.repaint(&mut fonts);
                     if let Some((_, y)) = page.anchors.iter().find(|(a, _)| a == frag) {
                         let y = *y;
@@ -104,9 +105,10 @@ fn main() {
                         if new != page.scroll {
                             page.scroll = new;
                             page.repaint_scrolled(&mut fonts);
+                            page.dirty_all();
                         }
                     }
-                    let _ = send(&mut output, &frame_msg(&page));
+                    send_frame(&mut output, &mut page);
                     let _ = send(&mut output, &ToBrowser::LoadDone);
                     continue;
                 }
@@ -114,7 +116,11 @@ fn main() {
                 let (html, effective) = load_url(&url);
                 let t_fetch = t0.elapsed();
                 let t1 = std::time::Instant::now();
-                let doc = rowser_html::parse(&html);
+                let doc = if js_enabled() {
+                    rowser_html::parse_scripting(&html)
+                } else {
+                    rowser_html::parse(&html)
+                };
                 pt!("[prof] navigate fetch={t_fetch:?} parse={:?}", t1.elapsed());
                 // JS: run page scripts against the parsed DOM (SPAs build
                 // their UI this way). Errors are logged, never fatal.
@@ -155,17 +161,19 @@ fn main() {
                     }
                 }
                 let _ = send(&mut output, &ToBrowser::Title(title));
-                let _ = send(&mut output, &frame_msg(&page));
+                send_frame(&mut output, &mut page);
                 let _ = send(&mut output, &ToBrowser::LoadDone);
             }
             ToRenderer::ResizeViewport { width, height } => {
                 page.viewport = (width.max(1), height.max(1));
+                page.layout_dirty = true;
+                page.need_full = true;
                 if page.clear_sel() {
                     let _ = send(&mut output, &ToBrowser::SelText(String::new()));
                 }
                 if page.has_doc() {
                     page.repaint(&mut fonts);
-                    let _ = send(&mut output, &frame_msg(&page));
+                    send_frame(&mut output, &mut page);
                 } else {
                     let pixels = test_pattern(width.max(1), height.max(1));
                     let _ = send(
@@ -199,19 +207,23 @@ fn main() {
                     }
                 }
                 let hit = page.hit_at(mx, my);
-                let mut dirty = false;
+                // Which dynamic pseudos changed? A relayout only pays off
+                // when a sheet could restyle them — otherwise the repaint
+                // produces identical pixels and nothing gets sent.
+                let mut need = 0u8;
                 if page.state.hovered != hit {
                     page.state.hovered = hit;
-                    dirty = true;
+                    need |= P_HOVER;
                 }
                 // button release anywhere ends :active
                 if !md && page.state.active.is_some() {
                     page.state.active = None;
-                    dirty = true;
+                    need |= P_ACTIVE;
                 }
-                if dirty {
+                if need & page.pseudo_mask != 0 {
+                    page.layout_dirty = true;
                     page.repaint(&mut fonts);
-                    let _ = send(&mut output, &frame_msg(&page));
+                    send_frame(&mut output, &mut page);
                 }
                 // cursor: CSS `cursor` on the hovered element (or default)
                 let cur = hit.map(|n| page.hover_cursor(n)).unwrap_or_default();
@@ -225,8 +237,12 @@ fn main() {
                     let hit = page.hit_at(x, y);
                     if page.state.active != hit {
                         page.state.active = hit;
-                        page.repaint(&mut fonts);
-                        let _ = send(&mut output, &frame_msg(&page));
+                        // repaint only when an :active rule could match
+                        if page.pseudo_mask & P_ACTIVE != 0 {
+                            page.layout_dirty = true;
+                            page.repaint(&mut fonts);
+                            send_frame(&mut output, &mut page);
+                        }
                     }
                 }
             }
@@ -236,19 +252,19 @@ fn main() {
                 // the click is inverse-mapped back into that space
                 // release ends :active; focus moves to the nearest
                 // focusable ancestor of the hit (or clears)
-                let mut state_dirty = false;
                 if page.state.active.is_some() {
                     page.state.active = None;
-                    state_dirty = true;
+                    if page.pseudo_mask & P_ACTIVE != 0 {
+                        page.layout_dirty = true;
+                    }
                 }
                 let focus = page.hit_at(x, y).and_then(|n| page.focus_target(n));
                 if page.state.focused != focus {
-                    page.state.focused = focus;
-                    state_dirty = true;
+                    page.set_focus(focus); // marks layout_dirty itself
                 }
-                if state_dirty && page.has_doc() {
+                if page.layout_dirty && page.has_doc() {
                     page.repaint(&mut fonts);
-                    let _ = send(&mut output, &frame_msg(&page));
+                    send_frame(&mut output, &mut page);
                 }
                 // hit-test link regions in document space
                 let mut found = None;
@@ -342,13 +358,26 @@ fn main() {
                                 Ok(rep) => {
                                     dispatched = true;
                                     page.doc = Some(rep.doc);
+                                    // The fresh DOM may carry new <style>
+                                    // rules — relearn what layout depends
+                                    // on before reusing anything.
+                                    page.layout_dirty = true;
+                                    page.pseudo_mask = page.detect_pseudo_mask();
+                                    page.scroll_pinned = page.detect_scroll_pinned();
+                                    if let Some((n, c)) = page.edit {
+                                        // JS may have rewritten the
+                                        // value — clamp the caret
+                                        let len =
+                                            page.control_value(n).chars().count();
+                                        page.edit = Some((n, c.min(len)));
+                                    }
                                     for l in rep.logs {
                                         let _ = send(&mut output, &ToBrowser::Log(l));
                                     }
                                     page.clear_sel();
                                     page.start_image_prefetch();
                                     page.repaint(&mut fonts);
-                                    let _ = send(&mut output, &frame_msg(&page));
+                                    send_frame(&mut output, &mut page);
                                     let _ = send(&mut output, &ToBrowser::SelText(String::new()));
                                 }
                                 Err(_) => {
@@ -359,9 +388,33 @@ fn main() {
                     }
                     if !dispatched && page.clear_sel() && page.has_doc() {
                         page.repaint_scrolled(&mut fonts);
-                        let _ = send(&mut output, &frame_msg(&page));
+                        send_frame(&mut output, &mut page);
                         let _ = send(&mut output, &ToBrowser::SelText(String::new()));
                     }
+                    // Native form submission: a click on a submit
+                    // control navigates even when no JS handled it.
+                    if let Some(ctl) = target.and_then(|n| page.submitter(n)) {
+                        if let Some(url) =
+                            page.enclosing_form(ctl).and_then(|f| page.submit_url(f))
+                        {
+                            let _ = send(&mut output, &ToBrowser::NavigationRequest(url));
+                        }
+                    }
+                }
+            }
+            ToRenderer::Key { key, text, shift } => {
+                if !page.has_doc() {
+                    continue;
+                }
+                match page.key(&key, &text, shift) {
+                    KeyOut::Navigate(url) => {
+                        let _ = send(&mut output, &ToBrowser::NavigationRequest(url));
+                    }
+                    KeyOut::Repaint => {
+                        page.repaint(&mut fonts);
+                        send_frame(&mut output, &mut page);
+                    }
+                    KeyOut::None => {}
                 }
             }
             ToRenderer::Select { x0, y0, x1, y1 } => {
@@ -391,7 +444,7 @@ fn main() {
                 }
                 page.update_sel(&mut fonts, ax, ay, fx, fy);
                 page.repaint_scrolled(&mut fonts);
-                let _ = send(&mut output, &frame_msg(&page));
+                send_frame(&mut output, &mut page);
                 let _ = send(&mut output, &ToBrowser::SelText(page.sel_text.clone()));
             }
             ToRenderer::Scroll { dy } => {
@@ -410,14 +463,34 @@ fn main() {
                     }
                 }
                 if page.has_doc() {
+                    let old = page.scroll;
                     let new = (page.scroll + total).clamp(0.0, page.max_scroll());
                     if new != page.scroll {
                         page.scroll = new;
                         page.repaint_scrolled(&mut fonts);
+                        let d = new - old;
+                        // Integral scroll on an unpinned page is a pure
+                        // pixel shift — ship just the exposed strip and
+                        // let the chrome move its stored frame. Anything
+                        // else pending (relayout, newly decoded images)
+                        // forces a full frame instead.
+                        let msg = if !page.scroll_pinned
+                            && !page.need_full
+                            && d.fract() == 0.0
+                            && d.abs() < page.viewport.1 as f32
+                            && page.dirty.is_none()
+                        {
+                            Some(page.scroll_delta(d))
+                        } else {
+                            page.dirty_all();
+                            page.take_frame()
+                        };
+                        if let Some(m) = msg {
+                            let _ = send(&mut output, &m);
+                        }
                     }
-                    // Unchanged offset: cached pixels are still valid — just
-                    // resend the last frame instead of re-running the pipeline.
-                    let _ = send(&mut output, &frame_msg(&page));
+                    // Unchanged offset: the chrome's stored frame is
+                    // already correct — send nothing at all.
                 }
             }
             ToRenderer::DomDump => {
@@ -461,6 +534,48 @@ enum JsJob {
 struct JsReply {
     doc: rowser_dom::Document,
     logs: Vec<String>,
+}
+
+/// Outcome of a `ToRenderer::Key` press.
+enum KeyOut {
+    None,
+    Repaint,
+    Navigate(String),
+}
+
+/// `application/x-www-form-urlencoded` byte encoding — alphanumerics
+/// and `*-._` pass through, space is `+`, everything else %XX.
+fn form_urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Selected <option>'s value — `value` attr, else its text. First
+/// option wins when none carry `selected` (the HTML default).
+fn select_value(doc: &rowser_dom::Document, select: rowser_dom::NodeId) -> String {
+    let opts: Vec<rowser_dom::NodeId> = doc
+        .descendants(select)
+        .filter(|&n| doc.tag(n) == Some("option"))
+        .collect();
+    let chosen = opts
+        .iter()
+        .find(|&&n| doc.attr(n, "selected").is_some())
+        .or(opts.first());
+    match chosen {
+        Some(&o) => doc.attr(o, "value").map(String::from).unwrap_or_else(|| {
+            doc.text_content(o).trim().to_string()
+        }),
+        None => String::new(),
+    }
 }
 
 struct Page {
@@ -516,9 +631,35 @@ struct Page {
     /// Interaction state (`:hover`/`:focus`/`:active`/`:target`) — fed
     /// into every layout pass so dynamic pseudo-classes restyle.
     state: rowser_css::PseudoState,
+    /// Focused editable control + caret char index into its `value`.
+    /// Set/cleared alongside `state.focused`; `state.caret` mirrors the
+    /// index at each repaint.
+    edit: Option<(rowser_dom::NodeId, usize)>,
     /// Last cursor keyword reported to the browser — `Cursor` frames are
     /// only sent when the resolved value changes.
     last_cursor: String,
+    /// Viewport-space damage (x, y, w, h device px) accumulated since the
+    /// last frame message — `None` means the painted pixels are unchanged
+    /// and no frame needs sending at all.
+    dirty: Option<Rect>,
+    /// The chrome's stored framebuffer is stale or the wrong size — the
+    /// next frame must be a full `Frame` (set on load and resize).
+    need_full: bool,
+    /// The display list is stale — set by anything layout depends on:
+    /// DOM mutation, stylesheet change, viewport resize, a pseudo-state
+    /// change a loaded rule can match, font load. `repaint` reuses
+    /// `items` while this is clear.
+    layout_dirty: bool,
+    /// The editing caret moved with no layout-affecting change — a
+    /// repaint may relocate the caret FillRect in place instead.
+    caret_moved: bool,
+    /// Bitmask (P_*) of dynamic pseudo-classes the page's sheets could
+    /// match — hover/active/target state changes skip layout entirely
+    /// when their bit is off.
+    pseudo_mask: u8,
+    /// <img> srcs that resolved (decoded or failed) in the last
+    /// `load_images` — their item rects join the damage set.
+    img_new: Vec<String>,
 }
 
 impl Page {
@@ -551,7 +692,14 @@ impl Page {
             sel_text: String::new(),
             sel_tint: None,
             state: rowser_css::PseudoState::default(),
+            edit: None,
             last_cursor: String::new(),
+            dirty: None,
+            need_full: false,
+            layout_dirty: false,
+            caret_moved: false,
+            pseudo_mask: P_FOCUS,
+            img_new: Vec::new(),
         }
     }
 
@@ -571,16 +719,34 @@ impl Page {
         self.sel_text.clear();
         self.sel_tint = None;
         self.state = rowser_css::PseudoState::default();
+        self.edit = None;
         self.last_cursor.clear();
         self.images.clear();
         self.img_failed.clear();
         self.img_waited = false;
+        self.img_new.clear();
+        self.items.clear();
+        self.dirty = None;
+        self.need_full = true;
+        self.layout_dirty = true;
+        self.caret_moved = false;
         self.sheets.clear();
         // Start image fetches immediately — they overlap the (blocking)
         // stylesheet fetch and layout, so first paint rarely waits.
         self.start_image_prefetch();
         self.load_linked_css();
         self.scroll_pinned = self.detect_scroll_pinned();
+        self.pseudo_mask = self.detect_pseudo_mask();
+        // autofocus: first element in doc order carrying the attribute
+        // (if editable) takes focus so it's typable without a click
+        if let Some(doc) = &self.doc {
+            let af = doc
+                .descendants(doc.root)
+                .find(|&n| doc.attr(n, "autofocus").is_some());
+            if let Some(n) = af.filter(|&n| self.editable(n)) {
+                self.set_focus(Some(n));
+            }
+        }
     }
 
     /// Fetch <link rel="stylesheet" href=...> documents into style sheets.
@@ -730,6 +896,7 @@ impl Page {
             width: rw,
             height: rh,
             pixels: rowser_layout::svg::render(&doc, svg, rw, rh, 0xff000000),
+            density: 4.0,
         })
     }
 
@@ -812,22 +979,26 @@ impl Page {
         for src in self.missing_srcs() {
             match resolve_url(&self.url_base, &src) {
                 None => {
-                    self.img_failed.insert(src);
+                    self.img_failed.insert(src.clone());
+                    self.img_new.push(src);
                 }
                 Some(u) => match self.img_by_url.get(&u) {
                     Some(Some(img)) => {
                         // Image isn't Clone — copy its public fields.
                         self.images.insert(
-                            src,
+                            src.clone(),
                             rowser_image::Image {
                                 width: img.width,
                                 height: img.height,
                                 pixels: img.pixels.clone(),
+                                density: img.density,
                             },
                         );
+                        self.img_new.push(src);
                     }
                     Some(None) => {
-                        self.img_failed.insert(src);
+                        self.img_failed.insert(src.clone());
+                        self.img_new.push(src);
                     }
                     None => {
                         if let Some(body) = self.img_bodies.remove(&u) {
@@ -891,6 +1062,7 @@ impl Page {
     /// stragglers up to IMG_FETCH_DEADLINE; later repaints just collect
     /// what finished so scrolling never stalls on the network.
     fn load_images(&mut self, wait: bool) {
+        self.img_new.clear();
         if !wait {
             self.drain_images();
             let outstanding = self.sync_pending_images();
@@ -965,6 +1137,23 @@ impl Page {
         false
     }
 
+    /// Bitmask (P_*) of dynamic pseudo-classes the page's linked and
+    /// inline sheets could match. `P_FOCUS` is always set — the UA
+    /// stylesheet outlines focused controls and the edit caret needs
+    /// layout regardless of author CSS.
+    fn detect_pseudo_mask(&self) -> u8 {
+        let mut mask = P_FOCUS;
+        for sh in &self.sheets {
+            mask |= sheet_mask(sh);
+        }
+        if let Some(doc) = &self.doc {
+            for sh in rowser_css::document_sheets(doc).iter() {
+                mask |= sheet_mask(sh);
+            }
+        }
+        mask
+    }
+
     fn max_scroll(&self) -> f32 {
         (self.content_h - self.viewport.1 as f32).max(0.0)
     }
@@ -1006,6 +1195,276 @@ impl Page {
         None
     }
 
+    /// Move focus to `focus` and (re)arm text editing when it lands on
+    /// an editable control — caret starts at the end of the value.
+    /// Any focus move re-lays out: the edit caret is a layout-drawn rect
+    /// and the UA sheet gives controls a :focus outline.
+    fn set_focus(&mut self, focus: Option<rowser_dom::NodeId>) {
+        self.state.focused = focus;
+        self.edit = focus
+            .filter(|&n| self.editable(n))
+            .map(|n| (n, self.control_value(n).chars().count()));
+        self.layout_dirty = true;
+    }
+
+    /// `node` accepts typed text — text-like <input> types and
+    /// <textarea>. Buttons/hidden/checkable controls are not editable.
+    fn editable(&self, node: rowser_dom::NodeId) -> bool {
+        let Some(doc) = &self.doc else { return false };
+        match doc.tag(node) {
+            Some("textarea") => true,
+            Some("input") => !matches!(
+                doc.attr(node, "type")
+                    .map(|t| t.to_ascii_lowercase()),
+                Some(t)
+                    if matches!(
+                        t.as_str(),
+                        "hidden"
+                            | "submit"
+                            | "button"
+                            | "reset"
+                            | "image"
+                            | "checkbox"
+                            | "radio"
+                            | "range"
+                            | "color"
+                            | "file"
+                    )
+            ),
+            _ => false,
+        }
+    }
+
+    /// An editable control's current text — its `value` attr (layout
+    /// paints `value` for both <input> and <textarea>).
+    fn control_value(&self, node: rowser_dom::NodeId) -> String {
+        self.doc
+            .as_ref()
+            .and_then(|d| d.attr(node, "value"))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Ancestor <form> of `node`, if any.
+    fn enclosing_form(&self, node: rowser_dom::NodeId) -> Option<rowser_dom::NodeId> {
+        let doc = self.doc.as_ref()?;
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if doc.tag(n) == Some("form") {
+                return Some(n);
+            }
+            cur = doc.parent(n);
+        }
+        None
+    }
+
+    /// Focusable elements in document order — the same set `focus_target`
+    /// accepts: links, form controls, `tabindex`ed elements.
+    fn focusables(&self) -> Vec<rowser_dom::NodeId> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        doc.descendants(doc.root)
+            .filter(|&n| {
+                matches!(
+                    doc.tag(n),
+                    Some("a") | Some("button") | Some("input") | Some("select") | Some("textarea")
+                ) || doc.attr(n, "tabindex").is_some()
+            })
+            .collect()
+    }
+
+    /// Tab / Shift+Tab — cycle focus through `focusables`.
+    fn tab_focus(&mut self, back: bool) {
+        let list = self.focusables();
+        if list.is_empty() {
+            self.set_focus(None);
+            return;
+        }
+        let idx = self
+            .state
+            .focused
+            .and_then(|f| list.iter().position(|&n| n == f));
+        let next = match (idx, back) {
+            (Some(i), false) => (i + 1) % list.len(),
+            (Some(i), true) => (i + list.len() - 1) % list.len(),
+            (None, false) => 0,
+            (None, true) => list.len() - 1,
+        };
+        self.set_focus(Some(list[next]));
+    }
+
+    /// `node` activates its form — <button> and <input> submit/image
+    /// types (button defaults to type=submit). Climbs ancestors since
+    /// buttons can nest phrasing content; stops at a <form> boundary.
+    fn submitter(&self, node: rowser_dom::NodeId) -> Option<rowser_dom::NodeId> {
+        let doc = self.doc.as_ref()?;
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            match doc.tag(n) {
+                Some("form") => return None,
+                Some("button") => {
+                    let t = doc.attr(n, "type").unwrap_or("submit").to_ascii_lowercase();
+                    if t == "submit" || t.is_empty() {
+                        return Some(n);
+                    }
+                    return None;
+                }
+                Some("input") => {
+                    let t = doc.attr(n, "type").unwrap_or("text").to_ascii_lowercase();
+                    if t == "submit" || t == "image" {
+                        return Some(n);
+                    }
+                    return None;
+                }
+                _ => cur = doc.parent(n),
+            }
+        }
+        None
+    }
+
+    /// Handle a key press aimed at the focused element. Returns what the
+    /// caller should do about it.
+    fn key(&mut self, key: &str, text: &str, shift: bool) -> KeyOut {
+        if key == "tab" {
+            self.tab_focus(shift);
+            return KeyOut::Repaint;
+        }
+        if let Some((nid, mut cur)) = self.edit {
+            // editing a text control — printable text inserts, editing
+            // keys move/delete, enter submits the enclosing form
+            let mut v: Vec<char> = self.control_value(nid).chars().collect();
+            cur = cur.min(v.len());
+            match key {
+                "enter" => {
+                    if let Some(url) = self
+                        .enclosing_form(nid)
+                        .and_then(|f| self.submit_url(f))
+                    {
+                        return KeyOut::Navigate(url);
+                    }
+                }
+                "escape" => self.set_focus(None),
+                "backspace" => {
+                    if cur > 0 {
+                        v.remove(cur - 1);
+                        cur -= 1;
+                    }
+                }
+                "delete" => {
+                    if cur < v.len() {
+                        v.remove(cur);
+                    }
+                }
+                "left" => cur = cur.saturating_sub(1),
+                "right" => cur = (cur + 1).min(v.len()),
+                "home" => cur = 0,
+                "end" => cur = v.len(),
+                _ => {
+                    if !text.is_empty() {
+                        for c in text.chars() {
+                            v.insert(cur, c);
+                            cur += 1;
+                        }
+                    }
+                }
+            }
+            let s: String = v.iter().collect();
+            let caret0 = self.edit.map(|e| e.1);
+            if s != self.control_value(nid) {
+                if let Some(doc) = &mut self.doc {
+                    doc.set_attr(nid, "value", &s);
+                }
+                // the value's text width changed — real layout geometry
+                self.layout_dirty = true;
+            }
+            let still_editing = self.edit.is_some();
+            self.edit = self.edit.map(|(n, _)| (n, cur));
+            if !self.layout_dirty && still_editing && caret0 != Some(cur) {
+                // caret-only move — repaint tries patching the caret rect
+                self.caret_moved = true;
+            }
+            return if self.layout_dirty || self.caret_moved {
+                KeyOut::Repaint
+            } else {
+                KeyOut::None
+            };
+        }
+        // not editing: enter activates a focused link or submit control
+        if key == "enter" {
+            if let Some(f) = self.state.focused {
+                if let Some(doc) = &self.doc {
+                    if doc.tag(f) == Some("a") {
+                        if let Some(h) = doc.attr(f, "href") {
+                            if let Ok(u) =
+                                rowser_net::Url::parse(&self.cur_url).and_then(|b| b.resolve(h))
+                            {
+                                return KeyOut::Navigate(u.to_string());
+                            }
+                        }
+                    }
+                }
+                if let Some(ctl) = self.submitter(f) {
+                    if let Some(url) =
+                        self.enclosing_form(ctl).and_then(|f| self.submit_url(f))
+                    {
+                        return KeyOut::Navigate(url);
+                    }
+                }
+            }
+        }
+        KeyOut::None
+    }
+
+    /// Build the submission URL for `form`: `action` resolved against
+    /// the page URL with the successful controls serialized as a
+    /// `application/x-www-form-urlencoded` query. POST forms submit as
+    /// GET — the network layer is GET-only for now.
+    fn submit_url(&self, form: rowser_dom::NodeId) -> Option<String> {
+        let doc = self.doc.as_ref()?;
+        let action = doc.attr(form, "action").unwrap_or(&self.cur_url);
+        let base = rowser_net::Url::parse(&self.cur_url).ok()?;
+        let mut url = base.resolve(action).ok()?;
+        let mut data = String::new();
+        for n in doc.descendants(form) {
+            let Some(name) = doc.attr(n, "name") else { continue };
+            if name.is_empty() {
+                continue;
+            }
+            let val = match doc.tag(n) {
+                Some("input") => {
+                    let t = doc.attr(n, "type").unwrap_or("text").to_ascii_lowercase();
+                    match t.as_str() {
+                        "submit" | "button" | "reset" | "file" | "image" => continue,
+                        "checkbox" | "radio" => {
+                            if doc.attr(n, "checked").is_none() {
+                                continue;
+                            }
+                            doc.attr(n, "value").unwrap_or("on").to_string()
+                        }
+                        _ => doc.attr(n, "value").unwrap_or("").to_string(),
+                    }
+                }
+                Some("textarea") => match doc.attr(n, "value") {
+                    Some(v) => v.to_string(),
+                    None => doc.text_content(n),
+                },
+                Some("select") => select_value(doc, n),
+                _ => continue,
+            };
+            if !data.is_empty() {
+                data.push('&');
+            }
+            data.push_str(&form_urlencode(name));
+            data.push('=');
+            data.push_str(&form_urlencode(&val));
+        }
+        url.query = Some(data);
+        url.fragment = None;
+        if doc.attr(form, "method").map(|m| m.eq_ignore_ascii_case("post")) == Some(true) {
+            dlog("form method=post submitted as GET (no POST support yet)");
+        }
+        Some(url.to_string())
+    }
+
     /// CSS `cursor` keyword for `node` under the current pseudo-state.
     fn hover_cursor(&self, node: rowser_dom::NodeId) -> String {
         let Some(doc) = &self.doc else {
@@ -1014,11 +1473,231 @@ impl Page {
         rowser_layout::cursor_for(doc, self.viewport.0 as f32, &self.sheets, node, &self.state)
     }
 
+    /// Union `r` into the pending viewport-space damage.
+    fn dirty_rect(&mut self, r: Rect) {
+        self.dirty = Some(match self.dirty {
+            Some(d) => rect_union(d, r),
+            None => r,
+        });
+    }
+
+    /// Damage the whole viewport — every pixel may differ.
+    fn dirty_all(&mut self) {
+        self.dirty = Some((0.0, 0.0, self.viewport.0 as f32, self.viewport.1 as f32));
+    }
+
+    /// Union the current selection highlight rects into the damage — call
+    /// before mutating `sel` (erase) and after (draw).
+    fn dirty_sel(&mut self) {
+        let mut acc: Option<Rect> = None;
+        for &r in &self.sel {
+            acc = Some(acc.map_or(r, |a| rect_union(a, r)));
+        }
+        if let Some(r) = acc {
+            self.dirty_rect(r);
+        }
+    }
+
+    /// Union the rects of items whose <img> src just resolved — their
+    /// display items didn't change, but their paint did.
+    fn dirty_new_images(&mut self) {
+        if self.img_new.is_empty() {
+            return;
+        }
+        let new = std::mem::take(&mut self.img_new);
+        let mut acc: Option<Rect> = None;
+        for it in &self.items {
+            let (x, y, w, h, src) = match it {
+                rowser_layout::DisplayItem::Image { x, y, w, h, src, .. }
+                | rowser_layout::DisplayItem::BgImage { x, y, w, h, src, .. } => {
+                    (*x, *y, *w, *h, src)
+                }
+                _ => continue,
+            };
+            if new.iter().any(|s| s == src) {
+                let r = (x, y, w, h);
+                acc = Some(acc.map_or(r, |a| rect_union(a, r)));
+            }
+        }
+        if let Some(r) = acc {
+            self.dirty_rect(r);
+        }
+    }
+
+    /// Relocate the editing caret's FillRect in place — same geometry,
+    /// same item count, just a new x — so a caret move costs a paint,
+    /// not a layout. Returns false when the caret can't be identified
+    /// unambiguously; the caller re-lays out instead.
+    fn patch_caret(&mut self, fonts: &mut FontCache) -> bool {
+        let Some((nid, ci)) = self.edit else {
+            return false;
+        };
+        // Painted bounds of the focused control: hit rects live in
+        // pre-transform space — map the corners through like hit-testing
+        // inverse-maps clicks.
+        let mut bbox: Option<Rect> = None;
+        for &(hx, hy, hw, hh, n, m) in &self.hits {
+            if n != nid {
+                continue;
+            }
+            let (mut x0, mut y0, mut x1, mut y1) =
+                (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for (cx, cy) in [(hx, hy), (hx + hw, hy), (hx, hy + hh), (hx + hw, hy + hh)] {
+                let (px, py) = m.apply(cx, cy);
+                x0 = x0.min(px);
+                y0 = y0.min(py);
+                x1 = x1.max(px);
+                y1 = y1.max(py);
+            }
+            let r = (x0, y0, x1 - x0, y1 - y0);
+            bbox = Some(bbox.map_or(r, |b| rect_union(b, r)));
+        }
+        let Some((bx, by, bw, bh)) = bbox else {
+            return false;
+        };
+        // The caret is the only narrow FillRect layout emits inside a text
+        // control — zero or several candidates leave it ambiguous.
+        let mut idx = None;
+        for (i, it) in self.items.iter().enumerate() {
+            let rowser_layout::DisplayItem::FillRect { x, y, w, h, .. } = it else {
+                continue;
+            };
+            if *w < 0.5
+                || *w > 8.0
+                || *x + w < bx
+                || *x > bx + bw
+                || *y + h < by
+                || *y > by + bh
+            {
+                continue;
+            }
+            if idx.is_some() {
+                return false;
+            }
+            idx = Some(i);
+        }
+        let Some(i) = idx else { return false };
+        // The sibling Text carries the control's value — the word path
+        // emits the caret right before it, the clipped control path right
+        // after. Measure the prefix up to the caret index for the new x.
+        let j = [i + 1, i.wrapping_sub(1)]
+            .into_iter()
+            .find(|&j| {
+                matches!(self.items.get(j), Some(rowser_layout::DisplayItem::Text { .. }))
+            });
+        let Some(j) = j else { return false };
+        let Some(rowser_layout::DisplayItem::Text {
+            x,
+            text,
+            font,
+            size,
+            ls,
+            ..
+        }) = self.items.get(j)
+        else {
+            return false;
+        };
+        let (tx, text, font, size, ls) = (*x, text.clone(), *font, *size, *ls);
+        let prefix: String = text.chars().take(ci).collect();
+        let cw = fonts
+            .font(font)
+            .map(|f| f.measure(&prefix, size))
+            .unwrap_or(0.0)
+            + ls * prefix.chars().count() as f32;
+        let new_x = (tx + cw).clamp(bx, bx + bw - 1.0);
+        let rowser_layout::DisplayItem::FillRect { x, y, w, h, .. } = &mut self.items[i]
+        else {
+            return false;
+        };
+        let old_r = (*x, *y, *w, *h);
+        *x = new_x;
+        let new_r = (*x, *y, *w, *h);
+        self.dirty_rect(old_r);
+        self.dirty_rect(new_r);
+        true
+    }
+
+    /// Consume pending damage into the cheapest sufficient frame message
+    /// for the chrome: `Frame` when its stored buffer needs a refresh,
+    /// `FrameRegion` for a sub-rect — `None` when the pixels the chrome
+    /// already holds are correct.
+    fn take_frame(&mut self) -> Option<ToBrowser> {
+        let (vw, vh) = self.viewport;
+        if self.pixels.len() != vw as usize * vh as usize * 4 {
+            // No correctly-sized bitmap to crop from — nothing valid to send.
+            self.dirty = None;
+            return None;
+        }
+        let whole = (0.0, 0.0, vw as f32, vh as f32);
+        if self.need_full || self.dirty == Some(whole) {
+            self.need_full = false;
+            self.dirty = None;
+            return Some(ToBrowser::Frame {
+                width: vw,
+                height: vh,
+                pixels: self.pixels.clone(),
+            });
+        }
+        let (dx, dy, dw, dh) = self.dirty.take()?;
+        // Inflate a few px — glyph ink and shadows can spill past an
+        // item's nominal box.
+        const MARGIN: f32 = 4.0;
+        let x = (dx - MARGIN).floor().max(0.0) as i32;
+        let y = (dy - MARGIN).floor().max(0.0) as i32;
+        let x2 = (dx + dw + MARGIN).ceil().min(vw as f32) as i32;
+        let y2 = (dy + dh + MARGIN).ceil().min(vh as f32) as i32;
+        let (w, h) = (x2 - x, y2 - y);
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let stride = vw as usize * 4;
+        let mut px = Vec::with_capacity(w as usize * h as usize * 4);
+        for row in y..y + h {
+            let s = row as usize * stride + x as usize * 4;
+            px.extend_from_slice(&self.pixels[s..s + w as usize * 4]);
+        }
+        Some(ToBrowser::FrameRegion {
+            x: x as u32,
+            y: y as u32,
+            width: w as u32,
+            height: h as u32,
+            pixels: px,
+        })
+    }
+
+    /// Frame message for an integral scroll of an unpinned page: the
+    /// stored frame shifts by `d` device px and only the newly exposed
+    /// strip ships. Caller guarantees `d.fract() == 0` and `|d| < vh`.
+    fn scroll_delta(&mut self, d: f32) -> ToBrowser {
+        let (vw, vh) = (self.viewport.0 as i32, self.viewport.1 as i32);
+        let d = d as i32;
+        // d > 0 (scrolled down): content moved up, new strip at the bottom.
+        let (y, h) = if d > 0 { (vh - d, d) } else { (0, -d) };
+        let stride = vw as usize * 4;
+        let mut px = Vec::with_capacity(vw as usize * h as usize * 4);
+        for row in y..y + h {
+            let s = row as usize * stride;
+            px.extend_from_slice(&self.pixels[s..s + stride]);
+        }
+        self.dirty = None;
+        ToBrowser::ScrollDelta {
+            dy: d,
+            x: 0,
+            y: y as u32,
+            width: vw as u32,
+            height: h as u32,
+            pixels: px,
+        }
+    }
+
     /// Repaint after a scroll. Pages without fixed/sticky positioning keep
     /// their display list — items just translate by the scroll delta, so a
     /// scroll costs one paint instead of a full re-layout.
     fn repaint_scrolled(&mut self, fonts: &mut FontCache) {
-        if self.scroll_pinned {
+        // Pinned pages anchor to the viewport and a stale display list is
+        // no list at all — both take the full layout path.
+        if self.scroll_pinned || self.layout_dirty {
+            self.layout_dirty = true;
             self.repaint(fonts);
             return;
         }
@@ -1039,8 +1718,9 @@ impl Page {
             self.items_scroll = self.scroll;
         }
         self.load_images(false);
+        self.dirty_new_images();
         let t1 = std::time::Instant::now();
-        self.pixels = rowser_paint::paint(
+        self.pixels = rowser_paint::gpu::paint_auto(
             &self.items,
             fonts,
             self.viewport.0,
@@ -1056,31 +1736,61 @@ impl Page {
         );
     }
 
+    /// Produce fresh pixels honoring the cheapest sufficient path: a full
+    /// re-layout only when `layout_dirty`, an in-place caret patch when
+    /// only the caret moved, otherwise a plain repaint of `items`.
     fn repaint(&mut self, fonts: &mut FontCache) {
-        let Some(doc) = &self.doc else { return };
+        self.state.caret = self.edit.map(|e| e.1);
+        if self.doc.is_none() {
+            return;
+        }
         let t0 = std::time::Instant::now();
-        let (items, height, anchors, hits) = Layouter::layout_vh_st(
-            doc,
-            fonts,
-            self.viewport.0 as f32,
-            self.scroll,
-            self.viewport.1 as f32,
-            &self.sheets,
-            &self.state,
-        );
-        let t_layout = t0.elapsed();
-        self.content_h = height;
-        self.items = items;
-        self.hits = hits;
-        self.items_scroll = self.scroll;
-        self.anchors = anchors;
+        let mut t_layout = std::time::Duration::ZERO;
+        if self.layout_dirty {
+            let old_items = std::mem::take(&mut self.items);
+            let doc = self.doc.as_ref().unwrap();
+            let (items, height, anchors, hits) = Layouter::layout_vh_st(
+                doc,
+                fonts,
+                self.viewport.0 as f32,
+                self.scroll,
+                self.viewport.1 as f32,
+                &self.sheets,
+                &self.state,
+            );
+            t_layout = t0.elapsed();
+            self.content_h = height;
+            // Damage = union of differing items' painted bounds — identical
+            // items repaint identically, so untouched regions stay clean.
+            match diff_damage(&old_items, &items, fonts) {
+                Damage::All => self.dirty_all(),
+                Damage::Region(r) => self.dirty_rect(r),
+                Damage::Clean => {}
+            }
+            self.items = items;
+            self.hits = hits;
+            self.items_scroll = self.scroll;
+            self.anchors = anchors;
+            self.layout_dirty = false;
+            self.caret_moved = false;
+        } else if self.caret_moved {
+            if self.patch_caret(fonts) {
+                self.caret_moved = false;
+            } else {
+                // Ambiguous caret — re-lay out after all.
+                self.layout_dirty = true;
+                self.repaint(fonts);
+                return;
+            }
+        }
         let wait = !self.img_waited;
         self.img_waited = true;
         let t1 = std::time::Instant::now();
         self.load_images(wait);
+        self.dirty_new_images();
         let t_img = t1.elapsed();
         let t2 = std::time::Instant::now();
-        self.pixels = rowser_paint::paint(
+        self.pixels = rowser_paint::gpu::paint_auto(
             &self.items,
             fonts,
             self.viewport.0,
@@ -1100,15 +1810,20 @@ impl Page {
     /// Recompute `sel`/`sel_text` for a drag from (x0,y0) to (x1,y1) —
     /// viewport-space device px, same coordinates `Click` uses.
     fn update_sel(&mut self, fonts: &mut FontCache, x0: f32, y0: f32, x1: f32, y1: f32) {
+        self.dirty_sel();
         let (rects, text) = compute_selection(&self.items, fonts, x0, y0, x1, y1);
         self.sel = rects;
         self.sel_text = text;
+        self.dirty_sel();
     }
 
     /// Drop the selection. Returns whether one existed (caller must
     /// repaint to erase the baked-in highlight).
     fn clear_sel(&mut self) -> bool {
         let had = !self.sel.is_empty() || !self.sel_text.is_empty();
+        if had {
+            self.dirty_sel();
+        }
         self.sel.clear();
         self.sel_text.clear();
         had
@@ -1396,11 +2111,455 @@ fn shift_item_y(it: &mut rowser_layout::DisplayItem, dy: f32) {
     }
 }
 
-fn frame_msg(page: &Page) -> ToBrowser {
-    ToBrowser::Frame {
-        width: page.viewport.0,
-        height: page.viewport.1,
-        pixels: page.pixels.clone(),
+/// A device-pixel rect in viewport space: (x, y, w, h).
+type Rect = (f32, f32, f32, f32);
+
+fn rect_union(a: Rect, b: Rect) -> Rect {
+    let x0 = a.0.min(b.0);
+    let y0 = a.1.min(b.1);
+    let x1 = (a.0 + a.2).max(b.0 + b.2);
+    let y1 = (a.1 + a.3).max(b.1 + b.3);
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// Dynamic-pseudo bits for `Page::pseudo_mask` — which state changes a
+/// page's sheets could restyle. `P_FOCUS` also covers the UA sheet's
+/// `input:focus,textarea:focus,select:focus` outline, so it is set even
+/// when no author rule matches.
+const P_HOVER: u8 = 1;
+const P_FOCUS: u8 = 2;
+const P_ACTIVE: u8 = 4;
+const P_TARGET: u8 = 8;
+
+/// Pseudo-classes one `Simple` selector term can match, recursing into
+/// `:is`/`:where`/`:not`/`:has` argument lists.
+fn simple_mask(s: &rowser_css::Simple) -> u8 {
+    use rowser_css::Simple as S;
+    match s {
+        S::Hover => P_HOVER,
+        S::Focus | S::FocusWithin | S::FocusVisible => P_FOCUS,
+        S::Active => P_ACTIVE,
+        S::Target => P_TARGET,
+        S::Is(list) | S::Where(list) | S::Not(list) | S::Has(list) => list
+            .iter()
+            .fold(0, |m, sel| m | selector_mask(sel)),
+        _ => 0,
+    }
+}
+
+fn selector_mask(sel: &rowser_css::Selector) -> u8 {
+    sel.parts
+        .iter()
+        .flat_map(|(_, simples)| simples.iter())
+        .fold(0, |m, s| m | simple_mask(s))
+}
+
+/// Union of pseudo masks across a sheet's rules' selectors.
+fn sheet_mask(sheet: &rowser_css::StyleSheet) -> u8 {
+    sheet
+        .rules
+        .iter()
+        .flat_map(|r| r.selectors.iter())
+        .fold(0, |m, s| m | selector_mask(s))
+}
+
+/// Outcome of a display-list diff for damage purposes.
+enum Damage {
+    /// Lists are provably identical — the repaint can't differ.
+    Clean,
+    /// Diffs bounded by this rect.
+    Region(Rect),
+    /// Structural difference (item count, or a transform/effect whose
+    /// footprint spans other items) — damage the whole viewport.
+    All,
+}
+
+/// Painted-region diff of two display lists. Identical items paint
+/// identically, so only the bounds of pairwise-differing items join the
+/// damage — anything unbounded falls back to `All`.
+fn diff_damage(
+    old: &[rowser_layout::DisplayItem],
+    new: &[rowser_layout::DisplayItem],
+    fonts: &mut FontCache,
+) -> Damage {
+    if old.len() != new.len() {
+        return Damage::All;
+    }
+    let mut acc: Option<Rect> = None;
+    for (a, b) in old.iter().zip(new) {
+        if items_eq(a, b) {
+            continue;
+        }
+        match (item_bounds(a, fonts), item_bounds(b, fonts)) {
+            (Some(ra), Some(rb)) => {
+                let r = rect_union(ra, rb);
+                acc = Some(acc.map_or(r, |acc| rect_union(acc, r)));
+            }
+            _ => return Damage::All,
+        }
+    }
+    match acc {
+        Some(r) => Damage::Region(r),
+        None => Damage::Clean,
+    }
+}
+
+/// Fieldwise display-item equality for damage diffing — a pair we can't
+/// prove identical counts as different (more damage, never less).
+fn items_eq(a: &rowser_layout::DisplayItem, b: &rowser_layout::DisplayItem) -> bool {
+    use rowser_layout::DisplayItem as D;
+    match (a, b) {
+        (
+            D::Text {
+                x: ax,
+                baseline: ab,
+                text: at,
+                font: af,
+                size: a_s,
+                color: ac,
+                deco: ad,
+                sel: a_sel,
+                ls: al,
+                href: a_h,
+            },
+            D::Text {
+                x: bx,
+                baseline: bb,
+                text: bt,
+                font: bf,
+                size: b_s,
+                color: bc,
+                deco: bd,
+                sel: b_sel,
+                ls: bl,
+                href: b_h,
+            },
+        ) => {
+            ax == bx
+                && ab == bb
+                && at == bt
+                && af == bf
+                && a_s == b_s
+                && ac == bc
+                && a_sel == b_sel
+                && al == bl
+                && a_h == b_h
+                && ad.lines == bd.lines
+                && ad.style == bd.style
+                && ad.color == bd.color
+                && ad.thick == bd.thick
+                && ad.offset == bd.offset
+        }
+        (
+            D::FillRect {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                color: ac,
+            },
+            D::FillRect {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                color: bc,
+            },
+        ) => ax == bx && ay == by && aw == bw && ah == bh && ac == bc,
+        (
+            D::RoundedRect {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                radius: ar,
+                color: ac,
+            },
+            D::RoundedRect {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                radius: br,
+                color: bc,
+            },
+        ) => ax == bx && ay == by && aw == bw && ah == bh && ar == br && ac == bc,
+        (
+            D::RoundedRect2 {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                radii: ar,
+                color: ac,
+            },
+            D::RoundedRect2 {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                radii: br,
+                color: bc,
+            },
+        ) => ax == bx && ay == by && aw == bw && ah == bh && ar == br && ac == bc,
+        (
+            D::BorderSide {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                side: a_s,
+                style: a_st,
+                color: ac,
+            },
+            D::BorderSide {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                side: b_s,
+                style: b_st,
+                color: bc,
+            },
+        ) => {
+            ax == bx && ay == by && aw == bw && ah == bh && a_s == b_s && a_st == b_st && ac == bc
+        }
+        (
+            D::Shadow {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                dx: adx,
+                dy: ady,
+                blur: ab,
+                spread: a_s,
+                radii: ar,
+                color: ac,
+                inset: ai,
+            },
+            D::Shadow {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                dx: bdx,
+                dy: bdy,
+                blur: bb,
+                spread: b_s,
+                radii: br,
+                color: bc,
+                inset: bi,
+            },
+        ) => {
+            ax == bx
+                && ay == by
+                && aw == bw
+                && ah == bh
+                && adx == bdx
+                && ady == bdy
+                && ab == bb
+                && a_s == b_s
+                && ar == br
+                && ac == bc
+                && ai == bi
+        }
+        (
+            D::Raster {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                pixels: ap,
+            },
+            D::Raster {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                pixels: bp,
+            },
+        ) => ax == bx && ay == by && aw == bw && ah == bh && ap == bp,
+        (
+            D::Image {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                src: a_s,
+                near: an,
+            },
+            D::Image {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                src: b_s,
+                near: bn,
+            },
+        ) => ax == bx && ay == by && aw == bw && ah == bh && a_s == b_s && an == bn,
+        (
+            D::BgImage {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                px: apx,
+                py: apy,
+                pw: apw,
+                ph: aph,
+                mode: am,
+                sw: asw,
+                sh: ash,
+                fx: afx,
+                ax: aax,
+                fy: afy,
+                ay: aay,
+                rx: arx,
+                ry: ary,
+                src: a_s,
+                near: an,
+            },
+            D::BgImage {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                px: bpx,
+                py: bpy,
+                pw: bpw,
+                ph: bph,
+                mode: bm,
+                sw: bsw,
+                sh: bsh,
+                fx: bfx,
+                ax: bax,
+                fy: bfy,
+                ay: bay,
+                rx: brx,
+                ry: bry,
+                src: b_s,
+                near: bn,
+            },
+        ) => {
+            ax == bx
+                && ay == by
+                && aw == bw
+                && ah == bh
+                && apx == bpx
+                && apy == bpy
+                && apw == bpw
+                && aph == bph
+                && am == bm
+                && asw == bsw
+                && ash == bsh
+                && afx == bfx
+                && aax == bax
+                && afy == bfy
+                && aay == bay
+                && arx == brx
+                && ary == bry
+                && a_s == b_s
+                && an == bn
+        }
+        (
+            D::PushClip {
+                x: ax,
+                y: ay,
+                w: aw,
+                h: ah,
+                radii: ar,
+            },
+            D::PushClip {
+                x: bx,
+                y: by,
+                w: bw,
+                h: bh,
+                radii: br,
+            },
+        ) => ax == bx && ay == by && aw == bw && ah == bh && ar == br,
+        (D::PushTransform { m: am }, D::PushTransform { m: bm }) => am == bm,
+        (D::PopClip, D::PopClip) | (D::PopEffect, D::PopEffect) | (D::PopTransform, D::PopTransform) => {
+            true
+        }
+        (D::PushEffect(ae), D::PushEffect(be)) => format!("{ae:?}") == format!("{be:?}"),
+        _ => false,
+    }
+}
+
+/// Painted bounds of a display item (viewport space). `None` for
+/// structural items — effects/transforms/clips influence other items'
+/// footprints, so a diff there damages the whole viewport.
+fn item_bounds(it: &rowser_layout::DisplayItem, fonts: &mut FontCache) -> Option<Rect> {
+    use rowser_layout::DisplayItem as D;
+    match it {
+        D::FillRect { x, y, w, h, .. }
+        | D::RoundedRect { x, y, w, h, .. }
+        | D::RoundedRect2 { x, y, w, h, .. }
+        | D::BorderSide { x, y, w, h, .. }
+        | D::Raster { x, y, w, h, .. }
+        | D::Image { x, y, w, h, .. }
+        | D::PushClip { x, y, w, h, .. }
+        | D::BgImage { x, y, w, h, .. } => Some((*x, *y, *w, *h)),
+        D::Shadow {
+            x,
+            y,
+            w,
+            h,
+            dx,
+            dy,
+            blur,
+            spread,
+            ..
+        } => {
+            let m = blur * 3.0 + spread.abs();
+            let x0 = x.min(*x + *dx) - m;
+            let y0 = y.min(*y + *dy) - m;
+            let x1 = (*x + *w).max(*x + *dx + *w) + m;
+            let y1 = (*y + *h).max(*y + *dy + *h) + m;
+            Some((x0, y0, x1 - x0, y1 - y0))
+        }
+        D::Text {
+            x,
+            baseline,
+            text,
+            font,
+            size,
+            ls,
+            ..
+        } => {
+            let (top, bot, w) = match fonts.font(*font) {
+                Some(f) => {
+                    let ascent = f.ascent(*size);
+                    (
+                        *baseline - ascent,
+                        *baseline - ascent + f.line_height(*size),
+                        f.measure(text, *size) + ls * text.chars().count() as f32,
+                    )
+                }
+                None => (
+                    *baseline - *size,
+                    *baseline + *size * 0.4,
+                    text.chars().count() as f32 * size * 0.6,
+                ),
+            };
+            // a half-em of overhang covers ink escaping the advance box
+            Some((*x, top, w + size * 0.5, bot - top))
+        }
+        D::PushEffect(_)
+        | D::PopEffect
+        | D::PopClip
+        | D::PushTransform { .. }
+        | D::PopTransform => None,
+    }
+}
+
+/// Send a frame if damage is pending — a full `Frame` when the chrome's
+/// buffer needs it, a `FrameRegion` for a sub-rect, nothing at all when
+/// the painted pixels are unchanged.
+fn send_frame(w: &mut impl Write, page: &mut Page) {
+    if let Some(m) = page.take_frame() {
+        let _ = send(w, &m);
     }
 }
 
@@ -1453,7 +2612,7 @@ fn load_url(url: &str) -> (String, String) {
     if url.starts_with("http://") || url.starts_with("https://") {
         return match web_fetch(url) {
             Ok(res) => (
-                String::from_utf8_lossy(&res.body).into_owned(),
+                rowser_html::decode(&res.body, res.charset().as_deref()),
                 res.url.to_string(),
             ),
             Err(e) => (
@@ -1846,59 +3005,214 @@ fn resolve_url(base: &str, resource: &str) -> Option<String> {
     Some(resolved.to_string())
 }
 
-/// http/https fetch with cross-scheme redirect handling.
+/// One cookie store per renderer process (per tab) — seeded with
+/// `SOCS=CAI` on .google.com to skip the EU consent interstitial. The
+/// lock is only held for header lookup / Set-Cookie capture inside
+/// `fetch_loop`, never across socket IO, so the subresource pool stays
+/// parallel.
+fn jar() -> &'static std::sync::Mutex<rowser_net::CookieJar> {
+    static J: std::sync::OnceLock<std::sync::Mutex<rowser_net::CookieJar>> =
+        std::sync::OnceLock::new();
+    J.get_or_init(|| std::sync::Mutex::new(rowser_net::Session::with_google_consent().jar))
+}
+
+/// http/https fetch with redirects, cookies, keep-alive connection
+/// reuse and TLS session resumption. Each calling thread owns a Session
+/// — a connection pool is `!Sync`, so per-thread pools keep the
+/// subresource fetch pool parallel — while all threads share `jar()`.
 fn web_fetch(url: &str) -> io::Result<rowser_net::Response> {
-    use std::net::TcpStream;
-    let mut parsed =
-        rowser_net::Url::parse(url).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    for _ in 0..10 {
-        let resp = match parsed.scheme.as_str() {
-            "http" => {
-                let mut tcp = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
-                tcp.set_read_timeout(Some(FETCH_IO_TIMEOUT))?;
-                tcp.set_write_timeout(Some(FETCH_IO_TIMEOUT))?;
-                rowser_net::request_over(&mut tcp, &parsed)?
-            }
-            "https" => {
-                let tcp = TcpStream::connect((parsed.host.as_str(), parsed.port))?;
-                // SO_RCVTIMEO/SO_SNDTIMEO live on the socket — they stay in
-                // effect once `tcp` is moved into the TlsStream.
-                tcp.set_read_timeout(Some(FETCH_IO_TIMEOUT))?;
-                tcp.set_write_timeout(Some(FETCH_IO_TIMEOUT))?;
-                let mut tls = rowser_tls::TlsStream::connect(&parsed.host, parsed.port, tcp)?;
-                if let Err(e) = tls.verify_certificate() {
-                    return Ok(rowser_net::Response {
-                        url: parsed.to_string(),
-                        status: 0,
-                        headers: vec![],
-                        body: format!(
-                            "<html><body><h1>Certificate error</h1><p>{e}</p></body></html>"
-                        )
-                        .into_bytes(),
-                    });
-                }
-                rowser_net::request_over(&mut tls, &parsed)?
-            }
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("scheme {other}"),
-                ))
-            }
-        };
-        let is_redir = matches!(resp.status, 301 | 302 | 303 | 307 | 308);
-        if !is_redir {
-            return Ok(resp);
-        }
-        let loc = resp
-            .header("location")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no Location"))?;
-        parsed = parsed
-            .resolve(loc.trim())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    thread_local! {
+        static SESS: std::cell::RefCell<rowser_net::Session> =
+            std::cell::RefCell::new(rowser_net::Session::new());
     }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "too many redirects",
-    ))
+    SESS.with(|s| s.borrow_mut().fetch_with(url, jar()))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page_with(html: &str, url: &str) -> Page {
+        let mut p = Page::new();
+        p.doc = Some(rowser_html::parse(html));
+        p.cur_url = url.to_string();
+        p
+    }
+
+    fn first_form(p: &Page) -> rowser_dom::NodeId {
+        let doc = p.doc.as_ref().unwrap();
+        doc.descendants(doc.root)
+            .find(|&n| doc.tag(n) == Some("form"))
+            .unwrap()
+    }
+
+    #[test]
+    fn form_urlencode_spec() {
+        assert_eq!(form_urlencode("hello world"), "hello+world");
+        assert_eq!(form_urlencode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(form_urlencode("über"), "%C3%BCber");
+    }
+
+    #[test]
+    fn submit_get_collects_named_controls() {
+        let mut p = page_with(
+            r#"<form action="/html/" method="post">
+                 <input type="text" name="q" value="rust lang">
+                 <input type="hidden" name="kl" value="us-en">
+                 <input type="submit" name="ignored" value="x">
+                 <input name="unnamed-checked" type="checkbox" checked>
+                 <input type="radio" name="r" value="a">
+                 <input type="radio" name="r" value="b" checked>
+               </form>"#,
+            "https://duckduckgo.com/",
+        );
+        let f = first_form(&p);
+        assert_eq!(
+            p.submit_url(f).as_deref(),
+            Some("https://duckduckgo.com/html/?q=rust+lang&kl=us-en&unnamed-checked=on&r=b")
+        );
+    }
+
+    #[test]
+    fn submit_default_action_is_current_url() {
+        let p = page_with(
+            r#"<form><input name="q" value="x"></form>"#,
+            "https://example.com/search?old=1#f",
+        );
+        let f = first_form(&p);
+        // action missing → current URL, old query replaced, fragment dropped
+        assert_eq!(
+            p.submit_url(f).as_deref(),
+            Some("https://example.com/search?q=x")
+        );
+    }
+
+    #[test]
+    fn typing_edits_focused_input() {
+        let mut p = page_with(
+            r#"<form action="/s"><input name="q"></form>"#,
+            "https://e.com/",
+        );
+        let doc = p.doc.as_ref().unwrap();
+        let inp = doc
+            .descendants(doc.root)
+            .find(|&n| doc.tag(n) == Some("input"))
+            .unwrap();
+        p.set_focus(Some(inp));
+        assert_eq!(p.edit, Some((inp, 0)));
+        for c in ["h", "i"] {
+            p.key(c, c, false);
+        }
+        assert_eq!(p.control_value(inp), "hi");
+        p.key("backspace", "", false);
+        assert_eq!(p.control_value(inp), "h");
+        assert_eq!(p.edit, Some((inp, 1)));
+        // Enter submits with the typed value
+        match p.key("enter", "", false) {
+            KeyOut::Navigate(u) => assert_eq!(u, "https://e.com/s?q=h"),
+            _ => panic!("expected navigation"),
+        }
+    }
+
+    #[test]
+    fn caret_moves_inside_value() {
+        let mut p = page_with(r#"<input name="q" value="abc">"#, "https://e.com/");
+        let doc = p.doc.as_ref().unwrap();
+        let inp = doc
+            .descendants(doc.root)
+            .find(|&n| doc.tag(n) == Some("input"))
+            .unwrap();
+        p.set_focus(Some(inp));
+        assert_eq!(p.edit, Some((inp, 3)));
+        p.key("left", "", false);
+        p.key("a", "X", false);
+        assert_eq!(p.control_value(inp), "abXc");
+        assert_eq!(p.edit, Some((inp, 3)));
+    }
+
+    #[test]
+    fn hidden_and_submit_inputs_not_editable() {
+        let p = page_with(
+            r#"<input type="hidden"><input type="submit"><input type="text"><textarea></textarea>"#,
+            "https://e.com/",
+        );
+        let doc = p.doc.as_ref().unwrap();
+        let ns: Vec<_> = doc
+            .descendants(doc.root)
+            .filter(|&n| matches!(doc.tag(n), Some("input") | Some("textarea")))
+            .collect();
+        assert!(!p.editable(ns[0])); // hidden
+        assert!(!p.editable(ns[1])); // submit
+        assert!(p.editable(ns[2])); // text
+        assert!(p.editable(ns[3])); // textarea
+    }
+
+    #[test]
+    fn submitter_detects_buttons() {
+        let p = page_with(
+            r#"<form><button type="submit"><b>go</b></button>
+                 <input type="submit">
+                 <button type="button"></button></form>"#,
+            "https://e.com/",
+        );
+        let doc = p.doc.as_ref().unwrap();
+        let b_inner = doc
+            .descendants(doc.root)
+            .find(|&n| doc.tag(n) == Some("b"))
+            .unwrap();
+        assert!(p.submitter(b_inner).is_some()); // climbs <b> → <button>
+        let inp_submit = doc
+            .descendants(doc.root)
+            .find(|&n| doc.tag(n) == Some("input"))
+            .unwrap();
+        assert!(p.submitter(inp_submit).is_some());
+        let btn_button = doc
+            .descendants(doc.root)
+            .filter(|&n| doc.tag(n) == Some("button"))
+            .nth(1)
+            .unwrap();
+        assert!(p.submitter(btn_button).is_none()); // type=button
+    }
+
+    fn rect(x: f32, y: f32) -> rowser_layout::DisplayItem {
+        rowser_layout::DisplayItem::FillRect {
+            x,
+            y,
+            w: 10.0,
+            h: 10.0,
+            color: 0,
+        }
+    }
+
+    #[test]
+    fn diff_damage_tracks_changes() {
+        let mut fonts = FontCache::new();
+        let a = vec![rect(0.0, 0.0), rect(20.0, 0.0)];
+        // identical lists paint identically — no damage
+        assert!(matches!(
+            diff_damage(&a, &a.clone(), &mut fonts),
+            Damage::Clean
+        ));
+        // one moved item damages the union of old + new bounds
+        let b = vec![rect(0.0, 0.0), rect(25.0, 5.0)];
+        match diff_damage(&a, &b, &mut fonts) {
+            Damage::Region((x, y, w, h)) => {
+                assert_eq!((x, y, w, h), (20.0, 0.0, 15.0, 15.0));
+            }
+            _ => panic!("expected bounded region"),
+        }
+        // a changed item count is a structural change — whole viewport
+        assert!(matches!(diff_damage(&a, &a[..1], &mut fonts), Damage::All));
+    }
+
+    #[test]
+    fn pseudo_mask_scans_rules() {
+        let none = rowser_css::parse("a { color: red } li:nth-child(2) { b: c }");
+        assert_eq!(sheet_mask(&none), 0);
+        let sh = rowser_css::parse(
+            "a:hover{color:red} .x:focus-within{b:c} ul:not(:active){d:e} #t:target{f:g}",
+        );
+        assert_eq!(sheet_mask(&sh), P_HOVER | P_FOCUS | P_ACTIVE | P_TARGET);
+    }
 }

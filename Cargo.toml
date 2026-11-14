@@ -28,3 +28,8 @@ rowser-tls.opt-level = 3
 rowser-dom.opt-level = 3
 rowser-ipc.opt-level = 3
 rowser-renderer.opt-level = 3
+
+[profile.release]
+debug = true
+debug-assertions = false
+overflow-checks = false
