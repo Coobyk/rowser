@@ -479,7 +479,9 @@ fn install_protos(i: &mut Interp) {
         let p = i.p.string.clone();
         method(i, &p, "charAt", str_char_at);
         method(i, &p, "charCodeAt", str_char_code_at);
-        method(i, &p, "codePointAt", str_char_code_at);
+        method(i, &p, "codePointAt", str_code_point_at);
+        method(i, &p, "isWellFormed", str_is_well_formed);
+        method(i, &p, "toWellFormed", str_to_well_formed);
         method(i, &p, "at", str_at);
         method(i, &p, "indexOf", str_index_of);
         method(i, &p, "lastIndexOf", str_last_index_of);
@@ -2999,6 +3001,41 @@ fn str_char_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     })
 }
 
+/// spec codePointAt: UTF-16 indexed, surrogate pairs combine
+fn str_code_point_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let s = unbox_str(i, this)?;
+    let idx = i.to_num(&arg(args, 0)).unwrap_or(0.0);
+    if idx < 0.0 {
+        return Ok(Value::Und);
+    }
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let k = idx as usize;
+    let Some(&first) = units.get(k) else {
+        return Ok(Value::Und);
+    };
+    if (0xD800..=0xDBFF).contains(&first) {
+        if let Some(&second) = units.get(k + 1) {
+            if (0xDC00..=0xDFFF).contains(&second) {
+                let cp = 0x10000
+                    + ((first as u32 - 0xD800) << 10)
+                    + (second as u32 - 0xDC00);
+                return Ok(Value::Num(cp as f64));
+            }
+        }
+    }
+    Ok(Value::Num(first as f64))
+}
+
+fn str_is_well_formed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let _ = unbox_str(i, this)?;
+    // UTF-8 strings can't represent lone surrogates — always well-formed
+    Ok(Value::Bool(true))
+}
+
+fn str_to_well_formed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    Ok(Value::Str(unbox_str(i, this)?))
+}
+
 fn str_char_code_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let idx = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
@@ -3112,19 +3149,39 @@ fn str_to_upper(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     Ok(str_or_rc(s, &t))
 }
 
+/// spec WhiteSpace + LineTerminator set — NOT Rust is_whitespace
+/// (U+0085 NEL is ws in Unicode but not in JS)
+fn is_js_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}' | '\u{a}' | '\u{b}' | '\u{c}' | '\u{d}' | '\u{20}' | '\u{a0}'
+            | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}'
+            | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+    )
+}
+
 fn str_trim(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    Ok(str_or_rc(s.clone(), s.trim()))
+    Ok(str_or_rc(
+        s.clone(),
+        s.trim_matches(is_js_space),
+    ))
 }
 
 fn str_trim_start(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    Ok(str_or_rc(s.clone(), s.trim_start()))
+    Ok(str_or_rc(
+        s.clone(),
+        s.trim_start_matches(is_js_space),
+    ))
 }
 
 fn str_trim_end(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    Ok(str_or_rc(s.clone(), s.trim_end()))
+    Ok(str_or_rc(
+        s.clone(),
+        s.trim_end_matches(is_js_space),
+    ))
 }
 
 fn str_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -3216,15 +3273,41 @@ fn str_replace_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         }
     }
     let needle = i.to_str(&a0)?;
-    if needle.is_empty() {
-        return Ok(Value::Str(s));
-    }
     let repl_fn = arg(args, 1);
-    if i.is_callable(&repl_fn) {
-        let mut out = String::new();
-        let mut pos = 0;
-        for (b, _) in s.match_indices(&needle) {
+    let mut out = String::new();
+    let mut pos = 0usize;
+    if needle.is_empty() {
+        // spec: empty search inserts replacement at every char boundary
+        let callable = i.is_callable(&repl_fn);
+        let rep_str = if !callable {
+            i.to_str(&repl_fn)?.to_string()
+        } else {
+            String::new()
+        };
+        for (b, _) in s.char_indices().chain(std::iter::once((s.len(), '\0'))) {
             out.push_str(&s[pos..b]);
+            if callable {
+                let r = i.call(
+                    &repl_fn,
+                    Value::Und,
+                    vec![
+                        Value::Str(Rc::from("")),
+                        Value::Num(s[..b].chars().count() as f64),
+                        Value::Str(s.clone()),
+                    ],
+                )?;
+                out.push_str(&i.to_str(&r)?);
+            } else {
+                out.push_str(&expand_replacement(&rep_str, "", b, &s));
+            }
+            pos = b;
+        }
+        out.push_str(&s[pos..]);
+        return Ok(Value::Str(Rc::from(out.as_str())));
+    }
+    for (b, _) in s.match_indices(&needle) {
+        out.push_str(&s[pos..b]);
+        if i.is_callable(&repl_fn) {
             let r = i.call(
                 &repl_fn,
                 Value::Und,
@@ -3235,16 +3318,14 @@ fn str_replace_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 ],
             )?;
             out.push_str(&i.to_str(&r)?);
-            pos = b + needle.len();
+        } else {
+            let rep = i.to_str(&repl_fn)?;
+            out.push_str(&expand_replacement(&rep, &needle, b, &s));
         }
-        out.push_str(&s[pos..]);
-        return Ok(Value::Str(Rc::from(out.as_str())));
+        pos = b + needle.len();
     }
-    let rep = i.to_str(&repl_fn)?;
-    Ok(Value::Str(Rc::from(
-        s.replace(&needle as &str, &expand_replacement(&rep, &needle, 0, &s))
-            .as_str(),
-    )))
+    out.push_str(&s[pos..]);
+    Ok(Value::Str(Rc::from(out.as_str())))
 }
 
 fn str_match(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -3381,8 +3462,21 @@ fn str_pad_end(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(Value::Str(Rc::from(format!("{s}{p}").as_str())))
 }
 
+/// spec: search-string args must not be RegExp objects
+fn reject_regex_arg(i: &mut Interp, a: &Value, meth: &str) -> Result<(), Value> {
+    if let Value::Obj(o) = a {
+        if matches!(o.borrow().kind, ObjKind::Regex(_)) {
+            return Err(i.type_err(format!(
+                "First argument to String.prototype.{meth} must not be a regular expression"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn str_starts_with(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
+    reject_regex_arg(i, &arg(args, 0), "startsWith")?;
     let needle = i.to_str(&arg(args, 0))?;
     let pos = i.to_num(&arg(args, 1)).unwrap_or(0.0).max(0.0) as usize;
     let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
@@ -3391,14 +3485,29 @@ fn str_starts_with(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn str_ends_with(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
+    reject_regex_arg(i, &arg(args, 0), "endsWith")?;
     let needle = i.to_str(&arg(args, 0))?;
-    Ok(Value::Bool(s.ends_with(&needle)))
+    // spec: position is the END index (default = string length)
+    let chars = s.chars().count();
+    let pos = match arg(args, 1) {
+        Value::Und => chars,
+        v => (i.to_num(&v)?.max(0.0) as usize).min(chars),
+    };
+    let byte = s
+        .char_indices()
+        .nth(pos)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len());
+    Ok(Value::Bool(s[..byte].ends_with(&needle)))
 }
 
 fn str_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
+    reject_regex_arg(i, &arg(args, 0), "includes")?;
     let needle = i.to_str(&arg(args, 0))?;
-    Ok(Value::Bool(s.contains(&needle)))
+    let pos = i.to_num(&arg(args, 1)).unwrap_or(0.0).max(0.0) as usize;
+    let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
+    Ok(Value::Bool(s[byte..].contains(&needle)))
 }
 
 fn str_repeat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
