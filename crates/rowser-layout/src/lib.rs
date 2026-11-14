@@ -4482,6 +4482,18 @@ impl<'a> Layouter<'a> {
                 }
             }
             self.inset_h = inset_h;
+            // overflow other than visible/clip creates a block formatting
+            // context: outside floats can't wrap this box's inline
+            // content, and floats inside stay contained (DDG's
+            // .zci{overflow:auto} beside the floated search form).
+            let overflow_bfc = ["overflow", "overflow-x", "overflow-y"]
+                .into_iter()
+                .filter_map(|k| c.get(k))
+                .any(|v| !matches!(v.as_str(), "visible" | "clip"));
+            let saved_floats = overflow_bfc.then(|| {
+                self.floats_gen += 1;
+                std::mem::take(&mut self.floats)
+            });
             let floats_at_entry = self.floats.len();
             // sticky children clamp against this box's content bottom —
             // explicit heights apply after layout, so project the target now
@@ -4522,10 +4534,14 @@ impl<'a> Layouter<'a> {
             // display:flow-root establishes a block formatting context:
             // floats inside it extend its own height (margin-collapsing is
             // a no-op engine-wide, so nothing else to suppress)
-            if c.get("display").map(String::as_str) == Some("flow-root") {
+            if overflow_bfc || c.get("display").map(String::as_str) == Some("flow-root") {
                 for f in self.floats.iter().skip(floats_at_entry) {
                     self.y = self.y.max(f.bottom);
                 }
+            }
+            if let Some(f) = saved_floats {
+                self.floats = f;
+                self.floats_gen += 1;
             }
             self.cb_h = saved_cb_h;
             self.inset_h = saved_inset;
@@ -8311,8 +8327,13 @@ impl<'a> Layouter<'a> {
         st: &Style,
     ) -> (String, bool) {
         let _ = st;
+        let buttonish = tag == "input"
+            && matches!(itype, "submit" | "button" | "reset" | "image");
         match self.doc.attr(node, "value") {
-            Some(v) if !v.is_empty() => (v.to_string(), false),
+            // value="" means an empty caption for buttons — only an
+            // ABSENT attribute falls back to the default label. Text
+            // controls still fall through to their placeholder.
+            Some(v) if !v.is_empty() || buttonish => (v.to_string(), false),
             _ => {
                 if let Some(p) = self.doc.attr(node, "placeholder") {
                     return (p.to_string(), true);
@@ -11428,6 +11449,32 @@ mod tests {
             deep_x < 20.0,
             "line below the float returns to the left edge"
         );
+    }
+
+    #[test]
+    fn overflow_bfc_isolates_external_float() {
+        // overflow:auto establishes a BFC — its inline content must not
+        // wrap around an earlier page-level float (DDG .zci next to the
+        // floated search form): the heading starts at the box's own left.
+        let (items, _, _) = lay("<style>.fl{float:left;width:500px;height:80px}\
+             .zci{overflow:auto}</style>\
+             <div class=fl></div><div class=zci><h1>head</h1></div>");
+        let (x, _) = text_pos(&items, "head");
+        assert!(
+            x < 20.0,
+            "BFC text ignores the external float, x={x} (was indented to ~508 before)"
+        );
+    }
+
+    #[test]
+    fn overflow_visible_wraps_external_float() {
+        // same geometry but overflow:visible — content DOES wrap around
+        // the float (sanity counterpart to the BFC test).
+        let (items, _, _) = lay("<style>.fl{float:left;width:60px;height:80px}\
+             .zci{overflow:visible}</style>\
+             <div class=fl></div><div class=zci><h1>head</h1></div>");
+        let (x, _) = text_pos(&items, "head");
+        assert!(x > 60.0, "visible overflow wraps the float, x={x}");
     }
 
     #[test]
