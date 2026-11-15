@@ -517,9 +517,10 @@ const NATIVE_ARITY: &[(&str, f64)] = &[
     ("asinh", 1.0), ("atan", 1.0), ("atan2", 2.0), ("atanh", 1.0),
     ("cbrt", 1.0), ("ceil", 1.0), ("clz32", 1.0), ("cos", 1.0),
     ("cosh", 1.0), ("exp", 1.0), ("expm1", 1.0), ("floor", 1.0),
-    ("fround", 1.0), ("imul", 2.0), ("log", 1.0), ("log10", 1.0),
-    ("log1p", 1.0), ("log2", 1.0), ("pow", 2.0), ("round", 1.0),
-    ("sign", 1.0), ("sin", 1.0), ("sinh", 1.0), ("sqrt", 1.0),
+    ("fround", 1.0), ("hypot", 2.0), ("imul", 2.0), ("log", 1.0),
+    ("log10", 1.0), ("log1p", 1.0), ("log2", 1.0), ("max", 2.0),
+    ("min", 2.0), ("pow", 2.0), ("round", 1.0), ("sign", 1.0),
+    ("sin", 1.0), ("sinh", 1.0), ("sqrt", 1.0), ("sumPrecise", 1.0),
     ("tan", 1.0), ("tanh", 1.0), ("trunc", 1.0),
     // JSON
     ("parse", 2.0), ("stringify", 3.0),
@@ -1121,20 +1122,32 @@ fn install_protos(i: &mut Interp) {
     // -- Boolean.prototype --
     {
         let p = i.p.boolean.clone();
-        method(i, &p, "toString", bool_to_string);
+        method_len(i, &p, "toString", bool_to_string, 0.0);
         method(i, &p, "valueOf", bool_value_of);
     }
 
     // -- Symbol.prototype --
     {
         let p = i.p.symbol.clone();
-        method(i, &p, "toString", sym_to_string);
+        method_len(i, &p, "toString", sym_to_string, 0.0);
         method(i, &p, "valueOf", sym_value_of);
         // Symbol.prototype[@@toPrimitive] — returns the wrapped symbol
         let stp = native(i, "[Symbol.toPrimitive]", sym_to_primitive);
-        p.borrow_mut()
-            .props
-            .insert(PropKey::Sym(SYM_TOPRIMITIVE), Prop::builtin(stp));
+        if let Value::Obj(so) = &stp {
+            i.set_attr(so, "length", Value::Num(1.0), false, true);
+        }
+        // spec: { writable: false, enumerable: false, configurable: true }
+        p.borrow_mut().props.insert(
+            PropKey::Sym(SYM_TOPRIMITIVE),
+            Prop {
+                val: stp,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                get: None,
+                set: None,
+            },
+        );
         let get = native(i, "get description", sym_get_description);
         p.borrow_mut().props.insert(
             pk("description"),
@@ -3340,60 +3353,21 @@ fn install_globals(i: &mut Interp) {
     {
         let ctor = make_ctor(i, "Symbol", symbol_ctor, i.p.symbol.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
-        i.set_builtin(
-            o,
-            "iterator",
-            Value::Sym(SYM_ITERATOR, Rc::from("Symbol.iterator")),
-        );
-        i.set_builtin(
-            o,
-            "toPrimitive",
-            Value::Sym(SYM_TOPRIMITIVE, Rc::from("Symbol.toPrimitive")),
-        );
-        i.set_builtin(
-            o,
-            "toStringTag",
-            Value::Sym(SYM_TOSTRINGTAG, Rc::from("Symbol.toStringTag")),
-        );
-        i.set_builtin(
-            o,
-            "isConcatSpreadable",
-            Value::Sym(SYM_IS_CONCAT_SPREADABLE, Rc::from("Symbol.isConcatSpreadable")),
-        );
-        i.set_builtin(
-            o,
-            "species",
-            Value::Sym(SYM_SPECIES, Rc::from("Symbol.species")),
-        );
+        i.set_attr(o, "iterator", Value::Sym(SYM_ITERATOR, Rc::from("Symbol.iterator")), false, false);
+        i.set_attr(o, "toPrimitive", Value::Sym(SYM_TOPRIMITIVE, Rc::from("Symbol.toPrimitive")), false, false);
+        i.set_attr(o, "toStringTag", Value::Sym(SYM_TOSTRINGTAG, Rc::from("Symbol.toStringTag")), false, false);
+        i.set_attr(o, "isConcatSpreadable", Value::Sym(SYM_IS_CONCAT_SPREADABLE, Rc::from("Symbol.isConcatSpreadable")), false, false);
+        i.set_attr(o, "species", Value::Sym(SYM_SPECIES, Rc::from("Symbol.species")), false, false);
         i.set_builtin(o, "for", native(i, "for", symbol_for));
         i.set_builtin(o, "keyFor", native(i, "keyFor", symbol_key_for));
-        i.set_builtin(
-            o,
-            "hasInstance",
-            Value::Sym(SYM_HASINSTANCE, Rc::from("Symbol.hasInstance")),
-        );
-        i.set_builtin(o, "match", Value::Sym(SYM_MATCH, Rc::from("Symbol.match")));
-        i.set_builtin(
-            o,
-            "matchAll",
-            Value::Sym(SYM_MATCHALL, Rc::from("Symbol.matchAll")),
-        );
-        i.set_builtin(
-            o,
-            "replace",
-            Value::Sym(SYM_REPLACE, Rc::from("Symbol.replace")),
-        );
-        i.set_builtin(
-            o,
-            "search",
-            Value::Sym(SYM_SEARCH, Rc::from("Symbol.search")),
-        );
-        i.set_builtin(o, "split", Value::Sym(SYM_SPLIT, Rc::from("Symbol.split")));
-        i.set_builtin(
-            o,
-            "unscopables",
-            Value::Sym(SYM_UNSCOPABLES, Rc::from("Symbol.unscopables")),
-        );
+        i.set_attr(o, "hasInstance", Value::Sym(SYM_HASINSTANCE, Rc::from("Symbol.hasInstance")), false, false);
+        i.set_attr(o, "match", Value::Sym(SYM_MATCH, Rc::from("Symbol.match")), false, false);
+        i.set_attr(o, "matchAll", Value::Sym(SYM_MATCHALL, Rc::from("Symbol.matchAll")), false, false);
+        i.set_attr(o, "replace", Value::Sym(SYM_REPLACE, Rc::from("Symbol.replace")), false, false);
+        i.set_attr(o, "search", Value::Sym(SYM_SEARCH, Rc::from("Symbol.search")), false, false);
+        i.set_attr(o, "split", Value::Sym(SYM_SPLIT, Rc::from("Symbol.split")), false, false);
+        i.set_attr(o, "unscopables", Value::Sym(SYM_UNSCOPABLES, Rc::from("Symbol.unscopables")), false, false);
+        i.set_attr(o, "asyncIterator", Value::Sym(crate::interp::SYM_ASYNCITERATOR, Rc::from("Symbol.asyncIterator")), false, false);
         define_global(i, "Symbol", ctor);
     }
 
@@ -3696,18 +3670,27 @@ fn install_globals(i: &mut Interp) {
             ("log", math_log),
             ("log2", math_log2),
             ("log10", math_log10),
+            ("log1p", math_log1p),
             ("exp", math_exp),
+            ("expm1", math_expm1),
             ("sin", math_sin),
             ("cos", math_cos),
             ("tan", math_tan),
             ("asin", math_asin),
             ("acos", math_acos),
+            ("acosh", math_acosh),
+            ("asinh", math_asinh),
             ("atan", math_atan),
+            ("atanh", math_atanh),
             ("atan2", math_atan2),
+            ("sinh", math_sinh),
+            ("cosh", math_cosh),
+            ("tanh", math_tanh),
             ("hypot", math_hypot),
             ("imul", math_imul),
             ("clz32", math_clz32),
             ("fround", math_fround),
+            ("sumPrecise", math_sum_precise),
         ] {
             method(i, &m, n, f);
         }
@@ -4085,8 +4068,8 @@ fn install_globals(i: &mut Interp) {
         ("decodeURIComponent", g_decode_uri_component),
         ("escape", g_escape),
         ("unescape", g_unescape),
-        ("encodeURI", g_identity_str),
-        ("decodeURI", g_identity_str),
+        ("encodeURI", g_encode_uri),
+        ("decodeURI", g_decode_uri),
         ("$dyn_import", g_dyn_import),
         ("setTimeout", g_set_timeout),
         ("clearTimeout", g_noop),
@@ -6757,30 +6740,98 @@ fn array_is_array(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     Ok(Value::Bool(false))
 }
 
-fn array_from(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+/// spec Array.from(items, mapfn, thisArg):
+/// mapfn check → items nullish check → GetMethod(@@iterator) → either the
+/// iterator path (Construct(C,[]) → lazy steps → CreateDataProperty per
+/// element → Set length=k) or the array-like path (ToObject → ToLength →
+/// Construct(C,[len]) → per-index Get → CreateDataProperty → Set length).
+fn array_from(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let src = arg(args, 0);
+    let map_fn = arg(args, 1);
+    let this_arg = arg(args, 2);
+    let mapping = !matches!(map_fn, Value::Und);
+    if mapping && !i.is_callable(&map_fn) {
+        return Err(i.type_err("Array.from: mapping function is not callable"));
+    }
     if matches!(src, Value::Und | Value::Null) {
         return Err(i.type_err("Array.from requires an array-like or iterable"));
     }
-    let items = match i.iter_values(&src) {
-        Ok(v) => v,
-        Err(_) => to_elems(i, &src)?,
-    };
-    let map_fn = arg(args, 1);
-    let this_arg = arg(args, 2);
-    let mut out = Vec::new();
-    for (idx, it) in items.into_iter().enumerate() {
-        if i.is_callable(&map_fn) {
-            out.push(i.call(&map_fn, this_arg.clone(), vec![it, Value::Num(idx as f64)])?);
+    // GetMethod(items, @@iterator) — getters/proxy traps observable here
+    let im = i.get_prop(&src, &PropKey::Sym(SYM_ITERATOR))?;
+    if i.is_callable(&im) {
+        let a = if i.is_constructor(this) {
+            i.construct(this, vec![], None)?
         } else {
-            out.push(it);
+            Value::Obj(i.new_arr(Vec::new()))
+        };
+        let mut lz = for_of_iter(i, &src)?;
+        let mut k = 0usize;
+        loop {
+            let v = match iter_lazy_step(i, &mut lz)? {
+                Some(v) => v,
+                None => break,
+            };
+            let mapped = if mapping {
+                match i.call(&map_fn, this_arg.clone(), vec![v, Value::Num(k as f64)]) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = iter_lazy_close(i, &mut lz);
+                        return Err(e);
+                    }
+                }
+            } else {
+                v
+            };
+            if let Err(e) = create_data_prop(i, &a, k, mapped) {
+                let _ = iter_lazy_close(i, &mut lz);
+                return Err(e);
+            }
+            k += 1;
+            if k > 100_000_000 {
+                let _ = iter_lazy_close(i, &mut lz);
+                return Err(i.range_err("Array.from: too many elements"));
+            }
         }
+        i.set_prop(&a, PropKey::from_str("length"), Value::Num(k as f64))?;
+        return Ok(a);
     }
-    Ok(Value::Obj(i.new_arr(out)))
+    // array-like path — live Get per index (deleted/updated elements
+    // reflect at read time)
+    let obj = i.to_object(&src)?;
+    let lv = i.get_prop(&obj, &PropKey::from_str("length"))?;
+    let len = to_length_num(i.to_num(&lv)?);
+    let a = if i.is_constructor(this) {
+        i.construct(this, vec![Value::Num(len as f64)], None)?
+    } else {
+        Value::Obj(i.new_arr(Vec::new()))
+    };
+    for k in 0..len {
+        let v = i.get_prop(&obj, &idx_key(k))?;
+        let mapped = if mapping {
+            i.call(&map_fn, this_arg.clone(), vec![v, Value::Num(k as f64)])?
+        } else {
+            v
+        };
+        create_data_prop(i, &a, k, mapped)?;
+    }
+    i.set_prop(&a, PropKey::from_str("length"), Value::Num(len as f64))?;
+    Ok(a)
 }
 
-fn array_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    Ok(Value::Obj(i.new_arr(args.to_vec())))
+/// spec Array.of: constructor this → `new C(len)`, else ArrayCreate —
+/// then CreateDataProperty per arg + observable `length` Set
+fn array_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let len = args.len();
+    let a = if i.is_constructor(this) {
+        i.construct(this, vec![Value::Num(len as f64)], None)?
+    } else {
+        Value::Obj(i.new_arr(Vec::new()))
+    };
+    for (k, v) in args.iter().enumerate() {
+        create_data_prop(i, &a, k, v.clone())?;
+    }
+    i.set_prop(&a, PropKey::from_str("length"), Value::Num(len as f64))?;
+    Ok(a)
 }
 
 fn arr_push(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -8929,12 +8980,15 @@ fn symbol_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if matches!(this, Value::Obj(_)) {
         return Err(i.type_err("Symbol is not a constructor"));
     }
-    let d = match arg(args, 0) {
-        Value::Und => String::new(),
-        v => i.to_str(&v)?,
+    let (d, no_desc) = match arg(args, 0) {
+        Value::Und => (String::new(), true),
+        v => (i.to_str(&v)?, false),
     };
     let id = i.sym_counter;
     i.sym_counter += 1;
+    if no_desc {
+        i.sym_no_desc.insert(id);
+    }
     Ok(Value::Sym(id, Rc::from(d.as_str())))
 }
 
@@ -8952,6 +9006,9 @@ fn symbol_for(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 fn symbol_key_for(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let _ = i;
+    if !matches!(arg(args, 0), Value::Sym(..)) {
+        return Err(i.type_err("Symbol.keyFor called on non-symbol"));
+    }
     match arg(args, 0) {
         // only Symbol.for-registry ids (>= 1_000_000) have a key
         Value::Sym(id, d) if id >= 1_000_000 => {
@@ -8996,16 +9053,32 @@ fn sym_value_of(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 fn sym_get_description(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let _ = i;
-    match this {
-        Value::Sym(_, d) => {
-            if d.is_empty() {
+    // thisSymbolValue: primitive or Symbol wrapper; anything else → TypeError
+    let sym = match this {
+        Value::Sym(..) => this.clone(),
+        Value::Obj(o) => match o.borrow().props.get_str("$value") {
+            Some(p) if matches!(p.val, Value::Sym(..)) => p.val.clone(),
+            _ => {
+                return Err(i.type_err(
+                    "Method get Symbol.prototype.description called on incompatible receiver",
+                ))
+            }
+        },
+        _ => {
+            return Err(i.type_err(
+                "Method get Symbol.prototype.description called on incompatible receiver",
+            ))
+        }
+    };
+    match sym {
+        Value::Sym(id, d) => {
+            if i.sym_no_desc.contains(&id) {
                 Ok(Value::Und)
             } else {
                 Ok(Value::Str(Rc::from(d.as_ref())))
             }
         }
-        _ => Ok(Value::Und),
+        _ => unreachable!(),
     }
 }
 
@@ -9129,14 +9202,13 @@ fn err_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 /// `AggregateError(iterable, message)` — collects the iterable into an
 /// `errors` own data property
 fn agg_error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let errs = match args.first() {
-        Some(v) => i.iter_values(v)?,
-        None => Vec::new(),
-    };
+    // spec order: ToString(message) BEFORE IterableToList(errors)
     let msg = match args.get(1).cloned().unwrap_or(Value::Und) {
         Value::Und => String::new(),
         v => i.to_str(&v)?,
     };
+    // spec: `errors` is required — GetIterator(undefined) throws TypeError
+    let errs = i.iter_values(&arg(args, 0))?;
     let arr = Value::Obj(i.new_arr(errs));
     if let Value::Obj(o) = this {
         o.borrow_mut().kind = ObjKind::Err;
@@ -9203,57 +9275,137 @@ macro_rules! math1 {
 math1!(math_floor, f64::floor);
 math1!(math_ceil, f64::ceil);
 math1!(math_round, |n: f64| {
-    // JS rounds half toward +inf
-    (n + 0.5).floor()
+    // spec: NaN/±∞/±0 pass through, [-0.5, 0) → -0, ties go toward
+    // +∞. The naive (n + 0.5).floor() misrounds odd integers ≥ 2**53
+    // (n + 0.5 rounds up before the floor) — compare the fraction.
+    if !n.is_finite() || n == 0.0 {
+        n
+    } else if n >= -0.5 && n < 0.5 {
+        if n.is_sign_negative() { -0.0 } else { 0.0 }
+    } else {
+        let f = n.floor();
+        if n - f < 0.5 { f } else { f + 1.0 }
+    }
 });
 math1!(math_trunc, f64::trunc);
 math1!(math_abs, f64::abs);
-math1!(math_sign, |n: f64| if n.is_nan() {
-    f64::NAN
-} else {
-    n.signum()
+math1!(math_sign, |n: f64| {
+    // f64::signum maps -0 → -1; spec keeps the input's own zero
+    if n.is_nan() || n == 0.0 {
+        n
+    } else if n > 0.0 {
+        1.0
+    } else {
+        -1.0
+    }
 });
 math1!(math_sqrt, f64::sqrt);
 math1!(math_cbrt, f64::cbrt);
 math1!(math_log, f64::ln);
 math1!(math_log2, f64::log2);
 math1!(math_log10, f64::log10);
+math1!(math_log1p, f64::ln_1p);
 math1!(math_exp, f64::exp);
+math1!(math_expm1, f64::exp_m1);
 math1!(math_sin, f64::sin);
 math1!(math_cos, f64::cos);
 math1!(math_tan, f64::tan);
 math1!(math_asin, f64::asin);
 math1!(math_acos, f64::acos);
+math1!(math_acosh, f64::acosh);
+math1!(math_asinh, f64::asinh);
 math1!(math_atan, f64::atan);
+math1!(math_atanh, f64::atanh);
+math1!(math_sinh, f64::sinh);
+math1!(math_cosh, f64::cosh);
+math1!(math_tanh, f64::tanh);
 
 fn math_min(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    // spec coerces every arg first — a NaN must not skip a later
+    // valueOf; comparisons treat -0 as smaller than +0
     let mut m = f64::INFINITY;
+    let mut nan = false;
     for a in args {
         let n = i.to_num(a)?;
-        if n.is_nan() {
-            return Ok(Value::Num(f64::NAN));
+        nan |= n.is_nan();
+        if n < m || (n == m && n.is_sign_negative()) {
+            m = n;
         }
-        m = m.min(n);
     }
-    Ok(Value::Num(m))
+    Ok(Value::Num(if nan { f64::NAN } else { m }))
 }
 
 fn math_max(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let mut m = f64::NEG_INFINITY;
+    let mut nan = false;
     for a in args {
         let n = i.to_num(a)?;
-        if n.is_nan() {
-            return Ok(Value::Num(f64::NAN));
+        nan |= n.is_nan();
+        if n > m || (n == m && n.is_sign_positive()) {
+            m = n;
         }
-        m = m.max(n);
     }
-    Ok(Value::Num(m))
+    Ok(Value::Num(if nan { f64::NAN } else { m }))
 }
 
 fn math_pow(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    Ok(Value::Num(
-        i.to_num(&arg(args, 0))?.powf(i.to_num(&arg(args, 1))?),
-    ))
+    let b = i.to_num(&arg(args, 0))?;
+    let e = i.to_num(&arg(args, 1))?;
+    Ok(Value::Num(js_pow(b, e)))
+}
+
+/// `Number::exponentiate` — the platform pow diverges from the spec on
+/// pow(±1, ±∞) (C says 1, spec says NaN); ordered specials follow the
+/// spec list, powf covers the general case.
+fn js_pow(b: f64, e: f64) -> f64 {
+    if e.is_nan() {
+        return f64::NAN;
+    }
+    if e == 0.0 {
+        return 1.0; // x**±0 = 1 — even for NaN x
+    }
+    if b.is_nan() {
+        return f64::NAN;
+    }
+    let ab = b.abs();
+    if e.is_infinite() {
+        if ab == 1.0 {
+            return f64::NAN;
+        }
+        return if (ab > 1.0) == (e > 0.0) {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+    }
+    // odd-integer check for negative bases — for |e| ≥ 2**53 every
+    // finite double is even, so this correctly reports false there
+    let odd_int = e.fract() == 0.0 && (e * 0.5).fract() != 0.0;
+    if b.is_infinite() {
+        return if b > 0.0 {
+            if e > 0.0 { f64::INFINITY } else { 0.0 }
+        } else if e > 0.0 {
+            if odd_int { f64::NEG_INFINITY } else { f64::INFINITY }
+        } else if odd_int {
+            -0.0
+        } else {
+            0.0
+        };
+    }
+    if b == 0.0 {
+        let neg = b.is_sign_negative();
+        return if e > 0.0 {
+            if neg && odd_int { -0.0 } else { 0.0 }
+        } else if neg && odd_int {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    if b < 0.0 && e.fract() != 0.0 {
+        return f64::NAN; // negative base, non-integer exponent
+    }
+    b.powf(e)
 }
 
 fn math_random(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
@@ -9267,12 +9419,34 @@ fn math_atan2(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 }
 
 fn math_hypot(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let mut s = 0.0;
+    // spec: ToNumber every arg first — an abrupt completion stops all
+    // later coercions. Then: any ±∞ → +∞ (even past a NaN), any NaN →
+    // NaN, all-zero → +0. Scaling avoids intermediate overflow.
+    let mut nums = Vec::with_capacity(args.len());
     for a in args {
-        let n = i.to_num(a)?;
-        s += n * n;
+        nums.push(i.to_num(a)?);
     }
-    Ok(Value::Num(s.sqrt()))
+    let mut max = 0.0f64;
+    let mut nan = false;
+    for &n in &nums {
+        if n.is_infinite() {
+            return Ok(Value::Num(f64::INFINITY));
+        }
+        nan |= n.is_nan();
+        max = max.max(n.abs());
+    }
+    if nan {
+        return Ok(Value::Num(f64::NAN));
+    }
+    if max == 0.0 {
+        return Ok(Value::Num(0.0));
+    }
+    let mut s = 0.0;
+    for &n in &nums {
+        let r = n / max;
+        s += r * r;
+    }
+    Ok(Value::Num(max * s.sqrt()))
 }
 
 fn math_imul(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -9289,6 +9463,186 @@ fn math_clz32(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 fn math_fround(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     Ok(Value::Num(i.to_num(&arg(args, 0))? as f32 as f64))
+}
+
+/// `Math.sumPrecise` (ES2025) — GetIterator over the arg; each item must
+/// already be a Number (TypeError via IteratorClose — no coercion).
+/// Finite values are summed exactly in a fixed-point accumulator in
+/// units of 2**-1074 (every finite double is m·2**(k-1074) with a 53-bit
+/// m and k ≤ 2045), then correctly rounded — overflowing sums → ±∞.
+fn math_sum_precise(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let items = arg(args, 0);
+    let mut lz = for_of_iter(i, &items)?;
+    // two's-complement integer S, little-endian limbs: S * 2**-1074 is
+    // the exact running sum. 40*64 = 2560 bits ≫ the ~2115 reachable.
+    let mut acc = [0u64; 40];
+    let mut all_neg_zero = true;
+    let mut pos_inf = false;
+    let mut neg_inf = false;
+    let mut nan = false;
+    loop {
+        let Some(v) = iter_src_step(i, &mut lz.src)? else {
+            break;
+        };
+        let Value::Num(n) = v else {
+            let e = i.type_err("Math.sumPrecise values must be numbers");
+            // `? IteratorClose` — a close error replaces the TypeError
+            iter_src_close(i, &mut lz.src)?;
+            return Err(e);
+        };
+        if n.is_nan() {
+            nan = true;
+        } else if n == f64::INFINITY {
+            pos_inf = true;
+        } else if n == f64::NEG_INFINITY {
+            neg_inf = true;
+        } else {
+            if !(n == 0.0 && n.is_sign_negative()) {
+                all_neg_zero = false;
+            }
+            if n != 0.0 {
+                let bits = n.to_bits();
+                let bexp = ((bits >> 52) & 0x7ff) as usize;
+                let frac = bits & 0x000f_ffff_ffff_ffff;
+                // value = sign * m * 2**(k - 1074)
+                let (m, k) = if bexp == 0 {
+                    (frac, 0usize)
+                } else {
+                    (frac | (1u64 << 52), bexp - 1)
+                };
+                acc_add(&mut acc, m, k, n.is_sign_negative());
+            }
+        }
+    }
+    if nan || (pos_inf && neg_inf) {
+        return Ok(Value::Num(f64::NAN));
+    }
+    if pos_inf {
+        return Ok(Value::Num(f64::INFINITY));
+    }
+    if neg_inf {
+        return Ok(Value::Num(f64::NEG_INFINITY));
+    }
+    let r = acc_to_f64(&acc);
+    // an empty list or one whose every element is -0 sums to -0
+    Ok(Value::Num(if r == 0.0 && all_neg_zero {
+        -0.0
+    } else {
+        r
+    }))
+}
+
+/// add ±(m << k) to a little-endian two's-complement integer
+fn acc_add(acc: &mut [u64; 40], m: u64, k: usize, neg: bool) {
+    let limb = k / 64;
+    let sh = (k % 64) as u32;
+    let lo = m << sh;
+    let hi = if sh == 0 { 0 } else { m >> (64 - sh) };
+    if !neg {
+        let (s, c) = acc[limb].overflowing_add(lo);
+        acc[limb] = s;
+        let mut carry = c;
+        if hi != 0 || carry {
+            let (s, c2) = acc[limb + 1].overflowing_add(hi);
+            let (s, c3) = s.overflowing_add(carry as u64);
+            acc[limb + 1] = s;
+            carry = c2 || c3;
+            let mut j = limb + 2;
+            while carry && j < acc.len() {
+                let (s, c) = acc[j].overflowing_add(1);
+                acc[j] = s;
+                carry = c;
+                j += 1;
+            }
+        }
+    } else {
+        let (d, b) = acc[limb].overflowing_sub(lo);
+        acc[limb] = d;
+        let mut borrow = b;
+        if hi != 0 || borrow {
+            let (d, b2) = acc[limb + 1].overflowing_sub(hi);
+            let (d, b3) = d.overflowing_sub(borrow as u64);
+            acc[limb + 1] = d;
+            borrow = b2 || b3;
+            let mut j = limb + 2;
+            while borrow && j < acc.len() {
+                let (d, b) = acc[j].overflowing_sub(1);
+                acc[j] = d;
+                borrow = b;
+                j += 1;
+            }
+        }
+    }
+}
+
+/// convert the exact integer S (units of 2**-1074) to f64 with
+/// round-half-even; magnitude past the max biased exponent → ±∞
+fn acc_to_f64(acc: &[u64; 40]) -> f64 {
+    const FRAC: u64 = 0x000f_ffff_ffff_ffff;
+    let neg = (acc[39] >> 63) != 0;
+    let mut mag = *acc;
+    if neg {
+        let mut carry = true;
+        for l in mag.iter_mut() {
+            let (v, c) = (!*l).overflowing_add(carry as u64);
+            *l = v;
+            carry = c;
+        }
+    }
+    let mut p = -1i32; // position of the top set bit
+    for (idx, &l) in mag.iter().enumerate().rev() {
+        if l != 0 {
+            p = (idx * 64 + 63 - l.leading_zeros() as usize) as i32;
+            break;
+        }
+    }
+    if p < 0 {
+        return 0.0;
+    }
+    if p <= 52 {
+        // |S| < 2**53 — S·2**-1074 is exactly representable
+        let v = mag[0] as f64 * f64::from_bits(1);
+        return if neg { -v } else { v };
+    }
+    // keep the top 53 bits, round-half-even on what is dropped
+    let drop = (p - 52) as usize;
+    let limb = drop / 64;
+    let sh = (drop % 64) as u32;
+    let mut q = (mag[limb] >> sh)
+        | if sh == 0 {
+            0
+        } else {
+            mag.get(limb + 1).copied().unwrap_or(0) << (64 - sh)
+        };
+    let hl = (drop - 1) / 64;
+    let hb = (drop - 1) % 64;
+    let half = (mag[hl] >> hb as u32) & 1 == 1;
+    let mut rest = (mag[hl] & ((1u64 << hb as u32) - 1)) != 0;
+    if !rest {
+        for &l in &mag[..hl] {
+            if l != 0 {
+                rest = true;
+                break;
+            }
+        }
+    }
+    if half && (rest || q & 1 == 1) {
+        q += 1;
+    }
+    // result is q·2**(drop-1074); as an f64 that's q·2**(e-1075)
+    let mut e = drop + 1;
+    if q >> 53 != 0 {
+        q >>= 1;
+        e += 1;
+    }
+    if e >= 2047 {
+        return if neg {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    f64::from_bits(((neg as u64) << 63) | ((e as u64) << 52) | (q & FRAC))
 }
 
 // ===========================================================================
@@ -10041,8 +10395,10 @@ fn bound_native(i: &mut Interp, name: &str, f: NativeFn, holder: Value, len: f64
             extra: Vec::new(),
         },
     )));
-    i.set_attr(&b, "name", Value::Str(Rc::from(name)), false, true);
+    // spec CreateBuiltinFunction: SetFunctionLength runs BEFORE
+    // SetFunctionName — own-prop insertion order is `length` then `name`
     i.set_attr(&b, "length", Value::Num(len), false, true);
+    i.set_attr(&b, "name", Value::Str(Rc::from(name)), false, true);
     Value::Obj(b)
 }
 
@@ -10388,9 +10744,11 @@ fn mk_finally_fn(i: &mut Interp, ok: bool, cb: &Value, c: &Value, pr: &Value) ->
     i.set_builtin(&h, "$cb", cb.clone());
     i.set_builtin(&h, "$C", c.clone());
     i.set_builtin(&h, "$pr", pr.clone());
+    // spec: the thenFinally/catchFinally built-ins are anonymous — the
+    // functions handed to `then` have `length` 1 and `name` ""
     bound_native(
         i,
-        if ok { "thenFinally" } else { "catchFinally" },
+        "",
         if ok {
             promise_then_finally
         } else {
@@ -10525,14 +10883,17 @@ fn el_index(i: &Interp, h: &ObjRef) -> usize {
     }
 }
 
-fn remaining_n(i: &Interp, rem: &ObjRef) -> usize {
+/// the counter is SIGNED — spec element fns decrement unconditionally
+/// so a second call pushes it below zero and the `== 0` settle only ever
+/// fires once (no saturating at 0)
+fn remaining_n(i: &Interp, rem: &ObjRef) -> i64 {
     match i.obj_get_raw_str(rem, "n") {
-        Some(Value::Num(n)) => n.max(0.0) as usize,
+        Some(Value::Num(n)) => n as i64,
         _ => 0,
     }
 }
 
-fn set_remaining_n(rem: &ObjRef, n: usize) {
+fn set_remaining_n(rem: &ObjRef, n: i64) {
     let mut b = rem.borrow_mut();
     if let Some(pr) = b.props.get_str_mut("n") {
         pr.val = Value::Num(n as f64);
@@ -10544,8 +10905,8 @@ fn inc_remaining(i: &Interp, rem: &ObjRef) {
     set_remaining_n(rem, n + 1);
 }
 
-fn dec_remaining(i: &Interp, rem: &ObjRef) -> usize {
-    let n = remaining_n(i, rem).saturating_sub(1);
+fn dec_remaining(i: &Interp, rem: &ObjRef) -> i64 {
+    let n = remaining_n(i, rem) - 1;
     set_remaining_n(rem, n);
     n
 }
@@ -10702,11 +11063,16 @@ fn promise_combine(i: &mut Interp, this: &Value, args: &[Value], mode: PComb) ->
     let remaining = i.new_obj();
     i.set_builtin(&remaining, "n", Value::Num(1.0));
     let mut index = 0usize;
-    let mut iter_err: Option<Value> = None;
+    // abrupt exits from the spec Repeat loop carry a flag for
+    // iteratorRecord.[[Done]]: IteratorStep / IteratorValue abrupts set
+    // [[Done]] (NO IteratorClose — the `return` hook must not run), while
+    // abrupts from the loop body (C.resolve call, `then` lookup/invoke)
+    // leave [[Done]] false so the outer IfAbruptRejectPromise closes first
+    let mut iter_err: Option<(Value, bool)> = None;
     loop {
         match iter_lazy_step(i, &mut lz) {
             Err(e) => {
-                iter_err = Some(e);
+                iter_err = Some((e, false));
                 break;
             }
             Ok(None) => break,
@@ -10721,14 +11087,14 @@ fn promise_combine(i: &mut Interp, this: &Value, args: &[Value], mode: PComb) ->
                     _ => create_data_prop(i, &values, index, Value::Und).err(),
                 };
                 if let Some(e) = slot_err {
-                    iter_err = Some(e);
+                    iter_err = Some((e, true));
                     break;
                 }
                 let next_promise =
                     match i.call(&promise_resolve, this.clone(), vec![next_value]) {
                         Ok(v) => v,
                         Err(e) => {
-                            iter_err = Some(e);
+                            iter_err = Some((e, true));
                             break;
                         }
                     };
@@ -10757,29 +11123,38 @@ fn promise_combine(i: &mut Interp, this: &Value, args: &[Value], mode: PComb) ->
                         .map(|_| ()),
                 };
                 if let Err(e) = then_call {
-                    iter_err = Some(e);
+                    iter_err = Some((e, true));
                     break;
                 }
                 index += 1;
             }
         }
     }
-    if let Some(e) = iter_err {
-        // abrupt during iteration — IteratorClose, then reject
-        let _ = iter_lazy_close(i, &mut lz);
+    if let Some((e, needs_close)) = iter_err {
+        // abrupt during iteration — IteratorClose only while the record
+        // is not [[Done]], then reject the capability and return its
+        // promise (close errors are swallowed: a throw is in flight)
+        if needs_close {
+            let _ = iter_lazy_close(i, &mut lz);
+        }
         return reject_cap(i, &rej, &p, e);
     }
-    // normal loop exit: remaining--; on zero the result settles now
+    // normal loop exit: remaining--; on zero the result settles now. The
+    // iterator is exhausted ([[Done]] is set) so a throwing capability fn
+    // skips IteratorClose and the error only rejects the capability.
     if dec_remaining(i, &remaining) == 0 {
-        match mode {
+        let settle_err = match mode {
             PComb::All | PComb::AllSettled => {
-                i.call(&res, Value::Und, vec![values])?;
+                i.call(&res, Value::Und, vec![values]).err()
             }
             PComb::Any => {
-                let e = aggregate_error(i, errors);
-                i.call(&rej, Value::Und, vec![e])?;
+                let ae = aggregate_error(i, errors);
+                i.call(&rej, Value::Und, vec![ae]).err()
             }
-            PComb::Race => {}
+            PComb::Race => None,
+        };
+        if let Some(e) = settle_err {
+            return reject_cap(i, &rej, &p, e);
         }
     }
     Ok(p)
@@ -10801,25 +11176,26 @@ fn promise_race(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     promise_combine(i, this, args, PComb::Race)
 }
 
-/// spec Promise.try — the callback runs inside the call; its outcome
-/// routes through the capability's resolve/reject so errors settle the
-/// promise rather than throwing synchronously.
+/// spec Promise.try — the callback runs inside the call. Its result is
+/// lifted through PromiseResolve(C, ·) so a callback returning a promise
+/// whose constructor IS C yields that promise itself (no extra wrapper);
+/// a throwing callback produces a capability promise rejected with the
+/// error — the C instance is only constructed once, inside whichever
+/// path runs.
 fn promise_try(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !matches!(this, Value::Obj(_)) {
         return Err(i.type_err("Promise.try called on non-object receiver"));
     }
-    let (p, res, rej) = new_promise_capability(i, this)?;
     let f = arg(args, 0);
     let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
     match i.call(&f, Value::Und, rest) {
-        Ok(v) => {
-            i.call(&res, Value::Und, vec![v])?;
-        }
+        Ok(v) => promise_resolve_static(i, this, &[v]),
         Err(e) => {
+            let (p, _res, rej) = new_promise_capability(i, this)?;
             i.call(&rej, Value::Und, vec![e])?;
+            Ok(p)
         }
     }
-    Ok(p)
 }
 
 /// Promise.allKeyed — {fulfilled:{…}, rejected:{…}} snapshot keyed by
@@ -12404,7 +12780,17 @@ fn g_parse_int(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     } else {
         (1.0, t)
     };
-    let mut radix = i.to_num(&arg(args, 1)).unwrap_or(0.0) as u32;
+    // spec: R = ToInt32(radix); NaN/±0/±∞ → +0 (→ hex-detect or 10)
+    let rv = if matches!(arg(args, 1), Value::Und) {
+        0.0
+    } else {
+        i.to_num(&arg(args, 1))?
+    };
+    let mut radix = if !rv.is_finite() {
+        0u32
+    } else {
+        ((rv.trunc() as i64) & 0xFFFF_FFFF) as i32 as u32
+    };
     let mut t = t;
     if radix == 0 {
         if t.starts_with("0x") || t.starts_with("0X") {
@@ -12454,7 +12840,8 @@ fn g_parse_float(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             'e' | 'E' if seen_digit && !seen_e => seen_e = true,
             '0'..='9' => seen_digit = true,
             'I' if t[k..].starts_with("Infinity") => {
-                return Ok(Value::Num(f64::INFINITY));
+                let sign = if bytes.first() == Some(&'-') { -1.0 } else { 1.0 };
+                return Ok(Value::Num(sign * f64::INFINITY));
             }
             _ => break,
         }
@@ -12483,43 +12870,128 @@ fn g_identity_str(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     Ok(Value::Str(Rc::from(i.to_str(&arg(args, 0))?.as_str())))
 }
 
-fn g_encode_uri_component(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let s = i.to_str(&arg(args, 0))?;
+const URI_MARK: &str = "-_.!~*'()";
+/// uriReserved = `;/?:@&=+$,#` — left literal by encodeURI, kept %-escaped
+/// by decodeURI
+const URI_RESERVED: &str = ";/?:@&=+$,#";
+
+fn uri_err(i: &mut Interp, m: &str) -> Value {
+    let p = i.p.uri_error.clone();
+    i.err_obj(&p, "URIError", m)
+}
+
+/// spec Encode(string, unreservedSet): unreserved = alphanumerics +
+/// mark chars + `extra`; everything else UTF-8 encodes to %XX bytes
+/// (astral chars → their surrogate pair's UTF-8 = same bytes)
+fn uri_encode(
+    i: &mut Interp,
+    v: &Value,
+    extra: &str,
+) -> Result<String, Value> {
+    let s = i.to_str(v)?;
     let mut out = String::new();
-    for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
-            )
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric()
+            || URI_MARK.contains(ch)
+            || extra.contains(ch)
         {
-            out.push(b as char);
+            out.push(ch);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            for b in ch.encode_utf8(&mut buf).as_bytes() {
+                out.push_str(&format!("%{b:02X}"));
+            }
         }
     }
-    Ok(Value::Str(Rc::from(out.as_str())))
+    Ok(out)
+}
+
+/// spec Decode(string, reservedSet): %XX sequences decode to UTF-8 —
+/// malformed hex, bad continuation bytes, overlong forms, and surrogate
+/// halves all throw URIError. A decoded reserved byte stays escaped when
+/// `keep_reserved` (decodeURI) so the result reparses identically.
+fn uri_decode(
+    i: &mut Interp,
+    v: &Value,
+    keep_reserved: bool,
+) -> Result<String, Value> {
+    let s = i.to_str(v)?;
+    let b = s.as_bytes();
+    let mut out = String::new();
+    let mut k = 0;
+    let hexv = |c: u8| (c as char).to_digit(16);
+    while k < b.len() {
+        if b[k] != b'%' {
+            let ch = s[k..].chars().next().unwrap();
+            out.push(ch);
+            k += ch.len_utf8();
+            continue;
+        }
+        if k + 2 >= b.len() || hexv(b[k + 1]).is_none() || hexv(b[k + 2]).is_none() {
+            return Err(uri_err(i, "URI malformed"));
+        }
+        let first = (hexv(b[k + 1]).unwrap() * 16 + hexv(b[k + 2]).unwrap()) as u8;
+        let len = match first {
+            0x00..=0x7F => 1,
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return Err(uri_err(i, "URI malformed")),
+        };
+        if len == 1 {
+            let c = first as char;
+            if keep_reserved && URI_RESERVED.contains(c) {
+                out.push_str(&s[k..k + 3]);
+            } else {
+                out.push(c);
+            }
+        } else {
+            if k + 3 * len > b.len() {
+                return Err(uri_err(i, "URI malformed"));
+            }
+            let mut seq = vec![first];
+            for j in 1..len {
+                let o = k + 3 * j;
+                if b[o] != b'%'
+                    || hexv(b[o + 1]).is_none()
+                    || hexv(b[o + 2]).is_none()
+                {
+                    return Err(uri_err(i, "URI malformed"));
+                }
+                seq.push(
+                    (hexv(b[o + 1]).unwrap() * 16 + hexv(b[o + 2]).unwrap()) as u8,
+                );
+            }
+            // Rust UTF-8 validation rejects overlongs, surrogates,
+            // >U+10FFFF, and stray continuations — exactly the spec rules
+            match std::str::from_utf8(&seq) {
+                Ok(dec) => out.push_str(dec),
+                Err(_) => return Err(uri_err(i, "URI malformed")),
+            }
+        }
+        k += 3 * len;
+    }
+    Ok(out)
+}
+
+fn g_encode_uri(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let s = uri_encode(i, &arg(args, 0), URI_RESERVED)?;
+    Ok(Value::Str(Rc::from(s.as_str())))
+}
+
+fn g_decode_uri(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let s = uri_decode(i, &arg(args, 0), true)?;
+    Ok(Value::Str(Rc::from(s.as_str())))
+}
+
+fn g_encode_uri_component(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let s = uri_encode(i, &arg(args, 0), "")?;
+    Ok(Value::Str(Rc::from(s.as_str())))
 }
 
 fn g_decode_uri_component(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let s = i.to_str(&arg(args, 0))?;
-    let mut out = Vec::new();
-    let b = s.as_bytes();
-    let mut k = 0;
-    while k < b.len() {
-        if b[k] == b'%' && k + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[k + 1..k + 3], 16) {
-                out.push(v);
-                k += 3;
-                continue;
-            }
-        }
-        out.push(b[k]);
-        k += 1;
-    }
-    Ok(Value::Str(Rc::from(
-        String::from_utf8_lossy(&out).to_string().as_str(),
-    )))
+    let s = uri_decode(i, &arg(args, 0), false)?;
+    Ok(Value::Str(Rc::from(s.as_str())))
 }
 
 /// Legacy `escape()`: %XX for non-unreserved bytes, %uXXXX for non-ASCII

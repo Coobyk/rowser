@@ -116,6 +116,7 @@ pub const SYM_MATCHALL: u64 = 9;
 pub const SYM_IS_CONCAT_SPREADABLE: u64 = 10;
 pub const SYM_SPECIES: u64 = 11;
 pub const SYM_UNSCOPABLES: u64 = 12;
+pub const SYM_ASYNCITERATOR: u64 = 13;
 /// private-name symbol ids live at/above this bound — disjoint from
 /// well-known ids (1..) and every user-allocated symbol, so
 /// getOwnPropertySymbols / Reflect.ownKeys can keep them invisible
@@ -1180,6 +1181,10 @@ pub struct Interp {
     /// topmost entry for the receiving function)
     pub call_stack: Vec<Value>,
     pub sym_counter: u64,
+    /// symbols created without a description argument — lets
+    /// Symbol.prototype.description distinguish `Symbol()`/`Symbol(undefined)`
+    /// (→ undefined) from `Symbol("")` (→ "")
+    pub sym_no_desc: std::collections::HashSet<u64>,
     /// private-name id source — ids live in `PRIV_BASE..`, disjoint from
     /// every user-space symbol id, so enumeration can filter them
     pub priv_ctr: u64,
@@ -1388,6 +1393,7 @@ impl Interp {
             depth: 0,
             call_stack: Vec::new(),
             sym_counter: 16,
+            sym_no_desc: Default::default(),
             priv_ctr: 0,
             rng: {
                 let n = std::time::SystemTime::now()
@@ -5763,6 +5769,19 @@ impl Interp {
                 if !nctor {
                     return Err(self.type_err(format!("{name} is not a constructor")));
                 }
+                // spec Promise(executor): the IsCallable(executor) check
+                // (step 2) runs BEFORE OrdinaryCreateFromConstructor's
+                // newTarget.prototype read (step 3) — a throwing
+                // `prototype` getter must not mask the TypeError
+                if Rc::ptr_eq(o, &self.p.promise_ctor) {
+                    let executor = args.first().cloned().unwrap_or(Value::Und);
+                    if !self.is_callable(&executor) {
+                        let tn = self.type_name(&executor);
+                        return Err(self.type_err(format!(
+                            "Promise resolver {tn} is not a function"
+                        )));
+                    }
+                }
                 // OrdinaryCreateFromConstructor: new_target.prototype wins —
                 // read through [[Get]] so a proxy newTarget fires its
                 // `get` trap (revoked / throwing traps propagate)
@@ -6677,27 +6696,19 @@ impl Interp {
                 if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
                     return crate::builtins::iter_drain_lazy(self, v);
                 }
-                // Symbol.iterator protocol
+                // Symbol.iterator protocol (spec GetIterator): the
+                // method must be callable, its result an Object, or
+                // TypeError — no kind fallbacks (a proto-less or
+                // @@iterator-shadowed collection is NOT iterable)
                 let m = self.get_prop(v, &PropKey::Sym(SYM_ITERATOR))?;
                 if self.is_callable(&m) {
                     let iter = self.call(&m, v.clone(), Vec::new())?;
-                    return self.drain_iter(iter);
-                }
-                if let ObjKind::Arr(items) = &o.borrow().kind {
-                    return Ok(items.clone());
-                }
-                if let ObjKind::Iter { items, .. } = &o.borrow().kind {
-                    return Ok(items.clone());
-                }
-                if let ObjKind::Set(items) = &o.borrow().kind {
-                    return Ok(items.clone());
-                }
-                if let ObjKind::Map(m) = &o.borrow().kind {
-                    let mut out = Vec::new();
-                    for (k, v) in m.clone() {
-                        out.push(Value::Obj(self.new_arr(vec![k, v])));
+                    if !matches!(iter, Value::Obj(_)) {
+                        return Err(self.type_err(
+                            "Iterator result is not an object",
+                        ));
                     }
-                    return Ok(out);
+                    return self.drain_iter(iter);
                 }
                 Err(self.type_err("value is not iterable"))
             }
@@ -6733,6 +6744,13 @@ impl Interp {
                     return Err(e);
                 }
             };
+            // spec IteratorNext: the result must be an Object
+            if !matches!(r, Value::Obj(_)) {
+                let _ = self.iter_close_obj(&iter);
+                return Err(self.type_err(
+                    "iterator.next() returned a non-object value",
+                ));
+            }
             let done = match self.get_prop(&r, &PropKey::from_str("done")) {
                 Ok(d) => d,
                 Err(e) => {
