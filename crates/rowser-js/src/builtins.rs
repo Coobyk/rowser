@@ -1065,7 +1065,11 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
                 return iter_result(i, Value::Und, true);
             };
             let ip = i as *mut Interp;
-            corosensei::Coroutine::new(
+            // 8 MiB — interpreter frames are large; the 1 MiB default
+            // overflows on moderately nested generator bodies
+            let stack = corosensei::stack::DefaultStack::new(8 * 1024 * 1024)
+                .expect("generator stack");
+            corosensei::Coroutine::with_stack(stack,
                 move |y: &corosensei::Yielder<GenIn, Value>, first: GenIn|
                       -> GenRet {
                     // GeneratorResumeAbrupt on a suspendedStart

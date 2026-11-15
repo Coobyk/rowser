@@ -150,6 +150,10 @@ pub enum Pattern {
     Array(Vec<ArrayPatElem>),
     /// `{a, b: x, c = 1, ...rest}`
     Object(Vec<ObjPatElem>),
+    /// destructuring-ASSIGNMENT only: a member-expression lvalue
+    /// (`[a.b] = arr`, `({x: o.p} = o)`) — evaluated as a reference at
+    /// element-assign time. Never produced for declarations.
+    Target(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]

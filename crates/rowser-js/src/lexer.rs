@@ -299,11 +299,12 @@ impl Lexer {
                 self.number()?
             } else if is_ident_start(c) || c == '\\' {
                 let name = self.ident()?;
+                // escaped reserved words lex to their keyword token —
+                // IdentifierReference/BindingIdentifier positions only
+                // accept Tok::Ident so they're rejected contextually,
+                // while IdentifierName positions (member names, prop
+                // keys, labels) accept them per spec
                 match keyword(&name) {
-                    // always-reserved words can't appear escaped
-                    Some(kw) if self.tok_escaped && !crate::parser::is_contextual_ident_kw(&kw) => {
-                        return Err(self.err("escaped reserved word"));
-                    }
                     Some(kw) => Tok::Kw(kw),
                     None => Tok::Ident(name),
                 }

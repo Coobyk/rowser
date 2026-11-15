@@ -136,6 +136,21 @@ pub enum Value {
 
 pub type ObjRef = Rc<RefCell<Obj>>;
 
+/// A resolved member assignment reference — evaluating a destructuring
+/// target's base and key is a separate phase from storing the value.
+enum LRef {
+    Prop(Value, PropKey),
+    /// `super.x` — home object and receiver captured at eval time
+    Super(ObjRef, Value, PropKey),
+}
+
+/// A destructuring element whose member target has already resolved its
+/// reference (the value read/binding step runs after).
+enum PrepPat<'a> {
+    Pat(&'a Pattern),
+    Resolved(LRef),
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum PropKey {
     S(Rc<str>),
@@ -3814,6 +3829,76 @@ impl Interp {
         }
     }
 
+    /// Resolve a member expression into an assignable reference — the
+    /// base and key evaluate now; the store happens later (PutValue).
+    /// Destructuring evaluates the target ref BEFORE pulling iterator
+    /// values / reading object keys, so the two phases are split.
+    fn eval_lref(&mut self, e: &Expr, env: &EnvRef) -> Result<LRef, Value> {
+        let Expr::Member { obj, prop, .. } = e else {
+            return Err(self.syntax_err("invalid assignment target"));
+        };
+        if matches!(&**obj, Expr::Super) {
+            let Some((fscope, home)) = self.find_home(env) else {
+                return Err(self.syntax_err("'super' keyword unexpected here"));
+            };
+            let this = fscope.thisv.borrow().clone();
+            let k = self.member_key(prop, env)?;
+            return Ok(LRef::Super(home, this, k));
+        }
+        let ov = self.eval_expr(obj, env)?;
+        let k = self.member_key(prop, env)?;
+        Ok(LRef::Prop(ov, k))
+    }
+
+    fn member_key(&mut self, prop: &Expr, env: &EnvRef) -> Result<PropKey, Value> {
+        if let Expr::Str(s) = prop {
+            return Ok(PropKey::from_str(s));
+        }
+        let pv = self.eval_expr(prop, env)?;
+        self.to_propkey(&pv)
+    }
+
+    fn put_lref(&mut self, lr: LRef, v: Value) -> Result<(), Value> {
+        match lr {
+            LRef::Prop(b, k) => self.set_prop(&b, k, v),
+            LRef::Super(home, this, k) => {
+                let parent = home.borrow().proto.clone();
+                let Some(parent) = parent else {
+                    return Ok(());
+                };
+                self.obj_set(&parent, k, v, &this)
+            }
+        }
+    }
+
+    /// Evaluate a pattern's member-target ref eagerly where the spec
+    /// requires lref evaluation before the value read (array elements,
+    /// rest, keyed object properties).
+    fn prep_pat<'a>(
+        &mut self,
+        scope: &EnvRef,
+        p: &'a Pattern,
+    ) -> Result<PrepPat<'a>, Value> {
+        if let Pattern::Target(e) = p {
+            Ok(PrepPat::Resolved(self.eval_lref(e, scope)?))
+        } else {
+            Ok(PrepPat::Pat(p))
+        }
+    }
+
+    fn pat_bind_prepped(
+        &mut self,
+        scope: &EnvRef,
+        pp: PrepPat<'_>,
+        v: Value,
+        mode: BindMode,
+    ) -> Result<(), Value> {
+        match pp {
+            PrepPat::Pat(p) => self.pat_bind(scope, p, v, mode),
+            PrepPat::Resolved(lr) => self.put_lref(lr, v),
+        }
+    }
+
     fn pat_bind(
         &mut self,
         scope: &EnvRef,
@@ -3822,6 +3907,13 @@ impl Interp {
         mode: BindMode,
     ) -> Result<(), Value> {
         match pat {
+            Pattern::Target(e) => {
+                if !matches!(mode, BindMode::Assign) {
+                    return Err(self.syntax_err("invalid binding target"));
+                }
+                let lr = self.eval_lref(e, scope)?;
+                self.put_lref(lr, v)?;
+            }
             Pattern::Ident(name) => match mode {
                 BindMode::Assign => self.env_assign(scope, name, v)?,
                 // var initializers assign through the scope chain —
@@ -3837,8 +3929,11 @@ impl Interp {
             Pattern::Array(elems) => {
                 // lazy protocol pulls — IteratorClose on early completion
                 // (an infinite source must not be drained) and on abrupt
+                // PATTERN errors; iterator-internal errors (a throwing
+                // next()) propagate directly without a close call
                 let mut it = crate::builtins::for_of_iter(self, &v)?;
                 let mut done = false;
+                let mut it_err = false;
                 let res = (|| -> Result<(), Value> {
                     for e in elems {
                         macro_rules! pull {
@@ -3854,7 +3949,10 @@ impl Interp {
                                             done = true;
                                             Value::Und
                                         }
-                                        Err(e) => return Err(e),
+                                        Err(e) => {
+                                            it_err = true;
+                                            return Err(e);
+                                        }
                                     }
                                 }
                             }};
@@ -3864,10 +3962,13 @@ impl Interp {
                                 let _ = pull!();
                             }
                             ArrayPatElem::Elem(p) => {
+                                // target lref evaluates BEFORE the pull
+                                let pp = self.prep_pat(scope, p)?;
                                 let x = pull!();
-                                self.pat_bind(scope, p, x, mode)?;
+                                self.pat_bind_prepped(scope, pp, x, mode)?;
                             }
                             ArrayPatElem::Default(p, d) => {
+                                let pp = self.prep_pat(scope, p)?;
                                 let x = pull!();
                                 let x = if matches!(x, Value::Und) {
                                     let x = self.eval_expr(d, scope)?;
@@ -3880,9 +3981,12 @@ impl Interp {
                                 } else {
                                     x
                                 };
-                                self.pat_bind(scope, p, x, mode)?;
+                                self.pat_bind_prepped(scope, pp, x, mode)?;
                             }
                             ArrayPatElem::Rest(p) => {
+                                // the rest target's lref evaluates before
+                                // the iterator drains
+                                let pp = self.prep_pat(scope, p)?;
                                 // rest drains the iterator — it ends done
                                 let mut rest = Vec::new();
                                 loop {
@@ -3894,7 +3998,10 @@ impl Interp {
                                             done = true;
                                             break;
                                         }
-                                        Err(e) => return Err(e),
+                                        Err(e) => {
+                                            it_err = true;
+                                            return Err(e);
+                                        }
                                     }
                                 }
                                 let arr = Value::Obj(self.new_arr(rest));
@@ -3904,7 +4011,7 @@ impl Interp {
                     }
                     Ok(())
                 })();
-                if !done {
+                if !done && !it_err {
                     // pattern finished while the iterator is still open —
                     // IteratorClose (normal completion). On abrupt the
                     // close error is swallowed per spec.
@@ -3924,11 +4031,12 @@ impl Interp {
                 for e in elems {
                     if let ast::PropKey::Str(s) = &e.key {
                         if s.as_str() == REST_PAT_KEY {
-                            // `{...rest}` — copy remaining own enumerable props
+                            // `{...rest}` — CopyDataProperties over own
+                            // enumerable keys, string AND symbol, minus
+                            // the keys already consumed by the pattern
                             let rest = self.new_obj();
                             if let Value::Obj(src) = &v {
-                                let keys = self.own_keys(&v);
-                                let taken: HashSet<String> = elems
+                                let mut taken: HashSet<String> = elems
                                     .iter()
                                     .filter_map(|x| match &x.key {
                                         ast::PropKey::Str(s) | ast::PropKey::Ident(s)
@@ -3939,6 +4047,19 @@ impl Interp {
                                         _ => None,
                                     })
                                     .collect();
+                                // computed keys evaluate in source order —
+                                // their resolved names are also taken
+                                for x in elems {
+                                    if let ast::PropKey::Computed(ex) = &x.key {
+                                        let kv = self.eval_expr(ex, scope)?;
+                                        if let Ok(PropKey::S(pk)) =
+                                            self.to_propkey(&kv)
+                                        {
+                                            taken.insert(pk.to_string());
+                                        }
+                                    }
+                                }
+                                let keys = self.own_keys(&v);
                                 for k in keys {
                                     if !taken.contains(&k) {
                                         // CopyDataProperties uses [[Get]]
@@ -3947,6 +4068,27 @@ impl Interp {
                                             &PropKey::from_str(&k),
                                         )?;
                                         self.set_data(&rest, &k, val);
+                                    }
+                                }
+                                // enumerable symbol keys copy too
+                                if let Value::Obj(so) = &v {
+                                    let syms: Vec<u64> = so
+                                        .borrow()
+                                        .props
+                                        .iter()
+                                        .filter_map(|(k, p)| match k {
+                                            PropKey::Sym(id) if p.enumerable => Some(*id),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    for id in syms {
+                                        let val = self
+                                            .get_prop(&v, &PropKey::Sym(id))?;
+                                        let mut pb = rest.borrow_mut();
+                                        pb.props.insert(
+                                            PropKey::Sym(id),
+                                            crate::interp::Prop::data(val),
+                                        );
                                     }
                                 }
                             }
@@ -3962,6 +4104,9 @@ impl Interp {
                             self.to_propkey(&kv)?
                         }
                     };
+                    // the binding target's lref evaluates before the
+                    // source property [[Get]]
+                    let pp = self.prep_pat(scope, &e.val)?;
                     let got = self.get_prop(&v, &key)?;
                     let val = match (&got, &e.default) {
                         (Value::Und, Some(d)) => {
@@ -3975,7 +4120,7 @@ impl Interp {
                         }
                         _ => got,
                     };
-                    self.pat_bind(scope, &e.val, val, mode)?;
+                    self.pat_bind_prepped(scope, pp, val, mode)?;
                 }
             }
         }
@@ -4937,6 +5082,11 @@ impl Interp {
     ) -> Result<(), Value> {
         // like bind_pattern but overwrites let/const bindings each iteration
         match pat {
+            Pattern::Target(e) => {
+                let lr = self.eval_lref(e, scope)?;
+                self.put_lref(lr, v)?;
+                return Ok(());
+            }
             Pattern::Ident(n) => {
                 if kind == VarKind::Var {
                     return self.for_var_assign(scope, n, v);
@@ -5493,8 +5643,12 @@ impl Interp {
                 let Some(&y) = self.gen_yielders.last() else {
                     return Err(self.syntax_err("yield outside generator"));
                 };
-                // park the coroutine; the resumer's input arrives here
+                // pop MY yielder while parked — the resumer's yielder
+                // becomes current for its own $yield lookups — then
+                // re-push on resume so nested coroutines see me again
+                self.gen_yielders.pop();
                 let input = unsafe { (*y).suspend(v) };
+                self.gen_yielders.push(y);
                 return match input {
                     GenIn::Next(sent) => Ok(sent),
                     GenIn::Throw(e) => Err(e),
@@ -5513,7 +5667,10 @@ impl Interp {
                 loop {
                     match crate::builtins::iter_lazy_step(self, &mut inner) {
                         Ok(Some(x)) => {
-                            match unsafe { (*y).suspend(x) } {
+                            self.gen_yielders.pop();
+                            let input = unsafe { (*y).suspend(x) };
+                            self.gen_yielders.push(y);
+                            match input {
                                 GenIn::Next(_) => {}
                                 GenIn::Throw(e) => {
                                     let _ = crate::builtins::iter_lazy_close(
@@ -5962,15 +6119,9 @@ impl Interp {
                 self.env_assign(env, name, v.clone())?;
                 Ok(v)
             }
-            Expr::Member { obj, prop, .. } => {
-                let ov = self.eval_expr(obj, env)?;
-                if let Expr::Str(s) = &**prop {
-                    self.set_prop_str(&ov, s, v.clone())?;
-                    return Ok(v);
-                }
-                let pv = self.eval_expr(prop, env)?;
-                let key = self.to_propkey(&pv)?;
-                self.set_prop(&ov, key, v.clone())?;
+            Expr::Member { .. } => {
+                let lr = self.eval_lref(target, env)?;
+                self.put_lref(lr, v.clone())?;
                 Ok(v)
             }
             Expr::Array(_) | Expr::Object(_) => {
@@ -6348,6 +6499,10 @@ fn fndef_uses_arguments(def: &FnDef) -> bool {
 
 fn pat_uses_arguments(p: &Pattern) -> bool {
     match p {
+        Pattern::Target(e) => {
+            matches!(&**e, Expr::Member { obj, prop, .. }
+                if expr_uses_arguments(obj) || expr_uses_arguments(prop))
+        }
         Pattern::Ident(n) => n == "arguments",
         Pattern::Array(elems) => elems.iter().any(|e| match e {
             ArrayPatElem::Hole => false,
@@ -6617,6 +6772,7 @@ fn collect_stmt<'a>(
 
 fn collect_pattern_names<'a>(p: &'a Pattern, out: &mut Vec<&'a str>) {
     match p {
+        Pattern::Target(_) => {}
         Pattern::Ident(n) => out.push(n),
         Pattern::Array(elems) => {
             for e in elems {
@@ -6682,8 +6838,10 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                                 value,
                             } => (expr_to_pattern(target)?, Some((**value).clone())),
                             Expr::Ident(n) => (Pattern::Ident(n.clone()), None),
-                            // `{a: [x, y]} = o` / `{a: {b}} = o`
-                            Expr::Array(_) | Expr::Object(_) => (expr_to_pattern(ex)?, None),
+                            // `{a: [x, y]} = o` / `{a: {b}} = o` / `{a: x.y} = o`
+                            Expr::Array(_) | Expr::Object(_) | Expr::Member { .. } => {
+                                (expr_to_pattern(ex)?, None)
+                            }
                             _ => return None,
                         };
                         out.push(ObjPatElem {
@@ -6697,7 +6855,7 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
             }
             Some(Pattern::Object(out))
         }
-        Expr::Member { .. } => None, // member targets in destructuring unsupported
+        Expr::Member { .. } => Some(Pattern::Target(Box::new(e.clone()))),
         _ => None,
     }
 }

@@ -339,6 +339,11 @@ impl Parser {
     }
 
     fn statement_inner(&mut self) -> Result<Stmt, Error> {
+        // an escaped reserved word is an IdentifierName — never the
+        // keyword itself (`br\u0061k;` is not a break statement)
+        if self.peek().escaped && matches!(self.peek().tok, Tok::Kw(_)) {
+            return Err(self.err("escaped reserved word"));
+        }
         match self.peek().tok.clone() {
             Tok::Punct(";") => {
                 self.next();
@@ -601,6 +606,9 @@ impl Parser {
                         });
                         break;
                     }
+                    // shorthand `{name}` binds — keyword keys only legal
+                    // for contextual names; `{break}` is a SyntaxError
+                    let key_was_reserved = matches!(&self.peek().tok, Tok::Kw(k) if !is_contextual_ident_kw(k));
                     let key = self.prop_key(true)?;
                     // `key` or `key: pattern` or `key = default` or `key: pat = d`
                     let (val, default) = if self.eat_punct(":") {
@@ -619,6 +627,11 @@ impl Parser {
                                 return Err(self.err("computed key needs `: pattern`"))
                             }
                         };
+                        if key_was_reserved {
+                            return Err(self.err(format!(
+                                "reserved word `{name}` is not a valid binding"
+                            )));
+                        }
                         let d = if self.eat_punct("=") {
                             Some(self.assign_expr()?)
                         } else {
@@ -1929,6 +1942,9 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, Error> {
+        if self.peek().escaped && matches!(self.peek().tok, Tok::Kw(_)) {
+            return Err(self.err("escaped reserved word"));
+        }
         match self.peek().tok.clone() {
             Tok::Num(n) => {
                 self.check_octal()?;
@@ -2203,7 +2219,11 @@ impl Parser {
                         self.eat_punct(",");
                         continue;
                     }
-                    let key = self.prop_key(true)?;
+                    // a shorthand `{name}` binds the name — keyword keys
+        // are only legal for always-contextual names (`{break}` must
+        // be a SyntaxError, `{yield}` stays legal sloppy)
+        let key_was_reserved = matches!(&self.peek().tok, Tok::Kw(k) if !is_contextual_ident_kw(k));
+        let key = self.prop_key(true)?;
                     if matches!(&key, PropKey::Ident(s) | PropKey::Str(s) if s == "__proto__")
                         && self.at_punct(":")
                     {
@@ -2234,6 +2254,12 @@ impl Parser {
                         // shorthand / shorthand with default (destructuring pos)
                         match &key {
                             PropKey::Ident(s) | PropKey::Str(s) => {
+                                if key_was_reserved {
+                                    return Err(self.err(format!(
+                                        "reserved word `{s}` is not a valid binding"
+                                    )));
+                                }
+                                self.check_binding_name(s)?;
                                 let ident = Expr::Ident(s.clone());
                                 if self.at_punct("=") {
                                     // `{a = 1}` in destructuring — keep as
@@ -2330,6 +2356,7 @@ pub(crate) fn pattern_names<'a>(p: &'a Param, out: &mut Vec<&'a str>) {
 
 fn collect_pat_names<'a>(p: &'a Pattern, out: &mut Vec<&'a str>) {
     match p {
+        Pattern::Target(_) => {}
         Pattern::Ident(n) => out.push(n.as_str()),
         Pattern::Array(elems) => {
             for e in elems {
