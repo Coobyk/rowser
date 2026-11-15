@@ -396,12 +396,12 @@ impl Parser {
                 self.expect_punct("(")?;
                 let c = self.expression()?;
                 self.expect_punct(")")?;
-                let body = Box::new(self.statement()?);
+                let body = self.loop_body()?;
                 Ok(Stmt::While { c, body })
             }
             Tok::Kw(Kw::Do) => {
                 self.next();
-                let body = Box::new(self.statement()?);
+                let body = self.loop_body()?;
                 self.expect_kw(Kw::While)?;
                 self.expect_punct("(")?;
                 let c = self.expression()?;
@@ -643,12 +643,35 @@ impl Parser {
         let c = self.expression()?;
         self.expect_punct(")")?;
         let t = Box::new(self.statement()?);
+        if self.strict && matches!(&*t, Stmt::FnDecl(_)) {
+            return Err(self.err(
+                "function declaration not allowed in statement position",
+            ));
+        }
         let e = if self.eat_kw(Kw::Else) {
-            Some(Box::new(self.statement()?))
+            let inner = Box::new(self.statement()?);
+            if self.strict && matches!(&*inner, Stmt::FnDecl(_)) {
+                return Err(self.err(
+                    "function declaration not allowed in statement position",
+                ));
+            }
+            Some(inner)
         } else {
             None
         };
         Ok(Stmt::If { c, t, e })
+    }
+
+    /// a `for`/`do`/`while` body — FunctionDeclaration is never legal in
+    /// these statement positions (Annex-B only permits if/else/label)
+    fn loop_body(&mut self) -> Result<Box<Stmt>, Error> {
+        let body = self.statement()?;
+        if matches!(body, Stmt::FnDecl(_)) {
+            return Err(self.err(
+                "function declaration not allowed in statement position",
+            ));
+        }
+        Ok(Box::new(body))
     }
 
     fn for_stmt(&mut self) -> Result<Stmt, Error> {
@@ -677,7 +700,7 @@ impl Parser {
                 self.next();
                 let right = self.expression()?;
                 self.expect_punct(")")?;
-                let body = Box::new(self.statement()?);
+                let body = self.loop_body()?;
                 return Ok(Stmt::ForOf {
                     left: ForTarget::Var(kind, pat),
                     right,
@@ -688,7 +711,7 @@ impl Parser {
                 self.next();
                 let right = self.expression()?;
                 self.expect_punct(")")?;
-                let body = Box::new(self.statement()?);
+                let body = self.loop_body()?;
                 return Ok(Stmt::ForIn {
                     left: ForTarget::Var(kind, pat),
                     right,
@@ -725,7 +748,7 @@ impl Parser {
                 Some(self.expression()?)
             };
             self.expect_punct(")")?;
-            let body = Box::new(self.statement()?);
+            let body = self.loop_body()?;
             return Ok(Stmt::For {
                 init: Some(ForInit::Var(kind, decls)),
                 test,
@@ -748,7 +771,7 @@ impl Parser {
                 Some(self.expression()?)
             };
             self.expect_punct(")")?;
-            let body = Box::new(self.statement()?);
+            let body = self.loop_body()?;
             return Ok(Stmt::For {
                 init: None,
                 test,
@@ -766,7 +789,7 @@ impl Parser {
             self.next();
             let right = self.expression()?;
             self.expect_punct(")")?;
-            let body = Box::new(self.statement()?);
+            let body = self.loop_body()?;
             return Ok(Stmt::ForOf {
                 left: ForTarget::Expr(first),
                 right,
@@ -777,7 +800,7 @@ impl Parser {
             self.next();
             let right = self.expression()?;
             self.expect_punct(")")?;
-            let body = Box::new(self.statement()?);
+            let body = self.loop_body()?;
             return Ok(Stmt::ForIn {
                 left: ForTarget::Expr(first),
                 right,
@@ -797,7 +820,7 @@ impl Parser {
             Some(self.expression()?)
         };
         self.expect_punct(")")?;
-        let body = Box::new(self.statement()?);
+        let body = self.loop_body()?;
         Ok(Stmt::For {
             init: Some(ForInit::Expr(first)),
             test,
@@ -2398,29 +2421,37 @@ impl VCtx {
         Ok(())
     }
     /// declare a var name: a var propagates up through every enclosing
-    /// statement list, so it conflicts with a hard-lex name in ANY ancestor
-    /// block of this function (sibling scopes are already popped, but
-    /// `{ let f { var f } }` still errors)
+    /// statement list, so it joins the VarDeclaredNames of EVERY ancestor
+    /// block — conflicts with any lexically-declared name (let/const/
+    /// class/block-fn) in those lists, e.g. `{function f(){} {var f}}`
     fn decl_var(&mut self, name: &str) -> Result<(), Error> {
-        if self.hard.iter().any(|s| s.contains(name)) {
+        if self.lexes.iter().any(|s| s.contains(name)) {
             return Err(self.err(format!("`{name}` conflicts with a lexical declaration")));
         }
-        self.vars.last_mut().unwrap().insert(name.to_string());
+        for v in self.vars.iter_mut() {
+            v.insert(name.to_string());
+        }
         Ok(())
     }
-    /// declare a block-level function name: conflicts with hard lex names;
+    /// declare a block-level function name: conflicts with var names in
+    /// the SAME statement list (`{var f; function f(){}}`) and lex names;
     /// a same-name block fn is an error only in strict code
     fn decl_fn(&mut self, name: &str, in_block: bool) -> Result<(), Error> {
         if in_block {
             if self.hard.last().is_some_and(|h| h.contains(name))
+                || self.vars.last().is_some_and(|v| v.contains(name))
                 || (self.strict && self.lexes.last().is_some_and(|t| t.contains(name)))
             {
                 return Err(self.err(format!("duplicate declaration `{name}`")));
             }
             self.lexes.last_mut().unwrap().insert(name.to_string());
             // Annex B: block fn in sloppy code also creates a var binding
+            // at function scope — it enters the VarDeclaredNames of every
+            // enclosing statement list
             if !self.strict {
-                self.vars.last_mut().unwrap().insert(name.to_string());
+                for v in self.vars.iter_mut() {
+                    v.insert(name.to_string());
+                }
             }
             Ok(())
         } else {
@@ -2430,10 +2461,20 @@ impl VCtx {
     fn push_scope(&mut self) {
         self.lexes.push(Default::default());
         self.hard.push(Default::default());
+        self.vars.push(Default::default());
     }
     fn pop_scope(&mut self) {
         self.lexes.pop();
         self.hard.pop();
+        // var names declared inside the popped block propagate UP into
+        // the parent's VarDeclaredNames
+        if let Some(inner) = self.vars.pop() {
+            if let Some(outer) = self.vars.last_mut() {
+                for n in inner {
+                    outer.insert(n);
+                }
+            }
+        }
     }
 }
 
@@ -2828,7 +2869,6 @@ fn vfn(f: &FnDef, cx: &mut VCtx, method: Option<bool>) -> Result<(), Error> {
         }
     }
     cx.push_scope();
-    cx.vars.push(Default::default());
     let simple = f.params.iter().all(|p| matches!(p, Param::Ident(_)));
     let mut r = Ok(());
     for p in &f.params {
