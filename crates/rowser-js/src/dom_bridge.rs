@@ -258,14 +258,26 @@ fn doc_obj(i: &mut Interp, did: u32) -> Value {
         let p = &mut b.props;
         p.insert_str(K_DID, Prop::builtin(Value::Num(did as f64)));
         p.insert_str(K_NID, Prop::builtin(Value::Num(root as f64)));
-        p.insert_str("readyState", Prop::builtin(Value::Str(Rc::from("complete"))));
-        p.insert_str("compatMode", Prop::builtin(Value::Str(Rc::from("CSS1Compat"))));
+        p.insert_str(
+            "readyState",
+            Prop::builtin(Value::Str(Rc::from("complete"))),
+        );
+        p.insert_str(
+            "compatMode",
+            Prop::builtin(Value::Str(Rc::from("CSS1Compat"))),
+        );
         p.insert_str("characterSet", Prop::builtin(Value::Str(Rc::from("UTF-8"))));
         p.insert_str("charset", Prop::builtin(Value::Str(Rc::from("UTF-8"))));
-        p.insert_str("contentType", Prop::builtin(Value::Str(Rc::from("text/html"))));
+        p.insert_str(
+            "contentType",
+            Prop::builtin(Value::Str(Rc::from("text/html"))),
+        );
         p.insert_str("designMode", Prop::builtin(Value::Str(Rc::from("off"))));
         p.insert_str("URL", Prop::builtin(Value::Str(Rc::from(url.as_str()))));
-        p.insert_str("documentURI", Prop::builtin(Value::Str(Rc::from(url.as_str()))));
+        p.insert_str(
+            "documentURI",
+            Prop::builtin(Value::Str(Rc::from(url.as_str()))),
+        );
         p.insert_str("cookie", Prop::builtin(Value::Str(empty_rc())));
         p.insert_str("referrer", Prop::builtin(Value::Str(empty_rc())));
         p.insert_str("defaultView", Prop::builtin(Value::Obj(i.p.global.clone())));
@@ -1897,7 +1909,9 @@ fn el_id_get(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
         return Ok(Value::Str(empty_rc()));
     };
     Ok(with_ds(i, |ds| {
-        Value::Str(Rc::from(ds.docs[did as usize].attr(nid, "id").unwrap_or("")))
+        Value::Str(Rc::from(
+            ds.docs[did as usize].attr(nid, "id").unwrap_or(""),
+        ))
     }))
 }
 
@@ -1938,7 +1952,9 @@ macro_rules! reflect_str {
                 return Ok(Value::Str(empty_rc()));
             };
             Ok(with_ds(i, |ds| {
-                Value::Str(Rc::from(ds.docs[did as usize].attr(nid, $attr).unwrap_or("")))
+                Value::Str(Rc::from(
+                    ds.docs[did as usize].attr(nid, $attr).unwrap_or(""),
+                ))
             }))
         }
         fn $set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -2050,15 +2066,19 @@ fn link_host_port(u: &rowser_net::Url) -> String {
 
 link_prop!(link_host_get, |u| link_host_port(u));
 link_prop!(link_hostname_get, |u| u.host.clone());
-link_prop!(
-    link_origin_get,
-    |u| format!("{}://{}", u.scheme, link_host_port(u))
-);
+link_prop!(link_origin_get, |u| format!(
+    "{}://{}",
+    u.scheme,
+    link_host_port(u)
+));
 link_prop!(link_pathname_get, |u| u.path.clone());
-link_prop!(link_port_get, |u| match rowser_net::default_port(&u.scheme) {
-    Some(d) if d == u.port => String::new(),
-    _ => u.port.to_string(),
-});
+link_prop!(
+    link_port_get,
+    |u| match rowser_net::default_port(&u.scheme) {
+        Some(d) if d == u.port => String::new(),
+        _ => u.port.to_string(),
+    }
+);
 link_prop!(link_protocol_get, |u| format!("{}:", u.scheme));
 link_prop!(link_search_get, |u| u
     .query
@@ -2381,7 +2401,12 @@ fn cl_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     let Some((_, _, cur)) = cl_el(i, this) else {
         return Ok(Value::Str(empty_rc()));
     };
-    Ok(Value::Str(Rc::from(cur.split_whitespace().collect::<Vec<_>>().join(" ").as_str())))
+    Ok(Value::Str(Rc::from(
+        cur.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .as_str(),
+    )))
 }
 
 fn cl_length(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
@@ -2511,7 +2536,8 @@ fn style_obj(i: &mut Interp, el: &Value, proto: ObjRef) -> ObjRef {
     {
         let mut b = o.borrow_mut();
         b.props.insert_str(K_EL, Prop::builtin(el.clone()));
-        b.props.insert_str(K_DECLS, Prop::builtin(Value::Obj(decls)));
+        b.props
+            .insert_str(K_DECLS, Prop::builtin(Value::Obj(decls)));
         // interned prop names + shared empty string — one Rc clone per prop
         let empty = Value::Str(empty_rc());
         STYLE_PROP_KEYS.with(|c| {
@@ -2735,9 +2761,7 @@ fn sync_dom_side_effects(i: &mut Interp) {
     // only sync wrappers that were actually materialized — style/dataset
     // getters register their objects in DomState, so we don't have to scan
     // every cached node wrapper.
-    let (styles, datasets) = with_ds(i, |ds| {
-        (ds.styled_objs.clone(), ds.dataset_objs.clone())
-    });
+    let (styles, datasets) = with_ds(i, |ds| (ds.styled_objs.clone(), ds.dataset_objs.clone()));
     let mut style_writes: Vec<(u32, NodeId, String)> = Vec::new();
     let mut data_writes: Vec<(u32, NodeId, Vec<(String, String)>)> = Vec::new();
     for so in &styles {
@@ -2918,7 +2942,8 @@ fn event_stop_imm(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     if let Value::Obj(o) = this {
         let mut b = o.borrow_mut();
         b.props.insert_str(K_STOP, Prop::builtin(Value::Bool(true)));
-        b.props.insert_str(K_STOPIMM, Prop::builtin(Value::Bool(true)));
+        b.props
+            .insert_str(K_STOPIMM, Prop::builtin(Value::Bool(true)));
     }
     Ok(Value::Und)
 }
@@ -2929,7 +2954,10 @@ fn event_init_event(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         let mut b = o.borrow_mut();
         let p = &mut b.props;
         p.insert_str("type", Prop::builtin(Value::Str(ty)));
-        p.insert_str("bubbles", Prop::builtin(Value::Bool(i.to_bool(&arg(args, 1)))));
+        p.insert_str(
+            "bubbles",
+            Prop::builtin(Value::Bool(i.to_bool(&arg(args, 1)))),
+        );
         p.insert_str(
             "cancelable",
             Prop::builtin(Value::Bool(i.to_bool(&arg(args, 2)))),
@@ -2987,7 +3015,10 @@ fn st_get_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let k = to_rc(i, &arg(args, 0))?;
     let sess = store_session(i, this);
     Ok(with_ds(i, |ds| {
-        match store_map(ds, sess).iter().find(|(k2, _)| k2.as_str() == &*k) {
+        match store_map(ds, sess)
+            .iter()
+            .find(|(k2, _)| k2.as_str() == &*k)
+        {
             Some((_, v)) => Value::Str(Rc::from(v.as_str())),
             None => Value::Null,
         }
@@ -3012,7 +3043,9 @@ fn st_set_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 fn st_remove_item(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let k = to_rc(i, &arg(args, 0))?;
     let sess = store_session(i, this);
-    with_ds(i, |ds| store_map(ds, sess).retain(|(k2, _)| k2.as_str() != &*k));
+    with_ds(i, |ds| {
+        store_map(ds, sess).retain(|(k2, _)| k2.as_str() != &*k)
+    });
     Ok(Value::Und)
 }
 
@@ -3486,9 +3519,7 @@ fn met(i: &Interp, o: &ObjRef, name: &str, f: NativeFn) {
 fn acc(i: &Interp, o: &ObjRef, name: &str, get: Option<NativeFn>, set: Option<NativeFn>) {
     let g = get.map(|f| i.native(&format!("get {name}"), f));
     let s = set.map(|f| i.native(&format!("set {name}"), f));
-    o.borrow_mut()
-        .props
-        .insert_str(name, Prop::accessor(g, s));
+    o.borrow_mut().props.insert_str(name, Prop::accessor(g, s));
 }
 
 fn gdef(i: &mut Interp, name: &str, v: Value) {
@@ -4332,7 +4363,10 @@ impl DomContext {
             }
             if std::env::var("ROWSR_JS_DRAIN").is_ok() && n % 1000 == 0 {
                 let pending = with_ds(i, |ds| ds.microtasks.len());
-                eprintln!("[drain] job {n} pending={pending} cb={}", i.inspect(&cb, 0).chars().take(160).collect::<String>());
+                eprintln!(
+                    "[drain] job {n} pending={pending} cb={}",
+                    i.inspect(&cb, 0).chars().take(160).collect::<String>()
+                );
             }
             if let Err(e) = i.call(&cb, Value::Und, args) {
                 let msg = i.inspect(&e, 0);
@@ -4977,7 +5011,10 @@ mod tests {
         assert_eq!(s(&mut dc, "document.getElementById('a').hash"), "#frag");
         assert_eq!(s(&mut dc, "document.getElementById('a').search"), "?q=1");
         assert_eq!(s(&mut dc, "document.getElementById('a').pathname"), "/p");
-        assert_eq!(s(&mut dc, "document.getElementById('a').hostname"), "example.com");
+        assert_eq!(
+            s(&mut dc, "document.getElementById('a').hostname"),
+            "example.com"
+        );
         assert_eq!(s(&mut dc, "document.getElementById('b').hash"), "#about");
         assert_eq!(
             s(&mut dc, "document.getElementById('b').pathname"),
@@ -5003,6 +5040,9 @@ mod tests {
         );
         dc.drain_microtasks();
         assert_eq!(s(&mut dc, "seen.join(',')"), "1");
-        assert_eq!(s(&mut dc, "document.getElementById('r').className"), "in-view");
+        assert_eq!(
+            s(&mut dc, "document.getElementById('r').className"),
+            "in-view"
+        );
     }
 }

@@ -3,9 +3,7 @@
 //! web-platform stubs (Worker, Image, Blob, FormData, XMLHttpRequest,
 //! crypto) — all std-only, installed by `builtins::install`.
 
-use crate::builtins::{
-    clamp_index, make_iter, merge_sort, promise_resolve_static, to_elems,
-};
+use crate::builtins::{clamp_index, make_iter, merge_sort, promise_resolve_static, to_elems};
 use crate::interp::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -225,13 +223,10 @@ fn ta_intrinsic_name(v: &Value, kind: TAK) -> String {
         while let Some(c) = cur {
             let hit = {
                 let b = c.borrow();
-                let hit = b
-                    .props
-                    .get_str("__name")
-                    .and_then(|p| match &p.val {
-                        Value::Str(s) => Some(s.to_string()),
-                        _ => None,
-                    });
+                let hit = b.props.get_str("__name").and_then(|p| match &p.val {
+                    Value::Str(s) => Some(s.to_string()),
+                    _ => None,
+                });
                 (hit, b.proto.clone())
             };
             if let Some(name) = hit.0 {
@@ -255,13 +250,10 @@ fn bigint_prim_of(i: &mut Interp, this: &Value) -> Result<Value, Value> {
         if b.props.contains_key(&PropKey::from_str("__bigint")) {
             let wrapped = b.props.contains_key(&PropKey::from_str("__bigint_wrap"));
             if wrapped {
-                let bits = b
-                    .props
-                    .get_str("__bigint_x")
-                    .and_then(|p| match &p.val {
-                        Value::Str(s) => Some(s.to_string()),
-                        _ => None,
-                    });
+                let bits = b.props.get_str("__bigint_x").and_then(|p| match &p.val {
+                    Value::Str(s) => Some(s.to_string()),
+                    _ => None,
+                });
                 drop(b);
                 if let Some(x) = bits {
                     let (neg, mag) = match x.strip_prefix('-') {
@@ -424,10 +416,10 @@ fn install_typed_arrays(i: &mut Interp) {
         }
         i.set_builtin(&ta_intr, "from", from);
         let sp = i.native("get [Symbol.species]", ta_get_species);
-        ta_intr.borrow_mut().props.insert(
-            PropKey::Sym(SYM_SPECIES),
-            Prop::accessor(Some(sp), None),
-        );
+        ta_intr
+            .borrow_mut()
+            .props
+            .insert(PropKey::Sym(SYM_SPECIES), Prop::accessor(Some(sp), None));
     }
 
     for ((name, kind), cf) in TA_CLASSES.iter().zip(TA_CTORS.iter()) {
@@ -503,13 +495,7 @@ fn install_typed_arrays(i: &mut Interp) {
         // BYTES_PER_ELEMENT on the proto as well as the ctor —
         // `ta.BYTES_PER_ELEMENT` must resolve through the instance
         // (resizable-buffer tests compute expected lengths from it).
-        i.set_attr(
-            &proto,
-            "BYTES_PER_ELEMENT",
-            Value::Num(8.0),
-            false,
-            false,
-        );
+        i.set_attr(&proto, "BYTES_PER_ELEMENT", Value::Num(8.0), false, false);
         let ctor = i.native(name, cf);
         if let Value::Obj(co) = &ctor {
             if let ObjKind::Func(Func::Native { ctor, .. }) = &mut co.borrow_mut().kind {
@@ -750,13 +736,7 @@ fn ta_elem_matches(v: &Value, needle: &Value, big: bool, svz: bool) -> bool {
 /// delegating to the ordinary property write used by species-created
 /// destinations and `of`/`from`.
 #[allow(dead_code)]
-fn ta_store_val(
-    i: &mut Interp,
-    a: &Value,
-    k: usize,
-    v: &Value,
-    big: bool,
-) -> Result<(), Value> {
+fn ta_store_val(i: &mut Interp, a: &Value, k: usize, v: &Value, big: bool) -> Result<(), Value> {
     if !big && bigint_magnitude(v).is_some() {
         return Err(i.type_err("Cannot convert a BigInt value to a number"));
     }
@@ -806,9 +786,7 @@ pub(crate) fn bigint_magnitude(v: &Value) -> Option<f64> {
         return Some(bits_to_f64(neg, &mag));
     }
     if let Value::Obj(o) = v {
-        if let Some(Value::Num(n)) =
-            o.borrow().props.get_str("__bigint").map(|p| p.val.clone())
-        {
+        if let Some(Value::Num(n)) = o.borrow().props.get_str("__bigint").map(|p| p.val.clone()) {
             return Some(n);
         }
     }
@@ -910,11 +888,7 @@ pub(crate) fn ta_elem_stored(i: &mut Interp, v: &Value, big: bool) -> Result<f64
 
 /// coerce a value for a (possibly bigint-kind) typed-array element
 /// write — ToNumber/ToBigInt + the ToBigInt64/ToBigUint64 mod-2^64 wrap.
-pub(crate) fn ta_elem_write(
-    i: &mut Interp,
-    this: &Value,
-    v: &Value,
-) -> Result<f64, Value> {
+pub(crate) fn ta_elem_write(i: &mut Interp, this: &Value, v: &Value) -> Result<f64, Value> {
     ta_elem_stored(i, v, ta_is_big(this))
 }
 
@@ -928,8 +902,7 @@ pub(crate) fn ta_is_big(v: &Value) -> bool {
     };
     let mut cur = Some(o.clone());
     while let Some(c) = cur {
-        if c
-            .borrow()
+        if c.borrow()
             .props
             .get_str("__name")
             .is_some_and(|p| matches!(p.val, Value::Str(_)))
@@ -1058,27 +1031,25 @@ fn ta_species_result(
         return Err(i.type_err("species constructor did not return a TypedArray"));
     };
     let Some(eff) = t.eff() else {
-        return Err(i.type_err(
-            "species constructor returned a detached or out-of-bounds TypedArray",
-        ));
+        return Err(
+            i.type_err("species constructor returned a detached or out-of-bounds TypedArray")
+        );
     };
     // spec TypedArrayCreate: a single-Number argument list requires the
     // result's TypedArrayLength — the live computed length for tracking
     // views — to be at least the requested count.
     if let Some(n) = min_len {
         if eff < n {
-            return Err(i.type_err(
-                "species constructor returned a TypedArray that is too short",
-            ));
+            return Err(i.type_err("species constructor returned a TypedArray that is too short"));
         }
     }
     // spec TypedArraySpeciesCreate step: the result's [[ContentType]]
     // must match the exemplar's — bigint and number TypedArrays are
     // never interchangeable.
     if ta_is_big(&result) != ta_is_big(this) {
-        return Err(i.type_err(
-            "species constructor returned a TypedArray with a different content type",
-        ));
+        return Err(
+            i.type_err("species constructor returned a TypedArray with a different content type")
+        );
     }
     Ok(result)
 }
@@ -1130,7 +1101,9 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bo
                         v => Some(to_index(i, &v)?),
                     };
                     if o.borrow().detached {
-                        return Err(i.type_err("Cannot construct a TypedArray on a detached ArrayBuffer"));
+                        return Err(
+                            i.type_err("Cannot construct a TypedArray on a detached ArrayBuffer")
+                        );
                     }
                     let blen = b.borrow().len();
                     if off % sz != 0 || off > blen {
@@ -1169,9 +1142,7 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bo
                         return Err(i.type_err("source TypedArray is detached or out of bounds"));
                     }
                     if ta_is_big(&src) != target_big {
-                        return Err(
-                            i.type_err("Cannot mix BigInt and non-BigInt TypedArrays")
-                        );
+                        return Err(i.type_err("Cannot mix BigInt and non-BigInt TypedArrays"));
                     }
                     let elems = ta_f64s(&src);
                     let (buf, n) = mk_buf_of(i, &elems, kind);
@@ -1185,64 +1156,56 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bo
                     // spec IterableToList + InitializeTypedArrayFromList
                     // collect every value before the per-element number
                     // conversions; converting inline is equivalent.
-                    let convert = |items: Vec<Value>,
-                                   i: &mut Interp|
-                     -> Result<Vec<f64>, Value> {
+                    let convert = |items: Vec<Value>, i: &mut Interp| -> Result<Vec<f64>, Value> {
                         let mut elems = Vec::with_capacity(items.len());
                         for it in items {
                             elems.push(ta_elem_stored(i, &it, target_big)?);
                         }
                         Ok(elems)
                     };
-                    let elems: Vec<f64> =
-                        if matches!(iterm, Value::Und | Value::Null) {
-                            // engine-internal array/iterator kinds may carry
-                            // elements without a `length` prop — reuse the
-                            // shared drain for those.
-                            let internal =
-                                matches!(&src, Value::Obj(o) if matches!(
-                                    o.borrow().kind,
-                                    ObjKind::Arr(_)
-                                        | ObjKind::Iter { .. }
-                                        | ObjKind::IterLazy(_)
-                                ));
-                            if internal {
-                                convert(to_elems(i, &src)?, i)?
-                            } else {
-                                // spec InitializeTypedArrayFromArrayLike:
-                                // LengthOfArrayLike feeds
-                                // AllocateTypedArrayBuffer — a length beyond
-                                // the host element cap is a RangeError before
-                                // any element is read (`to_elems` would
-                                // silently clamp). Each Get then interleaves
-                                // with its ToNumber/ToBigInt — a valueOf on
-                                // element k may mutate element k+1.
-                                let len =
-                                    i.get_prop(&src, &PropKey::from_str("length"))?;
-                                let n = i.to_num(&len)?;
-                                if n.is_nan() || n <= 0.0 {
-                                    Vec::new()
-                                } else if !n.is_finite() || n > 8_000_000.0 {
-                                    return Err(
-                                        i.range_err("Invalid typed array length")
-                                    );
-                                } else {
-                                    let n = n.trunc() as usize;
-                                    let mut elems =
-                                        Vec::with_capacity(n.min(1_000_000));
-                                    for k in 0..n {
-                                        let it = i.get_prop(&src, &ta_elem_key(k))?;
-                                        elems.push(ta_elem_stored(i, &it, target_big)?);
-                                    }
-                                    elems
-                                }
-                            }
+                    let elems: Vec<f64> = if matches!(iterm, Value::Und | Value::Null) {
+                        // engine-internal array/iterator kinds may carry
+                        // elements without a `length` prop — reuse the
+                        // shared drain for those.
+                        let internal = matches!(&src, Value::Obj(o) if matches!(
+                            o.borrow().kind,
+                            ObjKind::Arr(_)
+                                | ObjKind::Iter { .. }
+                                | ObjKind::IterLazy(_)
+                        ));
+                        if internal {
+                            convert(to_elems(i, &src)?, i)?
                         } else {
-                            if !i.is_callable(&iterm) {
-                                return Err(i.type_err("value is not iterable"));
+                            // spec InitializeTypedArrayFromArrayLike:
+                            // LengthOfArrayLike feeds
+                            // AllocateTypedArrayBuffer — a length beyond
+                            // the host element cap is a RangeError before
+                            // any element is read (`to_elems` would
+                            // silently clamp). Each Get then interleaves
+                            // with its ToNumber/ToBigInt — a valueOf on
+                            // element k may mutate element k+1.
+                            let len = i.get_prop(&src, &PropKey::from_str("length"))?;
+                            let n = i.to_num(&len)?;
+                            if n.is_nan() || n <= 0.0 {
+                                Vec::new()
+                            } else if !n.is_finite() || n > 8_000_000.0 {
+                                return Err(i.range_err("Invalid typed array length"));
+                            } else {
+                                let n = n.trunc() as usize;
+                                let mut elems = Vec::with_capacity(n.min(1_000_000));
+                                for k in 0..n {
+                                    let it = i.get_prop(&src, &ta_elem_key(k))?;
+                                    elems.push(ta_elem_stored(i, &it, target_big)?);
+                                }
+                                elems
                             }
-                            convert(i.iter_values(&src)?, i)?
-                        };
+                        }
+                    } else {
+                        if !i.is_callable(&iterm) {
+                            return Err(i.type_err("value is not iterable"));
+                        }
+                        convert(i.iter_values(&src)?, i)?
+                    };
                     let (buf, n) = mk_buf_of(i, &elems, kind);
                     (buf, 0, n, false)
                 }
@@ -1408,7 +1371,9 @@ fn need_ta(i: &mut Interp, this: &Value) -> Result<Tap, Value> {
         i.type_err("Method called on incompatible receiver (expected TypedArray)")
     })?;
     if t.eff().is_none() {
-        return Err(i.type_err("Cannot perform operation on a detached or out-of-bounds TypedArray"));
+        return Err(
+            i.type_err("Cannot perform operation on a detached or out-of-bounds TypedArray")
+        );
     }
     Ok(t)
 }
@@ -1448,9 +1413,7 @@ fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         // out-of-bounds checks on both records, the ContentType check,
         // the length range check, then the copy.
         let Some(tlen) = t.eff() else {
-            return Err(
-                i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray")
-            );
+            return Err(i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray"));
         };
         let Some(slen) = s.eff() else {
             return Err(i.type_err("source TypedArray is detached or out of bounds"));
@@ -1479,9 +1442,7 @@ fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     // ToObject(source) / LengthOfArrayLike(source), so length getters
     // observe the original bounds while writes stay live-bounded.
     let Some(tlen) = t.eff() else {
-        return Err(
-            i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray")
-        );
+        return Err(i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray"));
     };
     if matches!(src, Value::Und | Value::Null) {
         return Err(i.type_err("set source must be an object"));
@@ -1552,19 +1513,11 @@ fn m_ta_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         v => clamp_index(ta_to_int(i, &v)?, len),
     };
     let count = end.saturating_sub(begin);
-    let a = ta_species_result(
-        i,
-        this,
-        t.kind,
-        vec![Value::Num(count as f64)],
-        Some(count),
-    )?;
+    let a = ta_species_result(i, this, t.kind, vec![Value::Num(count as f64)], Some(count))?;
     // spec re-validates the source after species construction — a
     // detached or shrunk-out-of-bounds view throws even when count is 0.
     if t.eff().is_none() {
-        return Err(
-            i.type_err("Cannot perform slice on a detached or out-of-bounds ArrayBuffer")
-        );
+        return Err(i.type_err("Cannot perform slice on a detached or out-of-bounds ArrayBuffer"));
     }
     if count > 0 {
         // spec: same element kind → byte-level copy (requires the same
@@ -1654,9 +1607,7 @@ fn m_ta_copy_within(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         let blen = bb.len();
         let to_byte = (t.off + target * sz).min(blen);
         let from_byte = (t.off + start * sz).min(blen);
-        let count_bytes = (count * sz)
-            .min(blen - to_byte)
-            .min(blen - from_byte);
+        let count_bytes = (count * sz).min(blen - to_byte).min(blen - from_byte);
         let tmp: Vec<u8> = bb[from_byte..from_byte + count_bytes].to_vec();
         bb[to_byte..to_byte + count_bytes].copy_from_slice(&tmp);
     }
@@ -1964,13 +1915,7 @@ fn m_ta_map(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let t = need_ta(i, this)?;
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
-    let a = ta_species_result(
-        i,
-        this,
-        t.kind,
-        vec![Value::Num(len as f64)],
-        Some(len),
-    )?;
+    let a = ta_species_result(i, this, t.kind, vec![Value::Num(len as f64)], Some(len))?;
     for k in 0..len {
         let kv = ta_pub_elem(i, this, k)?;
         let rv = i.call(
@@ -2221,7 +2166,8 @@ fn mk_ta_iter(i: &mut Interp, this: &Value, mode: u8) -> Value {
         let mut b = it.borrow_mut();
         b.props.insert_str("__src", Prop::builtin(this.clone()));
         b.props.insert_str("__i", Prop::builtin(Value::Num(0.0)));
-        b.props.insert_str("__m", Prop::builtin(Value::Num(mode as f64)));
+        b.props
+            .insert_str("__m", Prop::builtin(Value::Num(mode as f64)));
         b.props
             .insert_str("next", Prop::builtin(i.native("next", ta_iter_next)));
     }
@@ -2443,8 +2389,10 @@ fn ab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     // coercion; only an Object `options` is consulted per spec.
     let max = match arg(args, 1) {
         Value::Obj(opts) => {
-            let v =
-                i.get_prop(&Value::Obj(opts.clone()), &PropKey::from_str("maxByteLength"))?;
+            let v = i.get_prop(
+                &Value::Obj(opts.clone()),
+                &PropKey::from_str("maxByteLength"),
+            )?;
             if matches!(v, Value::Und) {
                 None
             } else {
@@ -2510,11 +2458,7 @@ fn m_ab_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             match s {
                 Value::Und | Value::Null => None,
                 s if i.is_constructor(&s) => Some(s),
-                _ => {
-                    return Err(
-                        i.type_err("constructor[Symbol.species] is not a constructor")
-                    )
-                }
+                _ => return Err(i.type_err("constructor[Symbol.species] is not a constructor")),
             }
         }
         _ => return Err(i.type_err("constructor is not an object")),
@@ -2523,9 +2467,7 @@ fn m_ab_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Some(c) => i.construct(&c, vec![Value::Num(new_len as f64)], None)?,
         None => {
             let g = i.global.clone();
-            let cv = i
-                .env_lookup(&g, "ArrayBuffer")?
-                .unwrap_or(Value::Und);
+            let cv = i.env_lookup(&g, "ArrayBuffer")?.unwrap_or(Value::Und);
             i.construct(&cv, vec![Value::Num(new_len as f64)], None)?
         }
     };
@@ -2560,8 +2502,7 @@ fn m_ab_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let sb_len = sb.borrow().len();
     let copy_len = new_len.min(sb_len.saturating_sub(start));
     if copy_len > 0 {
-        db.borrow_mut()[..copy_len]
-            .copy_from_slice(&sb.borrow()[start..start + copy_len]);
+        db.borrow_mut()[..copy_len].copy_from_slice(&sb.borrow()[start..start + copy_len]);
     }
     Ok(nv)
 }
@@ -2722,8 +2663,10 @@ fn sab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     // growable SharedArrayBuffers — options.maxByteLength
     let max = match arg(args, 1) {
         Value::Obj(opts) => {
-            let v =
-                i.get_prop(&Value::Obj(opts.clone()), &PropKey::from_str("maxByteLength"))?;
+            let v = i.get_prop(
+                &Value::Obj(opts.clone()),
+                &PropKey::from_str("maxByteLength"),
+            )?;
             if matches!(v, Value::Und) {
                 None
             } else {
@@ -2763,13 +2706,19 @@ fn sab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 /// only accepts objects carrying the `__shared` marker.
 fn need_sab(i: &mut Interp, this: &Value) -> Result<(ObjRef, Rc<RefCell<Vec<u8>>>), Value> {
     let Value::Obj(o) = this else {
-        return Err(i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)"));
+        return Err(
+            i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)")
+        );
     };
     if !is_shared(o) {
-        return Err(i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)"));
+        return Err(
+            i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)")
+        );
     }
     let Some(b) = buffer_bytes(o) else {
-        return Err(i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)"));
+        return Err(
+            i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)")
+        );
     };
     Ok((o.clone(), b))
 }
@@ -3034,9 +2983,7 @@ fn dv_get_index(
     let (buf, off, len) = need_view(i, this)?;
     let idx = to_index(i, &arg(args, 0))?;
     let Some(vlen) = dv_state(&buf, off, len) else {
-        return Err(
-            i.type_err("Cannot perform operation on a detached or out-of-bounds DataView")
-        );
+        return Err(i.type_err("Cannot perform operation on a detached or out-of-bounds DataView"));
     };
     if idx > vlen || sz > vlen - idx {
         return Err(i.range_err("Offset is outside the bounds of the DataView"));
@@ -3063,9 +3010,7 @@ fn dv_set_index(
     let idx = to_index(i, &arg(args, 0))?;
     let v = ta_elem_num(i, &arg(args, 1), big)?;
     let Some(vlen) = dv_state(&buf, off, len) else {
-        return Err(
-            i.type_err("Cannot perform operation on a detached or out-of-bounds DataView")
-        );
+        return Err(i.type_err("Cannot perform operation on a detached or out-of-bounds DataView"));
     };
     if idx > vlen || sz > vlen - idx {
         return Err(i.range_err("Offset is outside the bounds of the DataView"));
@@ -3091,9 +3036,7 @@ fn dv_set_index_big(
     let (_, m64) = bigint_as_int((neg, &mag), 64, false);
     let u = u64::from_str_radix(&m64, 2).unwrap_or(0);
     let Some(vlen) = dv_state(&buf, off, len) else {
-        return Err(
-            i.type_err("Cannot perform operation on a detached or out-of-bounds DataView")
-        );
+        return Err(i.type_err("Cannot perform operation on a detached or out-of-bounds DataView"));
     };
     if idx > vlen || sz > vlen - idx {
         return Err(i.range_err("Offset is outside the bounds of the DataView"));
@@ -3439,8 +3382,7 @@ fn te_encode_into(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
                 if written + enc.len() > cap {
                     break;
                 }
-                bb[tp.off + written..tp.off + written + enc.len()]
-                    .copy_from_slice(enc.as_bytes());
+                bb[tp.off + written..tp.off + written + enc.len()].copy_from_slice(enc.as_bytes());
                 written += enc.len();
                 read += c.len_utf16();
             }
@@ -4818,7 +4760,11 @@ fn blob_text(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     } else {
         String::new()
     };
-    promise_resolve_static(i, &Value::Obj(i.p.promise_ctor.clone()), &[Value::Str(Rc::from(s.as_str()))])
+    promise_resolve_static(
+        i,
+        &Value::Obj(i.p.promise_ctor.clone()),
+        &[Value::Str(Rc::from(s.as_str()))],
+    )
 }
 
 fn blob_array_buffer(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
@@ -5160,7 +5106,11 @@ pub(crate) fn bigint_bits(v: &Value) -> Option<(bool, Rc<str>)> {
 
 fn bnorm(s: &str) -> &str {
     let t = s.trim_start_matches('0');
-    if t.is_empty() { "0" } else { t }
+    if t.is_empty() {
+        "0"
+    } else {
+        t
+    }
 }
 
 fn snorm(neg: bool, mag: String) -> (bool, String) {
@@ -5179,7 +5129,11 @@ fn badd(a: &str, b: &str) -> String {
     let mut carry = 0u8;
     for i in 0..ab.len() {
         let x = ab[ab.len() - 1 - i] - b'0';
-        let y = if i < bb.len() { bb[bb.len() - 1 - i] - b'0' } else { 0 };
+        let y = if i < bb.len() {
+            bb[bb.len() - 1 - i] - b'0'
+        } else {
+            0
+        };
         let s = x + y + carry;
         out.push((s & 1) + b'0');
         carry = s >> 1;
@@ -5198,7 +5152,11 @@ fn bsub(a: &str, b: &str) -> String {
     let mut borrow = 0i16;
     for i in 0..ab.len() {
         let x = (ab[ab.len() - 1 - i] - b'0') as i16;
-        let y = if i < bb.len() { (bb[bb.len() - 1 - i] - b'0') as i16 } else { 0 };
+        let y = if i < bb.len() {
+            (bb[bb.len() - 1 - i] - b'0') as i16
+        } else {
+            0
+        };
         let mut d = x - y - borrow;
         if d < 0 {
             d += 2;
@@ -5290,7 +5248,11 @@ pub(crate) fn scmp_bits(a: (bool, &str), b: (bool, &str)) -> std::cmp::Ordering 
         return if a.0 { Less } else { Greater };
     }
     let c = bcmp(a.1, b.1);
-    if a.0 { c.reverse() } else { c }
+    if a.0 {
+        c.reverse()
+    } else {
+        c
+    }
 }
 
 // two's-complement bitwise --------------------------------------------------
@@ -5576,15 +5538,11 @@ pub(crate) fn bigint_order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     if let Some(y) = bigint_bits(b) {
         let c = match a {
             Value::Num(n) => bigint_cmp_num((y.0, &y.1), *n).map(|o| o.reverse()),
-            Value::Str(s) => lit_to_bits(s)
-                .map(|x| scmp_bits((x.0, &x.1), (y.0, &y.1))),
+            Value::Str(s) => lit_to_bits(s).map(|x| scmp_bits((x.0, &x.1), (y.0, &y.1))),
             Value::Bool(v) => {
-                bigint_cmp_num((y.0, &y.1), if *v { 1.0 } else { 0.0 })
-                    .map(|o| o.reverse())
+                bigint_cmp_num((y.0, &y.1), if *v { 1.0 } else { 0.0 }).map(|o| o.reverse())
             }
-            Value::Null | Value::Und => {
-                bigint_cmp_num((y.0, &y.1), 0.0).map(|o| o.reverse())
-            }
+            Value::Null | Value::Und => bigint_cmp_num((y.0, &y.1), 0.0).map(|o| o.reverse()),
             _ => None,
         };
         return c;
@@ -5595,7 +5553,11 @@ pub(crate) fn bigint_order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
 /// decimal text of a stand-in (toString/concat/inspect)
 pub(crate) fn bigint_dec_string(v: &Value) -> Option<String> {
     let (neg, mag) = bigint_bits(v)?;
-    Some(format!("{}{}", if neg { "-" } else { "" }, bits_to_dec(&mag)))
+    Some(format!(
+        "{}{}",
+        if neg { "-" } else { "" },
+        bits_to_dec(&mag)
+    ))
 }
 
 /// magnitude → arbitrary radix text (BigInt.prototype.toString)
@@ -5653,16 +5615,8 @@ pub(crate) fn bigint_apply(
         Add => sadd(a, b),
         Sub => ssub(a, b),
         Mul => smul(a, b),
-        Div => {
-            return sdivmod(a, b)
-                .map(|(q, _)| q)
-                .ok_or("Division by zero")
-        }
-        Mod => {
-            return sdivmod(a, b)
-                .map(|(_, r)| r)
-                .ok_or("Division by zero")
-        }
+        Div => return sdivmod(a, b).map(|(q, _)| q).ok_or("Division by zero"),
+        Mod => return sdivmod(a, b).map(|(_, r)| r).ok_or("Division by zero"),
         Pow => {
             if b.0 {
                 return Err("Exponent must be non-negative");
@@ -5670,7 +5624,10 @@ pub(crate) fn bigint_apply(
             // exponent as usize — results beyond ~16M bits are refused
             let mut e = 0usize;
             for c in b.1.bytes() {
-                e = match e.checked_mul(2).and_then(|v| v.checked_add((c - b'0') as usize)) {
+                e = match e
+                    .checked_mul(2)
+                    .and_then(|v| v.checked_add((c - b'0') as usize))
+                {
                     Some(v) => v,
                     None => return Err("Maximum BigInt size exceeded"),
                 };

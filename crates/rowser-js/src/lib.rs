@@ -1841,13 +1841,18 @@ mod tests {
             Ok(v) => panic!("setPrototypeOf cycle accepted"),
         }
         // deep-but-finite chains still resolve
-        assert_eq!(num("var a={x:9},b={},c={}; c.__proto__=b; b.__proto__=a; c.x"), 9.0);
+        assert_eq!(
+            num("var a={x:9},b={},c={}; c.__proto__=b; b.__proto__=a; c.x"),
+            9.0
+        );
     }
 
     #[test]
     fn json_stringify_circular_throws() {
         match eval("var a=[]; a[0]=a; JSON.stringify(a)") {
-            Err(e) => assert!(format!("{e}").contains("circular") || format!("{e}").contains("TypeError")),
+            Err(e) => {
+                assert!(format!("{e}").contains("circular") || format!("{e}").contains("TypeError"))
+            }
             Ok(v) => panic!("circular stringify succeeded"),
         }
         // shared (non-cyclic) refs serialize fine
@@ -1866,11 +1871,9 @@ mod tests {
              d.value===1 && !d.writable && !d.enumerable && !d.configurable"
         ));
         // existing prop: absent attrs are preserved
-        assert!(b(
-            "var o={x:5}; Object.defineProperty(o,'x',{value:7});\
+        assert!(b("var o={x:5}; Object.defineProperty(o,'x',{value:7});\
              var d=Object.getOwnPropertyDescriptor(o,'x');\
-             d.value===7 && d.writable && d.enumerable && d.configurable"
-        ));
+             d.value===7 && d.writable && d.enumerable && d.configurable"));
         // value+accessor mixing throws
         match eval("Object.defineProperty({},'x',{value:1,get:function(){}})") {
             Err(_) => {}
@@ -1885,15 +1888,16 @@ mod tests {
             Ok(v) => panic!("non-configurable redef accepted"),
         }
         // defineProperty on array index writes the element
-        assert_eq!(num("var a=[1,2,3]; Object.defineProperty(a,'1',{value:9}); a[1]"), 9.0);
+        assert_eq!(
+            num("var a=[1,2,3]; Object.defineProperty(a,'1',{value:9}); a[1]"),
+            9.0
+        );
     }
 
     #[test]
     fn delete_honors_configurable() {
-        assert!(b(
-            "var o={}; Object.defineProperty(o,'x',{value:1});\
-             delete o.x === false && 'x' in o"
-        ));
+        assert!(b("var o={}; Object.defineProperty(o,'x',{value:1});\
+             delete o.x === false && 'x' in o"));
         assert!(b("var o={x:1}; delete o.x === true && !('x' in o)"));
     }
 
@@ -1913,7 +1917,10 @@ mod tests {
         assert!(b("typeof Function === 'function'"));
         assert!(b("typeof Function.prototype.bind === 'function'"));
         // new Function compiles a working global-scoped function
-        assert_eq!(num("var f = new Function('a','b','return a+b'); f(3,4)"), 7.0);
+        assert_eq!(
+            num("var f = new Function('a','b','return a+b'); f(3,4)"),
+            7.0
+        );
         // bind on non-callable throws
         match eval("var o={}; o.__proto__=Function.prototype; o.bind()") {
             Err(_) => {}
@@ -1958,6 +1965,8 @@ mod tests {
         assert!(b(
             "var e = new Error('m'); Object.keys(e).length === 0 && e.message === 'm'"
         ));
-        assert!(b("Math.PI === Math.PI && Object.getOwnPropertyDescriptor(Math,'PI').writable === false"));
+        assert!(b(
+            "Math.PI === Math.PI && Object.getOwnPropertyDescriptor(Math,'PI').writable === false"
+        ));
     }
 }

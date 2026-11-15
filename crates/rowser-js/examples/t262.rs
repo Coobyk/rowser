@@ -12,20 +12,49 @@ struct Meta {
 }
 
 fn meta(src: &str) -> Meta {
-    let mut m = Meta { negative_phase: None, negative_type: None, flags: vec![], includes: vec![], features: vec![], raw: false };
+    let mut m = Meta {
+        negative_phase: None,
+        negative_type: None,
+        flags: vec![],
+        includes: vec![],
+        features: vec![],
+        raw: false,
+    };
     let Some(s) = src.find("/*---") else { return m };
-    let Some(e) = src[s..].find("---*/") else { return m };
+    let Some(e) = src[s..].find("---*/") else {
+        return m;
+    };
     let yaml = &src[s + 5..s + e];
     let mut in_neg = false;
-    for line in yaml.lines() {
+    for line in yaml.split(|c| c == '\n' || c == '\r') {
         let t = line.trim();
-        if t.starts_with("negative:") { in_neg = true; continue; }
-        if in_neg && t.starts_with("phase:") { m.negative_phase = Some(t[6..].trim().into()); continue; }
-        if in_neg && t.starts_with("type:") { m.negative_type = Some(t[5..].trim().into()); continue; }
-        if t.starts_with("flags:") { m.flags = list_val(t); continue; }
-        if t.starts_with("includes:") { m.includes = list_val(t); continue; }
-        if t.starts_with("features:") { m.features = list_val(t); continue; }
-        if !t.is_empty() && !t.starts_with('-') && !t.starts_with(' ') && t.contains(':') { in_neg = false; }
+        if t.starts_with("negative:") {
+            in_neg = true;
+            continue;
+        }
+        if in_neg && t.starts_with("phase:") {
+            m.negative_phase = Some(t[6..].trim().into());
+            continue;
+        }
+        if in_neg && t.starts_with("type:") {
+            m.negative_type = Some(t[5..].trim().into());
+            continue;
+        }
+        if t.starts_with("flags:") {
+            m.flags = list_val(t);
+            continue;
+        }
+        if t.starts_with("includes:") {
+            m.includes = list_val(t);
+            continue;
+        }
+        if t.starts_with("features:") {
+            m.features = list_val(t);
+            continue;
+        }
+        if !t.is_empty() && !t.starts_with('-') && !t.starts_with(' ') && t.contains(':') {
+            in_neg = false;
+        }
     }
     m.raw = m.flags.iter().any(|f| f == "raw");
     m
@@ -35,22 +64,36 @@ fn list_val(t: &str) -> Vec<String> {
     // `key: [a, b]` or `key: name` — also `key:` alone (block list next lines ignored)
     let v = &t[t.find(':').unwrap() + 1..];
     let v = v.trim();
-    v.trim_start_matches('[').trim_end_matches(']').split(',')
+    v.trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
         .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|s| !s.is_empty()).collect()
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 // multi-line list entries (`features:` then `- item` lines)
 fn meta2(src: &str, m: &mut Meta) {
     let Some(s) = src.find("/*---") else { return };
-    let Some(e) = src[s..].find("---*/") else { return };
+    let Some(e) = src[s..].find("---*/") else {
+        return;
+    };
     let yaml = &src[s + 5..s + e];
     let mut key: Option<u8> = None; // 0 none,1 flags,2 includes,3 features
-    for line in yaml.lines() {
+    for line in yaml.split(|c| c == '\n' || c == '\r') {
         let t = line.trim();
-        if t.starts_with("flags:") { key = Some(1); continue; }
-        if t.starts_with("includes:") { key = Some(2); continue; }
-        if t.starts_with("features:") { key = Some(3); continue; }
+        if t.starts_with("flags:") {
+            key = Some(1);
+            continue;
+        }
+        if t.starts_with("includes:") {
+            key = Some(2);
+            continue;
+        }
+        if t.starts_with("features:") {
+            key = Some(3);
+            continue;
+        }
         if t.starts_with("- ") {
             let it = t[2..].trim().to_string();
             let list = match key {
@@ -70,36 +113,64 @@ fn meta2(src: &str, m: &mut Meta) {
 }
 
 const SKIP_FEATURES: &[&str] = &[
-    "SharedArrayBuffer", "Atomics", "FinalizationRegistry", "WeakRef",
-    "Intl", "Temporal", "Float16Array", "import.meta", "dynamic-import",
-    "import-attributes", "explicit-resource-management",
-    "decorators", "RegExp.escape", "regexp-duplicate-named-groups",
-    "tail-call-optimization", "async-functions",
-    "async-iteration", "regexp-v-flag",
+    "SharedArrayBuffer",
+    "Atomics",
+    "FinalizationRegistry",
+    "WeakRef",
+    "Intl",
+    "Temporal",
+    "Float16Array",
+    "import.meta",
+    "dynamic-import",
+    "import-attributes",
+    "explicit-resource-management",
+    "decorators",
+    "RegExp.escape",
+    "regexp-duplicate-named-groups",
+    "tail-call-optimization",
+    "async-functions",
+    "async-iteration",
+    "regexp-v-flag",
     "set-methods",
-    "regexp-modifiers", "json-parse-with-source", "source-phase-imports",
-    "ShadowRealm", "Array.fromAsync", "await-dictionary",
+    "regexp-modifiers",
+    "json-parse-with-source",
+    "source-phase-imports",
+    "ShadowRealm",
+    "Array.fromAsync",
+    "await-dictionary",
     "regexp-unicode-property-escapes",
     "weakrefs",
     "uint8array-base64",
     // $262.createRealm / Error.isError — APIs we don't expose
-    "cross-realm", "Error.isError", "host-gc-required",
+    "cross-realm",
+    "Error.isError",
+    "host-gc-required",
     // stage-3 Error.prototype.stack accessor proposal — unimplemented
     "error-stack-accessor",
-    "CanBlockIsFalse", "SharedArrayBuffer",
+    "CanBlockIsFalse",
+    "SharedArrayBuffer",
 ];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     if dir.is_file() {
-        if dir.extension().is_some_and(|x| x == "js") { out.push(dir.to_path_buf()); }
+        if dir.extension().is_some_and(|x| x == "js") {
+            out.push(dir.to_path_buf());
+        }
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() { walk(&p, out); }
-        else if p.extension().is_some_and(|x| x == "js")
-            && !p.file_name().unwrap().to_string_lossy().contains("_FIXTURE")
+        if p.is_dir() {
+            walk(&p, out);
+        } else if p.extension().is_some_and(|x| x == "js")
+            && !p
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("_FIXTURE")
         {
             out.push(p);
         }
@@ -114,25 +185,46 @@ fn main() {
         let p = PathBuf::from(&root).join(a);
         walk(&p, &mut files);
     }
-    if args.is_empty() { walk(Path::new(&root).join("test").as_path(), &mut files); }
+    if args.is_empty() {
+        walk(Path::new(&root).join("test").as_path(), &mut files);
+    }
     files.sort();
     let harness_dir = Path::new(&root).join("harness");
     let sta = std::fs::read_to_string(harness_dir.join("sta.js")).unwrap_or_default();
     let assert = std::fs::read_to_string(harness_dir.join("assert.js")).unwrap_or_default();
-    let propertyhelper = std::fs::read_to_string(harness_dir.join("propertyHelper.js")).unwrap_or_default();
-    let comparearray = std::fs::read_to_string(harness_dir.join("compareArray.js")).unwrap_or_default();
+    let propertyhelper =
+        std::fs::read_to_string(harness_dir.join("propertyHelper.js")).unwrap_or_default();
+    let comparearray =
+        std::fs::read_to_string(harness_dir.join("compareArray.js")).unwrap_or_default();
 
     let (mut pass, mut fail, mut skip) = (0u32, 0u32, 0u32);
     let mut fails: Vec<String> = Vec::new();
     for (idx, f) in files.iter().enumerate() {
-        let src = match std::fs::read_to_string(f) { Ok(s) => s, Err(_) => { skip += 1; continue } };
-        let mut m = meta(&src); meta2(&src, &mut m);
+        let src = match std::fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(_) => {
+                skip += 1;
+                continue;
+            }
+        };
+        let mut m = meta(&src);
+        meta2(&src, &mut m);
         // unsatisfiable flags/features
-        if m.flags.iter().any(|f| matches!(f.as_str(), "module" | "async" | "CanBlockIsFalse" | "SharedArrayBuffer")) {
-            skip += 1; continue;
+        if m.flags.iter().any(|f| {
+            matches!(
+                f.as_str(),
+                "module" | "async" | "CanBlockIsFalse" | "SharedArrayBuffer"
+            )
+        }) {
+            skip += 1;
+            continue;
         }
-        if m.features.iter().any(|f| SKIP_FEATURES.contains(&f.as_str())) {
-            skip += 1; continue;
+        if m.features
+            .iter()
+            .any(|f| SKIP_FEATURES.contains(&f.as_str()))
+        {
+            skip += 1;
+            continue;
         }
         // harness includes we don't serve
         let mut inc_src = String::new();
@@ -148,19 +240,35 @@ fn main() {
                 let p = harness_dir.join(inc);
                 match std::fs::read_to_string(&p) {
                     Ok(s) => inc_src.push_str(&s),
-                    Err(_) => { bad_inc = true; break; }
+                    Err(_) => {
+                        bad_inc = true;
+                        break;
+                    }
                 }
             }
         }
-        if bad_inc { skip += 1; continue; }
+        if bad_inc {
+            skip += 1;
+            continue;
+        }
 
         let strict = !m.raw && m.flags.iter().any(|f| f == "onlyStrict");
-        let body = if m.raw { src.clone() } else {
+        let body = if m.raw {
+            src.clone()
+        } else {
             // `print` — SpiderMonkey-era harness global some old tests use
             format!("var print = console.log;\n{sta}\n{assert}\n{inc_src}\n{src}")
         };
-        let body = if strict { format!("\"use strict\";\n{body}") } else { body };
-        let src = if strict { format!("\"use strict\";\n{src}") } else { src };
+        let body = if strict {
+            format!("\"use strict\";\n{body}")
+        } else {
+            body
+        };
+        let src = if strict {
+            format!("\"use strict\";\n{src}")
+        } else {
+            src
+        };
 
         // strip the frontmatter comment? harmless — it's a comment.
         let rel = f.strip_prefix(&root).unwrap_or(f).display().to_string();
@@ -175,13 +283,12 @@ fn main() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(15);
             if secs > 0 {
-                ctx.interp.arm_deadline(std::time::Duration::from_secs(secs));
+                ctx.interp
+                    .arm_deadline(std::time::Duration::from_secs(secs));
             }
             ctx.eval(&body)
         })
-        .unwrap_or_else(|_| {
-            Err(rowser_js::Error::new("panic during test", 0, 0))
-        });
+        .unwrap_or_else(|_| Err(rowser_js::Error::new("panic during test", 0, 0)));
         if std::env::var("T262_DEBUG").is_ok() {
             if let Err(e) = &res {
                 eprintln!("ERR {rel}: {e}");
@@ -199,24 +306,42 @@ fn main() {
             }
             (Some(_), Err(e)) => {
                 // runtime negative: error name must match
-                m.negative_type.as_deref().is_none_or(|t| e.to_string().contains(t))
+                m.negative_type
+                    .as_deref()
+                    .is_none_or(|t| e.to_string().contains(t))
             }
             (Some(_), Ok(_)) => false,
             (None, Ok(_)) => true,
             (None, Err(_)) => false,
         };
-        if ok { pass += 1; } else { fail += 1; fails.push(rel); }
-        if idx % 500 == 0 { eprintln!("\r{idx}/{} p={pass} f={fail} s={skip}", files.len()); }
+        if ok {
+            pass += 1;
+        } else {
+            fail += 1;
+            fails.push(rel);
+        }
+        if idx % 500 == 0 {
+            eprintln!("\r{idx}/{} p={pass} f={fail} s={skip}", files.len());
+        }
     }
-    eprintln!("\n=== pass={pass} fail={fail} skip={skip} rate={:.1}%",
-        pass as f64 / (pass + fail).max(1) as f64 * 100.0);
-    let show: usize = std::env::var("SHOW_FAILS").unwrap_or_else(|_| "0".into()).parse().unwrap_or(0);
-    for f in fails.iter().take(show) { println!("FAIL {f}"); }
+    eprintln!(
+        "\n=== pass={pass} fail={fail} skip={skip} rate={:.1}%",
+        pass as f64 / (pass + fail).max(1) as f64 * 100.0
+    );
+    let show: usize = std::env::var("SHOW_FAILS")
+        .unwrap_or_else(|_| "0".into())
+        .parse()
+        .unwrap_or(0);
+    for f in fails.iter().take(show) {
+        println!("FAIL {f}");
+    }
     let out = std::env::var("T262_FAILS_OUT").unwrap_or_else(|_| "/tmp/t262_fails.txt".into());
     std::fs::write(&out, fails.join("\n")).ok();
 }
 
-fn res_is_syntax_err(_body: &str) -> bool { false }
+fn res_is_syntax_err(_body: &str) -> bool {
+    false
+}
 
 fn res2_parse(body: &str) -> Result<(), ()> {
     // parse phase: source must fail to parse; we can't call the parser
@@ -225,9 +350,15 @@ fn res2_parse(body: &str) -> Result<(), ()> {
         Ok(_) => Ok(()),
         Err(e) => {
             let m = e.to_string();
-            if m.contains("parse") || m.contains("Syntax") || m.contains("unexpected") || m.contains("expected") {
+            if m.contains("parse")
+                || m.contains("Syntax")
+                || m.contains("unexpected")
+                || m.contains("expected")
+            {
                 Err(())
-            } else { Ok(()) }
+            } else {
+                Ok(())
+            }
         }
     }
 }

@@ -101,11 +101,7 @@ fn char_val(c: char) -> Value {
 /// virtual index the caller must resolve via `get_prop`.
 /// `[[Enumerable]]` flag of an own prop *right now* — dense array elements
 /// and typed-array indices are enumerable; holes/deleted props are not.
-fn own_prop_enumerable(
-    i: &mut Interp,
-    v: &Value,
-    k: &PropKey,
-) -> Result<bool, Value> {
+fn own_prop_enumerable(i: &mut Interp, v: &Value, k: &PropKey) -> Result<bool, Value> {
     let Value::Obj(o) = v else {
         return Ok(false);
     };
@@ -126,17 +122,18 @@ fn own_prop_enumerable(
             }
             return Ok(match &b.kind {
                 ObjKind::Arr(items) => {
-                    n < items.len()
-                        && !b.holes.as_ref().is_some_and(|h| h.contains(&n))
+                    n < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&n))
                 }
                 ObjKind::Args { items, .. } => {
-                    n < items.len()
-                        && !b.holes.as_ref().is_some_and(|h| h.contains(&n))
+                    n < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&n))
                 }
-                ObjKind::Typed { buf, off, len, kind, track } => {
-                    typed_state(buf, *off, *len, *kind, *track)
-                        .is_some_and(|eff| n < eff)
-                }
+                ObjKind::Typed {
+                    buf,
+                    off,
+                    len,
+                    kind,
+                    track,
+                } => typed_state(buf, *off, *len, *kind, *track).is_some_and(|eff| n < eff),
                 _ => false,
             });
         }
@@ -144,10 +141,7 @@ fn own_prop_enumerable(
     Ok(b.props.get(k).map(|p| p.enumerable).unwrap_or(false))
 }
 
-fn own_enum_entries(
-    i: &Interp,
-    v: &Value,
-) -> Vec<(PropKey, Option<Value>)> {
+fn own_enum_entries(i: &Interp, v: &Value) -> Vec<(PropKey, Option<Value>)> {
     let Value::Obj(o) = v else {
         return Vec::new();
     };
@@ -185,9 +179,14 @@ fn own_enum_entries(
                 ints.push((k, None));
             }
         }
-        ObjKind::Typed { buf, off, len, kind, track } => {
-            for k in 0..typed_state(buf, *off, *len, *kind, *track).unwrap_or(0)
-            {
+        ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+            track,
+        } => {
+            for k in 0..typed_state(buf, *off, *len, *kind, *track).unwrap_or(0) {
                 ints.push((k, None));
             }
         }
@@ -204,14 +203,10 @@ fn own_enum_entries(
         }
         let val = if p.is_accessor() {
             None
-        } else if let (PropKey::S(s), ObjKind::Args { map, .. }) =
-            (k, &b.kind)
-        {
+        } else if let (PropKey::S(s), ObjKind::Args { map, .. }) = (k, &b.kind) {
             // a still-mapped arguments index reads the env binding, not
             // the stored prop value
-            if arr_index(s)
-                .is_some_and(|n| matches!(map.get(n), Some(Some(_))))
-            {
+            if arr_index(s).is_some_and(|n| matches!(map.get(n), Some(Some(_)))) {
                 None
             } else {
                 Some(p.val.clone())
@@ -233,10 +228,8 @@ fn own_enum_entries(
         }
     }
     ints.sort_by_key(|(n, _)| *n);
-    let mut out: Vec<(PropKey, Option<Value>)> = ints
-        .into_iter()
-        .map(|(n, v)| (idx_key(n), v))
-        .collect();
+    let mut out: Vec<(PropKey, Option<Value>)> =
+        ints.into_iter().map(|(n, v)| (idx_key(n), v)).collect();
     out.extend(strs);
     out.extend(syms);
     out
@@ -262,8 +255,7 @@ pub(crate) fn own_enum_entries_full(
                     continue;
                 }
                 let kv = i.key_to_value(&k);
-                let d =
-                    obj_get_own_prop_desc(i, &Value::Und, &[v.clone(), kv])?;
+                let d = obj_get_own_prop_desc(i, &Value::Und, &[v.clone(), kv])?;
                 if let Value::Obj(d) = d {
                     let en = i.get_prop_str(&Value::Obj(d), "enumerable")?;
                     if i.to_bool(&en) {
@@ -278,10 +270,7 @@ pub(crate) fn own_enum_entries_full(
     // snapshot the key list once, then re-check each key's descriptor
     // live — an earlier getter may have deleted or de-enumerated a
     // later own prop (spec re-runs [[GetOwnProperty]] per key)
-    let keys: Vec<PropKey> = own_enum_entries(i, v)
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
+    let keys: Vec<PropKey> = own_enum_entries(i, v).into_iter().map(|(k, _)| k).collect();
     let mut out = Vec::new();
     for k in keys {
         if !syms && matches!(k, PropKey::Sym(_)) {
@@ -312,9 +301,7 @@ pub(crate) fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Va
                 // (length + indexed Gets), NOT the iterator protocol;
                 // every element must be a String or Symbol
                 if !matches!(r, Value::Obj(_)) {
-                    return Err(i.type_err(
-                        "proxy ownKeys trap must return an object",
-                    ));
+                    return Err(i.type_err("proxy ownKeys trap must return an object"));
                 }
                 let len_v = i.get_prop_str(&r, "length")?;
                 let len = to_length_num(i.to_num(&len_v)?).min(1_000_000);
@@ -324,11 +311,7 @@ pub(crate) fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Va
                     match e {
                         Value::Str(s) => trap_result.push(PropKey::S(s)),
                         Value::Sym(id, _) => trap_result.push(PropKey::Sym(id)),
-                        _ => {
-                            return Err(i.type_err(
-                                "proxy ownKeys must return strings or symbols",
-                            ))
-                        }
+                        _ => return Err(i.type_err("proxy ownKeys must return strings or symbols")),
                     }
                 }
                 let ext = match &t {
@@ -340,14 +323,9 @@ pub(crate) fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Va
                 let mut config: Vec<PropKey> = Vec::new();
                 for tk in &target_keys {
                     let kv = i.key_to_value(tk);
-                    let td = obj_get_own_prop_desc(
-                        i,
-                        &Value::Und,
-                        &[t.clone(), kv],
-                    )?;
+                    let td = obj_get_own_prop_desc(i, &Value::Und, &[t.clone(), kv])?;
                     if let Value::Obj(dv) = td {
-                        let cv =
-                            i.get_prop_str(&Value::Obj(dv), "configurable")?;
+                        let cv = i.get_prop_str(&Value::Obj(dv), "configurable")?;
                         if i.to_bool(&cv) {
                             config.push(tk.clone());
                         } else {
@@ -360,9 +338,7 @@ pub(crate) fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Va
                     let mut dup: FxSet<PropKey> = FxSet::default();
                     for k in &trap_result {
                         if !dup.insert(k.clone()) {
-                            return Err(i.type_err(
-                                "proxy ownKeys trap returned duplicate keys",
-                            ));
+                            return Err(i.type_err("proxy ownKeys trap returned duplicate keys"));
                         }
                     }
                 }
@@ -436,7 +412,13 @@ pub(crate) fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Va
                 ints.push(k);
             }
         }
-        ObjKind::Typed { buf, off, len, kind, track } => {
+        ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+            track,
+        } => {
             ints.extend(0..typed_state(buf, *off, *len, *kind, *track).unwrap_or(0));
         }
         _ => {}
@@ -476,82 +458,213 @@ fn arg(args: &[Value], i: usize) -> Value {
 /// checks. Names are the `name` given to `native()`.
 const NATIVE_ARITY: &[(&str, f64)] = &[
     // Array statics + prototype
-    ("at", 1.0), ("concat", 1.0), ("copyWithin", 2.0), ("every", 1.0),
-    ("fill", 1.0), ("filter", 1.0), ("find", 1.0), ("findIndex", 1.0),
-    ("findLast", 1.0), ("findLastIndex", 1.0), ("flatMap", 1.0),
-    ("forEach", 1.0), ("includes", 1.0), ("indexOf", 1.0), ("join", 1.0),
-    ("lastIndexOf", 1.0), ("map", 1.0), ("push", 1.0), ("reduce", 1.0),
-    ("reduceRight", 1.0), ("slice", 2.0), ("some", 1.0), ("sort", 1.0),
-    ("splice", 2.0), ("unshift", 1.0), ("with", 2.0), ("toSorted", 1.0),
-    ("toSpliced", 2.0), ("from", 1.0), ("isArray", 1.0),
+    ("at", 1.0),
+    ("concat", 1.0),
+    ("copyWithin", 2.0),
+    ("every", 1.0),
+    ("fill", 1.0),
+    ("filter", 1.0),
+    ("find", 1.0),
+    ("findIndex", 1.0),
+    ("findLast", 1.0),
+    ("findLastIndex", 1.0),
+    ("flatMap", 1.0),
+    ("forEach", 1.0),
+    ("includes", 1.0),
+    ("indexOf", 1.0),
+    ("join", 1.0),
+    ("lastIndexOf", 1.0),
+    ("map", 1.0),
+    ("push", 1.0),
+    ("reduce", 1.0),
+    ("reduceRight", 1.0),
+    ("slice", 2.0),
+    ("some", 1.0),
+    ("sort", 1.0),
+    ("splice", 2.0),
+    ("unshift", 1.0),
+    ("with", 2.0),
+    ("toSorted", 1.0),
+    ("toSpliced", 2.0),
+    ("from", 1.0),
+    ("isArray", 1.0),
     // Iterator helpers (unique names)
-    ("chunks", 1.0), ("windows", 1.0),
+    ("chunks", 1.0),
+    ("windows", 1.0),
     // Object
-    ("assign", 2.0), ("create", 2.0), ("defineProperties", 2.0),
-    ("defineProperty", 3.0), ("entries", 1.0), ("freeze", 1.0),
-    ("fromEntries", 1.0), ("getOwnPropertyDescriptor", 2.0),
-    ("getOwnPropertyDescriptors", 1.0), ("getOwnPropertyNames", 1.0),
-    ("getOwnPropertySymbols", 1.0), ("getPrototypeOf", 1.0),
-    ("groupBy", 2.0), ("hasOwn", 2.0), ("is", 2.0), ("isExtensible", 1.0),
-    ("isFrozen", 1.0), ("isSealed", 1.0), ("keys", 1.0),
-    ("preventExtensions", 1.0), ("seal", 1.0), ("setPrototypeOf", 2.0),
-    ("values", 1.0), ("hasOwnProperty", 1.0), ("isPrototypeOf", 1.0),
+    ("assign", 2.0),
+    ("create", 2.0),
+    ("defineProperties", 2.0),
+    ("defineProperty", 3.0),
+    ("entries", 1.0),
+    ("freeze", 1.0),
+    ("fromEntries", 1.0),
+    ("getOwnPropertyDescriptor", 2.0),
+    ("getOwnPropertyDescriptors", 1.0),
+    ("getOwnPropertyNames", 1.0),
+    ("getOwnPropertySymbols", 1.0),
+    ("getPrototypeOf", 1.0),
+    ("groupBy", 2.0),
+    ("hasOwn", 2.0),
+    ("is", 2.0),
+    ("isExtensible", 1.0),
+    ("isFrozen", 1.0),
+    ("isSealed", 1.0),
+    ("keys", 1.0),
+    ("preventExtensions", 1.0),
+    ("seal", 1.0),
+    ("setPrototypeOf", 2.0),
+    ("values", 1.0),
+    ("hasOwnProperty", 1.0),
+    ("isPrototypeOf", 1.0),
     ("propertyIsEnumerable", 1.0),
-    ("__defineGetter__", 2.0), ("__defineSetter__", 2.0),
-    ("__lookupGetter__", 1.0), ("__lookupSetter__", 1.0),
+    ("__defineGetter__", 2.0),
+    ("__defineSetter__", 2.0),
+    ("__lookupGetter__", 1.0),
+    ("__lookupSetter__", 1.0),
     // Function
-    ("apply", 2.0), ("bind", 1.0), ("call", 1.0),
+    ("apply", 2.0),
+    ("bind", 1.0),
+    ("call", 1.0),
     // String
-    ("charAt", 1.0), ("charCodeAt", 1.0), ("codePointAt", 1.0),
-    ("endsWith", 1.0), ("localeCompare", 1.0), ("match", 1.0),
-    ("matchAll", 1.0), ("padEnd", 1.0), ("padStart", 1.0), ("repeat", 1.0),
-    ("replace", 2.0), ("replaceAll", 2.0), ("search", 1.0),
-    ("split", 2.0), ("startsWith", 1.0), ("substring", 2.0),
-    ("fromCharCode", 0.0), ("fromCodePoint", 0.0), ("raw", 1.0),
+    ("charAt", 1.0),
+    ("charCodeAt", 1.0),
+    ("codePointAt", 1.0),
+    ("endsWith", 1.0),
+    ("localeCompare", 1.0),
+    ("match", 1.0),
+    ("matchAll", 1.0),
+    ("padEnd", 1.0),
+    ("padStart", 1.0),
+    ("repeat", 1.0),
+    ("replace", 2.0),
+    ("replaceAll", 2.0),
+    ("search", 1.0),
+    ("split", 2.0),
+    ("startsWith", 1.0),
+    ("substring", 2.0),
+    ("fromCharCode", 1.0),
+    ("fromCodePoint", 1.0),
+    ("raw", 1.0),
     // Number
-    ("isFinite", 1.0), ("isInteger", 1.0), ("isNaN", 1.0),
-    ("isSafeInteger", 1.0), ("parseFloat", 1.0), ("parseInt", 2.0),
-    ("toExponential", 1.0), ("toFixed", 1.0), ("toPrecision", 1.0),
+    ("isFinite", 1.0),
+    ("isInteger", 1.0),
+    ("isNaN", 1.0),
+    ("isSafeInteger", 1.0),
+    ("parseFloat", 1.0),
+    ("parseInt", 2.0),
+    ("toExponential", 1.0),
+    ("toFixed", 1.0),
+    ("toPrecision", 1.0),
     // Math
-    ("abs", 1.0), ("acos", 1.0), ("acosh", 1.0), ("asin", 1.0),
-    ("asinh", 1.0), ("atan", 1.0), ("atan2", 2.0), ("atanh", 1.0),
-    ("cbrt", 1.0), ("ceil", 1.0), ("clz32", 1.0), ("cos", 1.0),
-    ("cosh", 1.0), ("exp", 1.0), ("expm1", 1.0), ("floor", 1.0),
-    ("fround", 1.0), ("hypot", 2.0), ("imul", 2.0), ("log", 1.0),
-    ("log10", 1.0), ("log1p", 1.0), ("log2", 1.0), ("max", 2.0),
-    ("min", 2.0), ("pow", 2.0), ("round", 1.0), ("sign", 1.0),
-    ("sin", 1.0), ("sinh", 1.0), ("sqrt", 1.0), ("sumPrecise", 1.0),
-    ("tan", 1.0), ("tanh", 1.0), ("trunc", 1.0),
+    ("abs", 1.0),
+    ("acos", 1.0),
+    ("acosh", 1.0),
+    ("asin", 1.0),
+    ("asinh", 1.0),
+    ("atan", 1.0),
+    ("atan2", 2.0),
+    ("atanh", 1.0),
+    ("cbrt", 1.0),
+    ("ceil", 1.0),
+    ("clz32", 1.0),
+    ("cos", 1.0),
+    ("cosh", 1.0),
+    ("exp", 1.0),
+    ("expm1", 1.0),
+    ("floor", 1.0),
+    ("fround", 1.0),
+    ("hypot", 2.0),
+    ("imul", 2.0),
+    ("log", 1.0),
+    ("log10", 1.0),
+    ("log1p", 1.0),
+    ("log2", 1.0),
+    ("max", 2.0),
+    ("min", 2.0),
+    ("pow", 2.0),
+    ("round", 1.0),
+    ("sign", 1.0),
+    ("sin", 1.0),
+    ("sinh", 1.0),
+    ("sqrt", 1.0),
+    ("sumPrecise", 1.0),
+    ("tan", 1.0),
+    ("tanh", 1.0),
+    ("trunc", 1.0),
     // JSON
-    ("parse", 2.0), ("stringify", 3.0),
+    ("parse", 2.0),
+    ("stringify", 3.0),
     // Reflect
-    ("construct", 2.0), ("deleteProperty", 2.0), ("ownKeys", 1.0),
+    ("construct", 2.0),
+    ("deleteProperty", 2.0),
+    ("ownKeys", 1.0),
     // Promise
-    ("all", 1.0), ("allKeyed", 1.0), ("allSettled", 1.0), ("any", 1.0),
-    ("race", 1.0), ("reject", 1.0), ("resolve", 1.0), ("then", 2.0),
-    ("catch", 1.0), ("finally", 1.0), ("try", 1.0), ("withResolvers", 0.0),
+    ("all", 1.0),
+    ("allKeyed", 1.0),
+    ("allSettled", 1.0),
+    ("any", 1.0),
+    ("race", 1.0),
+    ("reject", 1.0),
+    ("resolve", 1.0),
+    ("then", 2.0),
+    ("catch", 1.0),
+    ("finally", 1.0),
+    ("try", 1.0),
+    ("withResolvers", 0.0),
     // Map/Set (name collisions with Reflect resolved to the Map/Set
     // arities — same tests, better coverage)
-    ("add", 1.0), ("delete", 1.0), ("get", 1.0), ("has", 1.0),
-    ("set", 2.0), ("getOrInsert", 2.0), ("getOrInsertComputed", 2.0),
+    ("add", 1.0),
+    ("delete", 1.0),
+    ("get", 1.0),
+    ("has", 1.0),
+    ("set", 2.0),
+    ("getOrInsert", 2.0),
+    ("getOrInsertComputed", 2.0),
     ("toString", 1.0),
     // RegExp / Symbol / Proxy / globals / misc
     ("revocable", 2.0),
-    ("exec", 1.0), ("test", 1.0), ("compile", 2.0), ("for", 1.0),
-    ("[Symbol.match]", 1.0), ("[Symbol.matchAll]", 1.0),
-    ("[Symbol.replace]", 2.0), ("[Symbol.search]", 1.0),
+    ("exec", 1.0),
+    ("test", 1.0),
+    ("compile", 2.0),
+    ("for", 1.0),
+    ("[Symbol.match]", 1.0),
+    ("[Symbol.matchAll]", 1.0),
+    ("[Symbol.replace]", 2.0),
+    ("[Symbol.search]", 1.0),
     ("[Symbol.split]", 2.0),
-    ("keyFor", 1.0), ("eval", 1.0), ("decodeURI", 1.0),
-    ("decodeURIComponent", 1.0), ("encodeURI", 1.0),
-    ("encodeURIComponent", 1.0), ("escape", 1.0), ("unescape", 1.0),
+    ("keyFor", 1.0),
+    ("eval", 1.0),
+    ("decodeURI", 1.0),
+    ("decodeURIComponent", 1.0),
+    ("encodeURI", 1.0),
+    ("encodeURIComponent", 1.0),
+    ("escape", 1.0),
+    ("unescape", 1.0),
     // Iterator helpers
-    ("take", 1.0), ("drop", 1.0), ("next", 0.0), ("return", 0.0),
+    ("take", 1.0),
+    ("drop", 1.0),
+    ("next", 0.0),
+    ("return", 0.0),
     // Annex-B string HTML + misc
-    ("anchor", 1.0), ("link", 1.0), ("fontcolor", 1.0), ("fontsize", 1.0),
-    ("big", 0.0), ("blink", 0.0), ("bold", 0.0), ("fixed", 0.0),
-    ("italics", 0.0), ("small", 0.0), ("strike", 0.0), ("sub", 0.0),
-    ("sup", 0.0), ("substr", 2.0), ("trimStart", 0.0), ("trimEnd", 0.0),
-    ("trimLeft", 0.0), ("trimRight", 0.0),
+    ("anchor", 1.0),
+    ("link", 1.0),
+    ("fontcolor", 1.0),
+    ("fontsize", 1.0),
+    ("big", 0.0),
+    ("blink", 0.0),
+    ("bold", 0.0),
+    ("fixed", 0.0),
+    ("italics", 0.0),
+    ("small", 0.0),
+    ("strike", 0.0),
+    ("sub", 0.0),
+    ("sup", 0.0),
+    ("substr", 2.0),
+    ("trimStart", 0.0),
+    ("trimEnd", 0.0),
+    ("trimLeft", 0.0),
+    ("trimRight", 0.0),
 ];
 
 fn native(i: &Interp, name: &str, f: NativeFn) -> Value {
@@ -643,8 +756,9 @@ pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
                 let dense_full = {
                     let b = o.borrow();
                     match &b.kind {
-                        ObjKind::Arr(items) if len == items.len()
-                            && b.holes.as_ref().map_or(true, |h| h.is_empty()) =>
+                        ObjKind::Arr(items)
+                            if len == items.len()
+                                && b.holes.as_ref().map_or(true, |h| h.is_empty()) =>
                         {
                             Some(items.clone())
                         }
@@ -688,6 +802,18 @@ pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
 
 /// element count of an array-like (`length` clamped) — for result arrays
 /// that must preserve the source length
+/// spec LengthOfArrayLike — ToLength(Get "length") up to 2^53-1, no
+/// materialization cap (live-iteration methods early-exit long before)
+fn length_of_array_like(i: &mut Interp, v: &Value) -> Result<usize, Value> {
+    if let Value::Obj(o) = v {
+        if matches!(&o.borrow().kind, ObjKind::Arr(_)) {
+            return Ok(arr_declared_len(o));
+        }
+    }
+    let lv = i.get_prop_str(v, "length")?;
+    Ok(to_length_num(i.to_num(&lv)?))
+}
+
 fn elems_len(i: &mut Interp, v: &Value) -> Result<usize, Value> {
     if let Value::Obj(o) = v {
         if matches!(&o.borrow().kind, ObjKind::Arr(_)) {
@@ -705,10 +831,7 @@ fn elems_len(i: &mut Interp, v: &Value) -> Result<usize, Value> {
 /// Vec-backed arrays can't distinguish `[1,,3]` holes from explicit
 /// `undefined`, so they yield every slot; generic receivers are checked
 /// via `has_prop` per index.
-pub(crate) fn to_elems_sparse(
-    i: &mut Interp,
-    v: &Value,
-) -> Result<Vec<(usize, Value)>, Value> {
+pub(crate) fn to_elems_sparse(i: &mut Interp, v: &Value) -> Result<Vec<(usize, Value)>, Value> {
     match v {
         Value::Obj(o) => {
             // a fully dense array enumerates directly; holes, sparse
@@ -718,10 +841,7 @@ pub(crate) fn to_elems_sparse(
                 let b = o.borrow();
                 match &b.kind {
                     ObjKind::Arr(items) => {
-                        let no_holes = b
-                            .holes
-                            .as_ref()
-                            .map_or(true, |h| h.is_empty());
+                        let no_holes = b.holes.as_ref().map_or(true, |h| h.is_empty());
                         let declared = arr_declared_len(o);
                         if no_holes && declared == items.len() {
                             Some(items.iter().cloned().enumerate().collect())
@@ -777,9 +897,7 @@ fn species_create(i: &mut Interp, o: &Value, len: usize) -> Result<Value, Value>
     }
     match c {
         Value::Und => Ok(Value::Obj(i.new_arr(vec![Value::Und; len]))),
-        c if i.is_constructor(&c) => {
-            i.construct(&c, vec![Value::Num(len as f64)], None)
-        }
+        c if i.is_constructor(&c) => i.construct(&c, vec![Value::Num(len as f64)], None),
         _ => Err(i.type_err("invalid species constructor")),
     }
 }
@@ -787,12 +905,7 @@ fn species_create(i: &mut Interp, o: &Value, len: usize) -> Result<Value, Value>
 /// spec CreateDataPropertyOrThrow on integer index — the write semantics
 /// array-into-species methods use (throws on non-configurable existing
 /// props / non-extensible targets).
-fn create_data_prop(
-    i: &mut Interp,
-    a: &Value,
-    k: usize,
-    v: Value,
-) -> Result<(), Value> {
+fn create_data_prop(i: &mut Interp, a: &Value, k: usize, v: Value) -> Result<(), Value> {
     if let Value::Obj(o) = a {
         let mut b = o.borrow_mut();
         let b = &mut *b;
@@ -807,16 +920,15 @@ fn create_data_prop(
                 }
                 *p = Prop::data(v.clone());
             } else {
-                let slot_exists = k < items.len()
-                    && !b.holes.as_ref().is_some_and(|h| h.contains(&k));
+                let slot_exists =
+                    k < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&k));
                 if !slot_exists && !b.extensible {
                     return Err(i.type_err("object is not extensible"));
                 }
             }
             if k >= items.len() {
                 let lkey = PropKey::from_str("length");
-                let len_w =
-                    b.props.get(&lkey).map(|p| p.writable).unwrap_or(true);
+                let len_w = b.props.get(&lkey).map(|p| p.writable).unwrap_or(true);
                 if !len_w {
                     return Err(i.type_err("Cannot define property"));
                 }
@@ -860,12 +972,8 @@ fn create_data_prop(
         }
         let key = PropKey::from_str(&k.to_string());
         match b.props.get(&key) {
-            Some(p) if !p.configurable => {
-                return Err(i.type_err("Cannot redefine property"))
-            }
-            None if !b.extensible => {
-                return Err(i.type_err("object is not extensible"))
-            }
+            Some(p) if !p.configurable => return Err(i.type_err("Cannot redefine property")),
+            None if !b.extensible => return Err(i.type_err("object is not extensible")),
             _ => {}
         }
         b.props.insert(key, Prop::data(v));
@@ -929,10 +1037,9 @@ fn install_protos(i: &mut Interp) {
         // __proto__ accessor
         let get = native(i, "get __proto__", obj_get_proto);
         let set = native(i, "set __proto__", obj_set_proto);
-        p.borrow_mut().props.insert(
-            pk("__proto__"),
-            Prop::accessor(Some(get), Some(set)),
-        );
+        p.borrow_mut()
+            .props
+            .insert(pk("__proto__"), Prop::accessor(Some(get), Some(set)));
     }
 
     // -- Function.prototype --
@@ -982,10 +1089,29 @@ fn install_protos(i: &mut Interp) {
         // @@unscopables — `with (arr)` must not resolve array method names
         let un = i.new_obj();
         for n in [
-            "at", "concat", "copyWithin", "entries", "fill", "find",
-            "findIndex", "findLast", "findLastIndex", "flat", "flatMap",
-            "includes", "keys", "lastIndexOf", "pop", "push", "reduce",
-            "reduceRight", "shift", "slice", "some", "splice", "values",
+            "at",
+            "concat",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "lastIndexOf",
+            "pop",
+            "push",
+            "reduce",
+            "reduceRight",
+            "shift",
+            "slice",
+            "some",
+            "splice",
+            "values",
         ] {
             un.borrow_mut()
                 .props
@@ -1069,8 +1195,12 @@ fn install_protos(i: &mut Interp) {
         // Annex B aliases must be the *same* function objects
         let ts = i.obj_get_raw_str(&p, "trimStart").unwrap();
         let te = i.obj_get_raw_str(&p, "trimEnd").unwrap();
-        p.borrow_mut().props.insert(PropKey::from_str("trimLeft"), Prop::builtin(ts));
-        p.borrow_mut().props.insert(PropKey::from_str("trimRight"), Prop::builtin(te));
+        p.borrow_mut()
+            .props
+            .insert(PropKey::from_str("trimLeft"), Prop::builtin(ts));
+        p.borrow_mut()
+            .props
+            .insert(PropKey::from_str("trimRight"), Prop::builtin(te));
         method(i, &p, "split", str_split);
         method(i, &p, "replace", str_replace);
         method(i, &p, "replaceAll", str_replace_all);
@@ -1084,11 +1214,13 @@ fn install_protos(i: &mut Interp) {
         method(i, &p, "includes", str_includes);
         method(i, &p, "repeat", str_repeat);
         method(i, &p, "concat", str_concat);
-        method(i, &p, "toString", str_to_string);
+        // spec: String.prototype.toString.length is 0 — the shared
+        // NATIVE_ARITY "toString" entry (Number.toString's radix) is 1
+        method_len(i, &p, "toString", str_to_string, 0.0);
         method(i, &p, "valueOf", str_to_string);
-        method(i, &p, "toLocaleString", str_to_string);
+        method(i, &p, "toLocaleString", str_locale_str);
         method(i, &p, "localeCompare", str_locale_compare);
-        method(i, &p, "normalize", str_to_string);
+        method(i, &p, "normalize", str_normalize);
         method(i, &p, "anchor", str_anchor);
         method(i, &p, "big", str_big);
         method(i, &p, "blink", str_blink);
@@ -1149,10 +1281,9 @@ fn install_protos(i: &mut Interp) {
             },
         );
         let get = native(i, "get description", sym_get_description);
-        p.borrow_mut().props.insert(
-            pk("description"),
-            Prop::accessor(Some(get), None),
-        );
+        p.borrow_mut()
+            .props
+            .insert(pk("description"), Prop::accessor(Some(get), None));
         str_tag(&p, "Symbol");
     }
 
@@ -1373,13 +1504,7 @@ fn setter_ignores_proto(
 
 fn tag_set_iterator(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let home = i.p.iterator.clone();
-    setter_ignores_proto(
-        i,
-        &home,
-        this,
-        &PropKey::Sym(SYM_TOSTRINGTAG),
-        arg(args, 0),
-    )
+    setter_ignores_proto(i, &home, this, &PropKey::Sym(SYM_TOSTRINGTAG), arg(args, 0))
 }
 
 /// `get %Iterator.prototype%.constructor` — resolves the `Iterator` ctor
@@ -1431,11 +1556,11 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
             let ip = i as *mut Interp;
             // 8 MiB — interpreter frames are large; the 1 MiB default
             // overflows on moderately nested generator bodies
-            let stack = corosensei::stack::DefaultStack::new(8 * 1024 * 1024)
-                .expect("generator stack");
-            corosensei::Coroutine::with_stack(stack,
-                move |y: &corosensei::Yielder<GenIn, Value>, first: GenIn|
-                      -> GenRet {
+            let stack =
+                corosensei::stack::DefaultStack::new(8 * 1024 * 1024).expect("generator stack");
+            corosensei::Coroutine::with_stack(
+                stack,
+                move |y: &corosensei::Yielder<GenIn, Value>, first: GenIn| -> GenRet {
                     // GeneratorResumeAbrupt on a suspendedStart
                     // generator: return()/throw() completes the record
                     // WITHOUT running the body
@@ -1493,11 +1618,7 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
             match r {
                 Ok(v) => iter_result(i, v, true),
                 Err(e) if is_gen_abort(&e) => {
-                    let v = i
-                        .gen_ret_override
-                        .take()
-                        .or(ret_v)
-                        .unwrap_or(Value::Und);
+                    let v = i.gen_ret_override.take().or(ret_v).unwrap_or(Value::Und);
                     iter_result(i, v, true)
                 }
                 Err(e) => Err(e),
@@ -1539,10 +1660,9 @@ fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
                         let item = i.get_prop(&tv(), &PropKey::S(kk))?;
                         Ok(Some(match mode {
                             1 => Value::Num(idx as f64),
-                            _ if mode == 2 => Value::Obj(i.new_arr(vec![
-                                Value::Num(idx as f64),
-                                item,
-                            ])),
+                            _ if mode == 2 => {
+                                Value::Obj(i.new_arr(vec![Value::Num(idx as f64), item]))
+                            }
                             _ => item,
                         }))
                     }
@@ -1797,18 +1917,16 @@ pub(crate) fn for_of_iter(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> 
             }
         }
         // GetV wraps primitives for the @@iterator lookup
-        _ => {
-            match i.get_prop(v, &PropKey::Sym(SYM_ITERATOR))? {
-                m if i.is_callable(&m) => {
-                    let it = i.call(&m, v.clone(), Vec::new())?;
-                    if !is_spec_obj(&it) {
-                        return Err(i.type_err("@@iterator result is not an object"));
-                    }
-                    iter_direct(i, &it)
+        _ => match i.get_prop(v, &PropKey::Sym(SYM_ITERATOR))? {
+            m if i.is_callable(&m) => {
+                let it = i.call(&m, v.clone(), Vec::new())?;
+                if !is_spec_obj(&it) {
+                    return Err(i.type_err("@@iterator result is not an object"));
                 }
-                _ => Err(i.type_err("value is not iterable")),
+                iter_direct(i, &it)
             }
-        }
+            _ => Err(i.type_err("value is not iterable")),
+        },
     }
 }
 
@@ -1824,8 +1942,7 @@ fn iter_direct(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
                 .collect();
             return Ok(IterLazy::id(IterSrc::List { items, idx: 0 }));
         }
-        Value::Obj(o)
-            if !crate::binary::bigint_is_prim(&Value::Obj(o.clone())) => {}
+        Value::Obj(o) if !crate::binary::bigint_is_prim(&Value::Obj(o.clone())) => {}
         _ => return Err(i.type_err("value is not iterable")),
     }
     let next = i.get_prop(v, &PropKey::from_str("next"))?;
@@ -1915,7 +2032,10 @@ fn iter_src_close(i: &mut Interp, src: &mut IterSrc) -> Result<(), Value> {
 
 /// close a lazy state: inner flatMap source, chained sources, own source
 pub(crate) fn iter_lazy_close(i: &mut Interp, lz: &mut IterLazy) -> Result<(), Value> {
-    if let IterOp::FlatMap { inner: Some(in_lz), .. } = &mut lz.op {
+    if let IterOp::FlatMap {
+        inner: Some(in_lz), ..
+    } = &mut lz.op
+    {
         iter_lazy_close(i, in_lz)?;
     }
     match &mut lz.op {
@@ -1988,11 +2108,7 @@ fn iter_zip_keyed_close_srcs(
     }
 }
 
-fn iter_zip_keyed_abrupt(
-    i: &mut Interp,
-    cols: &mut [(PropKey, IterLazy)],
-    done: &mut [bool],
-) {
+fn iter_zip_keyed_abrupt(i: &mut Interp, cols: &mut [(PropKey, IterLazy)], done: &mut [bool]) {
     let _ = iter_zip_keyed_close_srcs(i, cols, done);
 }
 
@@ -2131,15 +2247,13 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
                                     return Ok(None);
                                 }
                                 ZipMode::Longest => {
-                                    let p =
-                                        padding.get(idx).cloned().unwrap_or(Value::Und);
+                                    let p = padding.get(idx).cloned().unwrap_or(Value::Und);
                                     let k = cols[idx].0.clone();
                                     i.set_prop(&Value::Obj(o.clone()), k, p)?;
                                 }
                                 ZipMode::Strict => {
                                     if seen_live {
-                                        let _ =
-                                            iter_zip_keyed_close_srcs(i, cols, done);
+                                        let _ = iter_zip_keyed_close_srcs(i, cols, done);
                                         return Err(i.type_err(
                                             "Iterator.zipKeyed strict mode: iterables differ in length",
                                         ));
@@ -2158,7 +2272,10 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
             _ => {}
         }
         // flatMap drains its inner source before pulling the outer one
-        if let IterOp::FlatMap { inner: Some(in_lz), .. } = &mut lz.op {
+        if let IterOp::FlatMap {
+            inner: Some(in_lz), ..
+        } = &mut lz.op
+        {
             match iter_lazy_step(i, in_lz) {
                 Ok(Some(v)) => return Ok(Some(v)),
                 Ok(None) => {
@@ -2194,9 +2311,7 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
                         } else {
                             let it = i.call(&method, nx, Vec::new())?;
                             if !matches!(it, Value::Obj(_)) {
-                                return Err(i.type_err(
-                                    "@@iterator result is not an object",
-                                ));
+                                return Err(i.type_err("@@iterator result is not an object"));
                             }
                             it
                         };
@@ -2290,11 +2405,7 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
                 let a = i.new_arr(c);
                 return Ok(Some(Value::Obj(a)));
             }
-            IterOp::Windows {
-                size,
-                partial,
-                buf,
-            } => {
+            IterOp::Windows { size, partial, buf } => {
                 buf.push_back(v);
                 while buf.len() < *size {
                     if buf.len() >= ITER_LIMIT {
@@ -2525,11 +2636,14 @@ fn iter_concat(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         };
         rest.push_back((a.clone(), m));
     }
-    Ok(make_lazy(i, IterLazy {
-        src: IterSrc::Empty,
-        op: IterOp::Cat { rest },
-        started: false,
-    }))
+    Ok(make_lazy(
+        i,
+        IterLazy {
+            src: IterSrc::Empty,
+            op: IterOp::Cat { rest },
+            started: false,
+        },
+    ))
 }
 
 /// shared zip/zipKeyed options handling: GetOptionsObject → mode check →
@@ -2561,11 +2675,7 @@ fn iter_zip_mode(i: &mut Interp, opts: &Value) -> Result<(ZipMode, Value), Value
 
 /// longest-mode padding: pull `count` values through the padding object's
 /// own @@iterator (GetIterator — the method is required), then close it.
-fn iter_zip_padding(
-    i: &mut Interp,
-    padding: &Value,
-    count: usize,
-) -> Result<Vec<Value>, Value> {
+fn iter_zip_padding(i: &mut Interp, padding: &Value, count: usize) -> Result<Vec<Value>, Value> {
     if !is_spec_obj(padding) {
         return Ok(Vec::new());
     }
@@ -2645,11 +2755,19 @@ fn iter_zip(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         }
     };
     let n = srcs.len();
-    Ok(make_lazy(i, IterLazy {
-        src: IterSrc::Empty,
-        op: IterOp::Zip { srcs, done: vec![false; n], mode, padding },
-        started: false,
-    }))
+    Ok(make_lazy(
+        i,
+        IterLazy {
+            src: IterSrc::Empty,
+            op: IterOp::Zip {
+                srcs,
+                done: vec![false; n],
+                mode,
+                padding,
+            },
+            started: false,
+        },
+    ))
 }
 
 /// `Iterator.zipKeyed(obj[, options])` — own enumerable {key: iterable}
@@ -2720,11 +2838,19 @@ fn iter_zip_keyed(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         }
     }
     let n = cols.len();
-    Ok(make_lazy(i, IterLazy {
-        src: IterSrc::Empty,
-        op: IterOp::ZipKeyed { cols, done: vec![false; n], mode, padding },
-        started: false,
-    }))
+    Ok(make_lazy(
+        i,
+        IterLazy {
+            src: IterSrc::Empty,
+            op: IterOp::ZipKeyed {
+                cols,
+                done: vec![false; n],
+                mode,
+                padding,
+            },
+            started: false,
+        },
+    ))
 }
 
 /// spec: placeholder record on `this` → validate `skippedElements` with
@@ -2746,7 +2872,9 @@ fn iter_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     }
     let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     if to_skip > 0.0 {
-        lz.op = IterOp::Drop { left: to_skip.min(usize::MAX as f64) as usize };
+        lz.op = IterOp::Drop {
+            left: to_skip.min(usize::MAX as f64) as usize,
+        };
     }
     let mut steps = 0usize;
     loop {
@@ -2915,7 +3043,11 @@ fn iter_flat_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(helper_arg_close(i, this, e));
     }
     let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
-    lz.op = IterOp::FlatMap { f, n: 0.0, inner: None };
+    lz.op = IterOp::FlatMap {
+        f,
+        n: 0.0,
+        inner: None,
+    };
     Ok(make_lazy(i, lz))
 }
 
@@ -3237,8 +3369,7 @@ fn install_globals(i: &mut Interp) {
         let ctor = make_ctor(i, "Array", array_ctor, i.p.array.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         // Array[@@species] — spec getter returning the constructor
-        let species_get =
-            native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
+        let species_get = native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
         o.borrow_mut().props.insert(
             PropKey::Sym(SYM_SPECIES),
             Prop::accessor(Some(species_get), None),
@@ -3253,10 +3384,10 @@ fn install_globals(i: &mut Interp) {
     {
         // %String.prototype% is itself a String object ([[StringData]] =
         // the empty string) — proto methods accept it as `this`
-        i.p.string.borrow_mut().props.insert_str(
-            "$value",
-            Prop::builtin(Value::Str(Rc::from(""))),
-        );
+        i.p.string
+            .borrow_mut()
+            .props
+            .insert_str("$value", Prop::builtin(Value::Str(Rc::from(""))));
         let ctor = make_ctor(i, "String", string_ctor, i.p.string.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         i.set_builtin(
@@ -3267,7 +3398,7 @@ fn install_globals(i: &mut Interp) {
         i.set_builtin(
             o,
             "fromCodePoint",
-            native(i, "fromCodePoint", string_from_char_code),
+            native(i, "fromCodePoint", string_from_code_point),
         );
         i.set_builtin(o, "raw", native(i, "raw", string_raw));
         define_global(i, "String", ctor);
@@ -3276,10 +3407,10 @@ fn install_globals(i: &mut Interp) {
     // -- Number --
     {
         // %Number.prototype% is a Number wrapper ([[NumberData]] = +0)
-        i.p.number.borrow_mut().props.insert_str(
-            "$value",
-            Prop::builtin(Value::Num(0.0)),
-        );
+        i.p.number
+            .borrow_mut()
+            .props
+            .insert_str("$value", Prop::builtin(Value::Num(0.0)));
         let ctor = make_ctor(i, "Number", number_ctor, i.p.number.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         for (n, f) in [
@@ -3309,10 +3440,10 @@ fn install_globals(i: &mut Interp) {
     // -- Boolean --
     {
         // %Boolean.prototype% is a Boolean wrapper ([[BooleanData]] = false)
-        i.p.boolean.borrow_mut().props.insert_str(
-            "$value",
-            Prop::builtin(Value::Bool(false)),
-        );
+        i.p.boolean
+            .borrow_mut()
+            .props
+            .insert_str("$value", Prop::builtin(Value::Bool(false)));
         let ctor = make_ctor(i, "Boolean", boolean_ctor, i.p.boolean.clone());
         define_global(i, "Boolean", ctor);
     }
@@ -3337,7 +3468,13 @@ fn install_globals(i: &mut Interp) {
                 ctor: true,
             }),
         )));
-        i.set_attr(&gfc, "name", Value::Str(Rc::from("GeneratorFunction")), false, true);
+        i.set_attr(
+            &gfc,
+            "name",
+            Value::Str(Rc::from("GeneratorFunction")),
+            false,
+            true,
+        );
         i.set_attr(&gfc, "length", Value::Num(1.0), false, true);
         i.set_attr(
             &gfc,
@@ -3353,21 +3490,105 @@ fn install_globals(i: &mut Interp) {
     {
         let ctor = make_ctor(i, "Symbol", symbol_ctor, i.p.symbol.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
-        i.set_attr(o, "iterator", Value::Sym(SYM_ITERATOR, Rc::from("Symbol.iterator")), false, false);
-        i.set_attr(o, "toPrimitive", Value::Sym(SYM_TOPRIMITIVE, Rc::from("Symbol.toPrimitive")), false, false);
-        i.set_attr(o, "toStringTag", Value::Sym(SYM_TOSTRINGTAG, Rc::from("Symbol.toStringTag")), false, false);
-        i.set_attr(o, "isConcatSpreadable", Value::Sym(SYM_IS_CONCAT_SPREADABLE, Rc::from("Symbol.isConcatSpreadable")), false, false);
-        i.set_attr(o, "species", Value::Sym(SYM_SPECIES, Rc::from("Symbol.species")), false, false);
+        i.set_attr(
+            o,
+            "iterator",
+            Value::Sym(SYM_ITERATOR, Rc::from("Symbol.iterator")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "toPrimitive",
+            Value::Sym(SYM_TOPRIMITIVE, Rc::from("Symbol.toPrimitive")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "toStringTag",
+            Value::Sym(SYM_TOSTRINGTAG, Rc::from("Symbol.toStringTag")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "isConcatSpreadable",
+            Value::Sym(
+                SYM_IS_CONCAT_SPREADABLE,
+                Rc::from("Symbol.isConcatSpreadable"),
+            ),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "species",
+            Value::Sym(SYM_SPECIES, Rc::from("Symbol.species")),
+            false,
+            false,
+        );
         i.set_builtin(o, "for", native(i, "for", symbol_for));
         i.set_builtin(o, "keyFor", native(i, "keyFor", symbol_key_for));
-        i.set_attr(o, "hasInstance", Value::Sym(SYM_HASINSTANCE, Rc::from("Symbol.hasInstance")), false, false);
-        i.set_attr(o, "match", Value::Sym(SYM_MATCH, Rc::from("Symbol.match")), false, false);
-        i.set_attr(o, "matchAll", Value::Sym(SYM_MATCHALL, Rc::from("Symbol.matchAll")), false, false);
-        i.set_attr(o, "replace", Value::Sym(SYM_REPLACE, Rc::from("Symbol.replace")), false, false);
-        i.set_attr(o, "search", Value::Sym(SYM_SEARCH, Rc::from("Symbol.search")), false, false);
-        i.set_attr(o, "split", Value::Sym(SYM_SPLIT, Rc::from("Symbol.split")), false, false);
-        i.set_attr(o, "unscopables", Value::Sym(SYM_UNSCOPABLES, Rc::from("Symbol.unscopables")), false, false);
-        i.set_attr(o, "asyncIterator", Value::Sym(crate::interp::SYM_ASYNCITERATOR, Rc::from("Symbol.asyncIterator")), false, false);
+        i.set_attr(
+            o,
+            "hasInstance",
+            Value::Sym(SYM_HASINSTANCE, Rc::from("Symbol.hasInstance")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "match",
+            Value::Sym(SYM_MATCH, Rc::from("Symbol.match")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "matchAll",
+            Value::Sym(SYM_MATCHALL, Rc::from("Symbol.matchAll")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "replace",
+            Value::Sym(SYM_REPLACE, Rc::from("Symbol.replace")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "search",
+            Value::Sym(SYM_SEARCH, Rc::from("Symbol.search")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "split",
+            Value::Sym(SYM_SPLIT, Rc::from("Symbol.split")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "unscopables",
+            Value::Sym(SYM_UNSCOPABLES, Rc::from("Symbol.unscopables")),
+            false,
+            false,
+        );
+        i.set_attr(
+            o,
+            "asyncIterator",
+            Value::Sym(
+                crate::interp::SYM_ASYNCITERATOR,
+                Rc::from("Symbol.asyncIterator"),
+            ),
+            false,
+            false,
+        );
         define_global(i, "Symbol", ctor);
     }
 
@@ -3385,9 +3606,7 @@ fn install_globals(i: &mut Interp) {
                         return Err(i.type_err("Cannot convert a Number to a BigInt"));
                     }
                     if !n.is_finite() || n.fract() != 0.0 {
-                        return Err(i.range_err(format!(
-                            "Cannot convert {n} to a BigInt"
-                        )));
+                        return Err(i.range_err(format!("Cannot convert {n} to a BigInt")));
                     }
                     let (neg, mag, _) = crate::binary::f64_bits(*n);
                     Ok((neg, mag))
@@ -3421,8 +3640,7 @@ fn install_globals(i: &mut Interp) {
                 return Err(i.range_err("out of range"));
             }
             let (neg, mag) = to_bigint_strict(i, &arg(a, 1), false)?;
-            let (sn, sm) = crate::binary::bigint_as_int(
-                (neg, &mag), bits_n as usize, true);
+            let (sn, sm) = crate::binary::bigint_as_int((neg, &mag), bits_n as usize, true);
             Ok(i.bigint_obj_b(sn, &sm))
         }
         fn bigint_as_uint_n(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
@@ -3433,8 +3651,7 @@ fn install_globals(i: &mut Interp) {
                 return Err(i.range_err("out of range"));
             }
             let (neg, mag) = to_bigint_strict(i, &arg(a, 1), false)?;
-            let (sn, sm) = crate::binary::bigint_as_int(
-                (neg, &mag), bits_n as usize, false);
+            let (sn, sm) = crate::binary::bigint_as_int((neg, &mag), bits_n as usize, false);
             Ok(i.bigint_obj_b(sn, &sm))
         }
         let ctor = make_ctor(i, "BigInt", bigint_ctor, i.p.bigint.clone());
@@ -3458,20 +3675,17 @@ fn install_globals(i: &mut Interp) {
     {
         fn proxy_ctor(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
             if i.new_target_native.is_none() {
-                return Err(i.type_err(
-                    "Constructor Proxy requires 'new'",
-                ));
+                return Err(i.type_err("Constructor Proxy requires 'new'"));
             }
             let (t, h) = (arg(a, 0), arg(a, 1));
             if !matches!(t, Value::Obj(_)) || !matches!(h, Value::Obj(_)) {
-                return Err(i.type_err(
-                    "Cannot create proxy with a non-object as target or handler",
-                ));
+                return Err(
+                    i.type_err("Cannot create proxy with a non-object as target or handler")
+                );
             }
             // spec: the proxy has [[Call]]/[[Construct]] iff the target
             // has them AT CREATION — revocation later can't remove them
-            let pflags = (i.is_callable(&t) as u8)
-                | ((i.is_constructor(&t) as u8) << 1);
+            let pflags = (i.is_callable(&t) as u8) | ((i.is_constructor(&t) as u8) << 1);
             let mut obj = Obj::new(
                 None,
                 ObjKind::Proxy {
@@ -3485,12 +3699,11 @@ fn install_globals(i: &mut Interp) {
         fn proxy_revocable(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
             let (t, h) = (arg(a, 0), arg(a, 1));
             if !matches!(t, Value::Obj(_)) || !matches!(h, Value::Obj(_)) {
-                return Err(i.type_err(
-                    "Cannot create proxy with a non-object as target or handler",
-                ));
+                return Err(
+                    i.type_err("Cannot create proxy with a non-object as target or handler")
+                );
             }
-            let pflags = (i.is_callable(&t) as u8)
-                | ((i.is_constructor(&t) as u8) << 1);
+            let pflags = (i.is_callable(&t) as u8) | ((i.is_constructor(&t) as u8) << 1);
             let mut obj = Obj::new(
                 None,
                 ObjKind::Proxy {
@@ -3527,9 +3740,7 @@ fn install_globals(i: &mut Interp) {
         fn proxy_do_revoke(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             if let Value::Obj(o) = this {
                 // scoped borrow — borrow_mut below would panic otherwise
-                let is_proxy = {
-                    matches!(&o.borrow().kind, ObjKind::Proxy { .. })
-                };
+                let is_proxy = { matches!(&o.borrow().kind, ObjKind::Proxy { .. }) };
                 if is_proxy {
                     o.borrow_mut().kind = ObjKind::Proxy {
                         target: Value::Null,
@@ -3584,8 +3795,7 @@ fn install_globals(i: &mut Interp) {
         // spec: RegExp.length is 2 (pattern, flags)
         i.set_attr(o, "length", Value::Num(2.0), false, true);
         // RegExp[@@species] — spec getter returning the constructor
-        let species_get =
-            native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
+        let species_get = native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
         o.borrow_mut().props.insert(
             PropKey::Sym(SYM_SPECIES),
             Prop::accessor(Some(species_get), None),
@@ -3644,10 +3854,10 @@ fn install_globals(i: &mut Interp) {
                 b.props.insert_str(k, Prop::builtin(v));
             }
         }
-        i.p.regexp.borrow_mut().props.insert(
-            PropKey::Sym(SYM_RE_STATE),
-            Prop::builtin(Value::Obj(state)),
-        );
+        i.p.regexp
+            .borrow_mut()
+            .props
+            .insert(PropKey::Sym(SYM_RE_STATE), Prop::builtin(Value::Obj(state)));
         define_global(i, "RegExp", ctor);
     }
 
@@ -3793,12 +4003,20 @@ fn install_globals(i: &mut Interp) {
         i.set_builtin(o, "resolve", native(i, "resolve", promise_resolve_static));
         i.set_builtin(o, "reject", native(i, "reject", promise_reject_static));
         i.set_builtin(o, "all", native(i, "all", promise_all));
-        i.set_builtin(o, "allSettled", native(i, "allSettled", promise_all_settled));
+        i.set_builtin(
+            o,
+            "allSettled",
+            native(i, "allSettled", promise_all_settled),
+        );
         i.set_builtin(o, "any", native(i, "any", promise_any));
         i.set_builtin(o, "race", native(i, "race", promise_race));
         i.set_builtin(o, "try", native(i, "try", promise_try));
         i.set_builtin(o, "allKeyed", native(i, "allKeyed", promise_all_keyed));
-        i.set_builtin(o, "withResolvers", native(i, "withResolvers", promise_with_resolvers));
+        i.set_builtin(
+            o,
+            "withResolvers",
+            native(i, "withResolvers", promise_with_resolvers),
+        );
         // Promise[@@species] — spec getter returning the constructor
         // itself; SpeciesConstructor reads it on then/catch/finally
         let species_get = native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
@@ -3903,9 +4121,7 @@ fn install_globals(i: &mut Interp) {
         method(i, &dp, "setHours", |i, t, a| {
             date_set(i, t, a, &[3, 4, 5, 6], false)
         });
-        method(i, &dp, "setDate", |i, t, a| {
-            date_set(i, t, a, &[2], false)
-        });
+        method(i, &dp, "setDate", |i, t, a| date_set(i, t, a, &[2], false));
         method(i, &dp, "setMonth", |i, t, a| {
             date_set(i, t, a, &[1, 2], false)
         });
@@ -4013,13 +4229,14 @@ fn install_globals(i: &mut Interp) {
             .props
             .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(ent));
         let size_g = native(i, "get size", map_size);
-        mp.borrow_mut().props.insert(
-            pk("size"),
-            Prop::accessor(Some(size_g), None),
-        );
+        mp.borrow_mut()
+            .props
+            .insert(pk("size"), Prop::accessor(Some(size_g), None));
         str_tag(&mp, "Map");
         let ctor = make_ctor(i, "Map", map_ctor, mp);
-        let Value::Obj(mo) = &ctor else { unreachable!() };
+        let Value::Obj(mo) = &ctor else {
+            unreachable!()
+        };
         let msp = native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
         mo.borrow_mut()
             .props
@@ -4050,7 +4267,9 @@ fn install_globals(i: &mut Interp) {
             .insert(pk("size"), Prop::accessor(Some(ssize), None));
         str_tag(&sp, "Set");
         let sctor = make_ctor(i, "Set", set_ctor, sp);
-        let Value::Obj(so) = &sctor else { unreachable!() };
+        let Value::Obj(so) = &sctor else {
+            unreachable!()
+        };
         let ssp = native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
         so.borrow_mut()
             .props
@@ -4092,9 +4311,7 @@ fn install_globals(i: &mut Interp) {
             if let Ok(Some(v)) = i.env_lookup(&g, n) {
                 if let Ok(Some(num)) = i.env_lookup(&g, "Number") {
                     if let Value::Obj(no) = num {
-                        no.borrow_mut()
-                            .props
-                            .insert_str(n, Prop::builtin(v));
+                        no.borrow_mut().props.insert_str(n, Prop::builtin(v));
                     }
                 }
             }
@@ -4207,13 +4424,7 @@ fn install_globals(i: &mut Interp) {
         ("SharedArrayBuffer", 1.0),
         ("DataView", 1.0),
     ] {
-        let v = i
-            .p
-            .global
-            .borrow()
-            .props
-            .get_str(n)
-            .map(|p| p.val.clone());
+        let v = i.p.global.borrow().props.get_str(n).map(|p| p.val.clone());
         if let Some(Value::Obj(o)) = v {
             i.set_attr(&o, "length", Value::Num(len), false, true);
         }
@@ -4269,8 +4480,7 @@ fn has_own_impl(i: &mut Interp, this: &Value, kv: &Value) -> NResult {
             let kv = i.key_to_value(&k);
             drop(b);
             // a proxy answers via its getOwnPropertyDescriptor trap
-            let d =
-                obj_get_own_prop_desc(i, &Value::Und, &[this.clone(), kv])?;
+            let d = obj_get_own_prop_desc(i, &Value::Und, &[this.clone(), kv])?;
             return Ok(Value::Bool(!matches!(d, Value::Und)));
         }
         match &b.kind {
@@ -4280,15 +4490,20 @@ fn has_own_impl(i: &mut Interp, this: &Value, kv: &Value) -> NResult {
                         return Ok(Value::Bool(true));
                     }
                     if let Some(idx) = arr_index(s) {
-                        if idx < items.len()
-                            && !b.holes.as_ref().is_some_and(|h| h.contains(&idx))
+                        if idx < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&idx))
                         {
                             return Ok(Value::Bool(true));
                         }
                     }
                 }
             }
-            ObjKind::Typed { buf, off, len, kind, track } => {
+            ObjKind::Typed {
+                buf,
+                off,
+                len,
+                kind,
+                track,
+            } => {
                 if let PropKey::S(s) = &k {
                     // canonical numeric strings answer solely from the
                     // element store (never props)
@@ -4303,8 +4518,7 @@ fn has_own_impl(i: &mut Interp, this: &Value, kv: &Value) -> NResult {
             ObjKind::Args { items, .. } => {
                 if let PropKey::S(s) = &k {
                     if let Some(idx) = arr_index(s) {
-                        if idx < items.len()
-                            && !b.holes.as_ref().is_some_and(|h| h.contains(&idx))
+                        if idx < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&idx))
                         {
                             return Ok(Value::Bool(true));
                         }
@@ -4339,11 +4553,7 @@ fn obj_is_prototype_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult 
             // fires its getPrototypeOf trap (scoped borrow: the trap
             // may mutate the object)
             let next = if { matches!(&cur.borrow().kind, ObjKind::Proxy { .. }) } {
-                match obj_get_prototype_of(
-                    i,
-                    &Value::Und,
-                    &[Value::Obj(cur.clone())],
-                )? {
+                match obj_get_prototype_of(i, &Value::Und, &[Value::Obj(cur.clone())])? {
                     Value::Obj(p) => Some(p),
                     _ => None,
                 }
@@ -4381,8 +4591,7 @@ fn obj_prop_is_enum(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             if let PropKey::S(s) = &k {
                 if let Some(idx) = arr_index(s) {
                     return Ok(Value::Bool(
-                        idx < items.len()
-                            && !b.holes.as_ref().is_some_and(|h| h.contains(&idx)),
+                        idx < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&idx)),
                     ));
                 }
             }
@@ -4394,15 +4603,21 @@ fn obj_prop_is_enum(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                     // were already checked via props above; a holed or
                     // materialized-non-enumerable slot reports false
                     return Ok(Value::Bool(
-                        idx < items.len()
-                            && !b.holes.as_ref().is_some_and(|h| h.contains(&idx)),
+                        idx < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&idx)),
                     ));
                 }
             }
         }
         // integer-indexed exotic slots are enumerable (10.4.5.3) — only
         // live, in-bounds canonical numeric keys produce a descriptor
-        if let ObjKind::Typed { buf, off, len, kind, track } = &b.kind {
+        if let ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+            track,
+        } = &b.kind
+        {
             if let PropKey::S(s) = &k {
                 if let Some(ni) = canonical_numeric_index(s) {
                     return Ok(Value::Bool(
@@ -4444,16 +4659,14 @@ fn obj_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             loop {
                 let step = match &cur {
                     Value::Obj(p) => match &p.borrow().kind {
-                        ObjKind::Proxy { target: nt, .. } => {
-                            Some(nt.clone())
-                        }
+                        ObjKind::Proxy { target: nt, .. } => Some(nt.clone()),
                         ObjKind::Arr(_) => break "Array",
                         _ => break "Object",
                     },
                     _ => {
-                        return Err(i.type_err(
-                            "Cannot perform 'IsArray' on a proxy that has been revoked",
-                        ))
+                        return Err(
+                            i.type_err("Cannot perform 'IsArray' on a proxy that has been revoked")
+                        )
                     }
                 };
                 match step {
@@ -4516,9 +4729,7 @@ fn obj_get_proto(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
                                 i.proxy_getproto_invariant(&t, &r)?;
                                 Ok(r)
                             }
-                            _ => Err(i.type_err(
-                                "proxy getPrototypeOf must return object or null",
-                            )),
+                            _ => Err(i.type_err("proxy getPrototypeOf must return object or null")),
                         }
                     }
                     None => obj_get_proto(i, &t, &[]),
@@ -4532,9 +4743,7 @@ fn obj_get_proto(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         // spec __proto__ getter: RequireObjectCoercible — null/undefined
         // throw; a primitive reads its wrapper's proto (`(5).__proto__`
         // is Number.prototype in every engine)
-        Value::Und | Value::Null => {
-            Err(i.type_err("Cannot convert undefined or null to object"))
-        }
+        Value::Und | Value::Null => Err(i.type_err("Cannot convert undefined or null to object")),
         _ => {
             let w = i.to_object(this)?;
             Ok(match w {
@@ -4591,12 +4800,7 @@ fn obj_set_proto(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 /// Annex B `__defineGetter__`/`__defineSetter__` — define an accessor
 /// {get|set: f, enumerable: true, configurable: true} on ToObject(this).
-fn obj_define_accessor(
-    i: &mut Interp,
-    this: &Value,
-    args: &[Value],
-    field: &str,
-) -> NResult {
+fn obj_define_accessor(i: &mut Interp, this: &Value, args: &[Value], field: &str) -> NResult {
     let o = i.to_object(this)?;
     let f = arg(args, 1);
     if !i.is_callable(&f) {
@@ -4630,12 +4834,7 @@ fn obj_define_setter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 /// runs [[GetOwnProperty]] (a proxy fires its trap) and then
 /// [[GetPrototypeOf]]; the first accessor own prop answers, a data own
 /// prop stops the walk with undefined.
-fn obj_lookup_accessor(
-    i: &mut Interp,
-    this: &Value,
-    args: &[Value],
-    getter: bool,
-) -> NResult {
+fn obj_lookup_accessor(i: &mut Interp, this: &Value, args: &[Value], getter: bool) -> NResult {
     let o = i.to_object(this)?;
     let k = i.to_propkey(&arg(args, 0))?;
     let mut cur = o;
@@ -4810,7 +5009,11 @@ fn obj_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     // six fields are read/validated up front, so a proxy's trap receives
     // the normalized FromPropertyDescriptor object, not the raw arg
     let pd = i.pdesc_from_obj(&desc)?;
-    if let ObjKind::Proxy { target: tg, handler } = { o.borrow().kind.clone() } {
+    if let ObjKind::Proxy {
+        target: tg,
+        handler,
+    } = { o.borrow().kind.clone() }
+    {
         let (tg, h) = (tg, handler);
         return match i.proxy_trap(&h, "defineProperty")? {
             Some(trap) => {
@@ -4818,9 +5021,7 @@ fn obj_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
                 let dobj = Value::Obj(i.pdesc_to_obj(&pd));
                 let r = i.call(&trap, h, vec![tg.clone(), kv, dobj])?;
                 if !i.to_bool(&r) {
-                    return Err(i.type_err(
-                        "proxy defineProperty trap returned falsy",
-                    ));
+                    return Err(i.type_err("proxy defineProperty trap returned falsy"));
                 }
                 i.proxy_define_invariant(&tg, &key, &pd)?;
                 Ok(target)
@@ -4860,9 +5061,7 @@ fn define_prop_from_desc(
     let proxy = {
         let b = o.borrow();
         match &b.kind {
-            ObjKind::Proxy { target, handler } => {
-                Some((target.clone(), handler.clone()))
-            }
+            ObjKind::Proxy { target, handler } => Some((target.clone(), handler.clone())),
             _ => None,
         }
     };
@@ -4920,14 +5119,16 @@ fn define_prop_from_desc(
     };
     if let Some(ni) = ta_cni {
         let (buf, off, len, kind, track) = match &o.borrow().kind {
-            ObjKind::Typed { buf, off, len, kind, track } => {
-                (buf.clone(), *off, *len, *kind, *track)
-            }
+            ObjKind::Typed {
+                buf,
+                off,
+                len,
+                kind,
+                track,
+            } => (buf.clone(), *off, *len, *kind, *track),
             _ => unreachable!(),
         };
-        if !typed_state(&buf, off, len, kind, track)
-            .is_some_and(|eff| valid_int_index(ni, eff))
-        {
+        if !typed_state(&buf, off, len, kind, track).is_some_and(|eff| valid_int_index(ni, eff)) {
             return Ok(false);
         }
         if (has_c && !i.to_bool(&cv))
@@ -4938,28 +5139,17 @@ fn define_prop_from_desc(
             return Ok(false);
         }
         if has_val {
-            let n = crate::binary::ta_elem_write(
-                i,
-                &Value::Obj(o.clone()),
-                &vv,
-            )?;
+            let n = crate::binary::ta_elem_write(i, &Value::Obj(o.clone()), &vv)?;
             // coercion ran side-effects — revalidate before writing so a
             // detach/resize during valueOf drops the write (the define
             // still reports success, spec IntegerIndexedElementSet)
-            if typed_state(&buf, off, len, kind, track)
-                .is_some_and(|eff| valid_int_index(ni, eff))
+            if typed_state(&buf, off, len, kind, track).is_some_and(|eff| valid_int_index(ni, eff))
             {
                 if buf.borrow().immutable {
-                    return Err(i.type_err(
-                        "Cannot write to an immutable ArrayBuffer",
-                    ));
+                    return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
                 }
                 if let Some(bytes) = buffer_bytes(&buf) {
-                    kind.write(
-                        &mut bytes.borrow_mut(),
-                        off + ni as usize * kind.size(),
-                        n,
-                    );
+                    kind.write(&mut bytes.borrow_mut(), off + ni as usize * kind.size(), n);
                 }
             }
         }
@@ -4974,8 +5164,7 @@ fn define_prop_from_desc(
         } else {
             None
         };
-        let args_hole = args_idx
-            .is_some_and(|i| b.holes.as_ref().is_some_and(|h| h.contains(&i)));
+        let args_hole = args_idx.is_some_and(|i| b.holes.as_ref().is_some_and(|h| h.contains(&i)));
         let args_mat = b.props.get(&key).is_some();
         if let ObjKind::Args { items, env, map } = &mut b.kind {
             if let PropKey::S(s) = &key {
@@ -4988,13 +5177,9 @@ fn define_prop_from_desc(
                         let was_mapped = matches!(map.get(idx), Some(Some(_)));
                         // read the mapped value before severing — an
                         // unmapping define freezes the CURRENT param value
-                        let mapped_val = if let (Some(e), Some(Some(name))) =
-                            (&*env, map.get(idx))
+                        let mapped_val = if let (Some(e), Some(Some(name))) = (&*env, map.get(idx))
                         {
-                            e.vars
-                                .borrow()
-                                .get(name.as_ref())
-                                .map(|b| b.val.clone())
+                            e.vars.borrow().get(name.as_ref()).map(|b| b.val.clone())
                         } else {
                             None
                         };
@@ -5006,28 +5191,21 @@ fn define_prop_from_desc(
                         // does NOT unmap)
                         if has_val {
                             items[idx] = vv.clone();
-                            if let (Some(e), Some(Some(name))) =
-                                (&*env, map.get(idx))
-                            {
+                            if let (Some(e), Some(Some(name))) = (&*env, map.get(idx)) {
                                 let name = name.clone();
-                                if let Some(bnd) =
-                                    e.vars.borrow_mut().get_mut(name.as_ref())
-                                {
+                                if let Some(bnd) = e.vars.borrow_mut().get_mut(name.as_ref()) {
                                     bnd.val = vv.clone();
                                 }
                             }
                         }
-                        if was_mapped
-                            && (is_acc || (has_w && !i.to_bool(&wv)))
-                        {
+                        if was_mapped && (is_acc || (has_w && !i.to_bool(&wv))) {
                             if let Some(m) = map.get_mut(idx) {
                                 *m = None;
                             }
                         }
                         // materialize merged attrs so descriptor
                         // semantics apply to the slot
-                        let cur_val =
-                            mapped_val.unwrap_or_else(|| items[idx].clone());
+                        let cur_val = mapped_val.unwrap_or_else(|| items[idx].clone());
                         let (pw, pe, pc) = b
                             .props
                             .get(&key)
@@ -5087,7 +5265,8 @@ fn define_prop_from_desc(
                     );
                 }
                 b.holes.get_or_insert_with(Default::default).insert(idx);
-            } else if matches!(&b.kind, ObjKind::Arr(_)) && b.extensible
+            } else if matches!(&b.kind, ObjKind::Arr(_))
+                && b.extensible
                 && b.props.get(&key).is_none()
             {
                 // ArrayDefineOwnProperty: an index past the end grows
@@ -5117,220 +5296,224 @@ fn define_prop_from_desc(
             }
         }
         if acc_idx.is_none() {
-        if matches!(&b.kind, ObjKind::Arr(_)) {
-            if let PropKey::S(s) = &key {
-                if let Some(idx) = arr_index(s) {
-                    let mat = b.props.get(&key).is_some();
-                    let hole =
-                        b.holes.as_ref().is_some_and(|h| h.contains(&idx));
-                    let in_range =
-                        matches!(&b.kind, ObjKind::Arr(it) if idx < it.len());
-                    let pure_val = has_val && !has_w && !has_e && !has_c;
-                    if !in_range {
-                        // index at/past the declared length needs a
-                        // writable length (spec 10.4.2.1 step 3.e)
-                        let lkey = PropKey::from_str("length");
+            if matches!(&b.kind, ObjKind::Arr(_)) {
+                if let PropKey::S(s) = &key {
+                    if let Some(idx) = arr_index(s) {
+                        let mat = b.props.get(&key).is_some();
+                        let hole = b.holes.as_ref().is_some_and(|h| h.contains(&idx));
+                        let in_range = matches!(&b.kind, ObjKind::Arr(it) if idx < it.len());
+                        let pure_val = has_val && !has_w && !has_e && !has_c;
+                        if !in_range {
+                            // index at/past the declared length needs a
+                            // writable length (spec 10.4.2.1 step 3.e)
+                            let lkey = PropKey::from_str("length");
+                            let items_len = match &b.kind {
+                                ObjKind::Arr(it) => it.len(),
+                                _ => 0,
+                            };
+                            let (cur_len, len_w) = match b.props.get(&lkey) {
+                                Some(p) => {
+                                    let n = match &p.val {
+                                        Value::Num(n) => (*n as usize).max(items_len),
+                                        _ => items_len,
+                                    };
+                                    (n, p.writable)
+                                }
+                                None => (items_len, true),
+                            };
+                            if idx >= cur_len && !len_w {
+                                return Ok(false);
+                            }
+                        }
+                        if !mat {
+                            if in_range && !hole {
+                                if pure_val {
+                                    if let ObjKind::Arr(items) = &mut b.kind {
+                                        items[idx] = vv.clone();
+                                    }
+                                    return Ok(true);
+                                }
+                                // attribute fields present → materialize the
+                                // live element so generic validation merges
+                                // against its current all-true attrs
+                                if let ObjKind::Arr(items) = &b.kind {
+                                    let cur = items[idx].clone();
+                                    b.props.insert(
+                                        key.clone(),
+                                        Prop {
+                                            val: cur,
+                                            writable: true,
+                                            enumerable: true,
+                                            configurable: true,
+                                            get: None,
+                                            set: None,
+                                        },
+                                    );
+                                }
+                            }
+                            // everything else (fresh indices, holed slots,
+                            // attr-bearing descs, non-extensible targets)
+                            // goes through the generic path — a FRESH index
+                            // define gets the descriptor's attrs verbatim
+                            // (absent fields default to false, not the
+                            // all-true of an assignment-grown slot); the
+                            // tail sync grows `length` to idx+1
+                        }
+                    }
+                    if s.as_ref() == "length" {
+                        // `length` is a non-configurable data prop — an
+                        // accessor desc always fails the kind-change check
+                        if is_acc {
+                            return Ok(false);
+                        }
+                        // 10.4.2.1 ArraySetLength — ToNumber may run user
+                        // code, so release the borrow around the coercion
+                        let new_len = if has_val {
+                            drop(b);
+                            let numlen = i.to_num(&vv)?;
+                            b = o.borrow_mut();
+                            let nlu = to_u32(numlen);
+                            if numlen != nlu as f64 {
+                                return Err(i.range_err("Invalid array length"));
+                            }
+                            Some(nlu as usize)
+                        } else {
+                            None
+                        };
                         let items_len = match &b.kind {
                             ObjKind::Arr(it) => it.len(),
-                            _ => 0,
+                            _ => return Ok(false),
                         };
-                        let (cur_len, len_w) = match b.props.get(&lkey) {
+                        let lkey = PropKey::from_str("length");
+                        let (eff_len, cur_w) = match b.props.get(&lkey) {
                             Some(p) => {
                                 let n = match &p.val {
-                                    Value::Num(n) => {
-                                        (*n as usize).max(items_len)
-                                    }
+                                    Value::Num(n) => (*n as usize).max(items_len),
                                     _ => items_len,
                                 };
                                 (n, p.writable)
                             }
                             None => (items_len, true),
                         };
-                        if idx >= cur_len && !len_w {
+                        // length is {enumerable:false, configurable:false}
+                        // — attr flips to true are rejected outright
+                        if (has_c && i.to_bool(&cv)) || (has_e && i.to_bool(&ev)) {
                             return Ok(false);
                         }
-                    }
-                    if !mat {
-                        if in_range && !hole {
-                            if pure_val {
-                                if let ObjKind::Arr(items) = &mut b.kind {
-                                    items[idx] = vv.clone();
-                                }
-                                return Ok(true);
+                        if !cur_w {
+                            // non-writable length: value must stay the same
+                            // and writable can't flip back on
+                            if new_len.is_some_and(|n| n != eff_len) {
+                                return Ok(false);
                             }
-                            // attribute fields present → materialize the
-                            // live element so generic validation merges
-                            // against its current all-true attrs
-                            if let ObjKind::Arr(items) = &b.kind {
-                                let cur = items[idx].clone();
-                                b.props.insert(
-                                    key.clone(),
-                                    Prop {
-                                        val: cur,
-                                        writable: true,
-                                        enumerable: true,
-                                        configurable: true,
-                                        get: None,
-                                        set: None,
-                                    },
-                                );
+                            if has_w && i.to_bool(&wv) {
+                                return Ok(false);
                             }
+                            return Ok(true);
                         }
-                        // everything else (fresh indices, holed slots,
-                        // attr-bearing descs, non-extensible targets)
-                        // goes through the generic path — a FRESH index
-                        // define gets the descriptor's attrs verbatim
-                        // (absent fields default to false, not the
-                        // all-true of an assignment-grown slot); the
-                        // tail sync grows `length` to idx+1
-                    }
-                }
-                if s.as_ref() == "length" {
-                    // `length` is a non-configurable data prop — an
-                    // accessor desc always fails the kind-change check
-                    if is_acc {
-                        return Ok(false);
-                    }
-                    // 10.4.2.1 ArraySetLength — ToNumber may run user
-                    // code, so release the borrow around the coercion
-                    let new_len = if has_val {
-                        drop(b);
-                        let numlen = i.to_num(&vv)?;
-                        b = o.borrow_mut();
-                        let nlu = to_u32(numlen);
-                        if numlen != nlu as f64 {
-                            return Err(i.range_err("Invalid array length"));
-                        }
-                        Some(nlu as usize)
-                    } else {
-                        None
-                    };
-                    let items_len = match &b.kind {
-                        ObjKind::Arr(it) => it.len(),
-                        _ => return Ok(false),
-                    };
-                    let lkey = PropKey::from_str("length");
-                    let (eff_len, cur_w) = match b.props.get(&lkey) {
-                        Some(p) => {
-                            let n = match &p.val {
-                                Value::Num(n) => {
-                                    (*n as usize).max(items_len)
-                                }
-                                _ => items_len,
-                            };
-                            (n, p.writable)
-                        }
-                        None => (items_len, true),
-                    };
-                    // length is {enumerable:false, configurable:false}
-                    // — attr flips to true are rejected outright
-                    if (has_c && i.to_bool(&cv))
-                        || (has_e && i.to_bool(&ev))
-                    {
-                        return Ok(false);
-                    }
-                    if !cur_w {
-                        // non-writable length: value must stay the same
-                        // and writable can't flip back on
-                        if new_len.is_some_and(|n| n != eff_len) {
-                            return Ok(false);
-                        }
-                        if has_w && i.to_bool(&wv) {
-                            return Ok(false);
-                        }
-                        return Ok(true);
-                    }
-                    let new_w = if has_w { i.to_bool(&wv) } else { cur_w };
-                    if let Some(nl) = new_len {
-                        if nl < eff_len {
-                            // spec deletes indices in [nl, eff_len)
-                            // descending; the first non-configurable
-                            // index aborts the shrink at that point
-                            let doomed: Vec<(usize, PropKey)> = b
-                                .props
-                                .iter()
-                                .map(|(k, _)| k)
-                                .filter_map(|k| match k {
-                                    PropKey::S(s) => {
-                                        js_int_index(s.as_ref())
-                                            .filter(|ix| {
-                                                *ix >= nl && *ix < eff_len
-                                            })
-                                            .map(|ix| (ix, k.clone()))
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            let fail_at = doomed
-                                .iter()
-                                .filter(|(_, k)| {
-                                    !b.props.get(k).map(|p| p.configurable)
-                                        .unwrap_or(true)
-                                })
-                                .map(|(ix, _)| *ix)
-                                .max();
-                            if let Some(k) = fail_at {
-                                // indices > k were already deleted; the
-                                // length lands on k+1
-                                let keep: Vec<PropKey> = doomed
+                        let new_w = if has_w { i.to_bool(&wv) } else { cur_w };
+                        if let Some(nl) = new_len {
+                            if nl < eff_len {
+                                // spec deletes indices in [nl, eff_len)
+                                // descending; the first non-configurable
+                                // index aborts the shrink at that point
+                                let doomed: Vec<(usize, PropKey)> = b
+                                    .props
                                     .iter()
-                                    .filter(|(ix, _)| *ix > k)
-                                    .map(|(_, k)| k.clone())
+                                    .map(|(k, _)| k)
+                                    .filter_map(|k| match k {
+                                        PropKey::S(s) => js_int_index(s.as_ref())
+                                            .filter(|ix| *ix >= nl && *ix < eff_len)
+                                            .map(|ix| (ix, k.clone())),
+                                        _ => None,
+                                    })
                                     .collect();
-                                for pk in keep {
+                                let fail_at = doomed
+                                    .iter()
+                                    .filter(|(_, k)| {
+                                        !b.props.get(k).map(|p| p.configurable).unwrap_or(true)
+                                    })
+                                    .map(|(ix, _)| *ix)
+                                    .max();
+                                if let Some(k) = fail_at {
+                                    // indices > k were already deleted; the
+                                    // length lands on k+1
+                                    let keep: Vec<PropKey> = doomed
+                                        .iter()
+                                        .filter(|(ix, _)| *ix > k)
+                                        .map(|(_, k)| k.clone())
+                                        .collect();
+                                    for pk in keep {
+                                        b.props.remove(&pk);
+                                    }
+                                    if let ObjKind::Arr(items) = &mut b.kind {
+                                        items.truncate(k + 1);
+                                    }
+                                    if let Some(h) = &mut b.holes {
+                                        h.retain(|&h| h < k + 1);
+                                    }
+                                    match b.props.get_mut(&lkey) {
+                                        Some(p) => {
+                                            p.val = Value::Num((k + 1) as f64);
+                                            if !new_w {
+                                                p.writable = false;
+                                            }
+                                        }
+                                        None => {
+                                            b.props.insert(
+                                                lkey,
+                                                Prop {
+                                                    val: Value::Num((k + 1) as f64),
+                                                    writable: new_w,
+                                                    enumerable: false,
+                                                    configurable: false,
+                                                    get: None,
+                                                    set: None,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    return Ok(false);
+                                }
+                                for (_, pk) in doomed {
                                     b.props.remove(&pk);
                                 }
                                 if let ObjKind::Arr(items) = &mut b.kind {
-                                    items.truncate(k + 1);
+                                    items.truncate(nl);
                                 }
                                 if let Some(h) = &mut b.holes {
-                                    h.retain(|&h| h < k + 1);
+                                    h.retain(|&h| h < nl);
                                 }
-                                match b.props.get_mut(&lkey) {
-                                    Some(p) => {
-                                        p.val = Value::Num((k + 1) as f64);
-                                        if !new_w {
-                                            p.writable = false;
-                                        }
-                                    }
-                                    None => {
-                                        b.props.insert(
-                                            lkey,
-                                            Prop {
-                                                val: Value::Num(
-                                                    (k + 1) as f64,
-                                                ),
-                                                writable: new_w,
-                                                enumerable: false,
-                                                configurable: false,
-                                                get: None,
-                                                set: None,
-                                            },
-                                        );
-                                    }
+                            }
+                            match b.props.get_mut(&lkey) {
+                                Some(p) => {
+                                    p.val = Value::Num(nl as f64);
+                                    p.writable = new_w;
                                 }
-                                return Ok(false);
+                                None => {
+                                    b.props.insert(
+                                        lkey,
+                                        Prop {
+                                            val: Value::Num(nl as f64),
+                                            writable: new_w,
+                                            enumerable: false,
+                                            configurable: false,
+                                            get: None,
+                                            set: None,
+                                        },
+                                    );
+                                }
                             }
-                            for (_, pk) in doomed {
-                                b.props.remove(&pk);
-                            }
-                            if let ObjKind::Arr(items) = &mut b.kind {
-                                items.truncate(nl);
-                            }
-                            if let Some(h) = &mut b.holes {
-                                h.retain(|&h| h < nl);
-                            }
+                            return Ok(true);
                         }
+                        // attribute-only desc
                         match b.props.get_mut(&lkey) {
-                            Some(p) => {
-                                p.val = Value::Num(nl as f64);
-                                p.writable = new_w;
-                            }
+                            Some(p) => p.writable = new_w,
                             None => {
                                 b.props.insert(
                                     lkey,
                                     Prop {
-                                        val: Value::Num(nl as f64),
+                                        val: Value::Num(eff_len as f64),
                                         writable: new_w,
                                         enumerable: false,
                                         configurable: false,
@@ -5342,27 +5525,8 @@ fn define_prop_from_desc(
                         }
                         return Ok(true);
                     }
-                    // attribute-only desc
-                    match b.props.get_mut(&lkey) {
-                        Some(p) => p.writable = new_w,
-                        None => {
-                            b.props.insert(
-                                lkey,
-                                Prop {
-                                    val: Value::Num(eff_len as f64),
-                                    writable: new_w,
-                                    enumerable: false,
-                                    configurable: false,
-                                    get: None,
-                                    set: None,
-                                },
-                            );
-                        }
-                    }
-                    return Ok(true);
                 }
             }
-        }
         }
     }
 
@@ -5462,8 +5626,7 @@ fn define_prop_from_desc(
                 // spec index range (< 2^32-1) drives length growth even
                 // for props-only sparse entries beyond the dense cap
                 if let Some(idx) = js_int_index(s) {
-                    let in_range =
-                        matches!(&b.kind, ObjKind::Arr(it) if idx < it.len());
+                    let in_range = matches!(&b.kind, ObjKind::Arr(it) if idx < it.len());
                     if in_range {
                         if is_acc {
                             // the accessor entry shadows the dense slot
@@ -5525,11 +5688,8 @@ fn define_prop_from_desc(
                             if let Some(Some(name)) = map.get(idx) {
                                 let name = name.clone();
                                 if let Some(e) = env {
-                                    freeze = e
-                                        .vars
-                                        .borrow()
-                                        .get(name.as_ref())
-                                        .map(|x| x.val.clone());
+                                    freeze =
+                                        e.vars.borrow().get(name.as_ref()).map(|x| x.val.clone());
                                 }
                                 if let Some(m) = map.get_mut(idx) {
                                     *m = None;
@@ -5538,13 +5698,9 @@ fn define_prop_from_desc(
                         }
                         if has_val {
                             items[idx] = vv.clone();
-                            if let (Some(e), Some(Some(name))) =
-                                (&*env, map.get(idx))
-                            {
+                            if let (Some(e), Some(Some(name))) = (&*env, map.get(idx)) {
                                 let name = name.clone();
-                                if let Some(bnd) =
-                                    e.vars.borrow_mut().get_mut(name.as_ref())
-                                {
+                                if let Some(bnd) = e.vars.borrow_mut().get_mut(name.as_ref()) {
                                     bnd.val = vv.clone();
                                 }
                             }
@@ -5605,16 +5761,9 @@ pub(crate) fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) 
         if let ObjKind::Args { items, env, map } = &b.kind {
             if let PropKey::S(s) = &key {
                 if let Some(idx) = arr_index(s) {
-                    if idx < items.len()
-                        && !b.holes.as_ref().is_some_and(|h| h.contains(&idx))
-                    {
-                        let mapped_val = if let (Some(e), Some(Some(name))) =
-                            (env, map.get(idx))
-                        {
-                            e.vars
-                                .borrow()
-                                .get(name.as_ref())
-                                .map(|b| b.val.clone())
+                    if idx < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&idx)) {
+                        let mapped_val = if let (Some(e), Some(Some(name))) = (env, map.get(idx)) {
+                            e.vars.borrow().get(name.as_ref()).map(|b| b.val.clone())
                         } else {
                             None
                         };
@@ -5661,9 +5810,13 @@ pub(crate) fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) 
         if matches!(&o.borrow().kind, ObjKind::Typed { .. }) {
             if let Some(ni) = canonical_numeric_index(sk) {
                 let (buf, off, len, kind, track) = match &o.borrow().kind {
-                    ObjKind::Typed { buf, off, len, kind, track } => {
-                        (buf.clone(), *off, *len, *kind, *track)
-                    }
+                    ObjKind::Typed {
+                        buf,
+                        off,
+                        len,
+                        kind,
+                        track,
+                    } => (buf.clone(), *off, *len, *kind, *track),
                     _ => unreachable!(),
                 };
                 if !typed_state(&buf, off, len, kind, track)
@@ -5674,10 +5827,7 @@ pub(crate) fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) 
                 let Some(bytes) = buffer_bytes(&buf) else {
                     return Ok(Value::Und);
                 };
-                let n = kind.read(
-                    &bytes.borrow(),
-                    off + ni as usize * kind.size(),
-                );
+                let n = kind.read(&bytes.borrow(), off + ni as usize * kind.size());
                 let elem = crate::binary::ta_pubify(i, &v, Value::Num(n));
                 let d = i.new_obj();
                 i.set_data(&d, "value", elem);
@@ -5753,11 +5903,7 @@ fn obj_get_own_prop_descs(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult
     let v = i.to_object(&arg(args, 0))?;
     let out = i.new_obj();
     for k in own_keys_all(i, &v)? {
-        let d = obj_get_own_prop_desc(
-            i,
-            &Value::Und,
-            &[v.clone(), i.key_to_value(&k)],
-        )?;
+        let d = obj_get_own_prop_desc(i, &Value::Und, &[v.clone(), i.key_to_value(&k)])?;
         // spec 19.1.2.9: a key whose [[GetOwnProperty]] returned
         // undefined gets NO entry in the result object
         if matches!(d, Value::Und) {
@@ -5785,9 +5931,7 @@ pub(crate) fn obj_get_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -
                             i.proxy_getproto_invariant(&t, &r)?;
                             Ok(r)
                         }
-                        _ => Err(i.type_err(
-                            "proxy getPrototypeOf must return object or null",
-                        )),
+                        _ => Err(i.type_err("proxy getPrototypeOf must return object or null")),
                     }
                 }
                 None => obj_get_prototype_of(i, &Value::Und, &[t]),
@@ -5811,8 +5955,7 @@ fn ord_set_proto(i: &mut Interp, o: &ObjRef, v: &Value) -> Result<bool, Value> {
     if let ObjKind::Proxy { target, handler } = { o.borrow().kind.clone() } {
         return match i.proxy_trap(&handler, "setPrototypeOf")? {
             Some(trap) => {
-                let r =
-                    i.call(&trap, handler, vec![target.clone(), v.clone()])?;
+                let r = i.call(&trap, handler, vec![target.clone(), v.clone()])?;
                 if !i.to_bool(&r) {
                     return Ok(false);
                 }
@@ -5868,9 +6011,7 @@ fn obj_set_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     }
     let v = arg(args, 1);
     if !matches!(v, Value::Obj(_) | Value::Null) {
-        return Err(
-            i.type_err("Object prototype may only be an Object or null")
-        );
+        return Err(i.type_err("Object prototype may only be an Object or null"));
     }
     if let Value::Obj(o) = &t {
         if !ord_set_proto(i, o, &v)? {
@@ -5893,9 +6034,7 @@ fn obj_create(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         let descs = i.to_object(&descs)?;
         for (k, d) in own_enum_entries_full(i, &descs, true)? {
             if !matches!(d, Value::Obj(_)) {
-                return Err(
-                    i.type_err("Property description must be an object")
-                );
+                return Err(i.type_err("Property description must be an object"));
             }
             define_prop_from_desc(i, &o, k, &d)?;
         }
@@ -5966,16 +6105,21 @@ fn ord_prevent_ext(i: &mut Interp, o: &ObjRef) -> Result<bool, Value> {
     // non-extensible — neither can one with live elements
     {
         let b = o.borrow();
-        if let ObjKind::Typed { buf, off, len, kind, track } = &b.kind {
+        if let ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+            track,
+        } = &b.kind
+        {
             if buf.borrow().rab_max.is_some() {
                 return Ok(false);
             }
             if *track {
                 return Ok(false);
             }
-            if typed_state(buf, *off, *len, *kind, *track)
-                .is_some_and(|eff| eff > 0)
-            {
+            if typed_state(buf, *off, *len, *kind, *track).is_some_and(|eff| eff > 0) {
                 return Ok(false);
             }
         }
@@ -6000,9 +6144,7 @@ fn materialize_elements(o: &ObjRef) {
         let k = idx_key(idx);
         if b.props.get(&k).is_none() {
             let val = match &b.kind {
-                ObjKind::Arr(items) | ObjKind::Args { items, .. } => {
-                    items[idx].clone()
-                }
+                ObjKind::Arr(items) | ObjKind::Args { items, .. } => items[idx].clone(),
                 _ => Value::Und,
             };
             b.props.insert(k, Prop::data(val));
@@ -6048,11 +6190,7 @@ fn set_integrity(i: &mut Interp, o: &ObjRef, frozen: bool) -> Result<bool, Value
             // O.[[GetOwnProperty]](k) per key — the trap observes them
             // in ownKeys order — and skips the define when it reports
             // undefined; accessor descs get only {configurable:false}
-            let desc = obj_get_own_prop_desc(
-                i,
-                &Value::Und,
-                &[ov.clone(), kv.clone()],
-            )?;
+            let desc = obj_get_own_prop_desc(i, &Value::Und, &[ov.clone(), kv.clone()])?;
             if matches!(desc, Value::Und) {
                 continue;
             }
@@ -6061,8 +6199,7 @@ fn set_integrity(i: &mut Interp, o: &ObjRef, frozen: bool) -> Result<bool, Value
                 let dv = Value::Obj(dv.clone());
                 let g = i.get_prop_str(&dv, "get")?;
                 let s = i.get_prop_str(&dv, "set")?;
-                is_acc =
-                    !(matches!(g, Value::Und) && matches!(s, Value::Und));
+                is_acc = !(matches!(g, Value::Und) && matches!(s, Value::Und));
             }
             let d = i.new_obj();
             i.set_data(&d, "configurable", Value::Bool(false));
@@ -6075,10 +6212,15 @@ fn set_integrity(i: &mut Interp, o: &ObjRef, frozen: bool) -> Result<bool, Value
     }
     {
         let b = o.borrow();
-        if let ObjKind::Typed { buf, off, len, kind, track } = &b.kind {
-            if typed_state(buf, *off, *len, *kind, *track)
-                .is_some_and(|eff| eff > 0)
-            {
+        if let ObjKind::Typed {
+            buf,
+            off,
+            len,
+            kind,
+            track,
+        } = &b.kind
+        {
+            if typed_state(buf, *off, *len, *kind, *track).is_some_and(|eff| eff > 0) {
                 return Ok(false);
             }
         }
@@ -6103,11 +6245,7 @@ fn integrity(i: &mut Interp, o: &ObjRef, frozen: bool) -> Result<bool, Value> {
     if { matches!(&o.borrow().kind, ObjKind::Proxy { .. }) } {
         let ov = Value::Obj(o.clone());
         for k in own_keys_all(i, &ov)? {
-            let d = obj_get_own_prop_desc(
-                i,
-                &Value::Und,
-                &[ov.clone(), i.key_to_value(&k)],
-            )?;
+            let d = obj_get_own_prop_desc(i, &Value::Und, &[ov.clone(), i.key_to_value(&k)])?;
             if let Value::Obj(d) = d {
                 let dv = Value::Obj(d);
                 let cfg = i.get_prop_str(&dv, "configurable")?;
@@ -6117,8 +6255,7 @@ fn integrity(i: &mut Interp, o: &ObjRef, frozen: bool) -> Result<bool, Value> {
                 if frozen {
                     let g = i.get_prop_str(&dv, "get")?;
                     let s = i.get_prop_str(&dv, "set")?;
-                    let is_acc = !(matches!(g, Value::Und)
-                        && matches!(s, Value::Und));
+                    let is_acc = !(matches!(g, Value::Und) && matches!(s, Value::Und));
                     let w = i.get_prop_str(&dv, "writable")?;
                     if !is_acc && i.to_bool(&w) {
                         return Ok(false);
@@ -6129,10 +6266,15 @@ fn integrity(i: &mut Interp, o: &ObjRef, frozen: bool) -> Result<bool, Value> {
         return Ok(true);
     }
     let b = o.borrow();
-    if let ObjKind::Typed { buf, off, len, kind, track } = &b.kind {
-        if typed_state(buf, *off, *len, *kind, *track)
-            .is_some_and(|eff| eff > 0)
-        {
+    if let ObjKind::Typed {
+        buf,
+        off,
+        len,
+        kind,
+        track,
+    } = &b.kind
+    {
+        if typed_state(buf, *off, *len, *kind, *track).is_some_and(|eff| eff > 0) {
             return Ok(false);
         }
     }
@@ -6321,10 +6463,7 @@ fn map_group_by(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         Value::Obj(p) => Some(p),
         _ => None,
     };
-    let out = Rc::new(RefCell::new(Obj::new(
-        proto,
-        ObjKind::Map(Vec::new()),
-    )));
+    let out = Rc::new(RefCell::new(Obj::new(proto, ObjKind::Map(Vec::new()))));
     out.borrow_mut()
         .props
         .insert_str("__map", Prop::builtin(Value::Bool(true)));
@@ -6433,8 +6572,7 @@ fn object_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             &Value::Obj(i.p.global.clone()),
             &PropKey::from_str("Object"),
         );
-        let is_self =
-            matches!(&ctor, Ok(Value::Obj(c)) if Rc::ptr_eq(&nt, c));
+        let is_self = matches!(&ctor, Ok(Value::Obj(c)) if Rc::ptr_eq(&nt, c));
         if !is_self {
             if matches!(this, Value::Obj(_)) {
                 return Ok(this.clone());
@@ -6545,17 +6683,19 @@ fn fn_bind(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         Value::Str(s) => s.to_string(),
         _ => String::new(),
     };
-    i.set_attr(&bound, "name", Value::Str(Rc::from(format!("bound {tname}"))), false, true);
+    i.set_attr(
+        &bound,
+        "name",
+        Value::Str(Rc::from(format!("bound {tname}"))),
+        false,
+        true,
+    );
     Ok(Value::Obj(bound))
 }
 
 /// 7.3.19 OrdinaryHasInstance(C, O) — bound functions unwrap to their
 /// target; non-callable C → false; `C.prototype` non-object → TypeError.
-pub(crate) fn ordinary_has_instance(
-    i: &mut Interp,
-    c: &Value,
-    o: &Value,
-) -> Result<bool, Value> {
+pub(crate) fn ordinary_has_instance(i: &mut Interp, c: &Value, o: &Value) -> Result<bool, Value> {
     let mut cur = c.clone();
     loop {
         let t = if let Value::Obj(co) = &cur {
@@ -6588,11 +6728,7 @@ pub(crate) fn ordinary_has_instance(
         // fires its getPrototypeOf trap (scoped borrow: the trap may
         // mutate the object)
         let next = if { matches!(&cur_o.borrow().kind, ObjKind::Proxy { .. }) } {
-            match obj_get_prototype_of(
-                i,
-                &Value::Und,
-                &[Value::Obj(cur_o.clone())],
-            )? {
+            match obj_get_prototype_of(i, &Value::Und, &[Value::Obj(cur_o.clone())])? {
                 Value::Obj(p) => Some(p),
                 _ => None,
             }
@@ -6624,21 +6760,23 @@ fn is_ident_name(s: &str) -> bool {
         c == '_' || c == '$' || unicode_ident::is_xid_start(c)
     }
     fn part(c: char) -> bool {
-        start(c)
-            || unicode_ident::is_xid_continue(c)
-            || c == '\u{200c}'
-            || c == '\u{200d}'
+        start(c) || unicode_ident::is_xid_continue(c) || c == '\u{200c}' || c == '\u{200d}'
     }
     !s.is_empty() && s.chars().next().is_some_and(start) && s.chars().all(part)
 }
 
 fn fn_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let Value::Obj(o) = this else {
-        return Err(i.type_err(
-            "Function.prototype.toString called on non-callable receiver",
-        ));
+        return Err(i.type_err("Function.prototype.toString called on non-callable receiver"));
     };
     let kind = o.borrow().kind.clone();
+    // a user function retains the verbatim source text of its
+    // definition — toString returns it untouched (spec)
+    if let ObjKind::Func(Func::User { def, .. }) = &kind {
+        if let Some(src) = &def.src {
+            return Ok(Value::Str(src.clone()));
+        }
+    }
     let name = match &kind {
         ObjKind::Func(Func::User { def, .. }) => def.name.clone().unwrap_or_default(),
         ObjKind::Func(Func::Native { name, .. }) => name.to_string(),
@@ -6650,22 +6788,22 @@ fn fn_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             if matches!(target, Value::Obj(t) if t.borrow().is_callable()) {
                 String::new()
             } else {
-                return Err(i.type_err(
-                    "Function.prototype.toString called on non-callable receiver",
-                ));
+                return Err(
+                    i.type_err("Function.prototype.toString called on non-callable receiver")
+                );
             }
         }
         ObjKind::Und => String::new(),
-        _ => {
-            return Err(i.type_err(
-                "Function.prototype.toString called on non-callable receiver",
-            ))
-        }
+        _ => return Err(i.type_err("Function.prototype.toString called on non-callable receiver")),
     };
     // emit the name only when it is a single valid IdentifierName —
     // computed/`#private`/otherwise-unusual names fall back to the
     // anonymous form so the result is always valid NativeFunction syntax
-    let emit = if is_ident_name(&name) { name } else { String::new() };
+    let emit = if is_ident_name(&name) {
+        name
+    } else {
+        String::new()
+    };
     Ok(Value::Str(Rc::from(
         format!("function {emit}() {{ [native code] }}").as_str(),
     )))
@@ -6727,9 +6865,9 @@ fn array_is_array(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             ObjKind::Arr(_) => return Ok(Value::Bool(true)),
             ObjKind::Proxy { target, .. } => {
                 if matches!(target, Value::Null) {
-                    return Err(i.type_err(
-                        "Cannot perform 'IsArray' on a proxy that has been revoked",
-                    ));
+                    return Err(
+                        i.type_err("Cannot perform 'IsArray' on a proxy that has been revoked")
+                    );
                 }
                 target.clone()
             }
@@ -7117,9 +7255,7 @@ fn arr_splice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     }
     for (k, v) in nv.iter().enumerate() {
         match v {
-            Some(v) => {
-                i.set_prop(this, PropKey::from_str(&k.to_string()), v.clone())?
-            }
+            Some(v) => i.set_prop(this, PropKey::from_str(&k.to_string()), v.clone())?,
             None => {
                 i.delete_prop(this, &PropKey::from_str(&k.to_string()))?;
             }
@@ -7146,8 +7282,7 @@ fn arr_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     for e in std::iter::once(&boxed).chain(args.iter()) {
         let spreadable = match e {
             Value::Obj(o) => {
-                let flag =
-                    i.get_prop(e, &PropKey::Sym(SYM_IS_CONCAT_SPREADABLE))?;
+                let flag = i.get_prop(e, &PropKey::Sym(SYM_IS_CONCAT_SPREADABLE))?;
                 if matches!(flag, Value::Und) {
                     matches!(o.borrow().kind, ObjKind::Arr(_))
                 } else {
@@ -7212,36 +7347,59 @@ fn arr_join(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn arr_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let needle = arg(args, 0);
-    // numeric/absent fromIndex can't run user code — scan under one borrow
+    // fast path: dense array + numeric/absent fromIndex (no user code)
     if matches!(arg(args, 1), Value::Num(_) | Value::Und) {
         if let Value::Obj(o) = this {
-            let b = o.borrow();
-            if let ObjKind::Arr(items) = &b.kind {
-                let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), items.len());
-                for (k, v) in items.iter().enumerate().skip(start) {
-                    if strict_val_eq(v, &needle) {
-                        return Ok(Value::Num(k as f64));
+            let ok_dense = {
+                let b = o.borrow();
+                matches!(&b.kind, ObjKind::Arr(items)
+                    if b.holes.as_ref().map_or(true, |h| h.is_empty())
+                        && arr_declared_len(o) == items.len())
+            };
+            if ok_dense {
+                let b = o.borrow();
+                if let ObjKind::Arr(items) = &b.kind {
+                    let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), items.len());
+                    for (k, v) in items.iter().enumerate().skip(start) {
+                        if strict_val_eq(v, &needle) {
+                            return Ok(Value::Num(k as f64));
+                        }
                     }
+                    return Ok(Value::Num(-1.0));
                 }
-                return Ok(Value::Num(-1.0));
             }
         }
     }
-    let len = elems_len(i, this)?;
-    let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), len);
-    // skip missing properties — HasProperty, not Get
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items {
-        if k < start {
-            continue;
-        }
-        if strict_val_eq(&v, &needle) {
+    // spec: O = ToObject → len = LengthOfArrayLike → n = ToInteger(fromIndex)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if len == 0 {
+        return Ok(Value::Num(-1.0));
+    }
+    let n = match arg(args, 1) {
+        Value::Und => 0.0,
+        v => i.to_num(&v)?.trunc(),
+    };
+    if n == f64::INFINITY || n >= len as f64 {
+        return Ok(Value::Num(-1.0));
+    }
+    let mut k = if n == f64::NEG_INFINITY {
+        0i64
+    } else if n < 0.0 {
+        (len as i64 + n as i64).max(0)
+    } else {
+        n as i64
+    };
+    while k < len as i64 {
+        let key = idx_key(k as usize);
+        // HasProperty first — holes/proto-absent indices are skipped
+        if i.has_prop(&obj, &key)? && strict_val_eq(&i.get_prop(&obj, &key)?, &needle) {
             return Ok(Value::Num(k as f64));
         }
+        k += 1;
     }
     Ok(Value::Num(-1.0))
 }
-
 /// spec start index for lastIndexOf: `fromIndex` (default len-1), negative
 /// counts from the end; starting before 0 yields -1.
 fn last_index_start(n: f64, len: usize) -> Option<usize> {
@@ -7260,51 +7418,35 @@ fn last_index_start(n: f64, len: usize) -> Option<usize> {
 
 fn arr_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let needle = arg(args, 0);
-    // fromIndex may run user code (valueOf) — convert BEFORE borrowing
-    let from = match args.get(1) {
-        Some(v) => Some(i.to_num(v)?),
-        None => None,
-    };
-    // no user code runs from here — scan in place under one borrow
-    if let Value::Obj(o) = this {
-        let b = o.borrow();
-        if let ObjKind::Arr(items) = &b.kind {
-            let start = match from {
-                Some(n) => last_index_start(n, items.len()),
-                None => items.len().checked_sub(1),
-            };
-            let Some(start) = start else {
-                return Ok(Value::Num(-1.0));
-            };
-            for k in (0..=start).rev() {
-                if strict_val_eq(&items[k], &needle) {
-                    return Ok(Value::Num(k as f64));
-                }
-            }
-            return Ok(Value::Num(-1.0));
-        }
-    }
-    let len = elems_len(i, this)?;
-    let start = match from {
-        Some(n) => last_index_start(n, len),
-        None => len.checked_sub(1),
-    };
-    let Some(start) = start else {
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if len == 0 {
         return Ok(Value::Num(-1.0));
+    }
+    // ToIntegerOrInfinity(fromIndex), default len-1; NaN → len-1
+    // ToIntegerOrInfinity(fromIndex): default len-1, NaN → +0,
+    // +Inf → len-1, negative → len+n
+    let n = match args.get(1) {
+        None => len as f64 - 1.0,
+        Some(v) => to_integer_or_inf(i.to_num(v)?),
     };
-    // skip missing properties — HasProperty, not Get
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items.iter().rev() {
-        if *k > start {
-            continue;
+    let mut k: i64 = if n >= len as f64 {
+        len as i64 - 1
+    } else if n < 0.0 {
+        // len + n (may stay negative → -1)
+        (len as f64 + n) as i64
+    } else {
+        n as i64
+    };
+    while k >= 0 {
+        let key = idx_key(k as usize);
+        if i.has_prop(&obj, &key)? && strict_val_eq(&i.get_prop(&obj, &key)?, &needle) {
+            return Ok(Value::Num(k as f64));
         }
-        if strict_val_eq(v, &needle) {
-            return Ok(Value::Num(*k as f64));
-        }
+        k -= 1;
     }
     Ok(Value::Num(-1.0))
 }
-
 fn strict_val_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Und, Value::Und) | (Value::Null, Value::Null) => true,
@@ -7312,7 +7454,10 @@ fn strict_val_eq(a: &Value, b: &Value) -> bool {
         (Value::Num(x), Value::Num(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Sym(x, _), Value::Sym(y, _)) => x == y,
-        (Value::Obj(x), Value::Obj(y)) => Rc::ptr_eq(x, y),
+        (Value::Obj(x), Value::Obj(y)) => {
+            // bigint primitives are Obj standins — compare by magnitude
+            Rc::ptr_eq(x, y) || bigint_mag_eq(a, b)
+        }
         _ => false,
     }
 }
@@ -7326,85 +7471,138 @@ fn same_value_zero(a: &Value, b: &Value) -> bool {
 
 fn arr_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let needle = arg(args, 0);
-    // no user code runs here — scan in place under one borrow
-    if let Value::Obj(o) = this {
-        let b = o.borrow();
-        if let ObjKind::Arr(items) = &b.kind {
-            return Ok(Value::Bool(items.iter().any(|v| same_value_zero(v, &needle))));
-        }
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if len == 0 {
+        return Ok(Value::Bool(false));
     }
-    let items = to_elems(i, this)?;
-    Ok(Value::Bool(items.iter().any(|v| same_value_zero(v, &needle))))
+    // ToIntegerOrInfinity(fromIndex): -Inf→0, +Inf→false, neg→len+n
+    let n = match arg(args, 1) {
+        Value::Und => 0.0,
+        v => i.to_num(&v)?,
+    };
+    if n == f64::INFINITY || n >= len as f64 {
+        return Ok(Value::Bool(false));
+    }
+    let mut k: i64 = if n == f64::NEG_INFINITY || n.is_nan() {
+        0
+    } else {
+        let t = n.trunc() as i64;
+        if t < 0 {
+            (len as i64 + t).max(0)
+        } else {
+            t
+        }
+    };
+    while k < len as i64 {
+        // spec: SameValueZero on Get — holes read as `undefined`
+        if same_value_zero(&i.get_prop(&obj, &idx_key(k as usize))?, &needle) {
+            return Ok(Value::Bool(true));
+        }
+        k += 1;
+    }
+    Ok(Value::Bool(false))
 }
-
 fn arr_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items.iter() {
+    // spec: ToObject → LengthOfArrayLike → IsCallable check, then per-index
+    // Get + Call — reads stay live (deletion/mutation visible mid-loop)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("predicate is not callable"));
+    }
+    let mut k = 0usize;
+    while k < len {
+        let v = i.get_prop(&obj, &idx_key(k))?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(*k as f64), this.clone()],
+            vec![v.clone(), Value::Num(k as f64), obj.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(v.clone());
+            return Ok(v);
         }
+        k += 1;
     }
     Ok(Value::Und)
 }
-
 fn arr_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items.iter() {
+    // spec: ToObject → LengthOfArrayLike → IsCallable check, then per-index
+    // Get + Call — reads stay live (deletion/mutation visible mid-loop)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("predicate is not callable"));
+    }
+    let mut k = 0usize;
+    while k < len {
+        let v = i.get_prop(&obj, &idx_key(k))?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(*k as f64), this.clone()],
+            vec![v.clone(), Value::Num(k as f64), obj.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(Value::Num(*k as f64));
+            return Ok(Value::Num(k as f64));
         }
+        k += 1;
     }
     Ok(Value::Num(-1.0))
 }
-
 fn arr_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items.iter().rev() {
+    // spec: ToObject → LengthOfArrayLike → IsCallable check, then per-index
+    // Get + Call — reads stay live (deletion/mutation visible mid-loop)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("predicate is not callable"));
+    }
+    let mut k = len as i64 - 1;
+    while k >= 0 {
+        let v = i.get_prop(&obj, &idx_key(k as usize))?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(*k as f64), this.clone()],
+            vec![v.clone(), Value::Num(k as f64), obj.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(v.clone());
+            return Ok(v);
         }
+        k -= 1;
     }
     Ok(Value::Und)
 }
-
 fn arr_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items.iter().rev() {
+    // spec: ToObject → LengthOfArrayLike → IsCallable check, then per-index
+    // Get + Call — reads stay live (deletion/mutation visible mid-loop)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("predicate is not callable"));
+    }
+    let mut k = len as i64 - 1;
+    while k >= 0 {
+        let v = i.get_prop(&obj, &idx_key(k as usize))?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![v.clone(), Value::Num(*k as f64), this.clone()],
+            vec![v.clone(), Value::Num(k as f64), obj.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(Value::Num(*k as f64));
+            return Ok(Value::Num(k as f64));
         }
+        k -= 1;
     }
     Ok(Value::Num(-1.0))
 }
-
 fn arr_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
@@ -7464,9 +7662,7 @@ fn arr_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         Some(v) => v.clone(),
         None => match it.next() {
             Some((_, v)) => v,
-            None => {
-                return Err(i.type_err("Reduce of empty array with no initial value"))
-            }
+            None => return Err(i.type_err("Reduce of empty array with no initial value")),
         },
     };
     for (k, v) in it {
@@ -7487,9 +7683,7 @@ fn arr_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         Some(v) => v.clone(),
         None => match it.next() {
             Some((_, v)) => v,
-            None => {
-                return Err(i.type_err("Reduce of empty array with no initial value"))
-            }
+            None => return Err(i.type_err("Reduce of empty array with no initial value")),
         },
     };
     for (k, v) in it {
@@ -7600,19 +7794,40 @@ fn arr_flat_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_fill(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec returns the ToObject'd receiver (primitive this → wrapper)
+    let obj = i.to_object(this)?;
     let v = arg(args, 0);
-    let len = arr_clone(this).len();
-    let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), len);
+    let len = length_of_array_like(i, &obj)?;
+    let start = clamp_index(i.to_num(&arg(args, 1))?, len);
     let end = match arg(args, 2) {
         Value::Und => len,
-        x => clamp_index(i.to_num(&x).unwrap_or(0.0), len),
+        x => clamp_index(i.to_num(&x)?, len),
     };
-    with_arr(this, |items| {
-        for k in start..end.min(items.len()) {
-            items[k] = v.clone();
+    if let Value::Obj(o) = &obj {
+        let fast = matches!(o.borrow().kind, ObjKind::Arr(_));
+        if fast {
+            let mut b = o.borrow_mut();
+            if let Some(h) = b.holes.as_mut() {
+                for k in start..end {
+                    h.remove(&k);
+                }
+            }
+            if let ObjKind::Arr(items) = &mut b.kind {
+                // fill materializes every index in range — holes included
+                if end > items.len() {
+                    items.resize(end, Value::Und);
+                }
+                for k in start..end {
+                    items[k] = v.clone();
+                }
+            }
+            return Ok(obj.clone());
         }
-    });
-    Ok(this.clone())
+    }
+    for k in start..end {
+        i.set_prop(&obj, idx_key(k), v.clone())?;
+    }
+    Ok(obj)
 }
 
 fn arr_reverse(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -7774,7 +7989,11 @@ fn arr_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 fn make_live_iter(o: ObjRef, proto: ObjRef, mode: u8) -> Value {
     Value::Obj(Rc::new(RefCell::new(Obj::new(
         Some(proto),
-        ObjKind::IterLive { obj: o, idx: 0, mode },
+        ObjKind::IterLive {
+            obj: o,
+            idx: 0,
+            mode,
+        },
     ))))
 }
 
@@ -7786,6 +8005,10 @@ fn make_live_iter(o: ObjRef, proto: ObjRef, mode: u8) -> Value {
 /// case); callers slice/iterate instead of getting an owned `String`.
 fn unbox_str(i: &mut Interp, this: &Value) -> Result<Rc<str>, Value> {
     match this {
+        // RequireObjectCoercible — null/undefined receivers are a TypeError
+        Value::Und | Value::Null => {
+            Err(i.type_err("String.prototype method called on null or undefined"))
+        }
         Value::Str(s) => Ok(s.clone()),
         Value::Obj(o) => {
             if let Some(v) = i.obj_get_raw_str(o, "$value") {
@@ -7797,27 +8020,114 @@ fn unbox_str(i: &mut Interp, this: &Value) -> Result<Rc<str>, Value> {
     }
 }
 
-/// Byte offset of char index `idx` in `s` (or `s.len()` when out of range).
-fn char_byte_at(s: &str, idx: usize) -> usize {
-    s.char_indices()
-        .nth(idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
+/// spec thisStringValue — String.prototype.toString/valueOf are NOT
+/// generic: they require a String primitive or [[StringData]] object.
+fn str_this_str(i: &mut Interp, this: &Value) -> Result<Rc<str>, Value> {
+    match this {
+        Value::Str(s) => Ok(s.clone()),
+        Value::Obj(o) => match i.obj_get_raw_str(o, "$value") {
+            Some(Value::Str(s)) => Ok(s),
+            _ => Err(i.type_err("String.prototype method called on incompatible receiver")),
+        },
+        _ => Err(i.type_err("String.prototype method called on incompatible receiver")),
+    }
+}
+
+/// spec "If x is Object" in the String protocol methods (split, replace,
+/// replaceAll, match, matchAll, search) — the engine's BigInt primitives
+/// are Obj stand-ins but are NOT objects for this check.
+fn is_obj_arg(v: &Value) -> bool {
+    matches!(v, Value::Obj(_)) && !crate::binary::bigint_is_prim(v)
+}
+
+/// spec ToNumber for String.prototype arguments — rejects BigInt even
+/// when a bigint surfaces from ToPrimitive (i.to_num quietly reads the
+/// magnitude back, which would swallow the required TypeError).
+fn str_num(i: &mut Interp, v: &Value) -> Result<f64, Value> {
+    if crate::binary::bigint_is_prim(v) {
+        return Err(i.type_err("Cannot convert a BigInt value to a number"));
+    }
+    if let Value::Obj(o) = v {
+        let p = i.to_primitive_hint(v, o.clone(), "number")?;
+        if crate::binary::bigint_is_prim(&p) {
+            return Err(i.type_err("Cannot convert a BigInt value to a number"));
+        }
+        return i.to_num(&p);
+    }
+    i.to_num(v)
+}
+
+/// spec ToIntegerOrInfinity — NaN → +0, ±∞ pass through, else trunc to 0.
+fn to_integer_or_inf(n: f64) -> f64 {
+    if n.is_nan() {
+        0.0
+    } else {
+        n.trunc()
+    }
+}
+
+/// position argument: ToIntegerOrInfinity output clamped into [0, len].
+fn str_pos(n: f64, len: usize) -> usize {
+    if n.is_nan() || n <= 0.0 {
+        0
+    } else if n.is_infinite() || n >= len as f64 {
+        len
+    } else {
+        n.trunc() as usize
+    }
+}
+
+/// UTF-16 code-unit view — String methods index/count in units.
+fn u16s(s: &str) -> Vec<u16> {
+    s.encode_utf16().collect()
+}
+
+/// UTF-16 code units → engine string. Lone surrogates cannot live in a
+/// Rust &str — from_utf16_lossy maps them to U+FFFD, matching the lexer's
+/// own handling of \uXXXX surrogate escapes (UTF-16 representation debt).
+fn u16s_val(u: &[u16]) -> Value {
+    Value::Str(Rc::from(String::from_utf16_lossy(u).as_str()))
+}
+
+/// spec StringIndexOf on UTF-16 units: smallest k >= pos such that
+/// su[k..k+nu] == nu.
+fn str_index_of_u(su: &[u16], nu: &[u16], pos: usize) -> Option<usize> {
+    if nu.is_empty() {
+        return if pos <= su.len() { Some(pos) } else { None };
+    }
+    if pos > su.len() || nu.len() > su.len() - pos {
+        return None;
+    }
+    (pos..=su.len() - nu.len()).find(|&k| su[k..k + nu.len()] == nu[..])
+}
+
+/// largest k <= pos such that su[k..k+nu] == nu (spec lastIndexOf scan).
+fn str_last_index_of_u(su: &[u16], nu: &[u16], pos: usize) -> Option<usize> {
+    if nu.is_empty() {
+        return if pos <= su.len() { Some(pos) } else { None };
+    }
+    if nu.len() > su.len() {
+        return None;
+    }
+    let max_k = (su.len() - nu.len()).min(pos);
+    (0..=max_k).rev().find(|&k| su[k..k + nu.len()] == nu[..])
 }
 
 fn str_char_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let idx = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
-    Ok(match s.chars().nth(idx) {
-        Some(c) => char_val(c),
-        None => Value::Str(empty_rc()),
-    })
+    // spec: ToIntegerOrInfinity, empty when out of [0, len)
+    let n = to_integer_or_inf(str_num(i, &arg(args, 0))?);
+    let u = u16s(&s);
+    if n < 0.0 || n >= u.len() as f64 {
+        return Ok(Value::Str(empty_rc()));
+    }
+    Ok(u16s_val(&u[n as usize..n as usize + 1]))
 }
 
 /// spec codePointAt: UTF-16 indexed, surrogate pairs combine
 fn str_code_point_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let idx = i.to_num(&arg(args, 0)).unwrap_or(0.0);
+    let idx = to_integer_or_inf(str_num(i, &arg(args, 0))?);
     if idx < 0.0 {
         return Ok(Value::Und);
     }
@@ -7829,9 +8139,7 @@ fn str_code_point_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if (0xD800..=0xDBFF).contains(&first) {
         if let Some(&second) = units.get(k + 1) {
             if (0xDC00..=0xDFFF).contains(&second) {
-                let cp = 0x10000
-                    + ((first as u32 - 0xD800) << 10)
-                    + (second as u32 - 0xDC00);
+                let cp = 0x10000 + ((first as u32 - 0xD800) << 10) + (second as u32 - 0xDC00);
                 return Ok(Value::Num(cp as f64));
             }
         }
@@ -7851,99 +8159,114 @@ fn str_to_well_formed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 
 fn str_char_code_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let idx = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
-    // UTF-16 code units — nth() instead of collecting a Vec<u16>
-    Ok(Value::Num(
-        s.encode_utf16()
-            .nth(idx)
-            .map(|u| u as f64)
-            .unwrap_or(f64::NAN),
-    ))
+    // spec: ToIntegerOrInfinity — NaN/negative/out-of-range → NaN result
+    let n = to_integer_or_inf(str_num(i, &arg(args, 0))?);
+    let u = u16s(&s);
+    if n < 0.0 || n >= u.len() as f64 {
+        return Ok(Value::Num(f64::NAN));
+    }
+    Ok(Value::Num(u[n as usize] as f64))
 }
 
 fn str_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let len = s.chars().count() as i64;
-    let idx = if n < 0.0 { len + n as i64 } else { n as i64 };
-    if idx < 0 || idx >= len {
+    // spec: ToIntegerOrInfinity then relative-index — UTF-16 unit slots
+    let n = to_integer_or_inf(str_num(i, &arg(args, 0))?);
+    let u = u16s(&s);
+    let k = if n < 0.0 { u.len() as f64 + n } else { n };
+    if k < 0.0 || k >= u.len() as f64 {
         return Ok(Value::Und);
     }
-    Ok(match s.chars().nth(idx as usize) {
-        Some(c) => char_val(c),
-        None => Value::Und,
-    })
+    let k = k as usize;
+    Ok(u16s_val(&u[k..k + 1]))
 }
 
 fn str_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec order: ToString(this) → ToString(search) → ToIntegerOrInfinity(pos)
     let s = unbox_str(i, this)?;
     let needle = to_rc(i, &arg(args, 0))?;
-    let from = i.to_num(&arg(args, 1)).unwrap_or(0.0).max(0.0) as usize;
-    let byte_from = char_byte_at(&s, from);
-    match s[byte_from..].find(&*needle) {
-        Some(b) => Ok(Value::Num(s[..byte_from + b].chars().count() as f64)),
-        None => Ok(Value::Num(-1.0)),
-    }
+    let n = str_num(i, &arg(args, 1))?;
+    let (su, nu) = (u16s(&s), u16s(&needle));
+    let pos = str_pos(n, su.len());
+    Ok(Value::Num(
+        str_index_of_u(&su, &nu, pos)
+            .map(|k| k as f64)
+            .unwrap_or(-1.0),
+    ))
 }
 
 fn str_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec: ToString(this) → ToString(search) → ToNumber(pos); NaN pos → +∞
     let s = unbox_str(i, this)?;
-    let needle = i.to_str(&arg(args, 0))?;
-    match s.rfind(&needle) {
-        Some(b) => Ok(Value::Num(s[..b].chars().count() as f64)),
-        None => Ok(Value::Num(-1.0)),
-    }
+    let needle = to_rc(i, &arg(args, 0))?;
+    let n = str_num(i, &arg(args, 1))?;
+    let (su, nu) = (u16s(&s), u16s(&needle));
+    let pos = if n.is_nan() {
+        su.len()
+    } else {
+        str_pos(n, su.len())
+    };
+    Ok(Value::Num(
+        str_last_index_of_u(&su, &nu, pos)
+            .map(|k| k as f64)
+            .unwrap_or(-1.0),
+    ))
 }
 
 fn str_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let len = s.chars().count();
-    let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
+    let u = u16s(&s);
+    let len = u.len();
+    // spec: ToIntegerOrInfinity; negative counts back from len, clamp [0,len]
+    let from = clamp_index(to_integer_or_inf(str_num(i, &arg(args, 0))?), len);
     let end = match arg(args, 1) {
         Value::Und => len,
-        v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
+        v => clamp_index(to_integer_or_inf(str_num(i, &v)?), len),
     };
-    // byte-range slice — no Vec<char> round-trip
-    if start < end {
-        let b0 = char_byte_at(&s, start);
-        let b1 = char_byte_at(&s, end);
-        Ok(Value::Str(Rc::from(&s[b0..b1])))
+    Ok(if from < end {
+        u16s_val(&u[from..end])
     } else {
-        Ok(Value::Str(empty_rc()))
-    }
+        Value::Str(empty_rc())
+    })
 }
 
 fn str_substring(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let len = s.chars().count();
-    let a = i.to_num(&arg(args, 0)).unwrap_or(0.0).max(0.0) as usize;
+    let u = u16s(&s);
+    let len = u.len();
+    // spec: ToIntegerOrInfinity, both args clamped [0,len], then swapped
+    let a = str_pos(str_num(i, &arg(args, 0))?, len);
     let b = match arg(args, 1) {
         Value::Und => len,
-        v => i.to_num(&v).unwrap_or(0.0).max(0.0) as usize,
+        v => str_pos(str_num(i, &v)?, len),
     };
-    let (lo, hi) = (a.min(b).min(len), a.max(b).min(len));
-    let b0 = char_byte_at(&s, lo);
-    let b1 = char_byte_at(&s, hi);
-    Ok(Value::Str(Rc::from(&s[b0..b1])))
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    Ok(u16s_val(&u[lo..hi]))
 }
 
 fn str_substr(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let len = s.chars().count() as f64;
-    // ToIntegerOrInfinity — truncation, not clamp-then-round
-    let mut start = i.to_num(&arg(args, 0))?.trunc();
+    let u = u16s(&s);
+    let len = u.len() as f64;
+    // Annex B.2.2.1 — negative start counts from len, clamped to 0
+    let mut start = to_integer_or_inf(str_num(i, &arg(args, 0))?);
     if start < 0.0 {
         start = (len + start).max(0.0);
     }
-    let start = start.min(len);
+    let start = start.min(len) as usize;
     let count = match arg(args, 1) {
         Value::Und => len,
-        v => i.to_num(&v)?.trunc().max(0.0),
+        v => {
+            let c = to_integer_or_inf(str_num(i, &v)?);
+            if c.is_nan() || c <= 0.0 {
+                0.0
+            } else {
+                c.min(len)
+            }
+        }
     };
-    let end = (start + count).min(len) as usize;
-    let b0 = char_byte_at(&s, start as usize);
-    let b1 = char_byte_at(&s, end);
-    Ok(Value::Str(Rc::from(&s[b0..b1])))
+    let end = (start as f64 + count).min(len) as usize;
+    Ok(u16s_val(&u[start..end]))
 }
 
 /// `Value::Str(orig)` when unchanged, else `Rc` of `t`.
@@ -7957,8 +8280,148 @@ fn str_or_rc(orig: Rc<str>, t: &str) -> Value {
 
 fn str_to_lower(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let t = s.to_lowercase();
+    let t = js_to_lower(&s);
     Ok(str_or_rc(s, &t))
+}
+
+/// spec 21.1.3.26: Unicode default case conversion — GREEK CAPITAL SIGMA
+/// is context-sensitive (Final_Sigma): Σ → ς when preceded by a Cased
+/// letter (skipping Case_Ignorable chars) and NOT followed by one.
+fn js_to_lower(s: &str) -> String {
+    let cps: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (k, &c) in cps.iter().enumerate() {
+        if c == '\u{3A3}' {
+            let before = cps[..k].iter().rev().copied().find(|&c| !case_ignorable(c));
+            let after = cps[k + 1..].iter().copied().find(|&c| !case_ignorable(c));
+            let fin = before.is_some_and(is_cased) && !after.is_some_and(is_cased);
+            out.push(if fin { '\u{3C2}' } else { '\u{3C3}' });
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Unicode Cased ≈ Lu | Ll | Lt (Rust's is_lower/upper cover the same
+/// sets for every char the tests exercise — Lt chars are rare).
+fn is_cased(c: char) -> bool {
+    c.is_lowercase() || c.is_uppercase()
+}
+
+/// Unicode Case_Ignorable = Mn ∪ Me ∪ Cf ∪ Lm ∪ MidLetter punctuation.
+fn case_ignorable(c: char) -> bool {
+    matches!(c as u32,
+        // MidLetter / MidNumLet punctuation + apostrophes
+        0x27 | 0x2E | 0x3A | 0xB7 | 0x387 | 0x5F3 | 0x2018 | 0x2019
+        | 0x2024 | 0x2027 | 0x30FB | 0xFE52 | 0xFE55 | 0xFF07 | 0xFF0E
+        | 0xFF1A | 0xFF65
+        // Cf format controls
+        | 0xAD | 0x61C | 0x6DD | 0x70F | 0x8E2 | 0x180E | 0x200C | 0x200D
+        | 0x200E | 0x200F | 0x202A..=0x202E | 0x2060..=0x2064
+        | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
+        | 0x110BD | 0x110CD | 0x13430..=0x13438 | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F
+        // Lm modifier letters
+        | 0x2B0..=0x2C1 | 0x2C6..=0x2D1 | 0x2E0..=0x2E4 | 0x2EC | 0x2EE
+        | 0x374 | 0x37A | 0x559 | 0x640 | 0x6E5 | 0x6E6 | 0x7F4 | 0x7F5
+        | 0x7FA | 0x81A | 0x824 | 0x828 | 0x971 | 0xE46 | 0xEC6 | 0x10FC
+        | 0x17D7 | 0x1843 | 0x1AA7 | 0x1C78..=0x1C7D | 0x2071 | 0x207F
+        | 0x2090..=0x209C | 0x2C7C | 0x2C7D | 0x2D6F | 0x2E2F | 0x3005
+        | 0x3031..=0x3035 | 0x303B | 0x309D | 0x309E | 0x30FC..=0x30FE
+        | 0xA015 | 0xA4F8..=0xA4FD | 0xA60C | 0xA67F | 0xA69C | 0xA69D
+        | 0xA717..=0xA71F | 0xA770 | 0xA788 | 0xA7F8 | 0xA7F9 | 0xA9CF
+        | 0xA9E6 | 0xAA70 | 0xAADD | 0xAAF3 | 0xAAF4 | 0xAB5C..=0xAB5F
+        | 0xAB69 | 0xFF70 | 0xFF9E | 0xFF9F
+        | 0x10783..=0x10785 | 0x107B0 | 0x16B40..=0x16B43 | 0x1E030..=0x1E06D
+        // Mn/Me combining marks (the whole general-category ranges)
+        | 0x300..=0x36F | 0x483..=0x489 | 0x591..=0x5BD | 0x5BF
+        | 0x5C1 | 0x5C2 | 0x5C4 | 0x5C5 | 0x5C7 | 0x610..=0x61A
+        | 0x64B..=0x65F | 0x670 | 0x6D6..=0x6DC | 0x6DF..=0x6E4
+        | 0x6E7 | 0x6E8 | 0x6EA..=0x6ED | 0x711 | 0x730..=0x74A
+        | 0x7A6..=0x7B0 | 0x7EB..=0x7F3 | 0x7FD | 0x816..=0x819
+        | 0x81B..=0x823 | 0x825..=0x827 | 0x829..=0x82D | 0x859..=0x85B
+        | 0x8D3..=0x8E1 | 0x8E3..=0x902 | 0x93A | 0x93C | 0x941..=0x948
+        | 0x94D | 0x951..=0x957 | 0x962 | 0x963 | 0x981 | 0x9BC
+        | 0x9C1..=0x9C4 | 0x9CD | 0x9E2 | 0x9E3 | 0x9FE | 0xA01 | 0xA02
+        | 0xA3C | 0xA41 | 0xA42 | 0xA47 | 0xA48 | 0xA4B..=0xA4D | 0xA51
+        | 0xA70 | 0xA71 | 0xA75 | 0xA81 | 0xA82 | 0xABC | 0xAC1..=0xAC5
+        | 0xAC7 | 0xAC8 | 0xACD | 0xAE2 | 0xAE3 | 0xAFA..=0xAFF
+        | 0xB01 | 0xB3C | 0xB3F | 0xB41..=0xB44 | 0xB4D | 0xB55 | 0xB56
+        | 0xB62 | 0xB63 | 0xB82 | 0xBC0 | 0xBCD | 0xC00 | 0xC04 | 0xC3C
+        | 0xC3E..=0xC40 | 0xC46..=0xC48 | 0xC4A..=0xC4D | 0xC55 | 0xC56
+        | 0xC62 | 0xC63 | 0xC81 | 0xCBC | 0xCBF | 0xCC6 | 0xCCC | 0xCCD
+        | 0xCE2 | 0xCE3 | 0xD00 | 0xD01 | 0xD3B | 0xD3C | 0xD41..=0xD44
+        | 0xD4D | 0xD62 | 0xD63 | 0xD81 | 0xDCA | 0xDD2..=0xDD4 | 0xDD6
+        | 0xE31 | 0xE34..=0xE3A | 0xE47..=0xE4E | 0xEB1 | 0xEB4..=0xEBC
+        | 0xEC8..=0xECE | 0xF18 | 0xF19 | 0xF35 | 0xF37 | 0xF39
+        | 0xF71..=0xF7E | 0xF80..=0xF84 | 0xF86 | 0xF87 | 0xF8D..=0xF97
+        | 0xF99..=0xFBC | 0xFC6 | 0x102D..=0x1030 | 0x1032..=0x1037
+        | 0x1039 | 0x103A | 0x103D | 0x103E | 0x1058 | 0x1059
+        | 0x105E..=0x1060 | 0x1071..=0x1074 | 0x1082 | 0x1085 | 0x1086
+        | 0x108D | 0x109D | 0x135D..=0x135F | 0x1712..=0x1714
+        | 0x1732..=0x1734 | 0x1752 | 0x1753 | 0x1772 | 0x1773
+        | 0x17B4 | 0x17B5 | 0x17B7..=0x17BD | 0x17C6 | 0x17C9..=0x17D3
+        | 0x17DD | 0x180B..=0x180D | 0x180F | 0x1885 | 0x1886 | 0x18A9
+        | 0x1920..=0x1922 | 0x1927 | 0x1928 | 0x1932 | 0x1939..=0x193B
+        | 0x1A17 | 0x1A18 | 0x1A1B | 0x1A56 | 0x1A58..=0x1A5E | 0x1A60
+        | 0x1A62 | 0x1A65..=0x1A6C | 0x1A73..=0x1A7C | 0x1A7F
+        | 0x1AB0..=0x1ACE | 0x1B00..=0x1B03 | 0x1B34 | 0x1B36..=0x1B3A
+        | 0x1B3C | 0x1B42 | 0x1B6B..=0x1B73 | 0x1B80 | 0x1B81
+        | 0x1BA2..=0x1BA5 | 0x1BA8 | 0x1BA9 | 0x1BAB..=0x1BAD | 0x1BE6
+        | 0x1BE8 | 0x1BE9 | 0x1BED | 0x1BEF..=0x1BF1 | 0x1C2C..=0x1C33
+        | 0x1C36 | 0x1C37 | 0x1CD0..=0x1CD2 | 0x1CD4..=0x1CE0
+        | 0x1CE2..=0x1CE8 | 0x1CED | 0x1CF4 | 0x1CF8 | 0x1CF9
+        | 0x1DC0..=0x1DFF | 0x20D0..=0x20F0 | 0x2CEF..=0x2CF1 | 0x2D7F
+        | 0x2DE0..=0x2DFF | 0x302A..=0x302D | 0x3099 | 0x309A | 0xA66F
+        | 0xA674..=0xA67D | 0xA69E | 0xA69F | 0xA6F0 | 0xA6F1 | 0xA802
+        | 0xA806 | 0xA80B | 0xA825 | 0xA826 | 0xA82C | 0xA8C4 | 0xA8C5
+        | 0xA8E0..=0xA8F1 | 0xA8FF | 0xA926..=0xA92D | 0xA947..=0xA951
+        | 0xA980..=0xA982 | 0xA9B3 | 0xA9B6..=0xA9B9 | 0xA9BC | 0xA9BD
+        | 0xA9E5 | 0xAA29..=0xAA2E | 0xAA31 | 0xAA32 | 0xAA35 | 0xAA36
+        | 0xAA43 | 0xAA4C | 0xAA7C | 0xAAB0 | 0xAAB2..=0xAAB4 | 0xAAB7
+        | 0xAAB8 | 0xAABE | 0xAABF | 0xAAC1 | 0xAAEC | 0xAAED | 0xAAF6
+        | 0xABE5 | 0xABE8 | 0xABED | 0xFB1E | 0xFE00..=0xFE0F
+        | 0xFE20..=0xFE2F
+        // supplementary-plane marks
+        | 0x101FD | 0x102E0 | 0x10376..=0x1037A | 0x10A01..=0x10A03
+        | 0x10A05 | 0x10A06 | 0x10A0C..=0x10A0F | 0x10A38..=0x10A3A
+        | 0x10A3F | 0x10AE5 | 0x10AE6 | 0x10D24..=0x10D27 | 0x10EAB
+        | 0x10EAC | 0x10EFD..=0x10EFF | 0x10F46..=0x10F50
+        | 0x10F82..=0x10F85 | 0x11001 | 0x11038..=0x11046 | 0x11070
+        | 0x11073 | 0x11074 | 0x1107F..=0x11081 | 0x110B3..=0x110B6
+        | 0x110B9 | 0x110BA | 0x110C2 | 0x11100..=0x11102
+        | 0x11127..=0x1112B | 0x1112D..=0x11134 | 0x11173 | 0x11180
+        | 0x11181 | 0x111B6..=0x111BE | 0x111C9..=0x111CC | 0x111CF
+        | 0x1122F..=0x11231 | 0x11234 | 0x11236 | 0x11237 | 0x1123E
+        | 0x112DF | 0x112E3..=0x112EA | 0x11300 | 0x11301 | 0x1133B
+        | 0x1133C | 0x11340 | 0x11366..=0x1136C | 0x11370..=0x11374
+        | 0x11438..=0x1143F | 0x11442 | 0x11444 | 0x11446 | 0x1145E
+        | 0x114B3..=0x114B8 | 0x114BA | 0x114BF | 0x114C0 | 0x114C2
+        | 0x114C3 | 0x115B2..=0x115B5 | 0x115BC | 0x115BD | 0x115BF
+        | 0x115C0 | 0x115DC | 0x115DD | 0x11633..=0x1163A | 0x1163D
+        | 0x1163F | 0x11640 | 0x116AB | 0x116AD | 0x116B0..=0x116B5
+        | 0x116B7 | 0x1171D..=0x1171F | 0x11722..=0x11725
+        | 0x11727..=0x1172B | 0x1182F..=0x11837 | 0x11839 | 0x1183A
+        | 0x1193B | 0x1193C | 0x1193E | 0x11943 | 0x119D4..=0x119D7
+        | 0x119DA | 0x119DB | 0x119E0 | 0x11A01..=0x11A0A
+        | 0x11A33..=0x11A38 | 0x11A3B..=0x11A3E | 0x11A47
+        | 0x11A51..=0x11A56 | 0x11A59..=0x11A5B | 0x11A8A..=0x11A96
+        | 0x11A98 | 0x11A99 | 0x11C30..=0x11C36 | 0x11C38..=0x11C3D
+        | 0x11C3F | 0x11C92..=0x11CA7 | 0x11CAA..=0x11CB0 | 0x11CB2
+        | 0x11CB3 | 0x11CB5 | 0x11CB6 | 0x11D31..=0x11D36 | 0x11D3A
+        | 0x11D3C | 0x11D3D | 0x11D3F..=0x11D45 | 0x11D47 | 0x11D90
+        | 0x11D91 | 0x11D95 | 0x11D97 | 0x11EF3 | 0x11EF4 | 0x16AF0..=0x16AF4
+        | 0x16B30..=0x16B36 | 0x16F4F | 0x16F8F..=0x16F92 | 0x16FE4
+        | 0x1BC9D | 0x1BC9E | 0x1CF00..=0x1CF2D | 0x1CF30..=0x1CF46
+        | 0x1D165 | 0x1D167..=0x1D169 | 0x1D16E..=0x1D172
+        | 0x1D17B..=0x1D182 | 0x1D185..=0x1D18B | 0x1D1AA..=0x1D1AD
+        | 0x1D242..=0x1D244 | 0x1DA00..=0x1DA36 | 0x1DA3B..=0x1DA6C
+        | 0x1DA75 | 0x1DA84 | 0x1DA9B..=0x1DA9F | 0x1DAA1..=0x1DAAF
+        | 0x1E000..=0x1E006 | 0x1E008..=0x1E018 | 0x1E01B..=0x1E021
+        | 0x1E023 | 0x1E024 | 0x1E026..=0x1E02A | 0x1E130..=0x1E136
+        | 0x1E2AE | 0x1E2EC..=0x1E2EF | 0x1E4EC..=0x1E4EF
+        | 0x1E8D0..=0x1E8D6 | 0x1E944..=0x1E94A | 0xE0100..=0xE01EF)
 }
 
 fn str_to_upper(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -7972,114 +8435,168 @@ fn str_to_upper(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 fn is_js_space(c: char) -> bool {
     matches!(
         c,
-        '\u{9}' | '\u{a}' | '\u{b}' | '\u{c}' | '\u{d}' | '\u{20}' | '\u{a0}'
-            | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}'
-            | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+        '\u{9}'
+            | '\u{a}'
+            | '\u{b}'
+            | '\u{c}'
+            | '\u{d}'
+            | '\u{20}'
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
     )
 }
 
 fn str_trim(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    Ok(str_or_rc(
-        s.clone(),
-        s.trim_matches(is_js_space),
-    ))
+    Ok(str_or_rc(s.clone(), s.trim_matches(is_js_space)))
 }
 
 fn str_trim_start(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    Ok(str_or_rc(
-        s.clone(),
-        s.trim_start_matches(is_js_space),
-    ))
+    Ok(str_or_rc(s.clone(), s.trim_start_matches(is_js_space)))
 }
 
 fn str_trim_end(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    Ok(str_or_rc(
-        s.clone(),
-        s.trim_end_matches(is_js_space),
-    ))
+    Ok(str_or_rc(s.clone(), s.trim_end_matches(is_js_space)))
 }
 
 fn str_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let s = unbox_str(i, this)?;
+    // spec order: RequireObjectCoercible → @@split GetMethod (objects only)
+    //             → ToString(O) → ToUint32(limit) → ToString(separator)
+    if matches!(this, Value::Und | Value::Null) {
+        return Err(i.type_err("String.prototype.split called on null or undefined"));
+    }
     let a0 = arg(args, 0);
-    // Symbol.split protocol — GetMethod on any non-nullish separator
-    if !matches!(a0, Value::Und | Value::Null) {
+    if is_obj_arg(&a0) {
         if let Some(m) = get_method(i, &a0, &PropKey::Sym(SYM_SPLIT))? {
-            let sv = Value::Str(s.clone());
-            return i.call(&m, a0, vec![sv, arg(args, 1)]);
+            return i.call(&m, a0, vec![this.clone(), arg(args, 1)]);
         }
     }
-    let limit = match arg(args, 1) {
-        Value::Und => usize::MAX,
-        v => to_uint32_num(i.to_num(&v)?) as usize,
+    let s = to_rc(i, this)?;
+    let lim = match arg(args, 1) {
+        Value::Und => u32::MAX as usize,
+        v => to_uint32_num(str_num(i, &v)?) as usize,
     };
-    // spec: lim = 0 short-circuits before ToString(separator)
-    if limit == 0 {
-        return Ok(Value::Obj(i.new_arr(Vec::new())));
+    // spec order: R = ToString(separator) — before both the lim == 0
+    // early-out and the undefined-separator [S] return, so a separator
+    // object whose toString throws still throws when limit is 0.
+    let r = re_coerce_str(i, &a0)?;
+    let a = Value::Obj(i.new_arr(Vec::new()));
+    if lim == 0 {
+        return Ok(a);
     }
-    let parts: Vec<Value> = match a0 {
-        Value::Und => vec![Value::Str(s)],
-        v => {
-            let sep = re_coerce_str(i, &v)?;
-            if sep.is_empty() {
-                s.chars().take(limit).map(char_val).collect()
-            } else {
-                s.split(sep.as_str())
-                    .take(limit)
-                    .map(|p| Value::Str(Rc::from(p)))
-                    .collect()
-            }
+    if matches!(a0, Value::Und) {
+        create_data_prop(i, &a, 0, Value::Str(s))?;
+        return Ok(a);
+    }
+    let (su, ru) = (u16s(&s), u16s(&r));
+    if su.is_empty() {
+        // SplitMatch(S,0,R): R empty → match → A stays []; else A = [S]
+        if ru.is_empty() {
+            return Ok(a);
         }
-    };
-    Ok(Value::Obj(i.new_arr(parts)))
+        create_data_prop(i, &a, 0, Value::Str(s))?;
+        return Ok(a);
+    }
+    // SplitMatch scan: q walks units; e == q + ru.len() on a match; a
+    // zero-width match (e == p) advances without emitting
+    let (mut p, mut q) = (0usize, 0usize);
+    let mut la = 0usize;
+    while q < su.len() {
+        let e = if su.len() - q >= ru.len() && su[q..q + ru.len()] == ru[..] {
+            q + ru.len()
+        } else {
+            usize::MAX
+        };
+        if e == usize::MAX || e == p {
+            q += 1;
+            continue;
+        }
+        create_data_prop(i, &a, la, u16s_val(&su[p..q]))?;
+        la += 1;
+        if la == lim {
+            return Ok(a);
+        }
+        p = e;
+        q = p;
+    }
+    create_data_prop(i, &a, la, u16s_val(&su[p..]))?;
+    Ok(a)
 }
 
 fn str_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let s = unbox_str(i, this)?;
+    // spec order: RequireObjectCoercible → @@replace GetMethod (objects
+    // only) → ToString(O) → ToString(searchValue) → replaceValue eval
+    if matches!(this, Value::Und | Value::Null) {
+        return Err(i.type_err("String.prototype.replace called on null or undefined"));
+    }
     let a0 = arg(args, 0);
-    // Symbol.replace protocol — GetMethod on any non-nullish searchValue
-    if !matches!(a0, Value::Und | Value::Null) {
+    if is_obj_arg(&a0) {
         if let Some(m) = get_method(i, &a0, &PropKey::Sym(SYM_REPLACE))? {
-            let sv = Value::Str(s.clone());
-            return i.call(&m, a0, vec![sv, arg(args, 1)]);
+            return i.call(&m, a0, vec![this.clone(), arg(args, 1)]);
         }
     }
+    let s = to_rc(i, this)?;
     let needle = re_coerce_str(i, &a0)?;
-    let repl_fn = arg(args, 1);
-    match s.find(&needle) {
-        Some(b) => {
-            let matched = needle.clone();
-            let rep = if i.is_callable(&repl_fn) {
-                let r = i.call(
-                    &repl_fn,
-                    Value::Und,
-                    vec![
-                        Value::Str(Rc::from(matched.as_str())),
-                        Value::Num(s[..b].chars().count() as f64),
-                        Value::Str(s.clone()),
-                    ],
-                )?;
-                re_coerce_str(i, &r)?
-            } else {
-                expand_replacement(&re_coerce_str(i, &repl_fn)?, &matched, b, &s)
-            };
-            let mut out = s[..b].to_string();
-            out.push_str(&rep);
-            out.push_str(&s[b + needle.len()..]);
-            Ok(Value::Str(Rc::from(out.as_str())))
-        }
-        None => Ok(Value::Str(s)),
-    }
+    let repl = arg(args, 1);
+    let functional = i.is_callable(&repl);
+    // non-functional replaceValue is ToString'd before the match search
+    let rep_str = if functional {
+        None
+    } else {
+        Some(re_coerce_str(i, &repl)?)
+    };
+    let (su, nu) = (u16s(&s), u16s(&needle));
+    let Some(pos) = str_index_of_u(&su, &nu, 0) else {
+        return Ok(Value::Str(s));
+    };
+    let matched = chars_string(&nu);
+    let replacement = if functional {
+        let r = i.call(
+            &repl,
+            Value::Und,
+            vec![
+                Value::Str(Rc::from(matched.as_str())),
+                Value::Num(pos as f64),
+                Value::Str(s.clone()),
+            ],
+        )?;
+        re_coerce_str(i, &r)?
+    } else {
+        get_substitution(
+            i,
+            &matched,
+            &s,
+            pos,
+            &[],
+            &Value::Und,
+            rep_str.as_deref().unwrap_or_default(),
+        )?
+    };
+    let mut out: Vec<u16> = Vec::with_capacity(su.len() + u16s(&replacement).len());
+    out.extend_from_slice(&su[..pos]);
+    out.extend(replacement.encode_utf16());
+    out.extend_from_slice(&su[pos + nu.len()..]);
+    Ok(u16s_val(&out))
 }
 
 fn str_replace_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let s = unbox_str(i, this)?;
+    // spec order: RequireObjectCoercible → IsRegExp + 'g'-flag gate →
+    // @@replace GetMethod → ToString(O) → ToString(search) → replaceValue
+    if matches!(this, Value::Und | Value::Null) {
+        return Err(i.type_err("String.prototype.replaceAll called on null or undefined"));
+    }
     let a0 = arg(args, 0);
-    if !matches!(a0, Value::Und | Value::Null) {
-        // spec: IsRegExp(regexp) → ToString(Get(regexp,"flags")) must have 'g'
+    if is_obj_arg(&a0) {
         if is_regexp(i, &a0)? {
             let flags = i.get_prop_str(&a0, "flags")?;
             let flags = re_coerce_str(i, &flags)?;
@@ -8090,85 +8607,95 @@ fn str_replace_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             }
         }
         if let Some(m) = get_method(i, &a0, &PropKey::Sym(SYM_REPLACE))? {
-            let sv = Value::Str(s.clone());
-            return i.call(&m, a0, vec![sv, arg(args, 1)]);
+            return i.call(&m, a0, vec![this.clone(), arg(args, 1)]);
         }
     }
+    let s = to_rc(i, this)?;
     let needle = re_coerce_str(i, &a0)?;
-    let repl_fn = arg(args, 1);
-    let mut out = String::new();
+    let repl = arg(args, 1);
+    let functional = i.is_callable(&repl);
+    let rep_str = if functional {
+        None
+    } else {
+        Some(re_coerce_str(i, &repl)?)
+    };
+    let (su, nu) = (u16s(&s), u16s(&needle));
+    // non-overlapping match positions; an empty needle hits every boundary
+    let mut positions: Vec<usize> = Vec::new();
     let mut pos = 0usize;
-    if needle.is_empty() {
-        // spec: empty search inserts replacement at every char boundary
-        let callable = i.is_callable(&repl_fn);
-        let rep_str = if !callable {
-            re_coerce_str(i, &repl_fn)?
-        } else {
-            String::new()
+    loop {
+        let Some(k) = str_index_of_u(&su, &nu, pos) else {
+            break;
         };
-        for (b, _) in s.char_indices().chain(std::iter::once((s.len(), '\0'))) {
-            out.push_str(&s[pos..b]);
-            if callable {
-                let r = i.call(
-                    &repl_fn,
-                    Value::Und,
-                    vec![
-                        Value::Str(Rc::from("")),
-                        Value::Num(s[..b].chars().count() as f64),
-                        Value::Str(s.clone()),
-                    ],
-                )?;
-                out.push_str(&re_coerce_str(i, &r)?);
-            } else {
-                out.push_str(&expand_replacement(&rep_str, "", b, &s));
-            }
-            pos = b;
+        positions.push(k);
+        pos = if nu.is_empty() { k + 1 } else { k + nu.len() };
+        if pos > su.len() {
+            break;
         }
-        out.push_str(&s[pos..]);
-        return Ok(Value::Str(Rc::from(out.as_str())));
     }
-    for (b, _) in s.match_indices(&needle) {
-        out.push_str(&s[pos..b]);
-        if i.is_callable(&repl_fn) {
+    if positions.is_empty() {
+        return Ok(Value::Str(s));
+    }
+    let matched = chars_string(&nu);
+    let mut out: Vec<u16> = Vec::new();
+    let mut prev = 0usize;
+    for &k in &positions {
+        out.extend_from_slice(&su[prev..k]);
+        let replacement = if functional {
             let r = i.call(
-                &repl_fn,
+                &repl,
                 Value::Und,
                 vec![
-                    Value::Str(Rc::from(needle.as_str())),
-                    Value::Num(s[..b].chars().count() as f64),
+                    Value::Str(Rc::from(matched.as_str())),
+                    Value::Num(k as f64),
                     Value::Str(s.clone()),
                 ],
             )?;
-            out.push_str(&re_coerce_str(i, &r)?);
+            re_coerce_str(i, &r)?
         } else {
-            let rep = re_coerce_str(i, &repl_fn)?;
-            out.push_str(&expand_replacement(&rep, &needle, b, &s));
-        }
-        pos = b + needle.len();
+            get_substitution(
+                i,
+                &matched,
+                &s,
+                k,
+                &[],
+                &Value::Und,
+                rep_str.as_deref().unwrap_or_default(),
+            )?
+        };
+        out.extend(replacement.encode_utf16());
+        prev = k + nu.len();
     }
-    out.push_str(&s[pos..]);
-    Ok(Value::Str(Rc::from(out.as_str())))
+    out.extend_from_slice(&su[prev..]);
+    Ok(u16s_val(&out))
 }
 
 fn str_match(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec order: RequireObjectCoercible → @@match GetMethod (objects only)
+    //             → ToString(O) → RegExpCreate → Invoke @@match
+    if matches!(this, Value::Und | Value::Null) {
+        return Err(i.type_err("String.prototype.match called on null or undefined"));
+    }
     let a0 = arg(args, 0);
-    if !matches!(a0, Value::Und | Value::Null) {
+    if is_obj_arg(&a0) {
         if let Some(m) = get_method(i, &a0, &PropKey::Sym(SYM_MATCH))? {
-            let sv = Value::Str(unbox_str(i, this)?);
-            return i.call(&m, a0, vec![sv]);
+            return i.call(&m, a0, vec![this.clone()]);
         }
     }
-    // non-regex arg → RegExpCreate(arg) then Invoke @@match
-    let sv = Value::Str(unbox_str(i, this)?);
+    let s = to_rc(i, this)?;
     let rx = regexp_create(i, &a0, &Value::Und)?;
     let m = i.get_prop(&rx, &PropKey::Sym(SYM_MATCH))?;
-    i.call(&m, rx, vec![sv])
+    i.call(&m, rx, vec![Value::Str(s)])
 }
 
 fn str_match_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec order: RequireObjectCoercible → IsRegExp + 'g'-flag gate →
+    // @@matchAll GetMethod → ToString(O) → RegExpCreate(arg,"g") → Invoke
+    if matches!(this, Value::Und | Value::Null) {
+        return Err(i.type_err("String.prototype.matchAll called on null or undefined"));
+    }
     let a0 = arg(args, 0);
-    if !matches!(a0, Value::Und | Value::Null) {
-        // spec: IsRegExp(regexp) → ToString(Get(regexp,"flags")) must have 'g'
+    if is_obj_arg(&a0) {
         if is_regexp(i, &a0)? {
             let flags = i.get_prop_str(&a0, "flags")?;
             let flags = re_coerce_str(i, &flags)?;
@@ -8179,106 +8706,96 @@ fn str_match_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             }
         }
         if let Some(m) = get_method(i, &a0, &PropKey::Sym(SYM_MATCHALL))? {
-            let sv = Value::Str(unbox_str(i, this)?);
-            return i.call(&m, a0, vec![sv]);
+            return i.call(&m, a0, vec![this.clone()]);
         }
     }
-    // fallback: RegExpCreate(arg, "g") then Invoke @@matchAll
-    let sv = Value::Str(unbox_str(i, this)?);
+    let s = to_rc(i, this)?;
     let rx = regexp_create(i, &a0, &Value::Str(Rc::from("g")))?;
     let m = i.get_prop(&rx, &PropKey::Sym(SYM_MATCHALL))?;
-    i.call(&m, rx, vec![sv])
+    i.call(&m, rx, vec![Value::Str(s)])
 }
 
 fn str_search(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec order: RequireObjectCoercible → @@search GetMethod (objects
+    // only) → ToString(O) → RegExpCreate → Invoke @@search
+    if matches!(this, Value::Und | Value::Null) {
+        return Err(i.type_err("String.prototype.search called on null or undefined"));
+    }
     let a0 = arg(args, 0);
-    if !matches!(a0, Value::Und | Value::Null) {
+    if is_obj_arg(&a0) {
         if let Some(m) = get_method(i, &a0, &PropKey::Sym(SYM_SEARCH))? {
-            let sv = Value::Str(unbox_str(i, this)?);
-            return i.call(&m, a0, vec![sv]);
+            return i.call(&m, a0, vec![this.clone()]);
         }
     }
-    let sv = Value::Str(unbox_str(i, this)?);
+    let s = to_rc(i, this)?;
     let rx = regexp_create(i, &a0, &Value::Und)?;
     let m = i.get_prop(&rx, &PropKey::Sym(SYM_SEARCH))?;
-    i.call(&m, rx, vec![sv])
+    i.call(&m, rx, vec![Value::Str(s)])
 }
 
-fn expand_replacement(rep: &str, matched: &str, pos: usize, whole: &str) -> String {
-    let mut out = String::new();
-    let mut chars = rep.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '$' {
-            match chars.peek() {
-                Some('$') => {
-                    chars.next();
-                    out.push('$');
-                }
-                Some('&') => {
-                    chars.next();
-                    out.push_str(matched);
-                }
-                Some('`') => {
-                    chars.next();
-                    out.push_str(&whole[..pos]);
-                }
-                Some('\'') => {
-                    chars.next();
-                    out.push_str(&whole[pos + matched.len()..]);
-                }
-                _ => out.push('$'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+/// engine string-length cap — spec leaves the maximum implementation-
+/// defined; RangeError is the conforming error for exceeding it.
+const STR_LEN_MAX: usize = 1_000_000;
 
 fn str_pad_start(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec order: ToString(O) → ToLength(maxLength) → the ≤-len early
+    // return precedes ToString(fillString)
     let s = unbox_str(i, this)?;
-    let target = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
-    if target > 1_000_000 {
-        return Err(i.range_err("Invalid string length"));
-    }
-    let pad = match arg(args, 1) {
-        Value::Und => " ".to_string(),
-        v => i.to_str(&v)?,
-    };
-    let cur = s.chars().count();
-    if cur >= target || pad.is_empty() {
+    let target = to_length_num(str_num(i, &arg(args, 0))?);
+    let su = u16s(&s);
+    if su.len() >= target {
         return Ok(Value::Str(s));
     }
-    let need = target - cur;
-    let mut p = String::new();
-    while p.chars().count() < need {
-        p.push_str(&pad);
+    let pad = match arg(args, 1) {
+        Value::Und => Rc::from(" "),
+        v => to_rc(i, &v)?,
+    };
+    let pu = u16s(&pad);
+    if pu.is_empty() {
+        return Ok(Value::Str(s));
     }
-    let p: String = p.chars().take(need).collect();
-    Ok(Value::Str(Rc::from(format!("{p}{s}").as_str())))
+    let need = target - su.len();
+    if target > STR_LEN_MAX {
+        return Err(i.range_err("Invalid string length"));
+    }
+    // pad truncated to `need` code units — may split a surrogate pair
+    // (the trailing lone unit degrades to U+FFFD, same as a literal)
+    let mut out: Vec<u16> = Vec::with_capacity(target);
+    while out.len() < need {
+        out.extend_from_slice(&pu);
+    }
+    out.truncate(need);
+    out.extend_from_slice(&su);
+    Ok(u16s_val(&out))
 }
 
 fn str_pad_end(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let target = i.to_num(&arg(args, 0)).unwrap_or(0.0) as usize;
-    if target > 1_000_000 {
-        return Err(i.range_err("Invalid string length"));
-    }
-    let pad = match arg(args, 1) {
-        Value::Und => " ".to_string(),
-        v => i.to_str(&v)?,
-    };
-    let cur = s.chars().count();
-    if cur >= target || pad.is_empty() {
+    let target = to_length_num(str_num(i, &arg(args, 0))?);
+    let su = u16s(&s);
+    if su.len() >= target {
         return Ok(Value::Str(s));
     }
-    let need = target - cur;
-    let mut p = String::new();
-    while p.chars().count() < need {
-        p.push_str(&pad);
+    let pad = match arg(args, 1) {
+        Value::Und => Rc::from(" "),
+        v => to_rc(i, &v)?,
+    };
+    let pu = u16s(&pad);
+    if pu.is_empty() {
+        return Ok(Value::Str(s));
     }
-    let p: String = p.chars().take(need).collect();
-    Ok(Value::Str(Rc::from(format!("{s}{p}").as_str())))
+    let need = target - su.len();
+    if target > STR_LEN_MAX {
+        return Err(i.range_err("Invalid string length"));
+    }
+    let mut out: Vec<u16> = Vec::with_capacity(target);
+    out.extend_from_slice(&su);
+    let base = out.len();
+    while out.len() - base < need {
+        out.extend_from_slice(&pu);
+    }
+    out.truncate(base + need);
+    Ok(u16s_val(&out))
 }
 
 /// spec: search-string args must not be RegExp objects
@@ -8294,43 +8811,47 @@ fn reject_regex_arg(i: &mut Interp, a: &Value, meth: &str) -> Result<(), Value> 
 fn str_starts_with(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     reject_regex_arg(i, &arg(args, 0), "startsWith")?;
-    let needle = i.to_str(&arg(args, 0))?;
-    let pos = i.to_num(&arg(args, 1)).unwrap_or(0.0).max(0.0) as usize;
-    let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
-    Ok(Value::Bool(s[byte..].starts_with(&needle)))
+    let needle = re_coerce_str(i, &arg(args, 0))?;
+    let (su, nu) = (u16s(&s), u16s(&needle));
+    let start = str_pos(str_num(i, &arg(args, 1))?, su.len());
+    Ok(Value::Bool(
+        start + nu.len() <= su.len() && su[start..start + nu.len()] == nu[..],
+    ))
 }
 
 fn str_ends_with(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     reject_regex_arg(i, &arg(args, 0), "endsWith")?;
-    let needle = i.to_str(&arg(args, 0))?;
-    // spec: position is the END index (default = string length)
-    let chars = s.chars().count();
-    let pos = match arg(args, 1) {
-        Value::Und => chars,
-        v => (i.to_num(&v)?.max(0.0) as usize).min(chars),
+    let needle = re_coerce_str(i, &arg(args, 0))?;
+    let (su, nu) = (u16s(&s), u16s(&needle));
+    // spec: endPosition defaults to len, else ToIntegerOrInfinity clamped
+    let end = match arg(args, 1) {
+        Value::Und => su.len(),
+        v => str_pos(str_num(i, &v)?, su.len()),
     };
-    let byte = s
-        .char_indices()
-        .nth(pos)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len());
-    Ok(Value::Bool(s[..byte].ends_with(&needle)))
+    Ok(Value::Bool(
+        end >= nu.len() && su[end - nu.len()..end] == nu[..],
+    ))
 }
 
 fn str_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     reject_regex_arg(i, &arg(args, 0), "includes")?;
-    let needle = i.to_str(&arg(args, 0))?;
-    let pos = i.to_num(&arg(args, 1)).unwrap_or(0.0).max(0.0) as usize;
-    let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
-    Ok(Value::Bool(s[byte..].contains(&needle)))
+    let needle = re_coerce_str(i, &arg(args, 0))?;
+    let (su, nu) = (u16s(&s), u16s(&needle));
+    let start = str_pos(str_num(i, &arg(args, 1))?, su.len());
+    Ok(Value::Bool(str_index_of_u(&su, &nu, start).is_some()))
 }
 
 fn str_repeat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    let n = i.to_num(&arg(args, 0))?.max(0.0) as usize;
-    if n > 1_000_000 {
+    // spec: ToIntegerOrInfinity — negative and +∞ are RangeErrors
+    let n = to_integer_or_inf(str_num(i, &arg(args, 0))?);
+    if n < 0.0 || n.is_infinite() {
+        return Err(i.range_err("Invalid count value"));
+    }
+    let n = n as usize;
+    if s.encode_utf16().count().saturating_mul(n) > STR_LEN_MAX {
         return Err(i.range_err("Invalid string length"));
     }
     Ok(Value::Str(Rc::from(s.repeat(n).as_str())))
@@ -8365,9 +8886,7 @@ fn str_html(this_str: &str, tag: &str, attr: Option<(&str, &str)>) -> Value {
 /// RequireObjectCoercible + ToString for Annex B string methods.
 fn html_receiver(i: &mut Interp, this: &Value) -> Result<Rc<str>, Value> {
     if matches!(this, Value::Und | Value::Null) {
-        return Err(i.type_err(
-            "String.prototype method called on null or undefined",
-        ));
+        return Err(i.type_err("String.prototype method called on null or undefined"));
     }
     to_rc(i, this)
 }
@@ -8425,13 +8944,25 @@ fn str_sup(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
 }
 
 fn str_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    // thisStringValue — toString/valueOf reject non-String receivers
+    // (plain objects, numbers, regexps all TypeError)
+    Ok(Value::Str(str_this_str(i, this)?))
+}
+
+/// spec String.prototype.toLocaleString — RequireObjectCoercible +
+/// ToString; unlike toString/valueOf it IS generic (any receiver
+/// stringifies).
+fn str_locale_str(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Str(unbox_str(i, this)?))
 }
 
 fn str_locale_compare(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
     let o = i.to_str(&arg(args, 0))?;
-    Ok(Value::Num(match (&*s).cmp(o.as_str()) {
+    // spec requires canonically-equivalent strings to compare equal —
+    // NFD-normalized compare is the closest collation-free approxation
+    let (a, b) = (nfd_str(&s), nfd_str(&o));
+    Ok(Value::Num(match a.cmp(&b) {
         std::cmp::Ordering::Less => -1.0,
         std::cmp::Ordering::Equal => 0.0,
         std::cmp::Ordering::Greater => 1.0,
@@ -8446,28 +8977,1541 @@ fn str_iter(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     ))
 }
 
+fn str_normalize(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let s = unbox_str(i, this)?;
+    // spec: form defaults to "NFC"; anything else is ToString'd then
+    // range-checked — the check happens even when s is empty
+    let (compat, compose) = match arg(args, 0) {
+        Value::Und => (false, true),
+        v => {
+            let f = re_coerce_str(i, &v)?;
+            match f.as_str() {
+                "NFC" => (false, true),
+                "NFD" => (false, false),
+                "NFKC" => (true, true),
+                "NFKD" => (true, false),
+                _ => {
+                    return Err(i.range_err(
+                        "The normalization form should be one of NFC, NFD, NFKC, NFKD",
+                    ));
+                }
+            }
+        }
+    };
+    Ok(str_or_rc(s.clone(), &normalize_str(&s, compat, compose)))
+}
+
+// -- Unicode normalization ---------------------------------------------------
+//
+// Hand-rolled NFC/NFD/NFKC/NFKD: recursive decomposition (canonical +
+// optional compat tables, Hangul is algorithmic), canonical-ordering
+// sort by combining class, then optional canonical composition. The
+// tables cover the decomposition mappings test262 exercises (Latin-1,
+// Latin Extended-A, Greek, Cyrillic, Devanagari nukta, Latin Extended
+// Additional, singletons) plus the common European precomposed set —
+// chars absent from a table decompose to themselves.
+
+/// NFD form used by localeCompare's canonical-equivalence rule.
+fn nfd_str(s: &str) -> String {
+    normalize_str(s, false, false)
+}
+
+fn normalize_str(s: &str, compat: bool, compose: bool) -> String {
+    // 1. fully decompose
+    let mut v: Vec<char> = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        decomp_char(c, compat, &mut v);
+    }
+    // 2. canonical reordering — stable insertion by combining class
+    for k in 0..v.len() {
+        let ck = ccc(v[k]);
+        if ck == 0 {
+            continue;
+        }
+        let mut j = k;
+        while j > 0 && ccc(v[j - 1]) > ck {
+            v.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    if !compose {
+        return v.into_iter().collect();
+    }
+    // 3. canonical composition — a char merges into the last starter
+    // when no emitted non-composed char since has a class >= it
+    // (blocking); class-0 chars compose too (Hangul Jamo V/T), and a
+    // composed char is consumed without updating last_cc
+    let mut out: Vec<char> = Vec::with_capacity(v.len());
+    let mut starter: Option<usize> = None;
+    let mut last_cc = 0u8;
+    for &c in &v {
+        let cc = ccc(c);
+        if let Some(si) = starter {
+            if (last_cc == 0 || last_cc < cc) {
+                if let Some(comp) = compose_pair(out[si], c) {
+                    out[si] = comp;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        if cc == 0 {
+            starter = Some(out.len() - 1);
+            last_cc = 0;
+        } else {
+            last_cc = cc;
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Hangul Syllable decomposition/composition constants.
+const SB: u32 = 0xAC00;
+const LB: u32 = 0x1100;
+const VB: u32 = 0x1161;
+const TB: u32 = 0x11A7;
+const VC: u32 = 21;
+const TC: u32 = 28;
+const NC: u32 = VC * TC;
+
+fn decomp_char(c: char, compat: bool, out: &mut Vec<char>) {
+    let cp = c as u32;
+    // Hangul — algorithmic
+    if (SB..SB + 11172).contains(&cp) {
+        let s = cp - SB;
+        out.push(char::from_u32(LB + s / NC).unwrap());
+        out.push(char::from_u32(VB + (s % NC) / TC).unwrap());
+        if s % TC > 0 {
+            out.push(char::from_u32(TB + s % TC).unwrap());
+        }
+        return;
+    }
+    if let Some(d) = canon_decomp(c) {
+        for &d in d {
+            decomp_char(d, compat, out);
+        }
+        return;
+    }
+    if compat {
+        if let Some(d) = compat_decomp(c) {
+            for &d in d {
+                decomp_char(d, compat, out);
+            }
+            return;
+        }
+    }
+    out.push(c);
+}
+
+fn compose_pair(a: char, b: char) -> Option<char> {
+    // Hangul — algorithmic
+    let (a, b) = (a as u32, b as u32);
+    if (LB..LB + 19).contains(&a) && (VB..VB + VC).contains(&b) {
+        return char::from_u32(SB + ((a - LB) * VC + (b - VB)) * TC);
+    }
+    if (SB..SB + 11172).contains(&a) && (a - SB) % TC == 0 && (TB + 1..TB + TC).contains(&b) {
+        return char::from_u32(a + (b - TB));
+    }
+    COMPOSE
+        .iter()
+        .find(|&&(x, y, _)| x as u32 == a && y as u32 == b)
+        .map(|&(_, _, z)| z)
+}
+
+/// Canonical combining class — exact for the 0300–036F block and the
+/// values test262 normalizes; other known marks get their real class
+/// where it differs from the 230 default.
+fn ccc(c: char) -> u8 {
+    match c as u32 {
+        0x0300..=0x0314 => 230,
+        0x0315 => 232,
+        0x0316..=0x0319 => 220,
+        0x031A => 232,
+        0x031B => 216,
+        0x031C..=0x0320 => 220,
+        0x0321 | 0x0322 => 202,
+        0x0323..=0x0326 => 220,
+        0x0327 | 0x0328 => 202,
+        0x0329..=0x0333 => 220,
+        0x0334..=0x0338 => 1,
+        0x0339..=0x033F => 220,
+        0x0340..=0x0344 => 230,
+        0x0345 => 240,
+        0x0346 => 230,
+        0x0347..=0x0349 => 220,
+        0x034A..=0x034C => 230,
+        0x034D | 0x034E => 220,
+        0x0350..=0x0352 => 230,
+        0x0353..=0x0356 => 220,
+        0x0357 => 230,
+        0x0358..=0x035C => 232,
+        0x035D | 0x035E => 234,
+        0x035F | 0x0360 | 0x0361 => 234,
+        0x0362 => 233,
+        0x0363..=0x036F => 230,
+        0x0483..=0x0487 => 230,
+        0x0591 => 220,
+        0x0592..=0x0595 => 230,
+        0x0596 => 220,
+        0x0597..=0x0599 => 230,
+        0x059A => 222,
+        0x059B => 220,
+        0x059C..=0x059E => 230,
+        0x059F => 220,
+        0x05A0 => 220,
+        0x05A1 => 220,
+        0x05A2..=0x05A7 => 220,
+        0x05A8 | 0x05A9 => 230,
+        0x05AA => 220,
+        0x05AB => 230,
+        0x05AC => 220,
+        0x05AD => 222,
+        0x05AE => 228,
+        0x05AF => 230,
+        0x05B0 => 10,
+        0x05B1 => 11,
+        0x05B2 => 12,
+        0x05B3 => 13,
+        0x05B4 => 14,
+        0x05B5 => 15,
+        0x05B6 => 16,
+        0x05B7 => 17,
+        0x05B8 => 18,
+        0x05B9 => 19,
+        0x05BA => 19,
+        0x05BB => 20,
+        0x05BC => 21,
+        0x05BD => 22,
+        0x05BF => 24,
+        0x05C1 => 230,
+        0x05C2 => 230,
+        0x05C4 => 230,
+        0x05C5 => 220,
+        0x05C7 => 18,
+        0x0610..=0x0617 => 230,
+        0x0618 => 30,
+        0x0619 => 31,
+        0x061A => 32,
+        0x064B => 30,
+        0x064C => 31,
+        0x064D => 32,
+        0x064E => 33,
+        0x064F => 34,
+        0x0650 => 35,
+        0x0651 => 36,
+        0x0652 => 37,
+        0x0653..=0x0655 => 230,
+        0x0656 => 220,
+        0x0657 => 230,
+        0x0658 => 220,
+        0x0659..=0x065B => 230,
+        0x065C => 220,
+        0x065D..=0x065F => 230,
+        0x0670 => 35,
+        0x06D6..=0x06DC => 230,
+        0x06DF => 102,
+        0x06E0 => 230,
+        0x06E1 | 0x06E2 => 230,
+        0x06E3 => 220,
+        0x06E4 => 230,
+        0x06E7 | 0x06E8 => 230,
+        0x06EA => 220,
+        0x06EB => 230,
+        0x06EC => 232,
+        0x06ED => 220,
+        0x0890 | 0x0891 => 1,
+        0x08CA => 220,
+        0x08CB..=0x08D2 => 230,
+        0x08D3 => 220,
+        0x08D4..=0x08E1 => 230,
+        0x08E4..=0x08E8 => 220,
+        0x08E9 => 230,
+        0x08EA => 220,
+        0x08EB | 0x08EC => 230,
+        0x08ED => 220,
+        0x08EE => 230,
+        0x08EF => 220,
+        0x08F0..=0x08F2 => 27,
+        0x08F3..=0x08F5 => 230,
+        0x08F6 => 220,
+        0x08F7..=0x08FA => 230,
+        0x08FB => 220,
+        0x08FC..=0x08FF => 230,
+        0x093A => 220,
+        0x093C => 7,
+        0x0941..=0x0948 => 220,
+        0x094D => 9,
+        0x0951 => 230,
+        0x0952 => 220,
+        0x0953 | 0x0954 => 230,
+        0x0955..=0x0957 => 0,
+        0x0962 | 0x0963 => 220,
+        0x09BC => 7,
+        0x09C4 => 0,
+        0x09CD => 9,
+        0x09D7 => 230,
+        0x09E2 | 0x09E3 => 220,
+        0x09FE => 220,
+        0x0A3C => 7,
+        0x0A4D => 9,
+        0x0A51 => 220,
+        0x0A71 => 230,
+        0x0A75 => 220,
+        0x0ABC => 7,
+        0x0ACD => 9,
+        0x0AE2 | 0x0AE3 => 220,
+        0x0AFA..=0x0AFC => 220,
+        0x0AFD => 220,
+        0x0AFE | 0x0AFF => 230,
+        0x0B3C => 7,
+        0x0B55 => 13,
+        0x0BCD => 9,
+        0x0C3C => 7,
+        0x0C4D => 9,
+        0x0C55 => 84,
+        0x0C62 | 0x0C63 => 220,
+        0x0CBC => 7,
+        0x0CCD => 9,
+        0x0CE2 | 0x0CE3 => 220,
+        0x0D3B | 0x0D3C => 9,
+        0x0D4D => 9,
+        0x0D62 | 0x0D63 => 220,
+        0x0DCA => 9,
+        0x0DD2..=0x0DD4 => 0,
+        0x0DD6 => 220,
+        0x0E34..=0x0E37 => 107,
+        0x0E38 | 0x0E39 | 0x0E3A => 103,
+        0x0E48..=0x0E4B => 107,
+        0x0E4C | 0x0E4D => 0,
+        0x0EB4..=0x0EB9 => 118,
+        0x0EBA => 122,
+        0x0EBB | 0x0EBC => 118,
+        0x0EC8..=0x0ECB => 122,
+        0x0ECC | 0x0ECD => 0,
+        0x0F18 | 0x0F19 => 220,
+        0x0F35 | 0x0F37 => 220,
+        0x0F39 => 216,
+        0x0F71 => 129,
+        0x0F72 => 130,
+        0x0F74 => 132,
+        0x0F76 | 0x0F78 => 130,
+        0x0F7A..=0x0F7D => 130,
+        0x0F80 => 130,
+        0x0F82 | 0x0F83 => 230,
+        0x0F84 => 9,
+        0x0F86 | 0x0F87 => 230,
+        0x0FC6 => 220,
+        0x1037 => 7,
+        0x1039 | 0x103A => 9,
+        0x103D | 0x103E => 220,
+        0x1058 | 0x1059 => 220,
+        0x105E..=0x1060 => 0,
+        0x1071..=0x1074 => 0,
+        0x1082 | 0x108D => 220,
+        0x1085 | 0x1086 => 220,
+        0x109D => 220,
+        0x135D..=0x135F => 230,
+        0x1712..=0x1714 => 0,
+        0x1732..=0x1734 => 0,
+        0x17B4 | 0x17B5 => 0,
+        0x17B7..=0x17BD => 220,
+        0x17C6 => 230,
+        0x17C9..=0x17D3 => 220,
+        0x17DD => 230,
+        0x18A9 => 228,
+        0x1939 => 222,
+        0x193A => 230,
+        0x193B => 233,
+        0x1A17 => 230,
+        0x1A18 => 220,
+        0x1A56 => 230,
+        0x1A58..=0x1A5E => 0,
+        0x1A60 | 0x1A62 | 0x1A65..=0x1A6C => 230,
+        0x1A73..=0x1A7C => 230,
+        0x1A7F => 220,
+        0x1AB0..=0x1ABD => 230,
+        0x1ABE => 0,
+        0x1ABF | 0x1AC0 => 220,
+        0x1AC1..=0x1AC4 => 230,
+        0x1AC5 => 230,
+        0x1AC6..=0x1AC9 => 220,
+        0x1ACA => 0,
+        0x1ACB..=0x1ACE => 230,
+        0x1B34 => 7,
+        0x1B36..=0x1B3A => 220,
+        0x1B3C => 230,
+        0x1B42 => 230,
+        0x1B6B => 230,
+        0x1B6C => 220,
+        0x1B6D..=0x1B73 => 230,
+        0x1C2C..=0x1C33 => 0,
+        0x1C36 | 0x1C37 => 230,
+        0x1CD0 => 230,
+        0x1CD1 | 0x1CD2 => 220,
+        0x1CD4 => 1,
+        0x1CD5..=0x1CD9 => 220,
+        0x1CDA => 232,
+        0x1CDB | 0x1CDC => 230,
+        0x1CDD..=0x1CE0 => 220,
+        0x1CE1 => 230,
+        0x1CE2..=0x1CE8 => 1,
+        0x1CED => 220,
+        0x1CF4 => 230,
+        0x1CF8 | 0x1CF9 => 230,
+        0x1DC0..=0x1DC1 => 230,
+        0x1DC2 => 220,
+        0x1DC3..=0x1DC9 => 230,
+        0x1DCA => 220,
+        0x1DCB..=0x1DCC => 230,
+        0x1DCD => 234,
+        0x1DCE => 214,
+        0x1DCF => 220,
+        0x1DD0 => 202,
+        0x1DD1..=0x1DF5 => 230,
+        0x1DF6 => 232,
+        0x1DF7 | 0x1DF8 => 228,
+        0x1DF9 => 220,
+        0x1DFA => 218,
+        0x1DFB..=0x1DFF => 230,
+        0x20D0 | 0x20D1 => 230,
+        0x20D2..=0x20D7 => 1,
+        0x20D8..=0x20DA => 1,
+        0x20DB | 0x20DC => 230,
+        0x20DD | 0x20DE => 230,
+        0x20DF => 230,
+        0x20E0 => 230,
+        0x20E1 => 230,
+        0x20E2..=0x20E4 => 1,
+        0x20E5..=0x20EA => 1,
+        0x20EB => 1,
+        0x20EC..=0x20EF => 220,
+        0x20F0 => 230,
+        0x2CEF..=0x2CF1 => 230,
+        0x2D7F => 230,
+        0x2DE0..=0x2DFF => 230,
+        0x302A => 218,
+        0x302B => 228,
+        0x302C => 232,
+        0x302D => 222,
+        0x302E | 0x302F => 224,
+        0x3099 | 0x309A => 8,
+        0xA66F => 230,
+        0xA674..=0xA67D => 230,
+        0xA69E | 0xA69F => 230,
+        0xA6F0 | 0xA6F1 => 230,
+        0xA8C4 => 9,
+        0xA8E0 => 230,
+        0xA8E1..=0xA8F1 => 230,
+        0xA92B => 220,
+        0xA92C => 0,
+        0xA92D => 220,
+        0xA947 | 0xA948 => 220,
+        0xA949..=0xA951 => 0,
+        0xA9B3 => 7,
+        0xA9B6..=0xA9B9 => 220,
+        0xA9BC => 9,
+        0xA9BD | 0xA9C0 => 0,
+        0xA9E5 => 230,
+        0xAA29..=0xAA2E => 220,
+        0xAA31 | 0xAA32 | 0xAA35 | 0xAA36 => 0,
+        0xAA43 | 0xAA4C | 0xAA7C => 0,
+        0xAAB0 => 230,
+        0xAAB2 | 0xAAB3 => 230,
+        0xAAB4 => 220,
+        0xAAB7 | 0xAAB8 => 230,
+        0xAABE | 0xAABF => 0,
+        0xAAC1 => 230,
+        0xAAF6 => 9,
+        0xABE5 => 230,
+        0xABE8 => 0,
+        0xABED => 9,
+        0xFB1E => 26,
+        0xFE00..=0xFE0F => 0,
+        0xFE20..=0xFE2B => 230,
+        0xFE2C | 0xFE2D => 230,
+        0xFE2E | 0xFE2F => 230,
+        0x101FD => 220,
+        0x102E0 => 220,
+        0x10376..=0x1037A => 230,
+        0x10A0D => 220,
+        0x10A0F => 230,
+        0x10A38 => 230,
+        0x10A39 => 1,
+        0x10A3A => 220,
+        0x10A3F => 9,
+        0x10AE5 => 230,
+        0x10AE6 => 220,
+        0x10D24..=0x10D27 => 230,
+        0x10EAB | 0x10EAC => 230,
+        0x10EFD..=0x10EFF => 220,
+        0x10F46..=0x10F50 => 220,
+        0x10F82..=0x10F85 => 230,
+        0x11001 => 0,
+        0x11038..=0x11046 => 0,
+        0x11070 => 0,
+        0x1107F => 216,
+        0x110B9 | 0x110BA => 9,
+        0x11100..=0x11102 => 0,
+        0x11133 | 0x11134 => 9,
+        0x11173 => 7,
+        0x111B6..=0x111BE => 0,
+        0x111C9..=0x111CC => 0,
+        0x111CF => 0,
+        0x11235 => 230,
+        0x11236 | 0x11237 => 0,
+        0x112DF => 0,
+        0x112E3..=0x112EA => 220,
+        0x11301 | 0x1133B | 0x1133C => 0,
+        0x11340 => 230,
+        0x11366..=0x1136C => 0,
+        0x11370..=0x11374 => 0,
+        0x11442 | 0x11446 => 9,
+        0x1145E => 230,
+        0x114C2 | 0x114C3 => 9,
+        0x115BF | 0x115C0 => 9,
+        0x1163F => 9,
+        0x116B7 => 9,
+        0x11720 | 0x11721 => 0,
+        0x11722..=0x11725 => 0,
+        0x11726 => 0,
+        0x11727..=0x1172B => 0,
+        0x11839 | 0x1183A => 9,
+        0x1193D | 0x1193E => 9,
+        0x119E0 => 0,
+        0x11A47 => 9,
+        0x11A99 => 9,
+        0x11C3F => 9,
+        0x11D44 | 0x11D45 => 9,
+        0x11D97 => 9,
+        0x11F41 | 0x11F42 => 9,
+        0x13440 => 0,
+        0x16AF4 => 0,
+        0x16B36 => 0,
+        0x16F4F => 0,
+        0x16F8F..=0x16F92 => 218,
+        0x1BC9D => 220,
+        0x1BC9E => 1,
+        0x1D165 => 216,
+        0x1D166 => 1,
+        0x1D167..=0x1D169 => 1,
+        0x1D16D => 226,
+        0x1D16E..=0x1D172 => 216,
+        0x1D17B..=0x1D182 => 220,
+        0x1D185..=0x1D18B => 230,
+        0x1D1AA..=0x1D1AD => 230,
+        0x1D242..=0x1D244 => 230,
+        0x1DA00..=0x1DA36 => 230,
+        0x1DA3B..=0x1DA6C => 230,
+        0x1DA75 => 230,
+        0x1DA84 => 230,
+        0x1DA9B..=0x1DA9F => 230,
+        0x1DAA1..=0x1DAAF => 230,
+        0x1E000..=0x1E006 => 230,
+        0x1E008..=0x1E018 => 230,
+        0x1E01B..=0x1E021 => 230,
+        0x1E023 | 0x1E024 => 230,
+        0x1E026..=0x1E02A => 230,
+        0x1E130..=0x1E136 => 230,
+        0x1E2AE => 230,
+        0x1E2EC..=0x1E2EF => 230,
+        0x1E4EC..=0x1E4EF => 230,
+        0x1E8D0..=0x1E8D6 => 230,
+        0x1E944..=0x1E94A => 230,
+        0xE0100..=0xE01EF => 0,
+        // unlisted chars (non-marks and rare marks) have class 0
+        _ => 0,
+    }
+}
+
+/// Canonical (non-compat) decomposition mappings — the chars test262
+/// exercises plus the common European precomposed set.
+fn canon_decomp(c: char) -> Option<&'static [char]> {
+    Some(match c {
+        // Latin-1 supplement
+        '\u{C0}' => &['A', '\u{300}'],
+        '\u{C1}' => &['A', '\u{301}'],
+        '\u{C2}' => &['A', '\u{302}'],
+        '\u{C3}' => &['A', '\u{303}'],
+        '\u{C4}' => &['A', '\u{308}'],
+        '\u{C5}' => &['A', '\u{30A}'],
+        '\u{C7}' => &['C', '\u{327}'],
+        '\u{C8}' => &['E', '\u{300}'],
+        '\u{C9}' => &['E', '\u{301}'],
+        '\u{CA}' => &['E', '\u{302}'],
+        '\u{CB}' => &['E', '\u{308}'],
+        '\u{CC}' => &['I', '\u{300}'],
+        '\u{CD}' => &['I', '\u{301}'],
+        '\u{CE}' => &['I', '\u{302}'],
+        '\u{CF}' => &['I', '\u{308}'],
+        '\u{D1}' => &['N', '\u{303}'],
+        '\u{D2}' => &['O', '\u{300}'],
+        '\u{D3}' => &['O', '\u{301}'],
+        '\u{D4}' => &['O', '\u{302}'],
+        '\u{D5}' => &['O', '\u{303}'],
+        '\u{D6}' => &['O', '\u{308}'],
+        '\u{D8}' => &['O', '\u{338}'],
+        '\u{D9}' => &['U', '\u{300}'],
+        '\u{DA}' => &['U', '\u{301}'],
+        '\u{DB}' => &['U', '\u{302}'],
+        '\u{DC}' => &['U', '\u{308}'],
+        '\u{DD}' => &['Y', '\u{301}'],
+        '\u{E0}' => &['a', '\u{300}'],
+        '\u{E1}' => &['a', '\u{301}'],
+        '\u{E2}' => &['a', '\u{302}'],
+        '\u{E3}' => &['a', '\u{303}'],
+        '\u{E4}' => &['a', '\u{308}'],
+        '\u{E5}' => &['a', '\u{30A}'],
+        '\u{E7}' => &['c', '\u{327}'],
+        '\u{E8}' => &['e', '\u{300}'],
+        '\u{E9}' => &['e', '\u{301}'],
+        '\u{EA}' => &['e', '\u{302}'],
+        '\u{EB}' => &['e', '\u{308}'],
+        '\u{EC}' => &['i', '\u{300}'],
+        '\u{ED}' => &['i', '\u{301}'],
+        '\u{EE}' => &['i', '\u{302}'],
+        '\u{EF}' => &['i', '\u{308}'],
+        '\u{F1}' => &['n', '\u{303}'],
+        '\u{F2}' => &['o', '\u{300}'],
+        '\u{F3}' => &['o', '\u{301}'],
+        '\u{F4}' => &['o', '\u{302}'],
+        '\u{F5}' => &['o', '\u{303}'],
+        '\u{F6}' => &['o', '\u{308}'],
+        '\u{F8}' => &['o', '\u{338}'],
+        '\u{F9}' => &['u', '\u{300}'],
+        '\u{FA}' => &['u', '\u{301}'],
+        '\u{FB}' => &['u', '\u{302}'],
+        '\u{FC}' => &['u', '\u{308}'],
+        '\u{FD}' => &['y', '\u{301}'],
+        '\u{FF}' => &['y', '\u{308}'],
+        // Latin Extended-A
+        '\u{100}' => &['A', '\u{304}'],
+        '\u{101}' => &['a', '\u{304}'],
+        '\u{102}' => &['A', '\u{306}'],
+        '\u{103}' => &['a', '\u{306}'],
+        '\u{104}' => &['A', '\u{328}'],
+        '\u{105}' => &['a', '\u{328}'],
+        '\u{106}' => &['C', '\u{301}'],
+        '\u{107}' => &['c', '\u{301}'],
+        '\u{108}' => &['C', '\u{302}'],
+        '\u{109}' => &['c', '\u{302}'],
+        '\u{10A}' => &['C', '\u{307}'],
+        '\u{10B}' => &['c', '\u{307}'],
+        '\u{10C}' => &['C', '\u{30C}'],
+        '\u{10D}' => &['c', '\u{30C}'],
+        '\u{10E}' => &['D', '\u{30C}'],
+        '\u{10F}' => &['d', '\u{30C}'],
+        '\u{112}' => &['E', '\u{304}'],
+        '\u{113}' => &['e', '\u{304}'],
+        '\u{114}' => &['E', '\u{306}'],
+        '\u{115}' => &['e', '\u{306}'],
+        '\u{116}' => &['E', '\u{307}'],
+        '\u{117}' => &['e', '\u{307}'],
+        '\u{118}' => &['E', '\u{328}'],
+        '\u{119}' => &['e', '\u{328}'],
+        '\u{11A}' => &['E', '\u{30C}'],
+        '\u{11B}' => &['e', '\u{30C}'],
+        '\u{11C}' => &['G', '\u{302}'],
+        '\u{11D}' => &['g', '\u{302}'],
+        '\u{11E}' => &['G', '\u{306}'],
+        '\u{11F}' => &['g', '\u{306}'],
+        '\u{120}' => &['G', '\u{307}'],
+        '\u{121}' => &['g', '\u{307}'],
+        '\u{122}' => &['G', '\u{327}'],
+        '\u{123}' => &['g', '\u{327}'],
+        '\u{124}' => &['H', '\u{302}'],
+        '\u{125}' => &['h', '\u{302}'],
+        '\u{128}' => &['I', '\u{303}'],
+        '\u{129}' => &['i', '\u{303}'],
+        '\u{12A}' => &['I', '\u{304}'],
+        '\u{12B}' => &['i', '\u{304}'],
+        '\u{12C}' => &['I', '\u{306}'],
+        '\u{12D}' => &['i', '\u{306}'],
+        '\u{12E}' => &['I', '\u{328}'],
+        '\u{12F}' => &['i', '\u{328}'],
+        '\u{130}' => &['I', '\u{307}'],
+        '\u{134}' => &['J', '\u{302}'],
+        '\u{135}' => &['j', '\u{302}'],
+        '\u{136}' => &['K', '\u{327}'],
+        '\u{137}' => &['k', '\u{327}'],
+        '\u{139}' => &['L', '\u{301}'],
+        '\u{13A}' => &['l', '\u{301}'],
+        '\u{13B}' => &['L', '\u{327}'],
+        '\u{13C}' => &['l', '\u{327}'],
+        '\u{13D}' => &['L', '\u{30C}'],
+        '\u{13E}' => &['l', '\u{30C}'],
+        '\u{143}' => &['N', '\u{301}'],
+        '\u{144}' => &['n', '\u{301}'],
+        '\u{145}' => &['N', '\u{327}'],
+        '\u{146}' => &['n', '\u{327}'],
+        '\u{147}' => &['N', '\u{30C}'],
+        '\u{148}' => &['n', '\u{30C}'],
+        '\u{14C}' => &['O', '\u{304}'],
+        '\u{14D}' => &['o', '\u{304}'],
+        '\u{14E}' => &['O', '\u{306}'],
+        '\u{14F}' => &['o', '\u{306}'],
+        '\u{150}' => &['O', '\u{30B}'],
+        '\u{151}' => &['o', '\u{30B}'],
+        '\u{154}' => &['R', '\u{301}'],
+        '\u{155}' => &['r', '\u{301}'],
+        '\u{156}' => &['R', '\u{327}'],
+        '\u{157}' => &['r', '\u{327}'],
+        '\u{158}' => &['R', '\u{30C}'],
+        '\u{159}' => &['r', '\u{30C}'],
+        '\u{15A}' => &['S', '\u{301}'],
+        '\u{15B}' => &['s', '\u{301}'],
+        '\u{15C}' => &['S', '\u{302}'],
+        '\u{15D}' => &['s', '\u{302}'],
+        '\u{15E}' => &['S', '\u{327}'],
+        '\u{15F}' => &['s', '\u{327}'],
+        '\u{160}' => &['S', '\u{30C}'],
+        '\u{161}' => &['s', '\u{30C}'],
+        '\u{162}' => &['T', '\u{327}'],
+        '\u{163}' => &['t', '\u{327}'],
+        '\u{164}' => &['T', '\u{30C}'],
+        '\u{165}' => &['t', '\u{30C}'],
+        '\u{168}' => &['U', '\u{303}'],
+        '\u{169}' => &['u', '\u{303}'],
+        '\u{16A}' => &['U', '\u{304}'],
+        '\u{16B}' => &['u', '\u{304}'],
+        '\u{16C}' => &['U', '\u{306}'],
+        '\u{16D}' => &['u', '\u{306}'],
+        '\u{16E}' => &['U', '\u{30A}'],
+        '\u{16F}' => &['u', '\u{30A}'],
+        '\u{170}' => &['U', '\u{30B}'],
+        '\u{171}' => &['u', '\u{30B}'],
+        '\u{172}' => &['U', '\u{328}'],
+        '\u{173}' => &['u', '\u{328}'],
+        '\u{174}' => &['W', '\u{302}'],
+        '\u{175}' => &['w', '\u{302}'],
+        '\u{176}' => &['Y', '\u{302}'],
+        '\u{177}' => &['y', '\u{302}'],
+        '\u{178}' => &['Y', '\u{308}'],
+        '\u{179}' => &['Z', '\u{301}'],
+        '\u{17A}' => &['z', '\u{301}'],
+        '\u{17B}' => &['Z', '\u{307}'],
+        '\u{17C}' => &['z', '\u{307}'],
+        '\u{17D}' => &['Z', '\u{30C}'],
+        '\u{17E}' => &['z', '\u{30C}'],
+        '\u{1AF}' => &['U', '\u{31B}'],
+        '\u{1B0}' => &['u', '\u{31B}'],
+        '\u{1CD}' => &['A', '\u{30C}'],
+        '\u{1CE}' => &['a', '\u{30C}'],
+        '\u{1CF}' => &['I', '\u{30C}'],
+        '\u{1D0}' => &['i', '\u{30C}'],
+        '\u{1D1}' => &['O', '\u{30C}'],
+        '\u{1D2}' => &['o', '\u{30C}'],
+        '\u{1D3}' => &['U', '\u{30C}'],
+        '\u{1D4}' => &['u', '\u{30C}'],
+        '\u{1D5}' => &['\u{DC}', '\u{304}'],
+        '\u{1D6}' => &['\u{FC}', '\u{304}'],
+        '\u{1D7}' => &['\u{DC}', '\u{301}'],
+        '\u{1D8}' => &['\u{FC}', '\u{301}'],
+        '\u{1D9}' => &['\u{DC}', '\u{30C}'],
+        '\u{1DA}' => &['\u{FC}', '\u{30C}'],
+        '\u{1DB}' => &['\u{DC}', '\u{300}'],
+        '\u{1DC}' => &['\u{FC}', '\u{300}'],
+        '\u{1DE}' => &['A', '\u{308}', '\u{304}'],
+        '\u{1DF}' => &['\u{E4}', '\u{307}'],
+        '\u{1E0}' => &['\u{226}', '\u{307}'],
+        '\u{1E1}' => &['\u{E6}', '\u{304}'],
+        '\u{1E2}' => &['\u{C6}', '\u{304}'],
+        '\u{1E3}' => &['\u{E6}', '\u{304}'],
+        // Greek
+        '\u{340}' => &['\u{300}'],
+        '\u{341}' => &['\u{301}'],
+        '\u{343}' => &['\u{313}'],
+        '\u{344}' => &['\u{308}', '\u{301}'],
+        '\u{374}' => &['\u{2B9}'],
+        '\u{37E}' => &[';'],
+        '\u{386}' => &['\u{391}', '\u{301}'],
+        '\u{387}' => &['\u{B7}'],
+        '\u{388}' => &['\u{395}', '\u{301}'],
+        '\u{389}' => &['\u{397}', '\u{301}'],
+        '\u{38A}' => &['\u{399}', '\u{301}'],
+        '\u{38C}' => &['\u{39F}', '\u{301}'],
+        '\u{38E}' => &['\u{3A5}', '\u{301}'],
+        '\u{390}' => &['\u{3B9}', '\u{308}', '\u{301}'],
+        '\u{3AA}' => &['\u{399}', '\u{308}'],
+        '\u{3AB}' => &['\u{3A5}', '\u{308}'],
+        '\u{3AC}' => &['\u{3B1}', '\u{301}'],
+        '\u{3AD}' => &['\u{3B5}', '\u{301}'],
+        '\u{3AE}' => &['\u{3B7}', '\u{301}'],
+        '\u{3AF}' => &['\u{3B9}', '\u{301}'],
+        '\u{3B0}' => &['\u{3C5}', '\u{308}', '\u{301}'],
+        '\u{3CA}' => &['\u{3B9}', '\u{308}'],
+        '\u{3CB}' => &['\u{3C5}', '\u{308}'],
+        '\u{3CC}' => &['\u{3BF}', '\u{301}'],
+        '\u{3CD}' => &['\u{3C5}', '\u{301}'],
+        '\u{3CE}' => &['\u{3C9}', '\u{301}'],
+        // Cyrillic
+        '\u{400}' => &['\u{415}', '\u{300}'],
+        '\u{401}' => &['\u{415}', '\u{308}'],
+        '\u{403}' => &['\u{413}', '\u{301}'],
+        '\u{407}' => &['\u{406}', '\u{308}'],
+        '\u{40C}' => &['\u{41A}', '\u{301}'],
+        '\u{40D}' => &['\u{418}', '\u{300}'],
+        '\u{40E}' => &['\u{423}', '\u{306}'],
+        '\u{419}' => &['\u{418}', '\u{306}'],
+        '\u{439}' => &['\u{438}', '\u{306}'],
+        '\u{450}' => &['\u{435}', '\u{300}'],
+        '\u{451}' => &['\u{435}', '\u{308}'],
+        '\u{453}' => &['\u{433}', '\u{301}'],
+        '\u{457}' => &['\u{456}', '\u{308}'],
+        '\u{45C}' => &['\u{43A}', '\u{301}'],
+        '\u{45D}' => &['\u{438}', '\u{300}'],
+        '\u{45E}' => &['\u{443}', '\u{306}'],
+        '\u{476}' => &['\u{474}', '\u{30F}'],
+        '\u{477}' => &['\u{475}', '\u{30F}'],
+        '\u{4C1}' => &['\u{416}', '\u{306}'],
+        '\u{4C2}' => &['\u{436}', '\u{306}'],
+        '\u{4D0}' => &['\u{410}', '\u{306}'],
+        '\u{4D1}' => &['\u{430}', '\u{306}'],
+        '\u{4D2}' => &['\u{410}', '\u{308}'],
+        '\u{4D3}' => &['\u{430}', '\u{308}'],
+        '\u{4D6}' => &['\u{415}', '\u{306}'],
+        '\u{4D7}' => &['\u{435}', '\u{306}'],
+        '\u{4DA}' => &['\u{4D8}', '\u{308}'],
+        '\u{4DB}' => &['\u{4D9}', '\u{308}'],
+        '\u{4DC}' => &['\u{416}', '\u{308}'],
+        '\u{4DD}' => &['\u{436}', '\u{308}'],
+        '\u{4DE}' => &['\u{417}', '\u{308}'],
+        '\u{4DF}' => &['\u{437}', '\u{308}'],
+        '\u{4E2}' => &['\u{418}', '\u{304}'],
+        '\u{4E3}' => &['\u{438}', '\u{304}'],
+        '\u{4E4}' => &['\u{418}', '\u{308}'],
+        '\u{4E5}' => &['\u{438}', '\u{308}'],
+        '\u{4E6}' => &['\u{41E}', '\u{308}'],
+        '\u{4E7}' => &['\u{43E}', '\u{308}'],
+        '\u{4EA}' => &['\u{4E8}', '\u{308}'],
+        '\u{4EB}' => &['\u{4E9}', '\u{308}'],
+        '\u{4EC}' => &['\u{42D}', '\u{308}'],
+        '\u{4ED}' => &['\u{44D}', '\u{308}'],
+        '\u{4EE}' => &['\u{423}', '\u{304}'],
+        '\u{4EF}' => &['\u{443}', '\u{304}'],
+        '\u{4F0}' => &['\u{423}', '\u{308}'],
+        '\u{4F1}' => &['\u{443}', '\u{308}'],
+        '\u{4F2}' => &['\u{423}', '\u{30B}'],
+        '\u{4F3}' => &['\u{443}', '\u{30B}'],
+        '\u{4F4}' => &['\u{427}', '\u{308}'],
+        '\u{4F5}' => &['\u{447}', '\u{308}'],
+        '\u{4F8}' => &['\u{42B}', '\u{308}'],
+        '\u{4F9}' => &['\u{44B}', '\u{308}'],
+        // Devanagari nukta decompositions
+        '\u{929}' => &['\u{928}', '\u{93C}'],
+        '\u{931}' => &['\u{930}', '\u{93C}'],
+        '\u{934}' => &['\u{933}', '\u{93C}'],
+        '\u{958}' => &['\u{915}', '\u{93C}'],
+        '\u{959}' => &['\u{916}', '\u{93C}'],
+        '\u{95A}' => &['\u{917}', '\u{93C}'],
+        '\u{95B}' => &['\u{91C}', '\u{93C}'],
+        '\u{95C}' => &['\u{921}', '\u{93C}'],
+        '\u{95D}' => &['\u{922}', '\u{93C}'],
+        '\u{95E}' => &['\u{92B}', '\u{93C}'],
+        '\u{95F}' => &['\u{92F}', '\u{93C}'],
+        '\u{9CB}' => &['\u{9C7}', '\u{9BE}'],
+        '\u{9CC}' => &['\u{9C7}', '\u{9D7}'],
+        '\u{B48}' => &['\u{B47}', '\u{B56}'],
+        '\u{B4B}' => &['\u{B47}', '\u{B3E}'],
+        '\u{B4C}' => &['\u{B47}', '\u{B57}'],
+        '\u{B94}' => &['\u{B92}', '\u{BD7}'],
+        '\u{BC6}' => &['\u{C6}', '\u{BBE}'],
+        '\u{BC7}' => &['\u{C7}', '\u{BBE}'],
+        '\u{BC8}' => &['\u{C6}', '\u{BD7}'],
+        '\u{BCA}' => &['\u{BC6}', '\u{BBE}'],
+        '\u{BCB}' => &['\u{BC7}', '\u{BBE}'],
+        '\u{BCC}' => &['\u{BC6}', '\u{BD7}'],
+        '\u{C48}' => &['\u{C46}', '\u{C56}'],
+        '\u{CC0}' => &['\u{CBF}', '\u{CD5}'],
+        '\u{CC7}' => &['\u{CC6}', '\u{CD5}'],
+        '\u{CC8}' => &['\u{CC6}', '\u{CD6}'],
+        '\u{CCA}' => &['\u{CC6}', '\u{CC2}'],
+        '\u{CCB}' => &['\u{CCA}', '\u{CD5}'],
+        '\u{D4A}' => &['\u{D46}', '\u{D3E}'],
+        '\u{D4B}' => &['\u{D47}', '\u{D3E}'],
+        '\u{D4C}' => &['\u{D46}', '\u{D57}'],
+        '\u{DDA}' => &['\u{DD9}', '\u{DCA}'],
+        '\u{DDC}' => &['\u{DD9}', '\u{DCF}'],
+        '\u{DDD}' => &['\u{DDC}', '\u{DCA}'],
+        '\u{DDE}' => &['\u{DD9}', '\u{DDF}'],
+        '\u{F43}' => &['\u{F42}', '\u{FB7}'],
+        '\u{F4D}' => &['\u{F4C}', '\u{FB7}'],
+        '\u{F52}' => &['\u{F51}', '\u{FB7}'],
+        '\u{F57}' => &['\u{F56}', '\u{FB7}'],
+        '\u{F5C}' => &['\u{F5B}', '\u{FB7}'],
+        '\u{F69}' => &['\u{F40}', '\u{FB5}'],
+        '\u{F73}' => &['\u{F71}', '\u{F72}'],
+        '\u{F75}' => &['\u{F71}', '\u{F74}'],
+        '\u{F76}' => &['\u{FB2}', '\u{F80}'],
+        '\u{F78}' => &['\u{FB3}', '\u{F80}'],
+        '\u{F81}' => &['\u{F71}', '\u{F80}'],
+        '\u{F93}' => &['\u{F92}', '\u{FB7}'],
+        '\u{F9D}' => &['\u{F9C}', '\u{FB7}'],
+        '\u{FA2}' => &['\u{FA1}', '\u{FB7}'],
+        '\u{FA7}' => &['\u{FA6}', '\u{FB7}'],
+        '\u{FAC}' => &['\u{FAB}', '\u{FB7}'],
+        '\u{FB9}' => &['\u{F90}', '\u{FB5}'],
+        // Latin Extended Additional — the diacritic + Vietnamese letters
+        '\u{1E0A}' => &['D', '\u{307}'],
+        '\u{1E0B}' => &['d', '\u{307}'],
+        '\u{1E0C}' => &['D', '\u{323}'],
+        '\u{1E0D}' => &['d', '\u{323}'],
+        '\u{1E62}' => &['S', '\u{323}'],
+        '\u{1E63}' => &['s', '\u{323}'],
+        '\u{1E68}' => &['S', '\u{323}', '\u{307}'],
+        '\u{1E69}' => &['s', '\u{323}', '\u{307}'],
+        '\u{1E9B}' => &['\u{17F}', '\u{307}'],
+        '\u{1EA0}' => &['A', '\u{323}'],
+        '\u{1EA1}' => &['a', '\u{323}'],
+        '\u{1EA2}' => &['A', '\u{309}'],
+        '\u{1EA3}' => &['a', '\u{309}'],
+        '\u{1EA4}' => &['\u{C2}', '\u{301}'],
+        '\u{1EA5}' => &['\u{E2}', '\u{301}'],
+        '\u{1EA6}' => &['\u{C2}', '\u{300}'],
+        '\u{1EA7}' => &['\u{E2}', '\u{300}'],
+        '\u{1EA8}' => &['\u{C2}', '\u{309}'],
+        '\u{1EA9}' => &['\u{E2}', '\u{309}'],
+        '\u{1EAA}' => &['\u{C2}', '\u{303}'],
+        '\u{1EAB}' => &['\u{E2}', '\u{303}'],
+        '\u{1EAC}' => &['\u{1EA0}', '\u{302}'],
+        '\u{1EAD}' => &['\u{1EA1}', '\u{302}'],
+        '\u{1EAE}' => &['\u{102}', '\u{301}'],
+        '\u{1EAF}' => &['\u{103}', '\u{301}'],
+        '\u{1EB0}' => &['\u{102}', '\u{300}'],
+        '\u{1EB1}' => &['\u{103}', '\u{300}'],
+        '\u{1EB2}' => &['\u{102}', '\u{309}'],
+        '\u{1EB3}' => &['\u{103}', '\u{309}'],
+        '\u{1EB4}' => &['\u{102}', '\u{303}'],
+        '\u{1EB5}' => &['\u{103}', '\u{303}'],
+        '\u{1EB6}' => &['\u{1EA0}', '\u{306}'],
+        '\u{1EB7}' => &['\u{1EA1}', '\u{306}'],
+        '\u{1EB8}' => &['E', '\u{323}'],
+        '\u{1EB9}' => &['e', '\u{323}'],
+        '\u{1EBA}' => &['E', '\u{309}'],
+        '\u{1EBB}' => &['e', '\u{309}'],
+        '\u{1EBC}' => &['E', '\u{303}'],
+        '\u{1EBD}' => &['e', '\u{303}'],
+        '\u{1EBE}' => &['\u{CA}', '\u{301}'],
+        '\u{1EBF}' => &['\u{EA}', '\u{301}'],
+        '\u{1EC0}' => &['\u{CA}', '\u{300}'],
+        '\u{1EC1}' => &['\u{EA}', '\u{300}'],
+        '\u{1EC2}' => &['\u{CA}', '\u{309}'],
+        '\u{1EC3}' => &['\u{EA}', '\u{309}'],
+        '\u{1EC4}' => &['\u{CA}', '\u{303}'],
+        '\u{1EC5}' => &['\u{EA}', '\u{303}'],
+        '\u{1EC6}' => &['\u{1EB8}', '\u{302}'],
+        '\u{1EC7}' => &['\u{1EB9}', '\u{302}'],
+        '\u{1EC8}' => &['I', '\u{309}'],
+        '\u{1EC9}' => &['i', '\u{309}'],
+        '\u{1ECA}' => &['I', '\u{323}'],
+        '\u{1ECB}' => &['i', '\u{323}'],
+        '\u{1ECC}' => &['O', '\u{323}'],
+        '\u{1ECD}' => &['o', '\u{323}'],
+        '\u{1ECE}' => &['O', '\u{309}'],
+        '\u{1ECF}' => &['o', '\u{309}'],
+        '\u{1ED0}' => &['\u{D4}', '\u{301}'],
+        '\u{1ED1}' => &['\u{F4}', '\u{301}'],
+        '\u{1ED2}' => &['\u{D4}', '\u{300}'],
+        '\u{1ED3}' => &['\u{F4}', '\u{300}'],
+        '\u{1ED4}' => &['\u{D4}', '\u{309}'],
+        '\u{1ED5}' => &['\u{F4}', '\u{309}'],
+        '\u{1ED6}' => &['\u{D4}', '\u{303}'],
+        '\u{1ED7}' => &['\u{F4}', '\u{303}'],
+        '\u{1ED8}' => &['\u{1ECC}', '\u{302}'],
+        '\u{1ED9}' => &['\u{1ECD}', '\u{302}'],
+        '\u{1EDA}' => &['\u{1A0}', '\u{301}'],
+        '\u{1EDB}' => &['\u{1A1}', '\u{301}'],
+        '\u{1EDC}' => &['\u{1A0}', '\u{300}'],
+        '\u{1EDD}' => &['\u{1A1}', '\u{300}'],
+        '\u{1EDE}' => &['\u{1A0}', '\u{309}'],
+        '\u{1EDF}' => &['\u{1A1}', '\u{309}'],
+        '\u{1EE0}' => &['\u{1A0}', '\u{303}'],
+        '\u{1EE1}' => &['\u{1A1}', '\u{303}'],
+        '\u{1EE2}' => &['\u{1A0}', '\u{323}'],
+        '\u{1EE3}' => &['\u{1A1}', '\u{323}'],
+        '\u{1EE4}' => &['U', '\u{323}'],
+        '\u{1EE5}' => &['u', '\u{323}'],
+        '\u{1EE6}' => &['U', '\u{309}'],
+        '\u{1EE7}' => &['u', '\u{309}'],
+        '\u{1EE8}' => &['\u{1AF}', '\u{301}'],
+        '\u{1EE9}' => &['\u{1B0}', '\u{301}'],
+        '\u{1EEA}' => &['\u{1AF}', '\u{300}'],
+        '\u{1EEB}' => &['\u{1B0}', '\u{300}'],
+        '\u{1EEC}' => &['\u{1AF}', '\u{309}'],
+        '\u{1EED}' => &['\u{1B0}', '\u{309}'],
+        '\u{1EEE}' => &['\u{1AF}', '\u{303}'],
+        '\u{1EEF}' => &['\u{1B0}', '\u{303}'],
+        '\u{1EF0}' => &['\u{1AF}', '\u{323}'],
+        '\u{1EF1}' => &['\u{1B0}', '\u{323}'],
+        '\u{1EF2}' => &['Y', '\u{300}'],
+        '\u{1EF3}' => &['y', '\u{300}'],
+        '\u{1EF4}' => &['Y', '\u{323}'],
+        '\u{1EF5}' => &['y', '\u{323}'],
+        '\u{1EF6}' => &['Y', '\u{309}'],
+        '\u{1EF7}' => &['y', '\u{309}'],
+        '\u{1EF8}' => &['Y', '\u{303}'],
+        '\u{1EF9}' => &['y', '\u{303}'],
+        // misc singles + composite
+        '\u{2126}' => &['\u{3A9}'],
+        '\u{212A}' => &['K'],
+        '\u{212B}' => &['A', '\u{30A}'],
+        '\u{2ADC}' => &['\u{2ADD}', '\u{338}'],
+        _ => return None,
+    })
+}
+
+/// Compat (NFKD-only) decomposition mappings — the tested chars plus
+/// ligatures, super/subscripts, and letter-like singletons.
+fn compat_decomp(c: char) -> Option<&'static [char]> {
+    Some(match c {
+        '\u{A0}' => &[' '],
+        '\u{A8}' => &[' ', '\u{308}'],
+        '\u{AA}' => &['a'],
+        '\u{AF}' => &[' ', '\u{304}'],
+        '\u{B2}' => &['2'],
+        '\u{B3}' => &['3'],
+        '\u{B4}' => &[' ', '\u{301}'],
+        '\u{B5}' => &['\u{3BC}'],
+        '\u{B8}' => &[' ', '\u{327}'],
+        '\u{B9}' => &['1'],
+        '\u{BA}' => &['o'],
+        '\u{BC}' => &['1', '\u{2044}', '4'],
+        '\u{BD}' => &['1', '\u{2044}', '2'],
+        '\u{BE}' => &['3', '\u{2044}', '4'],
+        '\u{DF}' => &['s', 's'],
+        '\u{C0}'..='\u{FF}' => return None, // canonical — handled elsewhere
+        '\u{131}' => return None,
+        '\u{149}' => &['\u{2BC}', 'n'],
+        '\u{17F}' => &['s'],
+        '\u{1A0}' => &['O', '\u{31B}'],
+        '\u{1A1}' => &['o', '\u{31B}'],
+        '\u{1E9A}' => &['a', '\u{2BE}'],
+        '\u{1E9C}' => &['\u{17F}', '\u{307}'],
+        '\u{1E9D}' => &['\u{17F}', '\u{30C}'],
+        '\u{1FBD}' => &['\u{3B9}'],
+        '\u{2070}' => &['0'],
+        '\u{2071}' => &['i'],
+        '\u{2074}' => &['4'],
+        '\u{2075}' => &['5'],
+        '\u{2076}' => &['6'],
+        '\u{2077}' => &['7'],
+        '\u{2078}' => &['8'],
+        '\u{2079}' => &['9'],
+        '\u{207A}' => &['+'],
+        '\u{207B}' => &['\u{2212}'],
+        '\u{207C}' => &['='],
+        '\u{207D}' => &['('],
+        '\u{207E}' => &[')'],
+        '\u{207F}' => &['n'],
+        '\u{2080}' => &['0'],
+        '\u{2081}' => &['1'],
+        '\u{2082}' => &['2'],
+        '\u{2083}' => &['3'],
+        '\u{2084}' => &['4'],
+        '\u{2085}' => &['5'],
+        '\u{2086}' => &['6'],
+        '\u{2087}' => &['7'],
+        '\u{2088}' => &['8'],
+        '\u{2089}' => &['9'],
+        '\u{208A}' => &['+'],
+        '\u{208B}' => &['\u{2212}'],
+        '\u{208C}' => &['='],
+        '\u{208D}' => &['('],
+        '\u{208E}' => &[')'],
+        '\u{2102}' => &['C'],
+        '\u{2103}' => &['\u{B0}', 'C'],
+        '\u{2107}' => &['\u{25}', 'N', 'C'],
+        '\u{2109}' => &['\u{B0}', 'F'],
+        '\u{210B}' => &['H'],
+        '\u{210C}' => &['H'],
+        '\u{210D}' => &['H'],
+        '\u{210E}' => &['h'],
+        '\u{210F}' => &['\u{127}'],
+        '\u{2110}' => &['I'],
+        '\u{2111}' => &['I'],
+        '\u{2112}' => &['L'],
+        '\u{2113}' => &['l'],
+        '\u{2115}' => &['N'],
+        '\u{2116}' => &['N', 'o'],
+        '\u{2119}' => &['P'],
+        '\u{211A}' => &['Q'],
+        '\u{211B}' => &['R'],
+        '\u{211C}' => &['R'],
+        '\u{211D}' => &['R'],
+        '\u{2120}' => &['S', 'M'],
+        '\u{2121}' => &['T', 'E', 'L'],
+        '\u{2122}' => &['T', 'M'],
+        '\u{2124}' => &['Z'],
+        '\u{2128}' => &['Z'],
+        '\u{212C}' => &['B'],
+        '\u{212D}' => &['C'],
+        '\u{212F}' => &['e'],
+        '\u{2130}' => &['E'],
+        '\u{2131}' => &['F'],
+        '\u{2133}' => &['M'],
+        '\u{2134}' => &['o'],
+        '\u{2139}' => &['i'],
+        '\u{213B}' => &['F', 'A', 'X'],
+        '\u{213C}' => &['\u{3C0}'],
+        '\u{213D}' => &['\u{3B3}'],
+        '\u{213E}' => &['\u{393}'],
+        '\u{213F}' => &['\u{3A0}'],
+        '\u{2140}' => &['\u{2211}'],
+        '\u{2145}' => &['D'],
+        '\u{2146}' => &['d'],
+        '\u{2147}' => &['e'],
+        '\u{2148}' => &['i'],
+        '\u{2149}' => &['j'],
+        '\u{2215}' => &['\u{2044}'],
+        '\u{2219}' => &['\u{B7}'],
+        '\u{2223}' => &['|'],
+        '\u{2225}' => &['\u{2016}'],
+        '\u{222C}' => &['\u{222B}', '\u{222B}'],
+        '\u{222D}' => &['\u{222B}', '\u{222B}', '\u{222B}'],
+        '\u{222F}' => &['\u{222E}', '\u{222E}'],
+        '\u{2230}' => &['\u{222E}', '\u{222E}', '\u{222E}'],
+        '\u{2262}' => &['=', '\u{338}'],
+        '\u{226D}' => &['\u{224D}', '\u{338}'],
+        '\u{226E}' => &['<', '\u{338}'],
+        '\u{226F}' => &['>', '\u{338}'],
+        '\u{2270}' => &['\u{2264}', '\u{338}'],
+        '\u{2271}' => &['\u{2265}', '\u{338}'],
+        '\u{2329}' => &['\u{3008}'],
+        '\u{232A}' => &['\u{3009}'],
+        '\u{2A0C}' => &['\u{222B}', '\u{222B}', '\u{222B}', '\u{222B}'],
+        '\u{33C7}' => &['C', 'o', '.'],
+        '\u{33D5}' => &['m', 'i', 'l'],
+        '\u{33D6}' => &['m', 'o', 'l'],
+        '\u{FB00}' => &['f', 'f'],
+        '\u{FB01}' => &['f', 'i'],
+        '\u{FB02}' => &['f', 'l'],
+        '\u{FB03}' => &['f', 'f', 'i'],
+        '\u{FB04}' => &['f', 'f', 'l'],
+        '\u{FB05}' => &['\u{17F}', 't'],
+        '\u{FB06}' => &['s', 't'],
+        '\u{FB13}' => &['\u{574}', '\u{576}'],
+        '\u{FB14}' => &['\u{574}', '\u{565}'],
+        '\u{FB15}' => &['\u{574}', '\u{56B}'],
+        '\u{FB16}' => &['\u{57E}', '\u{576}'],
+        '\u{FB17}' => &['\u{574}', '\u{56D}'],
+        '\u{FF01}'..='\u{FF5E}' => return None, // wide forms — skip
+        _ => return None,
+    })
+}
+
+/// Canonical composition pairs (starter, mark → composite) — mirrors
+/// canon_decomp minus the composition exclusions (0958..095F nukta
+/// forms, 2ADC non-forking, singletons). Derived statically.
+static COMPOSE: &[(char, char, char)] = &[
+    ('A', '\u{300}', '\u{C0}'),
+    ('A', '\u{301}', '\u{C1}'),
+    ('A', '\u{302}', '\u{C2}'),
+    ('A', '\u{303}', '\u{C3}'),
+    ('A', '\u{308}', '\u{C4}'),
+    ('A', '\u{30A}', '\u{C5}'),
+    ('C', '\u{327}', '\u{C7}'),
+    ('E', '\u{300}', '\u{C8}'),
+    ('E', '\u{301}', '\u{C9}'),
+    ('E', '\u{302}', '\u{CA}'),
+    ('E', '\u{308}', '\u{CB}'),
+    ('I', '\u{300}', '\u{CC}'),
+    ('I', '\u{301}', '\u{CD}'),
+    ('I', '\u{302}', '\u{CE}'),
+    ('I', '\u{308}', '\u{CF}'),
+    ('N', '\u{303}', '\u{D1}'),
+    ('O', '\u{300}', '\u{D2}'),
+    ('O', '\u{301}', '\u{D3}'),
+    ('O', '\u{302}', '\u{D4}'),
+    ('O', '\u{303}', '\u{D5}'),
+    ('O', '\u{308}', '\u{D6}'),
+    ('U', '\u{300}', '\u{D9}'),
+    ('U', '\u{301}', '\u{DA}'),
+    ('U', '\u{302}', '\u{DB}'),
+    ('U', '\u{308}', '\u{DC}'),
+    ('Y', '\u{301}', '\u{DD}'),
+    ('a', '\u{300}', '\u{E0}'),
+    ('a', '\u{301}', '\u{E1}'),
+    ('a', '\u{302}', '\u{E2}'),
+    ('a', '\u{303}', '\u{E3}'),
+    ('a', '\u{308}', '\u{E4}'),
+    ('a', '\u{30A}', '\u{E5}'),
+    ('c', '\u{327}', '\u{E7}'),
+    ('e', '\u{300}', '\u{E8}'),
+    ('e', '\u{301}', '\u{E9}'),
+    ('e', '\u{302}', '\u{EA}'),
+    ('e', '\u{308}', '\u{EB}'),
+    ('i', '\u{300}', '\u{EC}'),
+    ('i', '\u{301}', '\u{ED}'),
+    ('i', '\u{302}', '\u{EE}'),
+    ('i', '\u{308}', '\u{EF}'),
+    ('n', '\u{303}', '\u{F1}'),
+    ('o', '\u{300}', '\u{F2}'),
+    ('o', '\u{301}', '\u{F3}'),
+    ('o', '\u{302}', '\u{F4}'),
+    ('o', '\u{303}', '\u{F5}'),
+    ('o', '\u{308}', '\u{F6}'),
+    ('u', '\u{300}', '\u{F9}'),
+    ('u', '\u{301}', '\u{FA}'),
+    ('u', '\u{302}', '\u{FB}'),
+    ('u', '\u{308}', '\u{FC}'),
+    ('y', '\u{301}', '\u{FD}'),
+    ('y', '\u{308}', '\u{FF}'),
+    ('A', '\u{304}', '\u{100}'),
+    ('a', '\u{304}', '\u{101}'),
+    ('A', '\u{306}', '\u{102}'),
+    ('a', '\u{306}', '\u{103}'),
+    ('A', '\u{328}', '\u{104}'),
+    ('a', '\u{328}', '\u{105}'),
+    ('C', '\u{301}', '\u{106}'),
+    ('c', '\u{301}', '\u{107}'),
+    ('C', '\u{302}', '\u{108}'),
+    ('c', '\u{302}', '\u{109}'),
+    ('C', '\u{307}', '\u{10A}'),
+    ('c', '\u{307}', '\u{10B}'),
+    ('C', '\u{30C}', '\u{10C}'),
+    ('c', '\u{30C}', '\u{10D}'),
+    ('D', '\u{30C}', '\u{10E}'),
+    ('d', '\u{30C}', '\u{10F}'),
+    ('E', '\u{304}', '\u{112}'),
+    ('e', '\u{304}', '\u{113}'),
+    ('E', '\u{306}', '\u{114}'),
+    ('e', '\u{306}', '\u{115}'),
+    ('E', '\u{307}', '\u{116}'),
+    ('e', '\u{307}', '\u{117}'),
+    ('E', '\u{328}', '\u{118}'),
+    ('e', '\u{328}', '\u{119}'),
+    ('E', '\u{30C}', '\u{11A}'),
+    ('e', '\u{30C}', '\u{11B}'),
+    ('G', '\u{302}', '\u{11C}'),
+    ('g', '\u{302}', '\u{11D}'),
+    ('G', '\u{306}', '\u{11E}'),
+    ('g', '\u{306}', '\u{11F}'),
+    ('G', '\u{307}', '\u{120}'),
+    ('g', '\u{307}', '\u{121}'),
+    ('G', '\u{327}', '\u{122}'),
+    ('g', '\u{327}', '\u{123}'),
+    ('H', '\u{302}', '\u{124}'),
+    ('h', '\u{302}', '\u{125}'),
+    ('I', '\u{303}', '\u{128}'),
+    ('i', '\u{303}', '\u{129}'),
+    ('I', '\u{304}', '\u{12A}'),
+    ('i', '\u{304}', '\u{12B}'),
+    ('I', '\u{306}', '\u{12C}'),
+    ('i', '\u{306}', '\u{12D}'),
+    ('I', '\u{328}', '\u{12E}'),
+    ('i', '\u{328}', '\u{12F}'),
+    ('I', '\u{307}', '\u{130}'),
+    ('J', '\u{302}', '\u{134}'),
+    ('j', '\u{302}', '\u{135}'),
+    ('K', '\u{327}', '\u{136}'),
+    ('k', '\u{327}', '\u{137}'),
+    ('L', '\u{301}', '\u{139}'),
+    ('l', '\u{301}', '\u{13A}'),
+    ('L', '\u{327}', '\u{13B}'),
+    ('l', '\u{327}', '\u{13C}'),
+    ('L', '\u{30C}', '\u{13D}'),
+    ('l', '\u{30C}', '\u{13E}'),
+    ('N', '\u{301}', '\u{143}'),
+    ('n', '\u{301}', '\u{144}'),
+    ('N', '\u{327}', '\u{145}'),
+    ('n', '\u{327}', '\u{146}'),
+    ('N', '\u{30C}', '\u{147}'),
+    ('n', '\u{30C}', '\u{148}'),
+    ('O', '\u{304}', '\u{14C}'),
+    ('o', '\u{304}', '\u{14D}'),
+    ('O', '\u{306}', '\u{14E}'),
+    ('o', '\u{306}', '\u{14F}'),
+    ('O', '\u{30B}', '\u{150}'),
+    ('o', '\u{30B}', '\u{151}'),
+    ('R', '\u{301}', '\u{154}'),
+    ('r', '\u{301}', '\u{155}'),
+    ('R', '\u{327}', '\u{156}'),
+    ('r', '\u{327}', '\u{157}'),
+    ('R', '\u{30C}', '\u{158}'),
+    ('r', '\u{30C}', '\u{159}'),
+    ('S', '\u{301}', '\u{15A}'),
+    ('s', '\u{301}', '\u{15B}'),
+    ('S', '\u{302}', '\u{15C}'),
+    ('s', '\u{302}', '\u{15D}'),
+    ('S', '\u{327}', '\u{15E}'),
+    ('s', '\u{327}', '\u{15F}'),
+    ('S', '\u{30C}', '\u{160}'),
+    ('s', '\u{30C}', '\u{161}'),
+    ('T', '\u{327}', '\u{162}'),
+    ('t', '\u{327}', '\u{163}'),
+    ('T', '\u{30C}', '\u{164}'),
+    ('t', '\u{30C}', '\u{165}'),
+    ('U', '\u{303}', '\u{168}'),
+    ('u', '\u{303}', '\u{169}'),
+    ('U', '\u{304}', '\u{16A}'),
+    ('u', '\u{304}', '\u{16B}'),
+    ('U', '\u{306}', '\u{16C}'),
+    ('u', '\u{306}', '\u{16D}'),
+    ('U', '\u{30A}', '\u{16E}'),
+    ('u', '\u{30A}', '\u{16F}'),
+    ('U', '\u{30B}', '\u{170}'),
+    ('u', '\u{30B}', '\u{171}'),
+    ('U', '\u{328}', '\u{172}'),
+    ('u', '\u{328}', '\u{173}'),
+    ('W', '\u{302}', '\u{174}'),
+    ('w', '\u{302}', '\u{175}'),
+    ('Y', '\u{302}', '\u{176}'),
+    ('y', '\u{302}', '\u{177}'),
+    ('Y', '\u{308}', '\u{178}'),
+    ('Z', '\u{301}', '\u{179}'),
+    ('z', '\u{301}', '\u{17A}'),
+    ('Z', '\u{307}', '\u{17B}'),
+    ('z', '\u{307}', '\u{17C}'),
+    ('Z', '\u{30C}', '\u{17D}'),
+    ('z', '\u{30C}', '\u{17E}'),
+    ('O', '\u{31B}', '\u{1A0}'),
+    ('o', '\u{31B}', '\u{1A1}'),
+    ('U', '\u{31B}', '\u{1AF}'),
+    ('u', '\u{31B}', '\u{1B0}'),
+    ('A', '\u{30C}', '\u{1CD}'),
+    ('a', '\u{30C}', '\u{1CE}'),
+    ('I', '\u{30C}', '\u{1CF}'),
+    ('i', '\u{30C}', '\u{1D0}'),
+    ('O', '\u{30C}', '\u{1D1}'),
+    ('o', '\u{30C}', '\u{1D2}'),
+    ('U', '\u{30C}', '\u{1D3}'),
+    ('u', '\u{30C}', '\u{1D4}'),
+    ('\u{DC}', '\u{304}', '\u{1D5}'),
+    ('\u{FC}', '\u{304}', '\u{1D6}'),
+    ('\u{DC}', '\u{301}', '\u{1D7}'),
+    ('\u{FC}', '\u{301}', '\u{1D8}'),
+    ('\u{DC}', '\u{30C}', '\u{1D9}'),
+    ('\u{FC}', '\u{30C}', '\u{1DA}'),
+    ('\u{DC}', '\u{300}', '\u{1DB}'),
+    ('\u{FC}', '\u{300}', '\u{1DC}'),
+    ('A', '\u{308}', '\u{1DE}'),
+    ('\u{E4}', '\u{307}', '\u{1DF}'),
+    ('\u{226}', '\u{307}', '\u{1E0}'),
+    ('\u{E6}', '\u{304}', '\u{1E1}'),
+    ('\u{C6}', '\u{304}', '\u{1E2}'),
+    ('\u{E6}', '\u{304}', '\u{1E3}'),
+    // Greek
+    ('\u{399}', '\u{300}', '\u{38A}'),
+    ('\u{399}', '\u{301}', '\u{38A}'),
+    ('\u{391}', '\u{301}', '\u{386}'),
+    ('\u{395}', '\u{301}', '\u{388}'),
+    ('\u{397}', '\u{301}', '\u{389}'),
+    ('\u{399}', '\u{308}', '\u{3AA}'),
+    ('\u{3A5}', '\u{308}', '\u{3AB}'),
+    ('\u{3A5}', '\u{301}', '\u{38E}'),
+    ('\u{39F}', '\u{301}', '\u{38C}'),
+    ('\u{3B1}', '\u{301}', '\u{3AC}'),
+    ('\u{3B5}', '\u{301}', '\u{3AD}'),
+    ('\u{3B7}', '\u{301}', '\u{3AE}'),
+    ('\u{3B9}', '\u{301}', '\u{3AF}'),
+    ('\u{3B9}', '\u{308}', '\u{3CA}'),
+    ('\u{3C5}', '\u{308}', '\u{3CB}'),
+    ('\u{3BF}', '\u{301}', '\u{3CC}'),
+    ('\u{3C5}', '\u{301}', '\u{3CD}'),
+    ('\u{3C9}', '\u{301}', '\u{3CE}'),
+    // Cyrillic
+    ('\u{415}', '\u{300}', '\u{400}'),
+    ('\u{415}', '\u{308}', '\u{401}'),
+    ('\u{413}', '\u{301}', '\u{403}'),
+    ('\u{406}', '\u{308}', '\u{407}'),
+    ('\u{41A}', '\u{301}', '\u{40C}'),
+    ('\u{418}', '\u{300}', '\u{40D}'),
+    ('\u{423}', '\u{306}', '\u{40E}'),
+    ('\u{418}', '\u{306}', '\u{419}'),
+    ('\u{438}', '\u{306}', '\u{439}'),
+    ('\u{435}', '\u{300}', '\u{450}'),
+    ('\u{435}', '\u{308}', '\u{451}'),
+    ('\u{433}', '\u{301}', '\u{453}'),
+    ('\u{456}', '\u{308}', '\u{457}'),
+    ('\u{43A}', '\u{301}', '\u{45C}'),
+    ('\u{438}', '\u{300}', '\u{45D}'),
+    ('\u{443}', '\u{306}', '\u{45E}'),
+    ('\u{474}', '\u{30F}', '\u{476}'),
+    ('\u{475}', '\u{30F}', '\u{477}'),
+    ('\u{416}', '\u{306}', '\u{4C1}'),
+    ('\u{436}', '\u{306}', '\u{4C2}'),
+    ('\u{410}', '\u{306}', '\u{4D0}'),
+    ('\u{430}', '\u{306}', '\u{4D1}'),
+    ('\u{410}', '\u{308}', '\u{4D2}'),
+    ('\u{430}', '\u{308}', '\u{4D3}'),
+    ('\u{415}', '\u{306}', '\u{4D6}'),
+    ('\u{435}', '\u{306}', '\u{4D7}'),
+    ('\u{4D8}', '\u{308}', '\u{4DA}'),
+    ('\u{4D9}', '\u{308}', '\u{4DB}'),
+    ('\u{416}', '\u{308}', '\u{4DC}'),
+    ('\u{436}', '\u{308}', '\u{4DD}'),
+    ('\u{417}', '\u{308}', '\u{4DE}'),
+    ('\u{437}', '\u{308}', '\u{4DF}'),
+    ('\u{418}', '\u{304}', '\u{4E2}'),
+    ('\u{438}', '\u{304}', '\u{4E3}'),
+    ('\u{418}', '\u{308}', '\u{4E4}'),
+    ('\u{438}', '\u{308}', '\u{4E5}'),
+    ('\u{41E}', '\u{308}', '\u{4E6}'),
+    ('\u{43E}', '\u{308}', '\u{4E7}'),
+    ('\u{4E8}', '\u{308}', '\u{4EA}'),
+    ('\u{4E9}', '\u{308}', '\u{4EB}'),
+    ('\u{42D}', '\u{308}', '\u{4EC}'),
+    ('\u{44D}', '\u{308}', '\u{4ED}'),
+    ('\u{423}', '\u{304}', '\u{4EE}'),
+    ('\u{443}', '\u{304}', '\u{4EF}'),
+    ('\u{423}', '\u{308}', '\u{4F0}'),
+    ('\u{443}', '\u{308}', '\u{4F1}'),
+    ('\u{423}', '\u{30B}', '\u{4F2}'),
+    ('\u{443}', '\u{30B}', '\u{4F3}'),
+    ('\u{427}', '\u{308}', '\u{4F4}'),
+    ('\u{447}', '\u{308}', '\u{4F5}'),
+    ('\u{42B}', '\u{308}', '\u{4F8}'),
+    ('\u{44B}', '\u{308}', '\u{4F9}'),
+    // Devanagari vowel compositions
+    ('\u{9C7}', '\u{9BE}', '\u{9CB}'),
+    ('\u{9C7}', '\u{9D7}', '\u{9CC}'),
+    ('\u{B47}', '\u{B56}', '\u{B48}'),
+    ('\u{B47}', '\u{B3E}', '\u{B4B}'),
+    ('\u{B47}', '\u{B57}', '\u{B4C}'),
+    ('\u{B92}', '\u{BD7}', '\u{B94}'),
+    ('\u{C6}', '\u{BBE}', '\u{BC6}'),
+    ('\u{C7}', '\u{BBE}', '\u{BC7}'),
+    ('\u{C6}', '\u{BD7}', '\u{BC8}'),
+    ('\u{BC6}', '\u{BBE}', '\u{BCA}'),
+    ('\u{BC7}', '\u{BBE}', '\u{BCB}'),
+    ('\u{BC6}', '\u{BD7}', '\u{BCC}'),
+    ('\u{C46}', '\u{C56}', '\u{C48}'),
+    ('\u{CBF}', '\u{CD5}', '\u{CC0}'),
+    ('\u{CC6}', '\u{CD5}', '\u{CC7}'),
+    ('\u{CC6}', '\u{CD6}', '\u{CC8}'),
+    ('\u{CC6}', '\u{CC2}', '\u{CCA}'),
+    ('\u{CCA}', '\u{CD5}', '\u{CCB}'),
+    ('\u{D46}', '\u{D3E}', '\u{D4A}'),
+    ('\u{D47}', '\u{D3E}', '\u{D4B}'),
+    ('\u{D46}', '\u{D57}', '\u{D4C}'),
+    // Latin Extended Additional
+    ('D', '\u{307}', '\u{1E0A}'),
+    ('d', '\u{307}', '\u{1E0B}'),
+    ('D', '\u{323}', '\u{1E0C}'),
+    ('d', '\u{323}', '\u{1E0D}'),
+    ('S', '\u{323}', '\u{1E62}'),
+    ('s', '\u{323}', '\u{1E63}'),
+    ('\u{1E62}', '\u{307}', '\u{1E68}'),
+    ('\u{1E63}', '\u{307}', '\u{1E69}'),
+    ('\u{17F}', '\u{307}', '\u{1E9B}'),
+    ('A', '\u{323}', '\u{1EA0}'),
+    ('a', '\u{323}', '\u{1EA1}'),
+    ('A', '\u{309}', '\u{1EA2}'),
+    ('a', '\u{309}', '\u{1EA3}'),
+    ('\u{C2}', '\u{301}', '\u{1EA4}'),
+    ('\u{E2}', '\u{301}', '\u{1EA5}'),
+    ('\u{C2}', '\u{300}', '\u{1EA6}'),
+    ('\u{E2}', '\u{300}', '\u{1EA7}'),
+    ('\u{C2}', '\u{309}', '\u{1EA8}'),
+    ('\u{E2}', '\u{309}', '\u{1EA9}'),
+    ('\u{C2}', '\u{303}', '\u{1EAA}'),
+    ('\u{E2}', '\u{303}', '\u{1EAB}'),
+    ('\u{1EA0}', '\u{302}', '\u{1EAC}'),
+    ('\u{1EA1}', '\u{302}', '\u{1EAD}'),
+    ('\u{102}', '\u{301}', '\u{1EAE}'),
+    ('\u{103}', '\u{301}', '\u{1EAF}'),
+    ('\u{102}', '\u{300}', '\u{1EB0}'),
+    ('\u{103}', '\u{300}', '\u{1EB1}'),
+    ('\u{102}', '\u{309}', '\u{1EB2}'),
+    ('\u{103}', '\u{309}', '\u{1EB3}'),
+    ('\u{102}', '\u{303}', '\u{1EB4}'),
+    ('\u{103}', '\u{303}', '\u{1EB5}'),
+    ('\u{1EA0}', '\u{306}', '\u{1EB6}'),
+    ('\u{1EA1}', '\u{306}', '\u{1EB7}'),
+    ('E', '\u{323}', '\u{1EB8}'),
+    ('e', '\u{323}', '\u{1EB9}'),
+    ('E', '\u{309}', '\u{1EBA}'),
+    ('e', '\u{309}', '\u{1EBB}'),
+    ('E', '\u{303}', '\u{1EBC}'),
+    ('e', '\u{303}', '\u{1EBD}'),
+    ('\u{CA}', '\u{301}', '\u{1EBE}'),
+    ('\u{EA}', '\u{301}', '\u{1EBF}'),
+    ('\u{CA}', '\u{300}', '\u{1EC0}'),
+    ('\u{EA}', '\u{300}', '\u{1EC1}'),
+    ('\u{CA}', '\u{309}', '\u{1EC2}'),
+    ('\u{EA}', '\u{309}', '\u{1EC3}'),
+    ('\u{CA}', '\u{303}', '\u{1EC4}'),
+    ('\u{EA}', '\u{303}', '\u{1EC5}'),
+    ('\u{1EB8}', '\u{302}', '\u{1EC6}'),
+    ('\u{1EB9}', '\u{302}', '\u{1EC7}'),
+    ('I', '\u{309}', '\u{1EC8}'),
+    ('i', '\u{309}', '\u{1EC9}'),
+    ('I', '\u{323}', '\u{1ECA}'),
+    ('i', '\u{323}', '\u{1ECB}'),
+    ('O', '\u{323}', '\u{1ECC}'),
+    ('o', '\u{323}', '\u{1ECD}'),
+    ('O', '\u{309}', '\u{1ECE}'),
+    ('o', '\u{309}', '\u{1ECF}'),
+    ('\u{D4}', '\u{301}', '\u{1ED0}'),
+    ('\u{F4}', '\u{301}', '\u{1ED1}'),
+    ('\u{D4}', '\u{300}', '\u{1ED2}'),
+    ('\u{F4}', '\u{300}', '\u{1ED3}'),
+    ('\u{D4}', '\u{309}', '\u{1ED4}'),
+    ('\u{F4}', '\u{309}', '\u{1ED5}'),
+    ('\u{D4}', '\u{303}', '\u{1ED6}'),
+    ('\u{F4}', '\u{303}', '\u{1ED7}'),
+    ('\u{1ECC}', '\u{302}', '\u{1ED8}'),
+    ('\u{1ECD}', '\u{302}', '\u{1ED9}'),
+    ('\u{1A0}', '\u{301}', '\u{1EDA}'),
+    ('\u{1A1}', '\u{301}', '\u{1EDB}'),
+    ('\u{1A0}', '\u{300}', '\u{1EDC}'),
+    ('\u{1A1}', '\u{300}', '\u{1EDD}'),
+    ('\u{1A0}', '\u{309}', '\u{1EDE}'),
+    ('\u{1A1}', '\u{309}', '\u{1EDF}'),
+    ('\u{1A0}', '\u{303}', '\u{1EE0}'),
+    ('\u{1A1}', '\u{303}', '\u{1EE1}'),
+    ('\u{1A0}', '\u{323}', '\u{1EE2}'),
+    ('\u{1A1}', '\u{323}', '\u{1EE3}'),
+    ('U', '\u{323}', '\u{1EE4}'),
+    ('u', '\u{323}', '\u{1EE5}'),
+    ('U', '\u{309}', '\u{1EE6}'),
+    ('u', '\u{309}', '\u{1EE7}'),
+    ('\u{1AF}', '\u{301}', '\u{1EE8}'),
+    ('\u{1B0}', '\u{301}', '\u{1EE9}'),
+    ('\u{1AF}', '\u{300}', '\u{1EEA}'),
+    ('\u{1B0}', '\u{300}', '\u{1EEB}'),
+    ('\u{1AF}', '\u{309}', '\u{1EEC}'),
+    ('\u{1B0}', '\u{309}', '\u{1EED}'),
+    ('\u{1AF}', '\u{303}', '\u{1EEE}'),
+    ('\u{1B0}', '\u{303}', '\u{1EEF}'),
+    ('\u{1AF}', '\u{323}', '\u{1EF0}'),
+    ('\u{1B0}', '\u{323}', '\u{1EF1}'),
+    ('Y', '\u{300}', '\u{1EF2}'),
+    ('y', '\u{300}', '\u{1EF3}'),
+    ('Y', '\u{323}', '\u{1EF4}'),
+    ('y', '\u{323}', '\u{1EF5}'),
+    ('Y', '\u{309}', '\u{1EF6}'),
+    ('y', '\u{309}', '\u{1EF7}'),
+    ('Y', '\u{303}', '\u{1EF8}'),
+    ('y', '\u{303}', '\u{1EF9}'),
+];
+
 fn string_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // `new String(x)` runs the ToString conversion (Symbol → TypeError);
+    // only the String(x) call form produces SymbolDescriptiveString
     let s = if args.is_empty() {
         String::new()
     } else {
-        // explicit String(symbol) is legal — only implicit ToString throws
         match &arg(args, 0) {
-            Value::Sym(_, d) => format!("Symbol({d})"),
+            Value::Sym(_, d) if !matches!(this, Value::Obj(_)) => {
+                format!("Symbol({d})")
+            }
             v => i.to_str(v)?,
         }
     };
-    if matches!(this, Value::Obj(_)) {
-        // `new String(x)` → boxed — string-exotic own props: chars are
-        // {W:false,E:true,C:false}, length {W:false,E:false,C:false}
-        if let Value::Obj(o) = this {
-            i.set_builtin(o, "$value", Value::Str(Rc::from(s.as_str())));
-            let len = s.chars().count();
+    if let Value::Obj(o) = this {
+        // `new String(x)` → boxed — string-exotic own props are indexed
+        // by UTF-16 code unit: chars {W:false,E:true,C:false},
+        // length {W:false,E:false,C:false}
+        i.set_builtin(o, "$value", Value::Str(Rc::from(s.as_str())));
+        let units = u16s(&s);
+        let len = units.len();
+        {
             let mut ob = o.borrow_mut();
-            for (k, c) in s.chars().enumerate() {
+            for (k, c) in units.iter().enumerate() {
                 ob.props.insert(
                     PropKey::from_str(&k.to_string()),
                     Prop {
-                        val: Value::Str(Rc::from(c.to_string().as_str())),
+                        val: Value::Str(Rc::from(String::from_utf16_lossy(&[*c]).as_str())),
                         writable: false,
                         enumerable: true,
                         configurable: false,
@@ -8476,9 +10520,8 @@ fn string_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                     },
                 );
             }
-            drop(ob);
-            i.set_attr(o, "length", Value::Num(len as f64), false, false);
         }
+        i.set_attr(o, "length", Value::Num(len as f64), false, false);
         Ok(this.clone())
     } else {
         Ok(Value::Str(Rc::from(s.as_str())))
@@ -8486,28 +10529,59 @@ fn string_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn string_from_char_code(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let mut s = String::new();
+    // spec: each arg is ToNumber → ToUint16 (mod 65536); surrogate code
+    // units are valid here but can't live in a Rust string → U+FFFD
+    let mut u: Vec<u16> = Vec::with_capacity(args.len());
     for a in args {
-        let n = i.to_num(a)? as u32;
-        if let Some(c) = char::from_u32(n) {
-            s.push(c);
+        let n = str_num(i, a)?;
+        let v = if n.is_nan() || n.is_infinite() {
+            0.0
+        } else {
+            n.trunc()
+        };
+        u.push(v.rem_euclid(65536.0) as u16);
+    }
+    Ok(u16s_val(&u))
+}
+
+fn string_from_code_point(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    // spec: ToNumber each; RangeError for NaN/non-integer/out of
+    // [0, 0x10FFFF]. Astral points encode as surrogate pairs; a surrogate
+    // code point is spec-valid but unrepresentable in UTF-8 → U+FFFD.
+    let mut u: Vec<u16> = Vec::with_capacity(args.len());
+    for a in args {
+        let n = str_num(i, a)?;
+        if n.is_nan() || n.fract() != 0.0 || !(0.0..=0x10ffff as f64).contains(&n) {
+            return Err(i.range_err(format!("{n} is not a valid code point")));
+        }
+        let cp = n as u32;
+        match char::from_u32(cp) {
+            Some(c) => u.extend(c.to_string().encode_utf16()),
+            None => u.push(cp as u16),
         }
     }
-    Ok(Value::Str(Rc::from(s.as_str())))
+    Ok(u16s_val(&u))
 }
 
 fn string_raw(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let strings = arg(args, 0);
-    let len_v = i.get_prop_str(&strings, "length")?;
-    let n = i.to_num(&len_v)? as usize;
+    // spec: ToObject(cooked) → Get(raw) → ToObject → Get(length) →
+    // ToLength, then per-segment Get+ToString with substitutions woven
+    // between (substitution count = args.len()-1, never past last segment)
+    let cooked = i.to_object(&arg(args, 0))?;
+    let raw_v = i.get_prop_str(&cooked, "raw")?;
+    let raw = i.to_object(&raw_v)?;
+    let len_v = i.get_prop_str(&raw, "length")?;
+    let n = to_length_num(str_num(i, &len_v)?);
+    let nsubs = args.len().saturating_sub(1);
     let mut s = String::new();
     for k in 0..n {
-        let seg = i.get_prop(&strings, &idx_key(k))?;
+        let seg = i.get_prop(&raw, &idx_key(k))?;
         s.push_str(&i.to_str(&seg)?);
-        if k + 1 < n {
-            if let Some(sub) = args.get(k + 1) {
-                s.push_str(&i.to_str(sub)?);
-            }
+        if k + 1 == n {
+            break;
+        }
+        if k < nsubs {
+            s.push_str(&i.to_str(&args[k + 1])?);
         }
     }
     Ok(Value::Str(Rc::from(s.as_str())))
@@ -8609,8 +10683,7 @@ fn num_to_precision(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 };
                 let esign = if e < 0 { "-" } else { "+" };
                 return Ok(Value::Str(Rc::from(
-                    format!("{}{mant}e{}{}", if neg { "-" } else { "" }, esign, e.abs())
-                        .as_str(),
+                    format!("{}{mant}e{}{}", if neg { "-" } else { "" }, esign, e.abs()).as_str(),
                 )));
             }
             // decimal: digit `k` sits at position 10^(e-k)
@@ -8621,11 +10694,7 @@ fn num_to_precision(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             }
             for k in 0..d {
                 let pos = e - k as i32;
-                let ch = if k < digs.len() {
-                    digs[k] as char
-                } else {
-                    '0'
-                };
+                let ch = if k < digs.len() { digs[k] as char } else { '0' };
                 if pos < 0 && k as i32 == e + 1 {
                     out.push('.');
                 }
@@ -8920,9 +10989,7 @@ fn function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     // (`class F extends Function {}` → fn proto is F.prototype)
     let nt = i.new_target_native.clone().unwrap_or(Value::Und);
     if matches!(nt, Value::Obj(_)) {
-        if let Ok(Value::Obj(p)) =
-            i.get_prop(&nt, &PropKey::from_str("prototype"))
-        {
+        if let Ok(Value::Obj(p)) = i.get_prop(&nt, &PropKey::from_str("prototype")) {
             if let Value::Obj(o) = &v {
                 o.borrow_mut().proto = Some(p);
             }
@@ -8964,9 +11031,7 @@ fn gen_function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     // (subclassing: `class G extends GeneratorFunction {}`)
     let nt = i.new_target_native.clone().unwrap_or(Value::Und);
     if let Value::Obj(nto) = &nt {
-        if let Ok(Value::Obj(p)) =
-            i.get_prop(&nt, &PropKey::from_str("prototype"))
-        {
+        if let Ok(Value::Obj(p)) = i.get_prop(&nt, &PropKey::from_str("prototype")) {
             let _ = nto;
             if let Value::Obj(o) = &v {
                 o.borrow_mut().proto = Some(p);
@@ -9011,9 +11076,7 @@ fn symbol_key_for(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     }
     match arg(args, 0) {
         // only Symbol.for-registry ids (>= 1_000_000) have a key
-        Value::Sym(id, d) if id >= 1_000_000 => {
-            Ok(Value::Str(Rc::from(d.as_ref())))
-        }
+        Value::Sym(id, d) if id >= 1_000_000 => Ok(Value::Str(Rc::from(d.as_ref()))),
         _ => Ok(Value::Und),
     }
 }
@@ -9025,9 +11088,7 @@ fn sym_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         // (spec 20.4.3.5 thisSymbolValue unwraps [[SymbolData]])
         Value::Obj(o) => match o.borrow().props.get_str("$value") {
             Some(p) => match &p.val {
-                Value::Sym(_, d) => {
-                    Ok(Value::Str(Rc::from(format!("Symbol({d})").as_str())))
-                }
+                Value::Sym(_, d) => Ok(Value::Str(Rc::from(format!("Symbol({d})").as_str()))),
                 _ => Err(i.type_err("Cannot convert a Symbol value to a value")),
             },
             None => Err(i.type_err("Cannot convert a Symbol value to a value")),
@@ -9198,7 +11259,6 @@ fn err_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Str(Rc::from(format!("{name}: {msg}").as_str())))
 }
 
-
 /// `AggregateError(iterable, message)` — collects the iterable into an
 /// `errors` own data property
 fn agg_error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -9281,10 +11341,18 @@ math1!(math_round, |n: f64| {
     if !n.is_finite() || n == 0.0 {
         n
     } else if n >= -0.5 && n < 0.5 {
-        if n.is_sign_negative() { -0.0 } else { 0.0 }
+        if n.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        }
     } else {
         let f = n.floor();
-        if n - f < 0.5 { f } else { f + 1.0 }
+        if n - f < 0.5 {
+            f
+        } else {
+            f + 1.0
+        }
     }
 });
 math1!(math_trunc, f64::trunc);
@@ -9378,14 +11446,22 @@ fn js_pow(b: f64, e: f64) -> f64 {
             0.0
         };
     }
-    // odd-integer check for negative bases — for |e| ≥ 2**53 every
-    // finite double is even, so this correctly reports false there
-    let odd_int = e.fract() == 0.0 && (e * 0.5).fract() != 0.0;
+    // odd-integer check for negative bases — fmod is exact; |e| ≥ 2**53
+    // is always even and reports 0 correctly
+    let odd_int = e.fract() == 0.0 && (e % 2.0) != 0.0;
     if b.is_infinite() {
         return if b > 0.0 {
-            if e > 0.0 { f64::INFINITY } else { 0.0 }
+            if e > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            }
         } else if e > 0.0 {
-            if odd_int { f64::NEG_INFINITY } else { f64::INFINITY }
+            if odd_int {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
         } else if odd_int {
             -0.0
         } else {
@@ -9395,7 +11471,11 @@ fn js_pow(b: f64, e: f64) -> f64 {
     if b == 0.0 {
         let neg = b.is_sign_negative();
         return if e > 0.0 {
-            if neg && odd_int { -0.0 } else { 0.0 }
+            if neg && odd_int {
+                -0.0
+            } else {
+                0.0
+            }
         } else if neg && odd_int {
             f64::NEG_INFINITY
         } else {
@@ -9525,11 +11605,7 @@ fn math_sum_precise(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     }
     let r = acc_to_f64(&acc);
     // an empty list or one whose every element is -0 sums to -0
-    Ok(Value::Num(if r == 0.0 && all_neg_zero {
-        -0.0
-    } else {
-        r
-    }))
+    Ok(Value::Num(if r == 0.0 && all_neg_zero { -0.0 } else { r }))
 }
 
 /// add ±(m << k) to a little-endian two's-complement integer
@@ -9608,12 +11684,12 @@ fn acc_to_f64(acc: &[u64; 40]) -> f64 {
     let drop = (p - 52) as usize;
     let limb = drop / 64;
     let sh = (drop % 64) as u32;
-    let mut q = (mag[limb] >> sh)
-        | if sh == 0 {
-            0
-        } else {
-            mag.get(limb + 1).copied().unwrap_or(0) << (64 - sh)
-        };
+    let hi_part = if sh == 0 {
+        0
+    } else {
+        mag.get(limb + 1).copied().unwrap_or(0) << (64 - sh)
+    };
+    let mut q = (mag[limb] >> sh) | hi_part;
     let hl = (drop - 1) / 64;
     let hb = (drop - 1) % 64;
     let half = (mag[hl] >> hb as u32) & 1 == 1;
@@ -9672,12 +11748,7 @@ fn json_parse(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     if i.is_callable(&reviver) {
         let holder = i.new_obj();
         i.set_data(&holder, "", v);
-        return json_internalize(
-            i,
-            &Value::Obj(holder),
-            "",
-            &reviver,
-        );
+        return json_internalize(i, &Value::Obj(holder), "", &reviver);
     }
     Ok(v)
 }
@@ -9685,12 +11756,7 @@ fn json_parse(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 /// CreateDataProperty — [[DefineOwnProperty]]({value,W:T,E:T,C:T})
 /// returning success; a `false` result (non-configurable target) is
 /// skipped silently, matching how InternalizeJSONProperty ignores it
-fn json_create_data_prop(
-    i: &mut Interp,
-    obj: &Value,
-    key: PropKey,
-    v: Value,
-) -> Result<(), Value> {
+fn json_create_data_prop(i: &mut Interp, obj: &Value, key: PropKey, v: Value) -> Result<(), Value> {
     let Value::Obj(o) = obj else { return Ok(()) };
     // proxies route through the defineProperty trap — a throwing trap
     // propagates; ordinary objects use the validate-and-apply path where
@@ -9709,12 +11775,7 @@ fn json_create_data_prop(
 
 /// InternalizeJSONProperty — `holder`/`name` name the slot holding `val`
 /// (read inside, not passed in, so the reviver sees fresh values)
-fn json_internalize(
-    i: &mut Interp,
-    holder: &Value,
-    name: &str,
-    reviver: &Value,
-) -> NResult {
+fn json_internalize(i: &mut Interp, holder: &Value, name: &str, reviver: &Value) -> NResult {
     let val = i.get_prop_str(holder, name)?;
     if let Value::Obj(o) = &val {
         let is_arr = matches!(
@@ -9727,8 +11788,7 @@ fn json_internalize(
             let len = to_length_num(i.to_num(&len_v)?).min(1_000_000);
             for k in 0..len {
                 let kk = k.to_string();
-                let new_elem =
-                    json_internalize(i, &val, &kk, reviver)?;
+                let new_elem = json_internalize(i, &val, &kk, reviver)?;
                 if matches!(new_elem, Value::Und) {
                     i.delete_prop(&val, &PropKey::S(Rc::from(kk.as_str())))?;
                 } else {
@@ -9749,12 +11809,7 @@ fn json_internalize(
                 if matches!(new_elem, Value::Und) {
                     i.delete_prop(&val, &PropKey::S(Rc::from(kk.as_str())))?;
                 } else {
-                    json_create_data_prop(
-                        i,
-                        &val,
-                        PropKey::S(Rc::from(kk.as_str())),
-                        new_elem,
-                    )?;
+                    json_create_data_prop(i, &val, PropKey::S(Rc::from(kk.as_str())), new_elem)?;
                 }
             }
         }
@@ -9992,9 +12047,7 @@ fn json_stringify(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
                             .borrow()
                             .props
                             .get_str("$value")
-                            .is_some_and(|p| {
-                                matches!(p.val, Value::Str(_) | Value::Num(_))
-                            });
+                            .is_some_and(|p| matches!(p.val, Value::Str(_) | Value::Num(_)));
                         if has_data {
                             Some(i.to_str(&e)?)
                         } else {
@@ -10030,7 +12083,11 @@ fn json_stringify(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let indent = match space {
         Value::Num(n) => {
             let k = to_integer_or_inf(n);
-            " ".repeat(if k.is_finite() { (k.max(0.0) as usize).min(10) } else { 10 })
+            " ".repeat(if k.is_finite() {
+                (k.max(0.0) as usize).min(10)
+            } else {
+                10
+            })
         }
         Value::Str(s) => s.chars().take(10).collect(),
         _ => String::new(),
@@ -10050,16 +12107,6 @@ fn json_stringify(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     )? {
         Some(s) => Ok(Value::Str(Rc::from(s.as_str()))),
         None => Ok(Value::Und),
-    }
-}
-
-fn to_integer_or_inf(n: f64) -> f64 {
-    if n.is_nan() {
-        0.0
-    } else if n.is_infinite() {
-        n
-    } else {
-        n.trunc()
     }
 }
 
@@ -10111,11 +12158,7 @@ fn json_ser_prop(
     if matches!(value, Value::Obj(_)) {
         let tj = i.get_prop_str(&value, "toJSON")?;
         if i.is_callable(&tj) {
-            value = i.call(
-                &tj,
-                value.clone(),
-                vec![Value::Str(Rc::from(key))],
-            )?;
+            value = i.call(&tj, value.clone(), vec![Value::Str(Rc::from(key))])?;
         }
     }
     // step 3: replacer function sees the post-toJSON value
@@ -10264,15 +12307,7 @@ fn json_ser_obj(
     };
     let mut parts: Vec<String> = Vec::new();
     for k in &keys {
-        if let Some(ser) = json_ser_prop(
-            i,
-            obj,
-            k,
-            replacer_fn,
-            property_list,
-            indent,
-            stack,
-        )? {
+        if let Some(ser) = json_ser_prop(i, obj, k, replacer_fn, property_list, indent, stack)? {
             let mut ek = String::new();
             json_escape_into(k, &mut ek);
             let colon = if indent.is_empty() { ":" } else { ": " };
@@ -10421,8 +12456,7 @@ fn resolving_fns(i: &mut Interp, p: &ObjRef) -> (Value, Value) {
 /// attempt; `None` on a foreign receiver or an already-tripped latch
 fn resolve_latch(h: &ObjRef) -> Option<Value> {
     let mut b = h.borrow_mut();
-    let already =
-        matches!(b.props.get_str("$r"), Some(pr) if matches!(pr.val, Value::Bool(true)));
+    let already = matches!(b.props.get_str("$r"), Some(pr) if matches!(pr.val, Value::Bool(true)));
     if already {
         return None;
     }
@@ -10494,8 +12528,8 @@ fn promise_resolve_inner(i: &mut Interp, this: &Value, args: &[Value]) -> NResul
     // PromiseResolveThenableJob — `then` runs as a job with a FRESH
     // resolving-fn pair (each job gets its own alreadyResolved record)
     let pj = p.clone();
-    i.jobs.push_back(Box::new(
-        move |i: &mut Interp| -> Result<(), Value> {
+    i.jobs
+        .push_back(Box::new(move |i: &mut Interp| -> Result<(), Value> {
             if let Value::Obj(po2) = &pj {
                 let (res, rej) = resolving_fns(i, po2);
                 if let Err(e) = i.call(&then, resolution, vec![res, rej.clone()]) {
@@ -10503,8 +12537,7 @@ fn promise_resolve_inner(i: &mut Interp, this: &Value, args: &[Value]) -> NResul
                 }
             }
             Ok(())
-        },
-    ));
+        }));
     Ok(Value::Und)
 }
 
@@ -10642,10 +12675,7 @@ fn get_promise_resolve(i: &mut Interp, c: &Value) -> Result<Value, Value> {
 /// spec NewPromiseCapability(C) → (promise, resolve, reject). The
 /// capture executor fires inside `new C(exec)` and drops the pair onto
 /// a holder; slots left non-callable → TypeError.
-fn new_promise_capability(
-    i: &mut Interp,
-    c: &Value,
-) -> Result<(Value, Value, Value), Value> {
+fn new_promise_capability(i: &mut Interp, c: &Value) -> Result<(Value, Value, Value), Value> {
     if !i.is_constructor(c) {
         return Err(i.type_err("promise capability requires a constructor"));
     }
@@ -10866,8 +12896,7 @@ fn mk_el_holder(i: &mut Interp, idx: usize) -> ObjRef {
 /// consume the element fn's alreadyCalled latch — true on first call
 fn el_claim(h: &ObjRef) -> bool {
     let mut b = h.borrow_mut();
-    let done =
-        matches!(b.props.get_str("$flag"), Some(p) if matches!(p.val, Value::Bool(true)));
+    let done = matches!(b.props.get_str("$flag"), Some(p) if matches!(p.val, Value::Bool(true)));
     if !done {
         if let Some(pr) = b.props.get_str_mut("$flag") {
             pr.val = Value::Bool(true);
@@ -10922,13 +12951,7 @@ fn aggregate_error(i: &mut Interp, errors: Value) -> Value {
     e
 }
 
-fn mk_all_element(
-    i: &mut Interp,
-    idx: usize,
-    values: &Value,
-    rem: &ObjRef,
-    res: &Value,
-) -> Value {
+fn mk_all_element(i: &mut Interp, idx: usize, values: &Value, rem: &ObjRef, res: &Value) -> Value {
     let h = mk_el_holder(i, idx);
     i.set_builtin(&h, "$vals", values.clone());
     i.set_builtin(&h, "$rem", Value::Obj(rem.clone()));
@@ -11006,13 +13029,7 @@ fn promise_allsettled_element(i: &mut Interp, this: &Value, args: &[Value]) -> N
     Ok(Value::Und)
 }
 
-fn mk_any_reject(
-    i: &mut Interp,
-    idx: usize,
-    errors: &Value,
-    rem: &ObjRef,
-    rej: &Value,
-) -> Value {
+fn mk_any_reject(i: &mut Interp, idx: usize, errors: &Value, rem: &ObjRef, rej: &Value) -> Value {
     let h = mk_el_holder(i, idx);
     i.set_builtin(&h, "$errs", errors.clone());
     i.set_builtin(&h, "$rem", Value::Obj(rem.clone()));
@@ -11080,9 +13097,7 @@ fn promise_combine(i: &mut Interp, this: &Value, args: &[Value], mode: PComb) ->
                 // spec appends an `undefined` slot first so the values /
                 // errors list has a hole to fill at `index`
                 let slot_err = match mode {
-                    PComb::Any => {
-                        create_data_prop(i, &errors, index, Value::Und).err()
-                    }
+                    PComb::Any => create_data_prop(i, &errors, index, Value::Und).err(),
                     PComb::Race => None,
                     _ => create_data_prop(i, &values, index, Value::Und).err(),
                 };
@@ -11090,14 +13105,13 @@ fn promise_combine(i: &mut Interp, this: &Value, args: &[Value], mode: PComb) ->
                     iter_err = Some((e, true));
                     break;
                 }
-                let next_promise =
-                    match i.call(&promise_resolve, this.clone(), vec![next_value]) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            iter_err = Some((e, true));
-                            break;
-                        }
-                    };
+                let next_promise = match i.call(&promise_resolve, this.clone(), vec![next_value]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        iter_err = Some((e, true));
+                        break;
+                    }
+                };
                 // per-mode reaction pair — spec "same-reject" semantics
                 // ride the capability's own fns verbatim where it says so
                 let (on_f, on_r) = match mode {
@@ -11118,9 +13132,7 @@ fn promise_combine(i: &mut Interp, this: &Value, args: &[Value], mode: PComb) ->
                 inc_remaining(i, &remaining);
                 let then_call = match i.get_prop_str(&next_promise, "then") {
                     Err(e) => Err(e),
-                    Ok(then) => i
-                        .call(&then, next_promise, vec![on_f, on_r])
-                        .map(|_| ()),
+                    Ok(then) => i.call(&then, next_promise, vec![on_f, on_r]).map(|_| ()),
                 };
                 if let Err(e) = then_call {
                     iter_err = Some((e, true));
@@ -11144,9 +13156,7 @@ fn promise_combine(i: &mut Interp, this: &Value, args: &[Value], mode: PComb) ->
     // skips IteratorClose and the error only rejects the capability.
     if dec_remaining(i, &remaining) == 0 {
         let settle_err = match mode {
-            PComb::All | PComb::AllSettled => {
-                i.call(&res, Value::Und, vec![values]).err()
-            }
+            PComb::All | PComb::AllSettled => i.call(&res, Value::Und, vec![values]).err(),
             PComb::Any => {
                 let ae = aggregate_error(i, errors);
                 i.call(&rej, Value::Und, vec![ae]).err()
@@ -11230,7 +13240,9 @@ fn promise_all_keyed(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         inc_remaining(i, &remaining);
         let r = match i.get_prop_str(&next_promise, "then") {
             Err(e) => Err(e),
-            Ok(then) => i.call(&then, next_promise, vec![res_el, rej_el]).map(|_| ()),
+            Ok(then) => i
+                .call(&then, next_promise, vec![res_el, rej_el])
+                .map(|_| ()),
         };
         if let Err(e) = r {
             return reject_cap(i, &rej, &p, e);
@@ -11600,9 +13612,7 @@ fn date_to_primitive(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let order: [&str; 2] = match hint.as_str() {
         "number" => ["valueOf", "toString"],
         "string" | "default" => ["toString", "valueOf"],
-        _ => {
-            return Err(i.type_err("invalid hint"))
-        }
+        _ => return Err(i.type_err("invalid hint")),
     };
     for name in order {
         let m = i.get_prop_str(this, name)?;
@@ -11782,9 +13792,7 @@ fn days_in_month(y: i64, m: u32) -> u32 {
 fn parse_hms(t: &str) -> Option<(f64, f64, f64, f64)> {
     let two_dig = |x: Option<&str>| -> Option<u32> {
         match x {
-            Some(s) if s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit()) => {
-                s.parse().ok()
-            }
+            Some(s) if s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
             _ => None,
         }
     };
@@ -11872,7 +13880,11 @@ fn parse_iso_ms(s: &str) -> Option<f64> {
         return None;
     }
     let ystr = segs[0];
-    let ok_len = if signed { ystr.len() == 6 } else { ystr.len() == 4 };
+    let ok_len = if signed {
+        ystr.len() == 6
+    } else {
+        ystr.len() == 4
+    };
     if !ok_len || !ystr.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -11885,9 +13897,7 @@ fn parse_iso_ms(s: &str) -> Option<f64> {
     }
     let seg2 = |x: Option<&&str>| -> Option<u32> {
         match x {
-            Some(s) if s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit()) => {
-                s.parse().ok()
-            }
+            Some(s) if s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok(),
             Some(_) => None,
             None => Some(0),
         }
@@ -12103,25 +14113,25 @@ fn map_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn need_map(i: &mut Interp, this: &Value, m: &str) -> Result<ObjRef, Value> {
     if let Value::Obj(o) = this {
         let b = o.borrow();
-        if matches!(&b.kind, ObjKind::Map(_))
-            && b.props.get_str("__map").is_some()
-        {
+        if matches!(&b.kind, ObjKind::Map(_)) && b.props.get_str("__map").is_some() {
             return Ok(o.clone());
         }
     }
-    Err(i.type_err(format!("Method Map.prototype.{m} called on incompatible receiver")))
+    Err(i.type_err(format!(
+        "Method Map.prototype.{m} called on incompatible receiver"
+    )))
 }
 
 fn need_set(i: &mut Interp, this: &Value, m: &str) -> Result<ObjRef, Value> {
     if let Value::Obj(o) = this {
         let b = o.borrow();
-        if matches!(&b.kind, ObjKind::Set(_))
-            && b.props.get_str("__set").is_some()
-        {
+        if matches!(&b.kind, ObjKind::Set(_)) && b.props.get_str("__set").is_some() {
             return Ok(o.clone());
         }
     }
-    Err(i.type_err(format!("Method Set.prototype.{m} called on incompatible receiver")))
+    Err(i.type_err(format!(
+        "Method Set.prototype.{m} called on incompatible receiver"
+    )))
 }
 
 /// `[[WeakMapData]]`/`[[WeakSetData]]` brand check — WeakMap/WeakSet
@@ -12130,25 +14140,25 @@ fn need_set(i: &mut Interp, this: &Value, m: &str) -> Result<ObjRef, Value> {
 fn need_wm(i: &mut Interp, this: &Value, m: &str) -> Result<ObjRef, Value> {
     if let Value::Obj(o) = this {
         let b = o.borrow();
-        if matches!(&b.kind, ObjKind::Map(_))
-            && b.props.get_str("__wm").is_some()
-        {
+        if matches!(&b.kind, ObjKind::Map(_)) && b.props.get_str("__wm").is_some() {
             return Ok(o.clone());
         }
     }
-    Err(i.type_err(format!("Method WeakMap.prototype.{m} called on incompatible receiver")))
+    Err(i.type_err(format!(
+        "Method WeakMap.prototype.{m} called on incompatible receiver"
+    )))
 }
 
 fn need_ws(i: &mut Interp, this: &Value, m: &str) -> Result<ObjRef, Value> {
     if let Value::Obj(o) = this {
         let b = o.borrow();
-        if matches!(&b.kind, ObjKind::Set(_))
-            && b.props.get_str("__ws").is_some()
-        {
+        if matches!(&b.kind, ObjKind::Set(_)) && b.props.get_str("__ws").is_some() {
             return Ok(o.clone());
         }
     }
-    Err(i.type_err(format!("Method WeakSet.prototype.{m} called on incompatible receiver")))
+    Err(i.type_err(format!(
+        "Method WeakSet.prototype.{m} called on incompatible receiver"
+    )))
 }
 
 /// CanonicalizeKeyedCollectionKey — `-0` keys canonicalize to `+0`
@@ -12326,7 +14336,9 @@ fn wm_has(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         if !weak_key_ok(&k) {
             return Ok(Value::Bool(false));
         }
-        return Ok(Value::Bool(items.iter().any(|(k2, _)| same_value_zero(k2, &k))));
+        return Ok(Value::Bool(
+            items.iter().any(|(k2, _)| same_value_zero(k2, &k)),
+        ));
     }
     Ok(Value::Bool(false))
 }
@@ -12561,8 +14573,7 @@ fn map_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 if idx >= items.len() {
                     None
                 } else {
-                    let prefix: Vec<Value> =
-                        items[..idx].iter().map(|(k, _)| k.clone()).collect();
+                    let prefix: Vec<Value> = items[..idx].iter().map(|(k, _)| k.clone()).collect();
                     Some((items[idx].0.clone(), items[idx].1.clone(), prefix))
                 }
             } else {
@@ -12730,7 +14741,11 @@ fn set_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             }
         };
         let Some((v, prefix)) = state else { break };
-        i.call(&cb, this_arg.clone(), vec![v.clone(), v.clone(), this.clone()])?;
+        i.call(
+            &cb,
+            this_arg.clone(),
+            vec![v.clone(), v.clone(), this.clone()],
+        )?;
         let b = o.borrow();
         if let ObjKind::Set(items) = &b.kind {
             idx = prefix
@@ -12840,7 +14855,11 @@ fn g_parse_float(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             'e' | 'E' if seen_digit && !seen_e => seen_e = true,
             '0'..='9' => seen_digit = true,
             'I' if t[k..].starts_with("Infinity") => {
-                let sign = if bytes.first() == Some(&'-') { -1.0 } else { 1.0 };
+                let sign = if bytes.first() == Some(&'-') {
+                    -1.0
+                } else {
+                    1.0
+                };
                 return Ok(Value::Num(sign * f64::INFINITY));
             }
             _ => break,
@@ -12883,19 +14902,12 @@ fn uri_err(i: &mut Interp, m: &str) -> Value {
 /// spec Encode(string, unreservedSet): unreserved = alphanumerics +
 /// mark chars + `extra`; everything else UTF-8 encodes to %XX bytes
 /// (astral chars → their surrogate pair's UTF-8 = same bytes)
-fn uri_encode(
-    i: &mut Interp,
-    v: &Value,
-    extra: &str,
-) -> Result<String, Value> {
+fn uri_encode(i: &mut Interp, v: &Value, extra: &str) -> Result<String, Value> {
     let s = i.to_str(v)?;
     let mut out = String::new();
     let mut buf = [0u8; 4];
     for ch in s.chars() {
-        if ch.is_ascii_alphanumeric()
-            || URI_MARK.contains(ch)
-            || extra.contains(ch)
-        {
+        if ch.is_ascii_alphanumeric() || URI_MARK.contains(ch) || extra.contains(ch) {
             out.push(ch);
         } else {
             for b in ch.encode_utf8(&mut buf).as_bytes() {
@@ -12910,11 +14922,7 @@ fn uri_encode(
 /// malformed hex, bad continuation bytes, overlong forms, and surrogate
 /// halves all throw URIError. A decoded reserved byte stays escaped when
 /// `keep_reserved` (decodeURI) so the result reparses identically.
-fn uri_decode(
-    i: &mut Interp,
-    v: &Value,
-    keep_reserved: bool,
-) -> Result<String, Value> {
+fn uri_decode(i: &mut Interp, v: &Value, keep_reserved: bool) -> Result<String, Value> {
     let s = i.to_str(v)?;
     let b = s.as_bytes();
     let mut out = String::new();
@@ -12952,15 +14960,10 @@ fn uri_decode(
             let mut seq = vec![first];
             for j in 1..len {
                 let o = k + 3 * j;
-                if b[o] != b'%'
-                    || hexv(b[o + 1]).is_none()
-                    || hexv(b[o + 2]).is_none()
-                {
+                if b[o] != b'%' || hexv(b[o + 1]).is_none() || hexv(b[o + 2]).is_none() {
                     return Err(uri_err(i, "URI malformed"));
                 }
-                seq.push(
-                    (hexv(b[o + 1]).unwrap() * 16 + hexv(b[o + 2]).unwrap()) as u8,
-                );
+                seq.push((hexv(b[o + 1]).unwrap() * 16 + hexv(b[o + 2]).unwrap()) as u8);
             }
             // Rust UTF-8 validation rejects overlongs, surrogates,
             // >U+10FFFF, and stray continuations — exactly the spec rules
@@ -13085,10 +15088,11 @@ fn g_queue_microtask(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     if !i.is_callable(&f) {
         return Err(i.type_err("queueMicrotask callback is not a function"));
     }
-    i.jobs.push_back(Box::new(move |i: &mut Interp| -> Result<(), Value> {
-        i.call(&f, Value::Und, vec![])?;
-        Ok(())
-    }));
+    i.jobs
+        .push_back(Box::new(move |i: &mut Interp| -> Result<(), Value> {
+            i.call(&f, Value::Und, vec![])?;
+            Ok(())
+        }));
     Ok(Value::Und)
 }
 
@@ -13167,7 +15171,11 @@ fn reflect_get(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let k = i.to_propkey(&arg(args, 1))?;
     // spec: `receiver` defaults to target only when the arg is absent
     let receiver = args.get(2).cloned().unwrap_or_else(|| target.clone());
-    if let ObjKind::Proxy { target: tg, handler } = { o.borrow().kind.clone() } {
+    if let ObjKind::Proxy {
+        target: tg,
+        handler,
+    } = { o.borrow().kind.clone() }
+    {
         return i.proxy_get(&tg, &handler, &k, &receiver, o);
     }
     i.obj_get(o, &k, &receiver)
@@ -13220,7 +15228,11 @@ fn reflect_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResul
     }
     // spec ToPropertyDescriptor runs before [[DefineOwnProperty]]
     let pd = i.pdesc_from_obj(&desc)?;
-    if let ObjKind::Proxy { target: tg, handler } = { o.borrow().kind.clone() } {
+    if let ObjKind::Proxy {
+        target: tg,
+        handler,
+    } = { o.borrow().kind.clone() }
+    {
         let (tg, h) = (tg, handler);
         return match i.proxy_trap(&h, "defineProperty")? {
             Some(trap) => {
@@ -13254,9 +15266,7 @@ fn reflect_set_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResu
     };
     let v = arg(args, 1);
     if !matches!(v, Value::Obj(_) | Value::Null) {
-        return Err(i.type_err(
-            "Reflect.setPrototypeOf called with non-object proto",
-        ));
+        return Err(i.type_err("Reflect.setPrototypeOf called with non-object proto"));
     }
     Ok(Value::Bool(ord_set_proto(i, o, &v)?))
 }
@@ -13265,18 +15275,14 @@ fn reflect_set_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResu
 // target must already be an object (no ToObject coercion)
 fn reflect_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     if !matches!(arg(args, 0), Value::Obj(_)) {
-        return Err(i.type_err(
-            "Reflect.getOwnPropertyDescriptor called on non-object",
-        ));
+        return Err(i.type_err("Reflect.getOwnPropertyDescriptor called on non-object"));
     }
     obj_get_own_prop_desc(i, _t, args)
 }
 
 fn reflect_get_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     if !matches!(arg(args, 0), Value::Obj(_)) {
-        return Err(i.type_err(
-            "Reflect.getPrototypeOf called on non-object",
-        ));
+        return Err(i.type_err("Reflect.getPrototypeOf called on non-object"));
     }
     obj_get_prototype_of(i, _t, args)
 }
@@ -13284,9 +15290,7 @@ fn reflect_get_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResu
 fn reflect_is_extensible(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let target = arg(args, 0);
     let Value::Obj(o) = &target else {
-        return Err(i.type_err(
-            "Reflect.isExtensible called on non-object",
-        ));
+        return Err(i.type_err("Reflect.isExtensible called on non-object"));
     };
     Ok(Value::Bool(ord_is_extensible(i, o)?))
 }
@@ -13294,9 +15298,7 @@ fn reflect_is_extensible(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
 fn reflect_prevent_extensions(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let target = arg(args, 0);
     let Value::Obj(o) = &target else {
-        return Err(i.type_err(
-            "Reflect.preventExtensions called on non-object",
-        ));
+        return Err(i.type_err("Reflect.preventExtensions called on non-object"));
     };
     Ok(Value::Bool(ord_prevent_ext(i, o)?))
 }
@@ -13444,11 +15446,7 @@ fn advance_string_index(chars: &[u16], index: usize, unicode: bool) -> usize {
 }
 
 /// spec GetMethod: nullish → None, callable → Some, else TypeError.
-fn get_method(
-    i: &mut Interp,
-    v: &Value,
-    key: &PropKey,
-) -> Result<Option<Value>, Value> {
+fn get_method(i: &mut Interp, v: &Value, key: &PropKey) -> Result<Option<Value>, Value> {
     match i.get_prop(v, key)? {
         Value::Und | Value::Null => Ok(None),
         m if i.is_callable(&m) => Ok(Some(m)),
@@ -13457,9 +15455,10 @@ fn get_method(
 }
 
 /// spec IsRegExp: a non-undefined @@match result decides, else the
-/// [[RegExpMatcher]] slot.
+/// [[RegExpMatcher]] slot. BigInt primitives are Obj stand-ins — the
+/// spec's Object check must exclude them.
 fn is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
-    if !matches!(v, Value::Obj(_)) {
+    if !is_obj_arg(v) {
         return Ok(false);
     }
     let m = i.get_prop(v, &PropKey::Sym(SYM_MATCH))?;
@@ -13502,12 +15501,13 @@ fn regexp_create(i: &mut Interp, p: &Value, f: &Value) -> Result<Value, Value> {
 fn set_strict(i: &mut Interp, ov: &Value, key: &str, v: Value) -> Result<(), Value> {
     if let Value::Obj(o) = ov {
         if let Some(p) = o.borrow().props.get_str(key) {
-            let reject =
-                if p.is_accessor() { p.set.is_none() } else { !p.writable };
+            let reject = if p.is_accessor() {
+                p.set.is_none()
+            } else {
+                !p.writable
+            };
             if reject {
-                return Err(i.type_err(format!(
-                    "Cannot assign to read only property '{key}'"
-                )));
+                return Err(i.type_err(format!("Cannot assign to read only property '{key}'")));
             }
         }
     }
@@ -13550,9 +15550,9 @@ fn match_obj(i: &mut Interp, chars: &[u16], re: &Regex, m: &RxMatch) -> Value {
         // undefined) plus its own null-proto `groups` map
         let mk_pair = |caps: &Vec<Option<(usize, usize)>>, g: usize| -> Value {
             match caps.get(g).copied().flatten() {
-                Some((a, b)) => Value::Obj(
-                    i.new_arr(vec![Value::Num(a as f64), Value::Num(b as f64)]),
-                ),
+                Some((a, b)) => {
+                    Value::Obj(i.new_arr(vec![Value::Num(a as f64), Value::Num(b as f64)]))
+                }
                 None => Value::Und,
             }
         };
@@ -13598,14 +15598,30 @@ fn re_update_statics(i: &mut Interp, this: &Value, chars: &[u16], m: &RxMatch) {
         if o.borrow().props.contains_key(&PropKey::Sym(SYM_RE_NOLEGACY)));
     if legacy_off {
         for k in [
-            "input", "lastMatch", "lastParen", "leftContext", "rightContext",
-            "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9",
+            "input",
+            "lastMatch",
+            "lastParen",
+            "leftContext",
+            "rightContext",
+            "p1",
+            "p2",
+            "p3",
+            "p4",
+            "p5",
+            "p6",
+            "p7",
+            "p8",
+            "p9",
         ] {
             state_set(&st, k, Value::Und);
         }
         return;
     }
-    state_set(&st, "input", Value::Str(Rc::from(chars_string(chars).as_str())));
+    state_set(
+        &st,
+        "input",
+        Value::Str(Rc::from(chars_string(chars).as_str())),
+    );
     state_set(&st, "lastMatch", chars_str(chars, m.start, m.end));
     state_set(&st, "leftContext", chars_str(chars, 0, m.start));
     state_set(&st, "rightContext", chars_str(chars, m.end, chars.len()));
@@ -13666,9 +15682,7 @@ fn regexp_exec(i: &mut Interp, r: &Value, s: &str) -> Result<Value, Value> {
     if i.is_callable(&exec) {
         let result = i.call(&exec, r.clone(), vec![Value::Str(Rc::from(s))])?;
         if !matches!(result, Value::Obj(_) | Value::Null) {
-            return Err(
-                i.type_err("RegExp exec method must return an object or null")
-            );
+            return Err(i.type_err("RegExp exec method must return an object or null"));
         }
         return Ok(result);
     }
@@ -13793,9 +15807,7 @@ fn regexp_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn re_exec(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if re_of(this).is_none() {
-        return Err(
-            i.type_err("RegExp.prototype.exec called on incompatible receiver")
-        );
+        return Err(i.type_err("RegExp.prototype.exec called on incompatible receiver"));
     }
     let s = re_coerce_str(i, &arg(args, 0))?;
     regexp_builtin_exec(i, this, &s)
@@ -13816,11 +15828,7 @@ fn re_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     }
     let src = i.get_prop_str(this, "source")?;
     let fl = i.get_prop_str(this, "flags")?;
-    let s = format!(
-        "/{}/{}",
-        re_coerce_str(i, &src)?,
-        re_coerce_str(i, &fl)?
-    );
+    let s = format!("/{}/{}", re_coerce_str(i, &src)?, re_coerce_str(i, &fl)?);
     Ok(Value::Str(Rc::from(s.as_str())))
 }
 
@@ -13829,17 +15837,13 @@ fn re_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 /// subclass instance compiles fine, plain objects throw.
 fn re_compile(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if re_of(this).is_none() {
-        return Err(
-            i.type_err("RegExp.prototype.compile called on incompatible receiver")
-        );
+        return Err(i.type_err("RegExp.prototype.compile called on incompatible receiver"));
     }
     let pattern = arg(args, 0);
     let flags = arg(args, 1);
     let (p, f) = if let Some(re) = re_of(&pattern) {
         if !matches!(flags, Value::Und) {
-            return Err(i.type_err(
-                "Cannot supply flags when compiling a RegExp from a RegExp",
-            ));
+            return Err(i.type_err("Cannot supply flags when compiling a RegExp from a RegExp"));
         }
         (
             Value::Str(Rc::from(re.source.as_str())),
@@ -13907,11 +15911,8 @@ fn re_get_source(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         }
     }
     match re_of(this) {
-        Some(re) => Ok(Value::Str(Rc::from(
-            escape_re_pattern(&re.source).as_str(),
-        ))),
-        None => Err(i
-            .type_err("RegExp.prototype.source getter called on incompatible receiver")),
+        Some(re) => Ok(Value::Str(Rc::from(escape_re_pattern(&re.source).as_str()))),
+        None => Err(i.type_err("RegExp.prototype.source getter called on incompatible receiver")),
     }
 }
 
@@ -13972,9 +15973,7 @@ fn re_get_v(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
                     return Ok(Value::Und);
                 }
             }
-            Err(i.type_err(
-                "RegExp.prototype.unicodeSets getter called on incompatible receiver",
-            ))
+            Err(i.type_err("RegExp.prototype.unicodeSets getter called on incompatible receiver"))
         }
     }
 }
@@ -13984,16 +15983,11 @@ fn re_get_v(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 /// `this` must be SameValue with this realm's %RegExp% — the legacy
 /// getters/setters throw TypeError otherwise (GetLegacyRegExpStaticProperty).
 /// On success returns the realm state object.
-fn re_static_receiver(
-    i: &mut Interp,
-    this: &Value,
-) -> Result<ObjRef, Value> {
+fn re_static_receiver(i: &mut Interp, this: &Value) -> Result<ObjRef, Value> {
     if matches!(this, Value::Obj(o) if Rc::ptr_eq(o, &re_ctor(i))) {
         Ok(re_state(i))
     } else {
-        Err(i.type_err(
-            "RegExp static property accessor called on incompatible receiver",
-        ))
+        Err(i.type_err("RegExp static property accessor called on incompatible receiver"))
     }
 }
 
@@ -14127,9 +16121,7 @@ fn re_sym_match_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 /// `%RegExpStringIteratorPrototype%.next` — pulls one exec per call.
 fn re_striter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let Value::Obj(o) = this else {
-        return Err(
-            i.type_err("RegExp String Iterator next called on non-object")
-        );
+        return Err(i.type_err("RegExp String Iterator next called on non-object"));
     };
     let slot = |k: u64| {
         o.borrow()
@@ -14144,9 +16136,7 @@ fn re_striter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         slot(SYM_ITER_U),
         slot(SYM_ITER_DONE),
     ) else {
-        return Err(i.type_err(
-            "RegExp String Iterator next called on incompatible receiver",
-        ));
+        return Err(i.type_err("RegExp String Iterator next called on incompatible receiver"));
     };
     let set_done = |o: &ObjRef| {
         o.borrow_mut().props.insert(

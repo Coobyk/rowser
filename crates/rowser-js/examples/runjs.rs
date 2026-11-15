@@ -9,7 +9,8 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(10);
     if secs > 0 {
-        ctx.interp.arm_deadline(std::time::Duration::from_secs(secs));
+        ctx.interp
+            .arm_deadline(std::time::Duration::from_secs(secs));
     }
     match ctx.eval(&src) {
         Ok(v) => println!("OK: {:?}", ctx.interp.inspect(&v, 0)),

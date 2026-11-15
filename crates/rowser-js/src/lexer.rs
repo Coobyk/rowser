@@ -193,6 +193,12 @@ fn keyword(s: &str) -> Option<Kw> {
 #[derive(Debug, Clone)]
 pub struct Token {
     pub tok: Tok,
+    /// char-index of the token's first char in the source (the lexer
+    /// works on `chars: Vec<char>` — this is a CHAR index, not bytes)
+    pub pos: usize,
+    /// token length in chars — `pos + len` is the char-index just past
+    /// the token's last char
+    pub len: usize,
     pub line: u32,
     pub col: u32,
     /// true if a newline separated this token from the previous one (for ASI)
@@ -278,10 +284,13 @@ impl Lexer {
         loop {
             self.skip_trivia()?;
             let (line, col, newline_before) = (self.line, self.col, self.newline);
+            let tok_start = self.i;
             self.newline = false;
             let Some(c) = self.peek() else {
                 out.push(Token {
                     tok: Tok::Eof,
+                    pos: tok_start,
+                    len: 0,
                     line,
                     col,
                     newline_before,
@@ -365,6 +374,8 @@ impl Lexer {
             self.newline = false;
             out.push(Token {
                 tok,
+                pos: tok_start,
+                len: self.i - tok_start,
                 line,
                 col,
                 newline_before,
@@ -380,8 +391,7 @@ impl Lexer {
                 // JS WhiteSpace = TAB/VT/FF/SP/NBSP/FEFF + Zs; NEL and
                 // FS/GS/RS/US are not whitespace
                 Some(c)
-                    if (c.is_whitespace()
-                        && !matches!(c, '\u{85}' | '\u{1c}'..='\u{1f}'))
+                    if (c.is_whitespace() && !matches!(c, '\u{85}' | '\u{1c}'..='\u{1f}'))
                         || c == '\u{feff}' =>
                 {
                     self.bump();
@@ -400,9 +410,7 @@ impl Lexer {
                 }
                 // Annex B `-->` opens a line comment only at line start
                 Some('-')
-                    if self.newline
-                        && self.peek2() == Some('-')
-                        && self.peek3() == Some('>') =>
+                    if self.newline && self.peek2() == Some('-') && self.peek3() == Some('>') =>
                 {
                     self.skip_line_comment();
                 }
@@ -511,10 +519,7 @@ impl Lexer {
     }
 
     /// scan digits of one class; `_` is legal only between two digits.
-    fn scan_num_digits(
-        &mut self,
-        pred: impl Fn(char) -> bool,
-    ) -> Result<String, Error> {
+    fn scan_num_digits(&mut self, pred: impl Fn(char) -> bool) -> Result<String, Error> {
         let mut out = String::new();
         let mut last_digit = false;
         loop {
@@ -526,18 +531,12 @@ impl Lexer {
                 }
                 Some('_') => {
                     if !last_digit {
-                        return Err(self.err(
-                            "numeric separator must be between digits",
-                        ));
+                        return Err(self.err("numeric separator must be between digits"));
                     }
                     self.bump();
                     match self.peek() {
                         Some(c2) if pred(c2) => {}
-                        _ => {
-                            return Err(self.err(
-                                "numeric separator must be between digits",
-                            ))
-                        }
+                        _ => return Err(self.err("numeric separator must be between digits")),
                     }
                     last_digit = false;
                 }
@@ -563,9 +562,9 @@ impl Lexer {
                 if v.is_empty() {
                     return Err(self.err("missing digits in numeric literal"));
                 }
-                let n = v.chars().fold(0f64, |a, c| {
-                    a * r as f64 + c.to_digit(r).unwrap() as f64
-                });
+                let n = v
+                    .chars()
+                    .fold(0f64, |a, c| a * r as f64 + c.to_digit(r).unwrap() as f64);
                 if self.peek() == Some('n') {
                     self.bump();
                     let p = match r {
@@ -581,9 +580,7 @@ impl Lexer {
         }
         // legacy octal: `0` followed by octal digits (may include 8/9 which
         // makes it a NonOctalDecimalIntegerLiteral — still a strict error)
-        if self.peek() == Some('0')
-            && self.peek2().is_some_and(|c| c.is_ascii_digit())
-        {
+        if self.peek() == Some('0') && self.peek2().is_some_and(|c| c.is_ascii_digit()) {
             let mut oct = true;
             let mut digits = String::new();
             let mut has_underscore = false;
@@ -626,11 +623,7 @@ impl Lexer {
                                 s.push(self.bump().unwrap());
                             }
                         }
-                        '_' => {
-                            return Err(self.err(
-                                "numeric separator must be between digits",
-                            ))
-                        }
+                        '_' => return Err(self.err("numeric separator must be between digits")),
                         _ => break,
                     }
                 }
@@ -653,9 +646,7 @@ impl Lexer {
         // leading-zero decimal like `0` alone; `0_…` is invalid —
         // separators can't follow a leading zero
         if self.peek() == Some('0') && self.peek2() == Some('_') {
-            return Err(self.err(
-                "numeric separator must be between digits",
-            ));
+            return Err(self.err("numeric separator must be between digits"));
         }
         let mut s = self.scan_num_digits(|c| c.is_ascii_digit())?;
         let mut seen_dot = false;
@@ -687,9 +678,7 @@ impl Lexer {
             if seen_dot || seen_exp {
                 return Err(self.err("bigint literal must be an integer"));
             }
-            return self.number_tail_ok(Tok::BigInt(std::rc::Rc::from(
-                s.as_str(),
-            )));
+            return self.number_tail_ok(Tok::BigInt(std::rc::Rc::from(s.as_str())));
         }
         let _ = seen_exp;
         self.number_tail(s)
@@ -773,8 +762,7 @@ impl Lexer {
                                 self.bump();
                                 let mut v: u32 = 0;
                                 let mut any = false;
-                                while let Some(d) = self.peek().and_then(|c| c.to_digit(16))
-                                {
+                                while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
                                     v = v.saturating_mul(16).saturating_add(d);
                                     any = true;
                                     self.bump();
@@ -794,17 +782,13 @@ impl Lexer {
                             let ch = if (0xd800..=0xdbff).contains(&cp) {
                                 let (si, scol) = (self.i, self.col);
                                 let mut paired = None;
-                                if self.peek() == Some('\\')
-                                    && self.peek2() == Some('u')
-                                {
+                                if self.peek() == Some('\\') && self.peek2() == Some('u') {
                                     self.bump();
                                     self.bump();
                                     if let Some(lo) = self.hex_digits(4) {
                                         if (0xdc00..=0xdfff).contains(&lo) {
                                             paired = Some(
-                                                0x10000
-                                                    + ((cp - 0xd800) << 10)
-                                                    + (lo - 0xdc00),
+                                                0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00),
                                             );
                                         }
                                     }
@@ -813,9 +797,7 @@ impl Lexer {
                                         self.col = scol;
                                     }
                                 }
-                                paired
-                                    .and_then(char::from_u32)
-                                    .unwrap_or('\u{fffd}')
+                                paired.and_then(char::from_u32).unwrap_or('\u{fffd}')
                             } else {
                                 char::from_u32(cp).unwrap_or('\u{fffd}')
                             };
@@ -879,29 +861,22 @@ impl Lexer {
                         }
                         '`' => cur.push('`'),
                         '$' => cur.push('$'),
-                        'x' => {
-                            match self
-                                .hex_digits(2)
-                                .and_then(char::from_u32)
-                            {
-                                Some(ch) => {
-                                    self.tok_escaped = true;
-                                    cur.push(ch);
-                                }
-                                None => {
-                                    self.tok_escaped = true;
-                                    cur.push_str("\\x");
-                                }
+                        'x' => match self.hex_digits(2).and_then(char::from_u32) {
+                            Some(ch) => {
+                                self.tok_escaped = true;
+                                cur.push(ch);
                             }
-                        }
+                            None => {
+                                self.tok_escaped = true;
+                                cur.push_str("\\x");
+                            }
+                        },
                         'u' => {
                             let cp = if self.peek() == Some('{') {
                                 self.bump();
                                 let mut v: u32 = 0;
                                 let mut any = false;
-                                while let Some(d) =
-                                    self.peek().and_then(|c| c.to_digit(16))
-                                {
+                                while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
                                     v = v.saturating_mul(16).saturating_add(d);
                                     any = true;
                                     self.bump();
@@ -956,15 +931,25 @@ impl Lexer {
                 return true;
             }
             for kw in [
-                "return", "typeof", "instanceof", "new", "delete", "void",
-                "throw", "yield", "await", "case", "do", "else", "in", "of",
+                "return",
+                "typeof",
+                "instanceof",
+                "new",
+                "delete",
+                "void",
+                "throw",
+                "yield",
+                "await",
+                "case",
+                "do",
+                "else",
+                "in",
+                "of",
             ] {
                 if trimmed.ends_with(kw) {
-                    let before =
-                        trimmed[..trimmed.len() - kw.len()].chars().last();
+                    let before = trimmed[..trimmed.len() - kw.len()].chars().last();
                     if before.is_none()
-                        || !(before.unwrap().is_alphanumeric()
-                            || "_$".contains(before.unwrap()))
+                        || !(before.unwrap().is_alphanumeric() || "_$".contains(before.unwrap()))
                     {
                         return true;
                     }
@@ -1090,8 +1075,7 @@ impl Lexer {
                 Some('\\') => {
                     self.bump();
                     match self.peek() {
-                        Some('\n') | Some('\r') | Some('\u{2028}') | Some('\u{2029}')
-                        | None => {
+                        Some('\n') | Some('\r') | Some('\u{2028}') | Some('\u{2029}') | None => {
                             self.rewind(si, sl, sc, sn);
                             return None;
                         }
@@ -1183,10 +1167,7 @@ fn brace_is_object(prev: Option<&Token>) -> bool {
         | Some(Tok::Ident(_))
         | Some(Tok::Regex { .. })
         | Some(Tok::Eof) => false,
-        Some(Tok::Punct(p)) => !matches!(
-            *p,
-            ")" | "]" | "}" | ";" | "." | "++" | "--"
-        ),
+        Some(Tok::Punct(p)) => !matches!(*p, ")" | "]" | "}" | ";" | "." | "++" | "--"),
         Some(Tok::Kw(k)) => matches!(
             k,
             Return
@@ -1268,8 +1249,5 @@ fn is_ident_start(c: char) -> bool {
     c == '_' || c == '$' || unicode_ident::is_xid_start(c)
 }
 fn is_ident_part(c: char) -> bool {
-    is_ident_start(c)
-        || unicode_ident::is_xid_continue(c)
-        || c == '\u{200c}'
-        || c == '\u{200d}'
+    is_ident_start(c) || unicode_ident::is_xid_continue(c) || c == '\u{200c}' || c == '\u{200d}'
 }

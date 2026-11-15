@@ -145,6 +145,10 @@ pub struct FnDef {
     /// strict-mode body: inherited strictness or a "use strict" directive
     /// prologue (class bodies are always strict)
     pub strict: bool,
+    /// verbatim source text of this function definition, captured at
+    /// parse time — `Function.prototype.toString` returns it untouched.
+    /// None for synthesized defs (default ctors, native wrappers).
+    pub src: Option<Rc<str>>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +192,11 @@ pub struct ClassDef {
     pub name: Option<String>,
     pub superclass: Option<Expr>,
     pub members: Vec<ClassMember>,
+    /// verbatim source text of the whole class definition — the class
+    /// object IS its constructor function, whose toString yields the
+    /// class source (spec: a class ctor's [[ECMAScriptCode]] is the
+    /// class definition)
+    pub src: Option<Rc<str>>,
 }
 
 #[derive(Debug)]
@@ -334,7 +343,10 @@ pub enum Stmt {
     Throw(Expr),
     Labeled(String, Box<Stmt>),
     /// `with (obj) body` — object environment record (sloppy only)
-    With { obj: Expr, body: Box<Stmt> },
+    With {
+        obj: Expr,
+        body: Box<Stmt>,
+    },
     /// `import ...` — recorded, not resolved.
     Import(ImportRec),
     /// `export` — inner decl executes, exports recorded.

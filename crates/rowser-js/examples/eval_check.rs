@@ -14,7 +14,8 @@ fn main() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10);
             if secs > 0 {
-                ctx.interp.arm_deadline(std::time::Duration::from_secs(secs));
+                ctx.interp
+                    .arm_deadline(std::time::Duration::from_secs(secs));
             }
             let t = std::time::Instant::now();
             match ctx.eval(&src) {

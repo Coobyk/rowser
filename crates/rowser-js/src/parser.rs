@@ -9,7 +9,7 @@ const MAX_PARSE_DEPTH: usize = 300;
 
 pub fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
     let toks = lex(src)?;
-    let mut p = Parser::new(toks);
+    let mut p = Parser::new(toks, Rc::from(src));
     let stmts = p.program()?;
     p.check_privates()?;
     validate(&stmts)?;
@@ -29,7 +29,7 @@ pub fn parse_eval(
     privs: Vec<String>,
 ) -> Result<Vec<Stmt>, Error> {
     let toks = lex(src)?;
-    let mut p = Parser::new(toks);
+    let mut p = Parser::new(toks, Rc::from(src));
     p.strict = strict;
     if in_fn {
         // new.target only — `return` is a SyntaxError in ALL eval code,
@@ -71,7 +71,7 @@ pub fn stmts_strict(stmts: &[Stmt]) -> bool {
 /// Parse a single expression from source (used for template interpolations).
 fn parse_expr_src(src: &str, ctx: &mut Parser) -> Result<Expr, Error> {
     let toks = lex(src)?;
-    let mut p = Parser::new(toks);
+    let mut p = Parser::new(toks, Rc::from(src));
     // template interpolations live in the enclosing parse context:
     // `yield` inside a generator's template is a YieldExpression,
     // strict mode applies, and private names resolve against the
@@ -104,6 +104,12 @@ fn parse_expr_src(src: &str, ctx: &mut Parser) -> Result<Expr, Error> {
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// the source text `toks` was lexed from — `FnDef::src` is sliced
+    /// out of it verbatim (Function.prototype.toString)
+    src: Rc<str>,
+    /// char-index → byte-offset map for slicing `src`: token positions
+    /// are CHAR indices but `str` slicing needs byte offsets
+    char_bytes: Vec<usize>,
     /// when set, `in` is NOT treated as a binary operator — used while
     /// parsing for-head init expressions so `for (x in y)` and the common
     /// minified `for (a in b&&c, d)` forms parse correctly
@@ -157,10 +163,18 @@ struct Parser {
 }
 
 impl Parser {
-    fn new(toks: Vec<Token>) -> Self {
+    fn new(toks: Vec<Token>, src: Rc<str>) -> Self {
+        // char index i ↦ byte offset of the i-th char (index len ↦ len)
+        let char_bytes: Vec<usize> = src
+            .char_indices()
+            .map(|(b, _)| b)
+            .chain(std::iter::once(src.len()))
+            .collect();
         Parser {
             toks,
             pos: 0,
+            src,
+            char_bytes,
             no_in: false,
             lex_decl: 0,
             strict: false,
@@ -253,6 +267,20 @@ impl Parser {
             Tok::Template(_) => "template literal".into(),
             Tok::Regex { pattern, flags } => format!("`/{pattern}/{flags}`"),
         }
+    }
+    /// Verbatim source slice from char-index `start` through the last
+    /// consumed token — the source span of a just-parsed construct
+    /// (function/method/class). Returns None when `start`/`end` can't
+    /// map into `src` (shouldn't happen for real tokens).
+    fn src_since(&self, start: usize) -> Option<Rc<str>> {
+        let end_tok = &self.toks[self.pos.saturating_sub(1).min(self.toks.len() - 1)];
+        let end = end_tok.pos + end_tok.len;
+        let sb = *self.char_bytes.get(start)?;
+        let eb = *self.char_bytes.get(end)?;
+        if eb < sb {
+            return None;
+        }
+        Some(Rc::from(&self.src[sb..eb]))
     }
     /// Automatic semicolon insertion: consume `;`, or allow newline/`}`/EOF.
     fn semi(&mut self) -> Result<(), Error> {
@@ -384,13 +412,11 @@ impl Parser {
                     // early error: a non-simple parameter list can't get
                     // its strictness from an explicit directive — applies
                     // to methods AND arrows, not just function decls
-                    let simple = params
-                        .iter()
-                        .all(|p| matches!(p, Param::Ident(_)));
+                    let simple = params.iter().all(|p| matches!(p, Param::Ident(_)));
                     if !simple {
-                        return Err(self.err(
-                            "\"use strict\" not allowed with non-simple parameters",
-                        ));
+                        return Err(
+                            self.err("\"use strict\" not allowed with non-simple parameters")
+                        );
                     }
                 }
             }
@@ -471,24 +497,27 @@ impl Parser {
                 }
             }
             Tok::Kw(Kw::Function) => {
+                let s0 = self.peek().pos;
                 self.next();
                 let g = self.eat_punct("*");
-                let f = self.fn_tail(true, g, false)?;
+                let f = self.fn_tail(true, g, false, s0)?;
                 Ok(Stmt::FnDecl(Rc::new(f)))
             }
             Tok::Kw(Kw::Async)
                 if matches!(self.peek2().tok, Tok::Kw(Kw::Function))
                     && !self.peek2().newline_before =>
             {
+                let s0 = self.peek().pos;
                 self.next();
                 self.next();
                 let g = self.eat_punct("*");
-                let f = self.fn_tail(true, g, true)?;
+                let f = self.fn_tail(true, g, true, s0)?;
                 Ok(Stmt::FnDecl(Rc::new(f)))
             }
             Tok::Kw(Kw::Class) => {
+                let s0 = self.peek().pos;
                 self.next();
-                let c = self.class_tail(true)?;
+                let c = self.class_tail(true, s0)?;
                 Ok(Stmt::ClassDecl(Rc::new(c)))
             }
             Tok::Kw(Kw::If) => self.if_stmt(),
@@ -528,9 +557,9 @@ impl Parser {
                     match inner {
                         Stmt::Labeled(_, i) => inner = i,
                         Stmt::FnDecl(_) => {
-                            return Err(self.err(
-                                "labelled function declaration not allowed as with body",
-                            ));
+                            return Err(
+                                self.err("labelled function declaration not allowed as with body")
+                            );
                         }
                         _ => break,
                     }
@@ -629,9 +658,7 @@ impl Parser {
                 self.next();
                 Ok(Some(s))
             }
-            Tok::Kw(Kw::Yield)
-                if !self.strict && self.yield_decl == 0 && !self.peek().escaped =>
-            {
+            Tok::Kw(Kw::Yield) if !self.strict && self.yield_decl == 0 && !self.peek().escaped => {
                 self.next();
                 Ok(Some("yield".to_string()))
             }
@@ -752,7 +779,8 @@ impl Parser {
                     }
                     // shorthand `{name}` binds — keyword keys only legal
                     // for contextual names; `{break}` is a SyntaxError
-                    let key_was_reserved = matches!(&self.peek().tok, Tok::Kw(k) if !is_contextual_ident_kw(k));
+                    let key_was_reserved =
+                        matches!(&self.peek().tok, Tok::Kw(k) if !is_contextual_ident_kw(k));
                     let key = self.prop_key(true)?;
                     // PrivateName is not a valid BindingPattern key —
                     // `{ #x: y } = o` is an early SyntaxError
@@ -777,9 +805,9 @@ impl Parser {
                             }
                         };
                         if key_was_reserved {
-                            return Err(self.err(format!(
-                                "reserved word `{name}` is not a valid binding"
-                            )));
+                            return Err(
+                                self.err(format!("reserved word `{name}` is not a valid binding"))
+                            );
                         }
                         let d = if self.eat_punct("=") {
                             Some(self.assign_expr()?)
@@ -828,9 +856,7 @@ impl Parser {
         // `let\nx`/`let\n{}` split via ASI into `let;` + a statement.
         let body = if matches!(self.peek().tok, Tok::Kw(Kw::Let)) {
             if matches!(self.peek2().tok, Tok::Punct("[")) {
-                return Err(
-                    self.err("`let [` is not allowed in statement position")
-                );
+                return Err(self.err("`let [` is not allowed in statement position"));
             }
             let e = self.expression()?;
             self.semi()?;
@@ -839,24 +865,14 @@ impl Parser {
             self.statement()?
         };
         match &body {
-            Stmt::VarDecl { kind, .. }
-                if matches!(kind, VarKind::Let | VarKind::Const) =>
-            {
-                return Err(self.err(
-                    "lexical declaration not allowed in statement position",
-                ));
+            Stmt::VarDecl { kind, .. } if matches!(kind, VarKind::Let | VarKind::Const) => {
+                return Err(self.err("lexical declaration not allowed in statement position"));
             }
             Stmt::ClassDecl(_) => {
-                return Err(self.err(
-                    "class declaration not allowed in statement position",
-                ));
+                return Err(self.err("class declaration not allowed in statement position"));
             }
-            Stmt::FnDecl(f)
-                if f.is_gen || f.is_async || !(fn_ok && !self.strict) =>
-            {
-                return Err(self.err(
-                    "function declaration not allowed in statement position",
-                ));
+            Stmt::FnDecl(f) if f.is_gen || f.is_async || !(fn_ok && !self.strict) => {
+                return Err(self.err("function declaration not allowed in statement position"));
             }
             // `for (...) label: function f(){}` — a fn decl reachable
             // through labels is still in a single-statement position:
@@ -1122,16 +1138,12 @@ impl Parser {
         let mut lex_s = std::collections::HashSet::new();
         for n in &lex {
             if !lex_s.insert(n.clone()) {
-                return Err(self.err(format!(
-                    "Identifier `{n}` has already been declared"
-                )));
+                return Err(self.err(format!("Identifier `{n}` has already been declared")));
             }
         }
         for v in &vars {
             if lex_s.contains(v) {
-                return Err(self.err(format!(
-                    "Identifier `{v}` has already been declared"
-                )));
+                return Err(self.err(format!("Identifier `{v}` has already been declared")));
             }
         }
         Ok(Stmt::Switch { disc, cases })
@@ -1265,13 +1277,15 @@ impl Parser {
         let rec = if self.eat_kw(Kw::Default) {
             // `export default function f(){}` / expr
             if self.at_kw(Kw::Function) {
+                let s0 = self.peek().pos;
                 self.next();
                 let g = self.eat_punct("*");
-                let f = self.fn_tail(false, g, false)?;
+                let f = self.fn_tail(false, g, false, s0)?;
                 ExportRec::Default(Expr::Fn(Rc::new(f)))
             } else if self.at_kw(Kw::Class) {
+                let s0 = self.peek().pos;
                 self.next();
-                let c = self.class_tail(false)?;
+                let c = self.class_tail(false, s0)?;
                 ExportRec::Default(Expr::Class(Rc::new(c)))
             } else {
                 let e = self.assign_expr()?;
@@ -1338,7 +1352,15 @@ impl Parser {
     /// `fn` after the `function` keyword: `name (params) { body }`.
     /// `name_required`: decls need names, expressions don't.
     /// `gen`: a `*` generator marker was already consumed.
-    fn fn_tail(&mut self, name_required: bool, gen: bool, is_async: bool) -> Result<FnDef, Error> {
+    /// `src_start`: char-index of the definition's first token (the
+    /// `async`/`function` keyword) — for FnDef.src.
+    fn fn_tail(
+        &mut self,
+        name_required: bool,
+        gen: bool,
+        is_async: bool,
+        src_start: usize,
+    ) -> Result<FnDef, Error> {
         let name = {
             // the name is parsed under the fn's own [Yield]/[Await]
             // parameters — `function* yield(){}` and `async function
@@ -1392,13 +1414,11 @@ impl Parser {
                         self.strict = true;
                         // early error: an explicit directive can't apply to
                         // a non-simple parameter list
-                        let simple = params
-                            .iter()
-                            .all(|p| matches!(p, Param::Ident(_)));
+                        let simple = params.iter().all(|p| matches!(p, Param::Ident(_)));
                         if !simple {
-                            return Err(self.err(
-                                "\"use strict\" not allowed with non-simple parameters",
-                            ));
+                            return Err(
+                                self.err("\"use strict\" not allowed with non-simple parameters")
+                            );
                         }
                     }
                 }
@@ -1408,9 +1428,9 @@ impl Parser {
             if self.strict {
                 if let Some(n) = &name {
                     if matches!(n.as_str(), "eval" | "arguments") {
-                        return Err(self.err(format!(
-                            "`{n}` is not a valid function name in strict mode"
-                        )));
+                        return Err(
+                            self.err(format!("`{n}` is not a valid function name in strict mode"))
+                        );
                     }
                 }
             }
@@ -1435,13 +1455,20 @@ impl Parser {
             arrow_expr: None,
             is_async,
             is_gen: gen,
-                    strict: self.strict,
+            strict: self.strict,
+            src: self.src_since(src_start),
         })
     }
 
     /// Method body: runs `fn_body` in method context (`super.x` legal,
     /// `super()` only when `is_ctor`) and restores the enclosing context.
-    fn method_body(&mut self, is_ctor: bool, gen: bool, is_async: bool, params: &[Param]) -> Result<Vec<Stmt>, Error> {
+    fn method_body(
+        &mut self,
+        is_ctor: bool,
+        gen: bool,
+        is_async: bool,
+        params: &[Param],
+    ) -> Result<Vec<Stmt>, Error> {
         let saved = (
             self.ctor_depth,
             self.method_depth,
@@ -1531,9 +1558,7 @@ impl Parser {
         // `let` is never a valid lexical-decl binding name (sloppy `var let`
         // stays legal — gated on the declaration kind, not strictness)
         if name == "let" && self.lex_decl > 0 {
-            return Err(
-                self.err("`let` is not a valid binding in a lexical declaration")
-            );
+            return Err(self.err("`let` is not a valid binding in a lexical declaration"));
         }
         if !self.strict {
             return Ok(());
@@ -1628,8 +1653,9 @@ impl Parser {
         });
     }
 
-    /// class tail after `class` keyword.
-    fn class_tail(&mut self, name_required: bool) -> Result<ClassDef, Error> {
+    /// class tail after the `class` keyword — `src_start` is the
+    /// char-index of the `class` token (for the ctor's toString source).
+    fn class_tail(&mut self, name_required: bool, src_start: usize) -> Result<ClassDef, Error> {
         let name = match self.peek().tok.clone() {
             Tok::Ident(s) => {
                 // class bodies are always strict — the name follows strict
@@ -1638,9 +1664,17 @@ impl Parser {
                 // reserved words); `await` stays legal in scripts
                 if matches!(
                     s.as_str(),
-                    "eval" | "arguments" | "let" | "implements" | "interface"
-                        | "package" | "private" | "protected" | "public"
-                        | "static" | "yield"
+                    "eval"
+                        | "arguments"
+                        | "let"
+                        | "implements"
+                        | "interface"
+                        | "package"
+                        | "private"
+                        | "protected"
+                        | "public"
+                        | "static"
+                        | "yield"
                 ) {
                     return Err(self.err(format!("`{s}` is not a valid class name")));
                 }
@@ -1653,10 +1687,7 @@ impl Parser {
             // same strict-reserved rules as ordinary idents
             Tok::Kw(k) if is_contextual_ident_kw(&k) => {
                 let s = k.name().to_string();
-                if matches!(
-                    s.as_str(),
-                    "let" | "static" | "yield"
-                ) {
+                if matches!(s.as_str(), "let" | "static" | "yield") {
                     return Err(self.err(format!("`{s}` is not a valid class name")));
                 }
                 self.check_binding_name(&s)?;
@@ -1695,6 +1726,10 @@ impl Parser {
             if self.at_eof() {
                 return Err(self.err("unterminated class body"));
             }
+            // char-index of the element's first token — `async`/`get`/
+            // `set`/`accessor`/`*`/name/`[` are part of the element's
+            // toString source (`static` is not — re-captured below)
+            let mut mstart = self.peek().pos;
             let mut is_static = false;
             let mut is_async = false;
             // modifiers — `static` and `async` can also be member names
@@ -1706,6 +1741,9 @@ impl Parser {
             {
                 self.next();
                 is_static = true;
+                // Function.prototype.toString excludes `static` —
+                // the function's source text starts after it
+                mstart = self.peek().pos;
             }
             // static initialization block `static { ... }`: a function-
             // like body — `this`/super.prop available, no return /
@@ -1744,14 +1782,10 @@ impl Parser {
                     self.in_static_block,
                 ) = bsaved;
                 if stmts_have_arguments(&stmts) {
-                    return Err(
-                        self.err("`arguments` is not allowed in class static blocks")
-                    );
+                    return Err(self.err("`arguments` is not allowed in class static blocks"));
                 }
                 if stmts_have_await(&stmts) {
-                    return Err(
-                        self.err("`await` is not allowed in class static blocks")
-                    );
+                    return Err(self.err("`await` is not allowed in class static blocks"));
                 }
                 members.push(ClassMember {
                     key: PropKey::Str(String::new()),
@@ -1765,6 +1799,7 @@ impl Parser {
                         is_async: false,
                         is_gen: false,
                         strict: true,
+                        src: self.src_since(mstart),
                     }),
                     is_static: true,
                     init: None,
@@ -1939,9 +1974,7 @@ impl Parser {
                         );
                     }
                     if expr_has_await(&e) {
-                        return Err(
-                            self.err("`await` is not allowed in class field initializer")
-                        );
+                        return Err(self.err("`await` is not allowed in class field initializer"));
                     }
                     Some(e)
                 } else {
@@ -1960,6 +1993,7 @@ impl Parser {
                 members.push(ClassMember {
                     key,
                     kind: MemberKind::Field,
+                    // field defs never surface as callable values — no src
                     func: Rc::new(FnDef {
                         name: None,
                         params: Vec::new(),
@@ -1969,6 +2003,7 @@ impl Parser {
                         is_async: false,
                         is_gen: false,
                         strict: true,
+                        src: None,
                     }),
                     is_static,
                     init,
@@ -2047,12 +2082,24 @@ impl Parser {
                     is_async,
                     is_gen: member_gen,
                     strict: self.strict,
+                    src: self.src_since(mstart),
                 }),
                 is_static,
                 init: None,
             });
         }
         self.expect_punct("}")?;
+        // the whole class's source text — the class object is its ctor,
+        // whose toString yields the class definition (spec [[ECMAScriptCode]])
+        let csrc = self.src_since(src_start);
+        for m in &mut members {
+            if m.kind == MemberKind::Ctor {
+                // just-built Rc is uniquely owned — patch in place
+                if let Some(f) = Rc::get_mut(&mut m.func) {
+                    f.src = csrc.clone();
+                }
+            }
+        }
         (self.strict, self.ctor_depth, self.method_depth) = saved;
         if let Some((id, set)) = self.priv_stack.pop() {
             self.resolve_privates(id, &set);
@@ -2061,6 +2108,7 @@ impl Parser {
             name,
             superclass,
             members,
+            src: csrc,
         })
     }
 
@@ -2088,9 +2136,7 @@ impl Parser {
             // and [no LineTerminator] separates `yield`/`yield*` from the
             // operand: `yield\n x` parses as `yield; x`.
             if self.param_depth > 0 {
-                return Err(self.err(
-                    "YieldExpression is not allowed in FormalParameters",
-                ));
+                return Err(self.err("YieldExpression is not allowed in FormalParameters"));
             }
             self.next();
             // [no LT] separates `yield` from `*` and (when absent) the
@@ -2160,6 +2206,7 @@ impl Parser {
     /// restoring position on failure.
     fn try_arrow(&mut self) -> Result<Option<Expr>, Error> {
         let start = self.pos;
+        let c0 = self.toks[start].pos;
         let is_async = self.at_kw(Kw::Async) && !self.peek2().newline_before;
         if is_async {
             self.next();
@@ -2168,9 +2215,7 @@ impl Parser {
         // names too: `async of => {}`, `async yield => {}`)
         let single = match self.peek().tok.clone() {
             Tok::Ident(name) => Some(name),
-            Tok::Kw(k) if is_contextual_ident_kw(&k) => {
-                Some(k.name().to_string())
-            }
+            Tok::Kw(k) if is_contextual_ident_kw(&k) => Some(k.name().to_string()),
             _ => None,
         };
         if let Some(name) = single {
@@ -2181,6 +2226,7 @@ impl Parser {
                     vec![Param::Ident(name)],
                     None,
                     is_async,
+                    c0,
                 )?));
             }
             self.pos = start;
@@ -2193,7 +2239,7 @@ impl Parser {
                 if self.at_punct(")") {
                     self.next();
                     if self.eat_punct("=>") {
-                        return Ok(Some(self.arrow_body(params, None, is_async)?));
+                        return Ok(Some(self.arrow_body(params, None, is_async, c0)?));
                     }
                 }
             }
@@ -2209,9 +2255,10 @@ impl Parser {
         params: Vec<Param>,
         name: Option<String>,
         is_async: bool,
+        src_start: usize,
     ) -> Result<Expr, Error> {
         let saved_strict = self.strict;
-        let res = self.arrow_body_inner(params, name, is_async);
+        let res = self.arrow_body_inner(params, name, is_async, src_start);
         self.strict = saved_strict;
         res
     }
@@ -2221,6 +2268,7 @@ impl Parser {
         params: Vec<Param>,
         name: Option<String>,
         is_async: bool,
+        src_start: usize,
     ) -> Result<Expr, Error> {
         if self.at_punct("{") {
             self.next();
@@ -2242,7 +2290,8 @@ impl Parser {
                 arrow_expr: None,
                 is_async,
                 is_gen: false,
-                    strict: self.strict,
+                strict: self.strict,
+                src: self.src_since(src_start),
             })))
         } else {
             self.check_params(&params, true)?;
@@ -2258,10 +2307,11 @@ impl Parser {
                 params,
                 body: Vec::new(),
                 is_gen: false,
-                    strict: self.strict,
+                strict: self.strict,
                 is_arrow: true,
                 arrow_expr: Some(e),
                 is_async,
+                src: self.src_since(src_start),
             })))
         }
     }
@@ -2298,9 +2348,7 @@ impl Parser {
                 // UnaryExpression can't be the `**` base: `-x ** 2`,
                 // `!x ** 2`, `delete x ** 2` are early errors
                 // (UpdateExpression and parenthesized unary are fine)
-                return Err(
-                    self.err("unary expression can't be the left operand of **")
-                );
+                return Err(self.err("unary expression can't be the left operand of **"));
             }
             self.next();
             // `**` is right-associative; everything else left.
@@ -2538,7 +2586,9 @@ impl Parser {
                     for p in parts {
                         match p {
                             crate::lexer::TemplPart::Str(s) => strings.push(Expr::Str(s)),
-                            crate::lexer::TemplPart::Expr(raw) => exprs.push(parse_expr_src(&raw, self)?),
+                            crate::lexer::TemplPart::Expr(raw) => {
+                                exprs.push(parse_expr_src(&raw, self)?)
+                            }
                         }
                     }
                     args.push(Arg::Expr(Expr::Array(
@@ -2687,9 +2737,10 @@ impl Parser {
                 Ok(Expr::Super)
             }
             Tok::Kw(Kw::Function) => {
+                let s0 = self.peek().pos;
                 self.next();
                 let g = self.eat_punct("*");
-                let f = self.fn_tail(false, g, false)?;
+                let f = self.fn_tail(false, g, false, s0)?;
                 Ok(Expr::Fn(Rc::new(f)))
             }
             Tok::Kw(Kw::Async)
@@ -2697,10 +2748,11 @@ impl Parser {
                     && !self.peek2().newline_before =>
             {
                 // `async function [name](...) {}` in expression position
+                let s0 = self.peek().pos;
                 self.next();
                 self.next();
                 let g = self.eat_punct("*");
-                let f = self.fn_tail(false, g, true)?;
+                let f = self.fn_tail(false, g, true, s0)?;
                 Ok(Expr::Fn(Rc::new(f)))
             }
             Tok::Kw(Kw::Import) => {
@@ -2719,8 +2771,9 @@ impl Parser {
                 }
             }
             Tok::Kw(Kw::Class) => {
+                let s0 = self.peek().pos;
                 self.next();
-                let c = self.class_tail(false)?;
+                let c = self.class_tail(false, s0)?;
                 Ok(Expr::Class(Rc::new(c)))
             }
             Tok::Ident(name) => {
@@ -2758,10 +2811,7 @@ impl Parser {
                 if (k == Kw::Yield && (self.yield_decl > 0 || self.strict))
                     || (self.strict && matches!(k, Kw::Let | Kw::Static))
                 {
-                    return Err(self.err(format!(
-                        "`{}` is not a valid identifier here",
-                        k.name()
-                    )));
+                    return Err(self.err(format!("`{}` is not a valid identifier here", k.name())));
                 }
                 self.next();
                 Ok(Expr::Ident(k.name().to_string()))
@@ -2796,8 +2846,8 @@ impl Parser {
                         let ex = self.assign_expr()?;
                         // `...x,]` — trailing comma marks the element so
                         // pattern conversion can reject it
-                        let trail = self.at_punct(",")
-                            && matches!(self.peek2().tok, Tok::Punct("]"));
+                        let trail =
+                            self.at_punct(",") && matches!(self.peek2().tok, Tok::Punct("]"));
                         elems.push(if trail {
                             ArrElem::SpreadTrail(ex)
                         } else {
@@ -2825,8 +2875,8 @@ impl Parser {
                 while !self.at_punct("}") {
                     if self.eat_punct("...") {
                         let ex = self.assign_expr()?;
-                        let trail = self.at_punct(",")
-                            && matches!(self.peek2().tok, Tok::Punct("}"));
+                        let trail =
+                            self.at_punct(",") && matches!(self.peek2().tok, Tok::Punct("}"));
                         props.push(ObjProp {
                             key: PropKey::Str(String::new()),
                             val: if trail {
@@ -2838,6 +2888,9 @@ impl Parser {
                         self.eat_punct(",");
                         continue;
                     }
+                    // char-index of the member's first token — `get`/
+                    // `set`/`async`/`*`/name/`[` begin its toString source
+                    let mstart = self.peek().pos;
                     // `get`/`set` accessor, `async`/`static` methods
                     let is_getset = matches!(self.peek().tok, Tok::Kw(Kw::Get) | Tok::Kw(Kw::Set))
                         && !matches!(
@@ -2875,7 +2928,8 @@ impl Parser {
                             arrow_expr: None,
                             is_async: false,
                             is_gen: false,
-                    strict: self.strict,
+                            strict: self.strict,
+                            src: self.src_since(mstart),
                         });
                         props.push(ObjProp {
                             key,
@@ -2913,7 +2967,8 @@ impl Parser {
                                 arrow_expr: None,
                                 is_async: true,
                                 is_gen: member_gen,
-                    strict: self.strict,
+                                strict: self.strict,
+                                src: self.src_since(mstart),
                             })),
                         });
                         self.eat_punct(",");
@@ -2937,17 +2992,19 @@ impl Parser {
                                 arrow_expr: None,
                                 is_async: false,
                                 is_gen: true,
-                    strict: self.strict,
+                                strict: self.strict,
+                                src: self.src_since(mstart),
                             })),
                         });
                         self.eat_punct(",");
                         continue;
                     }
                     // a shorthand `{name}` binds the name — keyword keys
-        // are only legal for always-contextual names (`{break}` must
-        // be a SyntaxError, `{yield}` stays legal sloppy)
-        let key_was_reserved = matches!(&self.peek().tok, Tok::Kw(k) if !is_contextual_ident_kw(k));
-        let key = self.prop_key(true)?;
+                    // are only legal for always-contextual names (`{break}` must
+                    // be a SyntaxError, `{yield}` stays legal sloppy)
+                    let key_was_reserved =
+                        matches!(&self.peek().tok, Tok::Kw(k) if !is_contextual_ident_kw(k));
+                    let key = self.prop_key(true)?;
                     if matches!(&key, PropKey::Ident(s) | PropKey::Str(s) if s == "__proto__")
                         && self.at_punct(":")
                     {
@@ -2972,7 +3029,8 @@ impl Parser {
                             arrow_expr: None,
                             is_async: false,
                             is_gen: false,
-                    strict: self.strict,
+                            strict: self.strict,
+                            src: self.src_since(mstart),
                         }))
                     } else {
                         // shorthand / shorthand with default (destructuring pos)
@@ -3077,25 +3135,20 @@ fn is_assignable(e: &Expr, strict: bool) -> bool {
         // `new.target` desugars to a synthetic ident — not a target;
         // strict mode forbids `eval`/`arguments` as assignment targets
         Expr::Ident(n) => {
-            n.as_str() != "$new_target"
-                && !(strict && matches!(n.as_str(), "eval" | "arguments"))
+            n.as_str() != "$new_target" && !(strict && matches!(n.as_str(), "eval" | "arguments"))
         }
         Expr::Member { optional, .. } => !optional,
         Expr::Array(elems) => elems.iter().enumerate().all(|(i, el)| match el {
             ArrElem::Hole => true,
             ArrElem::Expr(ex) => is_assignable_elem(ex, strict),
-            ArrElem::Spread(ex) => {
-                i + 1 == elems.len() && is_assignable(ex, strict)
-            }
+            ArrElem::Spread(ex) => i + 1 == elems.len() && is_assignable(ex, strict),
             ArrElem::SpreadTrail(_) => false,
         }),
         Expr::Object(props) | Expr::ObjDup(props) => {
             props.iter().enumerate().all(|(i, p)| match &p.val {
-            PropVal::Expr(ex) => is_assignable_elem(ex, strict),
-            PropVal::Spread(ex) => {
-                i + 1 == props.len() && is_assignable(ex, strict)
-            }
-            PropVal::SpreadTrail(_) => false,
+                PropVal::Expr(ex) => is_assignable_elem(ex, strict),
+                PropVal::Spread(ex) => i + 1 == props.len() && is_assignable(ex, strict),
+                PropVal::SpreadTrail(_) => false,
                 PropVal::Method(_) | PropVal::Get(_) | PropVal::Set(_) => false,
             })
         }
@@ -3131,9 +3184,7 @@ fn collect_pat_names<'a>(p: &'a Pattern, out: &mut Vec<&'a str>) {
         Pattern::Array(elems) => {
             for e in elems {
                 match e {
-                    ArrayPatElem::Elem(p) | ArrayPatElem::Rest(p) => {
-                        collect_pat_names(p, out)
-                    }
+                    ArrayPatElem::Elem(p) | ArrayPatElem::Rest(p) => collect_pat_names(p, out),
                     ArrayPatElem::Default(p, _) => collect_pat_names(p, out),
                     ArrayPatElem::Hole => {}
                 }
@@ -3172,7 +3223,11 @@ fn lex_names(s: &Stmt, out: &mut Vec<String>) {
 
 /// `var`-declared names of a statement (top-level patterns only).
 fn var_names(s: &Stmt, out: &mut Vec<String>) {
-    if let Stmt::VarDecl { kind: VarKind::Var, decls } = s {
+    if let Stmt::VarDecl {
+        kind: VarKind::Var,
+        decls,
+    } = s
+    {
         for (p, _) in decls {
             let mut ns = Vec::new();
             collect_pat_names(p, &mut ns);
@@ -3308,8 +3363,7 @@ fn validate_strict_ctx(
         match s {
             Stmt::Import(_) | Stmt::Export(_) => {
                 return Err(Error {
-                    msg: "import/export declarations are only allowed in modules"
-                        .into(),
+                    msg: "import/export declarations are only allowed in modules".into(),
                     line: 0,
                     col: 0,
                 })
@@ -3415,9 +3469,9 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
                 && (matches!(&**t, Stmt::FnDecl(_))
                     || e.as_ref().is_some_and(|e| matches!(&**e, Stmt::FnDecl(_))))
             {
-                return Err(cx.err(
-                    "function declaration not allowed in statement position in strict mode",
-                ));
+                return Err(
+                    cx.err("function declaration not allowed in statement position in strict mode")
+                );
             }
             vstmt(t, cx)?;
             if let Some(e) = e {
@@ -3446,7 +3500,12 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             r?;
             vexpr(c, cx)
         }
-        Stmt::For { init, test, update, body } => {
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
             cx.push_scope();
             if let Some(i) = init {
                 match i {
@@ -3534,7 +3593,12 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             cx.in_switch -= 1;
             r
         }
-        Stmt::Try { block, param, handler, finally } => {
+        Stmt::Try {
+            block,
+            param,
+            handler,
+            finally,
+        } => {
             vblock(block, cx, true)?;
             if let Some(p) = param {
                 cx.push_scope();
@@ -3605,9 +3669,7 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
                 return Err(cx.err("labelled lexical declaration"));
             }
             if cx.strict && matches!(&**inner, Stmt::FnDecl(_)) {
-                return Err(cx.err(
-                    "labelled function declaration not allowed in strict mode",
-                ));
+                return Err(cx.err("labelled function declaration not allowed in strict mode"));
             }
             if cx.labels.iter().any(|(n, _)| n == name) {
                 return Err(cx.err(format!("duplicate label `{name}`")));
@@ -3854,10 +3916,7 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
                 while let Expr::Paren(i) = t {
                     t = &**i;
                 }
-                if let Expr::Member {
-                    prop, computed, ..
-                } = t
-                {
+                if let Expr::Member { prop, computed, .. } = t {
                     // `delete o.#x` is an early error; `delete o["#x"]`
                     // is an ordinary string-property delete
                     if !*computed {
@@ -3918,7 +3977,9 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
         Expr::Array(elems) => {
             for el in elems {
                 match el {
-                    ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => vexpr(e, cx)?,
+                    ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => {
+                        vexpr(e, cx)?
+                    }
                     ArrElem::Hole => {}
                 }
             }
@@ -4006,9 +4067,7 @@ fn vexpr_pat(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
             for p in props {
                 match &p.val {
                     PropVal::Expr(ex) => vexpr_pat(ex, cx)?,
-                    PropVal::Spread(ex) | PropVal::SpreadTrail(ex) => {
-                        vexpr_pat(ex, cx)?
-                    }
+                    PropVal::Spread(ex) | PropVal::SpreadTrail(ex) => vexpr_pat(ex, cx)?,
                     PropVal::Method(d) | PropVal::Get(d) | PropVal::Set(d) => {
                         vfn(d, cx, Some(false))?
                     }
@@ -4019,8 +4078,9 @@ fn vexpr_pat(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
         Expr::Array(elems) => {
             for el in elems {
                 match el {
-                    ArrElem::Expr(ex) | ArrElem::Spread(ex)
-                    | ArrElem::SpreadTrail(ex) => vexpr_pat(ex, cx)?,
+                    ArrElem::Expr(ex) | ArrElem::Spread(ex) | ArrElem::SpreadTrail(ex) => {
+                        vexpr_pat(ex, cx)?
+                    }
                     ArrElem::Hole => {}
                 }
             }
@@ -4049,9 +4109,7 @@ fn vexpr_pat(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
 /// lexically scoped even in sloppy mode).
 fn collect_switch_lex(st: &Stmt, out: &mut Vec<String>) {
     match st {
-        Stmt::VarDecl { kind, decls }
-            if matches!(kind, VarKind::Let | VarKind::Const) =>
-        {
+        Stmt::VarDecl { kind, decls } if matches!(kind, VarKind::Let | VarKind::Const) => {
             for (p, _) in decls {
                 let mut names = Vec::new();
                 crate::interp::collect_pattern_names(p, &mut names);
@@ -4092,9 +4150,7 @@ fn collect_switch_vars(stmts: &[Stmt], out: &mut Vec<String>) {
                     collect_switch_vars(std::slice::from_ref(e), out);
                 }
             }
-            Stmt::While { body, .. }
-            | Stmt::DoWhile { body, .. }
-            | Stmt::With { body, .. } => {
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::With { body, .. } => {
                 collect_switch_vars(std::slice::from_ref(body), out)
             }
             Stmt::For { init, body, .. } => {
@@ -4185,9 +4241,7 @@ fn pat_has_arguments(p: &Pattern) -> bool {
         Pattern::Array(elems) => elems.iter().any(|e| match e {
             ArrayPatElem::Hole => false,
             ArrayPatElem::Elem(p) | ArrayPatElem::Rest(p) => pat_has_arguments(p),
-            ArrayPatElem::Default(p, d) => {
-                pat_has_arguments(p) || expr_has_arguments(d)
-            }
+            ArrayPatElem::Default(p, d) => pat_has_arguments(p) || expr_has_arguments(d),
         }),
         Pattern::Object(elems) => elems.iter().any(|e| {
             matches!(&e.key, PropKey::Computed(x) if expr_has_arguments(x))
@@ -4217,11 +4271,12 @@ pub fn stmts_have_arguments(stmts: &[Stmt]) -> bool {
 fn stmt_has_arguments(s: &Stmt) -> bool {
     match s {
         Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => expr_has_arguments(e),
-        Stmt::Return(None) | Stmt::Empty | Stmt::Import(_)
-        | Stmt::Break(_) | Stmt::Continue(_) => false,
-        Stmt::VarDecl { decls, .. } => decls
-            .iter()
-            .any(|(p, i)| pat_has_arguments(p) || i.as_ref().is_some_and(|e| expr_has_arguments(e))),
+        Stmt::Return(None) | Stmt::Empty | Stmt::Import(_) | Stmt::Break(_) | Stmt::Continue(_) => {
+            false
+        }
+        Stmt::VarDecl { decls, .. } => decls.iter().any(|(p, i)| {
+            pat_has_arguments(p) || i.as_ref().is_some_and(|e| expr_has_arguments(e))
+        }),
         Stmt::FnDecl(_) => false,
         Stmt::ClassDecl(c) => class_has_arguments(c),
         Stmt::If { c, t, e } => {
@@ -4233,7 +4288,12 @@ fn stmt_has_arguments(s: &Stmt) -> bool {
         Stmt::While { c, body } | Stmt::DoWhile { c, body } => {
             expr_has_arguments(c) || stmt_has_arguments(body)
         }
-        Stmt::For { init, test, update, body } => {
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
             init.as_ref().is_some_and(|i| match i {
                 ForInit::Var(_, decls) => decls.iter().any(|(p, e)| {
                     pat_has_arguments(p) || e.as_ref().is_some_and(|e| expr_has_arguments(e))
@@ -4327,9 +4387,7 @@ fn expr_has_arguments(e: &Expr) -> bool {
                     Arg::Expr(e) | Arg::Spread(e) => expr_has_arguments(e),
                 })
         }
-        Expr::Member { obj, prop, .. } => {
-            expr_has_arguments(obj) || expr_has_arguments(prop)
-        }
+        Expr::Member { obj, prop, .. } => expr_has_arguments(obj) || expr_has_arguments(prop),
         Expr::Seq(exprs) => exprs.iter().any(expr_has_arguments),
     }
 }
@@ -4342,7 +4400,9 @@ fn expr_has_await(e: &Expr) -> bool {
         // `await` is a reserved word in static-block / field-init
         // contexts — bare-identifier uses are early errors too
         Expr::Ident(n) => n == "await",
-        Expr::Unary { op: UnaryOp::Await, .. } => true,
+        Expr::Unary {
+            op: UnaryOp::Await, ..
+        } => true,
         // arrows are transparent to `await` (they inherit the context);
         // non-arrow functions get their own — an `await` inside them is
         // either legal (async) or a plain identifier (non-async)
@@ -4351,17 +4411,15 @@ fn expr_has_await(e: &Expr) -> bool {
         // only the heritage expr + computed keys live in OUR context
         Expr::Class(c) => {
             c.superclass.as_ref().is_some_and(|e| expr_has_await(e))
-                || c.members.iter().any(|m| {
-                    matches!(&m.key, PropKey::Computed(e) if expr_has_await(e))
-                })
+                || c.members
+                    .iter()
+                    .any(|m| matches!(&m.key, PropKey::Computed(e) if expr_has_await(e)))
         }
         Expr::Template(parts) => parts
             .iter()
             .any(|p| matches!(p, TemplPart::Expr(e) if expr_has_await(e))),
         Expr::Array(elems) => elems.iter().any(|el| match el {
-            ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => {
-                expr_has_await(e)
-            }
+            ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => expr_has_await(e),
             ArrElem::Hole => false,
         }),
         Expr::Object(props) | Expr::ObjDup(props) => props.iter().any(|p| {
@@ -4378,12 +4436,8 @@ fn expr_has_await(e: &Expr) -> bool {
         Expr::Binary { l, r, .. } | Expr::Logical { l, r, .. } => {
             expr_has_await(l) || expr_has_await(r)
         }
-        Expr::Assign { target, value, .. } => {
-            expr_has_await(target) || expr_has_await(value)
-        }
-        Expr::Cond { c, t, f } => {
-            expr_has_await(c) || expr_has_await(t) || expr_has_await(f)
-        }
+        Expr::Assign { target, value, .. } => expr_has_await(target) || expr_has_await(value),
+        Expr::Cond { c, t, f } => expr_has_await(c) || expr_has_await(t) || expr_has_await(f),
         Expr::Call { callee, args } | Expr::New { callee, args } => {
             expr_has_await(callee)
                 || args.iter().any(|a| match a {
@@ -4459,20 +4513,23 @@ fn stmt_has_await(s: &Stmt) -> bool {
         // heritage expr + computed keys live in ours
         Stmt::ClassDecl(c) => {
             c.superclass.as_ref().is_some_and(|e| expr_has_await(e))
-                || c.members.iter().any(|m| {
-                    matches!(&m.key, PropKey::Computed(e) if expr_has_await(e))
-                })
+                || c.members
+                    .iter()
+                    .any(|m| matches!(&m.key, PropKey::Computed(e) if expr_has_await(e)))
         }
         Stmt::If { c, t, e } => {
-            expr_has_await(c)
-                || stmt_has_await(t)
-                || e.as_ref().is_some_and(|e| stmt_has_await(e))
+            expr_has_await(c) || stmt_has_await(t) || e.as_ref().is_some_and(|e| stmt_has_await(e))
         }
         Stmt::Block(b) => stmts_have_await(b),
         Stmt::While { c, body } | Stmt::DoWhile { c, body } => {
             expr_has_await(c) || stmt_has_await(body)
         }
-        Stmt::For { init, test, update, body } => {
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
             init.as_ref().is_some_and(|i| match i {
                 ForInit::Var(_, decls) => decls.iter().any(|(p, e)| {
                     pat_has_await(p) || e.as_ref().is_some_and(|e| expr_has_await(e))
@@ -4492,8 +4549,7 @@ fn stmt_has_await(s: &Stmt) -> bool {
         Stmt::Switch { disc, cases } => {
             expr_has_await(disc)
                 || cases.iter().any(|c| {
-                    c.test.as_ref().is_some_and(|e| expr_has_await(e))
-                        || stmts_have_await(&c.body)
+                    c.test.as_ref().is_some_and(|e| expr_has_await(e)) || stmts_have_await(&c.body)
                 })
         }
         Stmt::Try {

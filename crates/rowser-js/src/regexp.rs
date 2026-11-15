@@ -145,10 +145,7 @@ impl Regex {
         }
         let names = p.names.clone();
         let root = resolve_names(root, &names, p.unicode)?;
-        let canonical: String = "dgimsuvy"
-            .chars()
-            .filter(|c| seen.contains(*c))
-            .collect();
+        let canonical: String = "dgimsuvy".chars().filter(|c| seen.contains(*c)).collect();
         Ok(Rc::new(Regex {
             source: source.to_string(),
             flags: canonical,
@@ -184,11 +181,7 @@ impl Regex {
 
     /// spec AdvanceStringIndex — +2 over a surrogate pair in unicode mode
     fn advance(&self, s: &[u16], p: usize) -> usize {
-        if self.umatch()
-            && p + 1 < s.len()
-            && is_hi(s[p])
-            && is_lo(s[p + 1])
-        {
+        if self.umatch() && p + 1 < s.len() && is_hi(s[p]) && is_lo(s[p + 1]) {
             p + 2
         } else {
             p + 1
@@ -274,7 +267,10 @@ impl Regex {
 
 /// split an astral code point into its UTF-16 surrogate halves
 fn split_pair(v: u32) -> (u32, u32) {
-    (0xD800 + ((v - 0x10000) >> 10), 0xDC00 + ((v - 0x10000) & 0x3FF))
+    (
+        0xD800 + ((v - 0x10000) >> 10),
+        0xDC00 + ((v - 0x10000) & 0x3FF),
+    )
 }
 
 /// a literal char node — astral chars become a unit sequence outside
@@ -557,9 +553,7 @@ impl ReParser {
             ']' | '}' | '{' if self.unicode => Err(format!("unexpected '{c}'")),
             // `{` in atom position: if it parses as a braced quantifier it
             // is a SyntaxError (InvalidBracedQuantifier) — else a literal
-            '{' if self.brace_quant_shape_at(self.i - 1) => {
-                Err("quantifier without atom".into())
-            }
+            '{' if self.brace_quant_shape_at(self.i - 1) => Err("quantifier without atom".into()),
             // stray `]`/`}`/`{` are treated as literals (Annex-B leniency)
             c => Ok(self.lit_char(c)),
         }
@@ -624,8 +618,7 @@ impl ReParser {
                             let (name, _raw) = self.parse_group_name()?;
                             // a name may be reused across different `|`
                             // alternatives but never twice in the same one
-                            let (union, arm) =
-                                self.name_scope.last_mut().expect("inside alt()");
+                            let (union, arm) = self.name_scope.last_mut().expect("inside alt()");
                             if !arm.insert(name.clone()) {
                                 return Err(format!(
                                     "duplicate group name '{name}' in the same alternative"
@@ -718,10 +711,7 @@ impl ReParser {
         } else {
             self.hex(4).ok_or("invalid \\u escape in group name")?
         };
-        if (0xD800..0xDC00).contains(&v)
-            && self.peek() == Some('\\')
-            && self.peek2() == Some('u')
-        {
+        if (0xD800..0xDC00).contains(&v) && self.peek() == Some('\\') && self.peek2() == Some('u') {
             let save = self.i;
             self.i += 2;
             if let Some(t) = self.hex(4) {
@@ -1153,11 +1143,7 @@ fn count_capture_groups(src: &str) -> (usize, bool) {
 /// leniency: in non-unicode patterns with NO named groups at all, `\k<name>`
 /// is just literal text (`k`, `<`, name chars, `>`) — those never reach
 /// here because the parser emits literal atoms for them.
-fn resolve_names(
-    n: Node,
-    names: &[(String, usize)],
-    unicode: bool,
-) -> Result<Node, String> {
+fn resolve_names(n: Node, names: &[(String, usize)], unicode: bool) -> Result<Node, String> {
     Ok(match n {
         Node::BackrefName(name, raw) => match names.iter().find(|(nm, _)| *nm == name) {
             Some((_, idx)) => Node::Backref(*idx as u32),
@@ -1179,8 +1165,7 @@ fn resolve_names(
                 .collect::<Result<_, _>>()?,
         ),
         Node::Alt(arms) => Node::Alt(
-            arms
-                .into_iter()
+            arms.into_iter()
                 .map(|x| resolve_names(x, names, unicode))
                 .collect::<Result<_, _>>()?,
         ),
@@ -1457,14 +1442,10 @@ fn mat<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
         Node::BackrefName(..) => false, // resolved at compile
         Node::Anchor(a) => {
             let ok = match a {
-                Anchor::Start => {
-                    pos == 0 || (c.multiline && is_lineterm_cp(c.s[pos - 1] as u32))
-                }
+                Anchor::Start => pos == 0 || (c.multiline && is_lineterm_cp(c.s[pos - 1] as u32)),
                 Anchor::End => {
                     pos == c.s.len()
-                        || (c.multiline
-                            && pos < c.s.len()
-                            && is_lineterm_cp(c.s[pos] as u32))
+                        || (c.multiline && pos < c.s.len() && is_lineterm_cp(c.s[pos] as u32))
                 }
                 Anchor::WordB => at_wordb(c, pos),
                 Anchor::NotWordB => !at_wordb(c, pos),
@@ -1545,14 +1526,10 @@ fn mat_bwd<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
         Node::BackrefName(..) => false,
         Node::Anchor(a) => {
             let ok = match a {
-                Anchor::Start => {
-                    pos == 0 || (c.multiline && is_lineterm_cp(c.s[pos - 1] as u32))
-                }
+                Anchor::Start => pos == 0 || (c.multiline && is_lineterm_cp(c.s[pos - 1] as u32)),
                 Anchor::End => {
                     pos == c.s.len()
-                        || (c.multiline
-                            && pos < c.s.len()
-                            && is_lineterm_cp(c.s[pos] as u32))
+                        || (c.multiline && pos < c.s.len() && is_lineterm_cp(c.s[pos] as u32))
                 }
                 Anchor::WordB => at_wordb(c, pos),
                 Anchor::NotWordB => !at_wordb(c, pos),
@@ -1965,10 +1942,11 @@ fn at_wordb(c: &Ctx, pos: usize) -> bool {
 /// (tab, LF, VT, FF, CR, SP, NBSP, ZWSP-ogham, the Zs block 2000–200A,
 /// LS, PS, NNBSP, MMSP, IDSP, and BOM/FEFF — notably NOT U+0085 NEL)
 fn is_re_space(cp: u32) -> bool {
-    matches!(cp,
-        0x0009 | 0x000A | 0x000B | 0x000C | 0x000D | 0x0020 | 0x00A0
-        | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F
-        | 0x3000 | 0xFEFF)
+    matches!(
+        cp,
+        0x0009 | 0x000A | 0x000B | 0x000C | 0x000D | 0x0020 | 0x00A0 | 0x1680 | 0x2000
+            ..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF
+    )
 }
 
 /// Canonicalize — spec-correct case folding for the `i` flag.
@@ -2013,20 +1991,20 @@ fn canon_nonu(cp: u32) -> u32 {
 /// (`ΐ`→`ΐ`, `ΰ`→`ΰ`, `ﬅ`→`ﬆ`).
 fn scf_cp(cp: u32) -> u32 {
     match cp {
-        0x00B5 => 0x03BC, // µ micro sign → μ (CaseFolding; no lowercase)
-        0x017F => 0x0073, // ſ → s
-        0x0345 => 0x03B9, // ͅ combining ypogegrammeni → ι
+        0x00B5 => 0x03BC,          // µ micro sign → μ (CaseFolding; no lowercase)
+        0x017F => 0x0073,          // ſ → s
+        0x0345 => 0x03B9,          // ͅ combining ypogegrammeni → ι
         0x037B..=0x037D => 0x03C3, // ͻ/ͼ/ͽ lunate sigmas → σ
-        0x03C2 => 0x03C3, // ς → σ
-        0x03D0 => 0x03B2, // ϐ → β
-        0x03D1 => 0x03B8, // ϑ → θ
-        0x03D5 => 0x03C6, // ϕ → φ
-        0x03D6 => 0x03C0, // ϖ → π
-        0x03F0 => 0x03BA, // ϰ → κ
-        0x03F1 => 0x03C1, // ϱ → ρ
-        0x03F2 => 0x03F9, // ϲ → Ϲ
-        0x03F3 => 0x037F, // ϳ → Ϳ
-        0x03F5 => 0x03B5, // ϵ → ε
+        0x03C2 => 0x03C3,          // ς → σ
+        0x03D0 => 0x03B2,          // ϐ → β
+        0x03D1 => 0x03B8,          // ϑ → θ
+        0x03D5 => 0x03C6,          // ϕ → φ
+        0x03D6 => 0x03C0,          // ϖ → π
+        0x03F0 => 0x03BA,          // ϰ → κ
+        0x03F1 => 0x03C1,          // ϱ → ρ
+        0x03F2 => 0x03F9,          // ϲ → Ϲ
+        0x03F3 => 0x037F,          // ϳ → Ϳ
+        0x03F5 => 0x03B5,          // ϵ → ε
         // Georgian Nuskhuri → Mkhedruli (the fold target — the case
         // pair is actually Asomtavruli, which folds to Nuskhuri instead)
         0x2D00..=0x2D25 => cp - 0x1C30,
@@ -2044,7 +2022,7 @@ fn scf_cp(cp: u32) -> u32 {
         // fold up to them, so toLowercase must not be applied here
         0x13A0..=0x13F5 => cp,
         0x13F8..=0x13FD => cp - 8, // Cherokee smalls ᏸ–ᏽ → 13F0–13F5
-        0x1E9B => 0x1E61, // ẛ → ṡ
+        0x1E9B => 0x1E61,          // ẛ → ṡ
         // Greek capitals with prosgegrammeni: only *full* (multi-char)
         // folds exist, so the simple fold is the identity — toLowercase
         // would wrongly give the corresponding small letter
@@ -2052,14 +2030,14 @@ fn scf_cp(cp: u32) -> u32 {
         0x1F98..=0x1F9F => cp,
         0x1FA8..=0x1FAF => cp,
         0x1FBC | 0x1FCC | 0x1FFC => cp,
-        0x1FBE => 0x03B9, // ι prosgegrammeni → ι
-        0x214E => 0x2132, // ⅎ → Ⅎ
-        0xA7F8 => 0x0126, // ꟸ → Ħ
-        0xA7F9 => 0x0153, // ꟹ → œ
+        0x1FBE => 0x03B9,               // ι prosgegrammeni → ι
+        0x214E => 0x2132,               // ⅎ → Ⅎ
+        0xA7F8 => 0x0126,               // ꟸ → Ħ
+        0xA7F9 => 0x0153,               // ꟹ → œ
         0xAB70..=0xABBF => cp - 0x97D0, // Cherokee smalls ꭰ–ꮿ → 13A0–13EF
-        0x1FD3 => 0x0390, // ΐ → ΐ
-        0x1FE3 => 0x03B0, // ΰ → ΰ
-        0xFB05 => 0xFB06, // ﬅ → ﬆ
+        0x1FD3 => 0x0390,               // ΐ → ΐ
+        0x1FE3 => 0x03B0,               // ΰ → ΰ
+        0xFB05 => 0xFB06,               // ﬅ → ﬆ
         _ => {
             let Some(c) = char::from_u32(cp) else {
                 return cp;
@@ -2085,8 +2063,7 @@ fn units_eq(c: &Ctx, x: usize, y: usize, l: usize) -> bool {
         return c.s[x..x + l] == c.s[y..y + l];
     }
     if !c.umatch {
-        return (0..l)
-            .all(|i| ch_eq_cp(c.s[x + i] as u32, c.s[y + i] as u32, true, false));
+        return (0..l).all(|i| ch_eq_cp(c.s[x + i] as u32, c.s[y + i] as u32, true, false));
     }
     let (mut a, mut b) = (x, y);
     let end = x + l;
@@ -2121,8 +2098,7 @@ fn class_match(items: &[ClassItem], cp: u32, icase: bool, umatch: bool) -> bool 
     items.iter().any(|it| match it {
         ClassItem::Ch(w) => ch_eq_cp(cp, *w, icase, umatch),
         ClassItem::Range(lo, hi) => {
-            (*lo..=*hi).contains(&cp)
-                || (icase && range_icase_match(*lo, *hi, cp, umatch))
+            (*lo..=*hi).contains(&cp) || (icase && range_icase_match(*lo, *hi, cp, umatch))
         }
         // `\w`/`\d`/`\s` sets are canonicalized too — under `i` the input
         // char folds into the set (u-mode `ſ`→`s` makes it a word char)
