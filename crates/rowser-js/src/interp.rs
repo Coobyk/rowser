@@ -391,11 +391,35 @@ pub enum Func {
         /// home object for `super.prop` lookups (methods)
         home: Option<ObjRef>,
         ctor: CtorKind,
+        /// class instance fields: evaluated-key + initializer, run at
+        /// construction (base ctor: before body; derived: after super())
+        inst_fields: Option<Rc<ClassFields>>,
     },
     Native {
         name: Rc<str>,
         f: NativeFn,
     },
+}
+
+/// instance elements captured on a class ctor — run on `this` in
+/// declaration order at construction (base ctor: during BindThis;
+/// derived: right after super() binds `this`)
+pub struct ClassFields {
+    pub elems: Vec<InstElem>,
+    /// scope the initializers/methods close over (the class scope —
+    /// class-name binding + computed-key environment)
+    pub env: EnvRef,
+    /// the class prototype — `home` for `super.prop` in initializers
+    pub home: ObjRef,
+}
+
+/// one entry of ClassFields — InitializeInstanceElements runs these in
+/// order: fields define an own data prop; private methods get a fresh
+/// fn object per instance; private accessors merge get/set on one slot
+pub enum InstElem {
+    Field(PropKey, Option<crate::ast::Expr>),
+    Method(PropKey, Rc<crate::ast::FnDef>),
+    Access(PropKey, Option<Rc<crate::ast::FnDef>>, Option<Rc<crate::ast::FnDef>>),
 }
 
 pub type NativeFn = fn(&mut Interp, &Value, &[Value]) -> Result<Value, Value>;
@@ -713,6 +737,11 @@ fn view_own_prop_str(i: &Interp, o: &ObjRef, key: &str) -> Option<Value> {
                 return Some(Value::Num(n as f64));
             }
             if let Some(i) = arr_index(key) {
+                // a materialized props entry owns the slot (attr changes,
+                // accessor defines) — defer to the normal props path
+                if b.props.contains_str(key) {
+                    return None;
+                }
                 if b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
                     return None; // hole → not an own prop
                 }
@@ -913,6 +942,9 @@ pub struct Scope {
     /// `with (obj)` object environment record — bindings resolve as
     /// properties of `obj` (filtered through @@unscopables)
     pub obj_env: Option<ObjRef>,
+    /// derived-ctor `this` TDZ: `this`/`super.prop`/`super()` before the
+    /// super() call throw ReferenceError; cleared when super() binds it
+    pub this_uninit: std::cell::Cell<bool>,
 }
 
 pub type EnvRef = Rc<Scope>;
@@ -930,6 +962,7 @@ impl Scope {
             ctor_fn: RefCell::new(Value::Und),
             param_env: std::cell::Cell::new(false),
             obj_env: None,
+            this_uninit: std::cell::Cell::new(false),
         })
     }
 
@@ -946,6 +979,7 @@ impl Scope {
             ctor_fn: RefCell::new(Value::Und),
             param_env: std::cell::Cell::new(false),
             obj_env: Some(obj),
+            this_uninit: std::cell::Cell::new(false),
         })
     }
 }
@@ -1109,6 +1143,13 @@ pub struct Interp {
     /// set when `gen_cap` tripped — the gen call boundary converts the
     /// resulting unwind into "return what was collected"
     pub(crate) gen_cap_hit: bool,
+    /// `yield*` suspended with a raw inner iterator result — `gen_resume`
+    /// returns it to the consumer verbatim instead of wrapping it as
+    /// `{value, done: false}`
+    pub(crate) yieldstar_raw: bool,
+    /// `yield*` saw `inner.return()` produce a done result — overrides the
+    /// value `gen_resume` reports for the injected return-completion
+    pub(crate) gen_ret_override: Option<Value>,
     /// NewTarget while a native constructor body runs — `Some(f)` when
     /// `f` was `new`-ed without an explicit newTarget; `None` for calls.
     /// Lets natives implement "NewTarget === active function" checks
@@ -1129,7 +1170,22 @@ impl Interp {
     pub fn new() -> Interp {
         let mk = |proto: Option<ObjRef>| Rc::new(RefCell::new(Obj::new(proto, ObjKind::Ord)));
         let obj = mk(None);
-        let func = mk(Some(obj.clone()));
+        // %Function.prototype% is itself a function (calling it returns
+        // undefined) — is_callable must see it
+        fn empty_fn(
+            _i: &mut Interp,
+            _t: &Value,
+            _a: &[Value],
+        ) -> Result<Value, Value> {
+            Ok(Value::Und)
+        }
+        let func = Rc::new(RefCell::new(Obj::new(
+            Some(obj.clone()),
+            ObjKind::Func(Func::Native {
+                name: Rc::from(""),
+                f: empty_fn,
+            }),
+        )));
         let iterator = mk(Some(obj.clone()));
         Interp {
             global: Scope::new(None, true),
@@ -1195,6 +1251,8 @@ impl Interp {
             eval_fn: None,
             gen_yielders: Vec::new(),
             gen_cap: u64::MAX,
+            yieldstar_raw: false,
+            gen_ret_override: None,
             gen_cap_hit: false,
             new_target_native: None,
         }
@@ -1493,10 +1551,18 @@ impl Interp {
                         )));
                     }
                     if !b.mutable {
+                        // SetMutableBinding: immutable + caller strict →
+                        // TypeError; sloppy → silently ignored. `const`
+                        // bindings (lexical) are strict-immutable and
+                        // always throw; named-fn-expr names aren't.
+                        let hard = b.lexical;
                         drop(vars);
-                        return Err(
-                            self.type_err(format!("Assignment to constant variable '{name}'"))
-                        );
+                        if hard || self.cur_strict {
+                            return Err(
+                                self.type_err(format!("Assignment to constant variable '{name}'"))
+                            );
+                        }
+                        return Ok(());
                     }
                     let lexical = b.lexical;
                     b.val = v.clone();
@@ -1525,13 +1591,15 @@ impl Interp {
         if self.cur_strict {
             return Err(self.ref_err(format!("{name} is not defined")));
         }
-        // sloppy: create global; mirror onto global object
+        // sloppy: create global; mirror onto global object. An
+        // undeclared global is a configurable own prop of the global
+        // object — `delete x` removes it
         let k = self.intern(name);
         self.global.vars.borrow_mut().insert(
             k.clone(),
             Binding {
                 val: v.clone(),
-                mutable: true, uninit: false, deletable: false, lexical: false,
+                mutable: true, uninit: false, deletable: true, lexical: false,
             },
         );
         self.p
@@ -1560,10 +1628,21 @@ impl Interp {
                 let mut vars = cur.vars.borrow_mut();
                 if let Some(b) = vars.get_mut(name) {
                     if !b.mutable {
+                        // sloppy write to a non-lexical immutable (named
+                        // fn-expr name): silently no-op — the update
+                        // value still yields without mutating the binding
+                        let hard = b.lexical;
+                        let old = b.val.clone();
                         drop(vars);
-                        return Some(Err(
-                            self.type_err(format!("Assignment to constant variable '{name}'"))
-                        ));
+                        if hard || self.cur_strict {
+                            return Some(Err(
+                                self.type_err(format!("Assignment to constant variable '{name}'"))
+                            ));
+                        }
+                        if let Value::Num(n) = old {
+                            return Some(Ok((n, n + delta)));
+                        }
+                        return None;
                     }
                     if let Value::Num(n) = b.val {
                         let new = n + delta;
@@ -2071,18 +2150,34 @@ impl Interp {
                         set: None,
                     },
                 );
-                // String wrappers expose length + indexed characters
+                // String wrappers expose length + indexed characters —
+                // string-exotic attrs: chars {W:false,E:true,C:false},
+                // length {W:false,E:false,C:false}
                 if let Value::Str(s) = v {
                     let len = s.chars().count();
                     for (k, c) in s.chars().enumerate() {
                         obj.borrow_mut().props.insert(
                             PropKey::from_str(&k.to_string()),
-                            Prop::data(Value::Str(Rc::from(c.to_string().as_str()))),
+                            Prop {
+                                val: Value::Str(Rc::from(c.to_string().as_str())),
+                                writable: false,
+                                enumerable: true,
+                                configurable: false,
+                                get: None,
+                                set: None,
+                            },
                         );
                     }
                     obj.borrow_mut().props.insert(
                         PropKey::from_str("length"),
-                        Prop::builtin(Value::Num(len as f64)),
+                        Prop {
+                            val: Value::Num(len as f64),
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                            get: None,
+                            set: None,
+                        },
                     );
                 }
                 Ok(Value::Obj(obj))
@@ -2145,7 +2240,7 @@ impl Interp {
     }
 
     /// proto-chain walk; `receiver` is the `this` for getters.
-    fn obj_get(&mut self, o: &ObjRef, key: &PropKey, receiver: &Value) -> ERes {
+    pub(crate) fn obj_get(&mut self, o: &ObjRef, key: &PropKey, receiver: &Value) -> ERes {
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
             {
@@ -2305,7 +2400,9 @@ impl Interp {
                     if self.to_bool(&r2) {
                         Ok(())
                     } else {
-                        Err(self.type_err("proxy set trap returned falsy"))
+                        // [[Set]] returns false — strict callers throw,
+                        // Reflect.set reads it back as `false`
+                        self.set_fail(&self.key_to_name(&key))
                     }
                 }
                 // spec fallback: target.[[Set]](P, V, Receiver)
@@ -2535,7 +2632,30 @@ impl Interp {
                 match b.props.get(&key) {
                     Some(p) if p.is_accessor() => (Some(p.set.clone()), None, false),
                     Some(p) => (None, Some(p.writable), Rc::ptr_eq(&c, o)),
-                    None => (None, None, false),
+                    None => {
+                        // a live dense element is an own writable data
+                        // prop even though it lives outside `props` — it
+                        // stops the chain walk like any other own prop
+                        let virt = if let PropKey::S(sk) = &key {
+                            arr_index(sk).is_some_and(|i| {
+                                let items = match &b.kind {
+                                    ObjKind::Arr(items) => Some(items.len()),
+                                    ObjKind::Args { items, .. } => Some(items.len()),
+                                    _ => None,
+                                };
+                                items.is_some_and(|n| {
+                                    i < n && !b.holes.as_ref().is_some_and(|h| h.contains(&i))
+                                })
+                            })
+                        } else {
+                            false
+                        };
+                        if virt {
+                            (None, Some(true), Rc::ptr_eq(&c, o))
+                        } else {
+                            (None, None, false)
+                        }
+                    }
                 }
             };
             if let Some(setter) = found_accessor {
@@ -2553,11 +2673,28 @@ impl Interp {
                             return self.set_on_receiver(receiver, key, v);
                         }
                     }
+                    // a virtual dense element has no props entry — route
+                    // the write through obj_define_data so items[i] (and
+                    // a mapped param binding) stay the source of truth
+                    let no_props_entry = c.borrow().props.get(&key).is_none();
+                    if no_props_entry {
+                        return self.obj_define_data(o, key, v);
+                    }
+                    // ArraySetLength coercion — a.length = v runs
+                    // ToNumber → uint32 and rejects non-integral values
+                    let mut v = v;
+                    let arr_len = matches!(&c.borrow().kind, ObjKind::Arr(_))
+                        && matches!(&key, PropKey::S(s) if s.as_ref() == "length");
+                    if arr_len && writable {
+                        let nl = self.to_num(&v)?;
+                        let nlu = to_u32(nl) as f64;
+                        if nl != nlu {
+                            return Err(self.range_err("Invalid array length"));
+                        }
+                        v = Value::Num(nlu);
+                    }
                     // update own prop
                     let mut b = c.borrow_mut();
-                    if let ObjKind::Arr(items) = &mut b.kind {
-                        let _ = items; // handled below via index path before props
-                    }
                     if !writable {
                         return self.set_fail(&self.key_to_name(&key));
                     }
@@ -2572,6 +2709,13 @@ impl Interp {
                                     b.props.get_mut(&key).unwrap().val =
                                         Value::Num(n as f64);
                                     return Ok(());
+                                }
+                            }
+                            // a materialized dense element keeps items[i]
+                            // in sync — the props entry owns the attrs
+                            if let Some(i) = arr_index(s) {
+                                if i < items.len() {
+                                    items[i] = v.clone();
                                 }
                             }
                         }
@@ -2626,6 +2770,19 @@ impl Interp {
         key: PropKey,
         v: Value,
     ) -> Result<(), Value> {
+        // ArraySetLength coercion — writing `length` on an array routes
+        // the value through ToNumber → uint32 first
+        let mut v = v;
+        if matches!(&o.borrow().kind, ObjKind::Arr(_))
+            && matches!(&key, PropKey::S(s) if s.as_ref() == "length")
+        {
+            let nl = self.to_num(&v)?;
+            let nlu = to_u32(nl) as f64;
+            if nl != nlu {
+                return Err(self.range_err("Invalid array length"));
+            }
+            v = Value::Num(nlu);
+        }
         let mut b = o.borrow_mut();
         if !b.extensible {
             return self.set_fail(&self.key_to_name(&key));
@@ -2720,9 +2877,14 @@ impl Interp {
                         items.resize(i + 1, Value::Und);
                     }
                     if i < items.len() {
-                        items[i] = v;
+                        items[i] = v.clone();
                         if let Some(h) = &mut b.holes {
                             h.remove(&i);
+                        }
+                        // a materialized index prop stays authoritative —
+                        // mirror the value into its entry
+                        if let Some(p) = b.props.get_mut(&key) {
+                            p.val = v.clone();
                         }
                     }
                     return Ok(());
@@ -2734,18 +2896,24 @@ impl Interp {
                             items.truncate(n);
                         }
                         // n > items.len() → holes: record the declared
-                        // length without dense allocation
-                        b.props.insert(
-                            PropKey::from_str("length"),
-                            Prop {
-                                val: Value::Num(n as f64),
-                                writable: true,
-                                enumerable: false,
-                                configurable: false,
-                                get: None,
-                                set: None,
-                            },
-                        );
+                        // length without dense allocation; a materialized
+                        // entry keeps its attribute flags
+                        match b.props.get_mut(&key) {
+                            Some(p) => p.val = Value::Num(n as f64),
+                            None => {
+                                b.props.insert(
+                                    key.clone(),
+                                    Prop {
+                                        val: Value::Num(n as f64),
+                                        writable: true,
+                                        enumerable: false,
+                                        configurable: false,
+                                        get: None,
+                                        set: None,
+                                    },
+                                );
+                            }
+                        }
                         return Ok(());
                     }
                 }
@@ -2802,13 +2970,20 @@ impl Interp {
                 },
             };
         }
-        // ordinary: dense/virtual indices count as own writable props
+        // ordinary: a stored props entry wins over dense/virtual slots —
+        // materialized indices carry real attributes
         {
             let b = ro.borrow();
+            if let Some(p) = b.props.get(key) {
+                return Ok(Some((p.is_accessor(), p.writable)));
+            }
             if let PropKey::S(sk) = key {
                 if let Some(i) = arr_index(sk) {
                     let virt = match &b.kind {
-                        ObjKind::Arr(items) => i < items.len(),
+                        ObjKind::Arr(items) => {
+                            i < items.len()
+                                && !b.holes.as_ref().is_some_and(|h| h.contains(&i))
+                        }
                         ObjKind::Args { items, .. } => i < items.len()
                             && !b.holes.as_ref().is_some_and(|h| h.contains(&i)),
                         ObjKind::Typed { buf, off, len, kind, track } => {
@@ -2822,9 +2997,7 @@ impl Interp {
                     }
                 }
             }
-            Ok(b.props
-                .get(key)
-                .map(|p| (p.is_accessor(), p.writable)))
+            Ok(None)
         }
     }
 
@@ -2949,7 +3122,9 @@ impl Interp {
                     if self.to_bool(&r2) {
                         Ok(())
                     } else {
-                        Err(self.type_err("proxy set trap returned falsy"))
+                        // [[Set]] returns false — strict callers throw,
+                        // Reflect.set reads it back as `false`
+                        self.set_fail(key)
                     }
                 }
                 // spec fallback: target.[[Set]](P, V, Receiver)
@@ -3136,7 +3311,26 @@ impl Interp {
                 match b.props.get_str(key) {
                     Some(p) if p.is_accessor() => (Some(p.set.clone()), None, false),
                     Some(p) => (None, Some(p.writable), Rc::ptr_eq(&c, o)),
-                    None => (None, None, false),
+                    None => {
+                        // a live dense element is an own writable data
+                        // prop even though it lives outside `props` — it
+                        // stops the chain walk like any other own prop
+                        let virt = arr_index(key).is_some_and(|i| {
+                            let items = match &b.kind {
+                                ObjKind::Arr(items) => Some(items.len()),
+                                ObjKind::Args { items, .. } => Some(items.len()),
+                                _ => None,
+                            };
+                            items.is_some_and(|n| {
+                                i < n && !b.holes.as_ref().is_some_and(|h| h.contains(&i))
+                            })
+                        });
+                        if virt {
+                            (None, Some(true), Rc::ptr_eq(&c, o))
+                        } else {
+                            (None, None, false)
+                        }
+                    }
                 }
             };
             if let Some(setter) = found_accessor {
@@ -3156,6 +3350,31 @@ impl Interp {
                             );
                         }
                     }
+                    // a virtual dense element has no props entry — route
+                    // the write through obj_define_data so items[i] (and
+                    // a mapped param binding) stay the source of truth
+                    let no_props_entry =
+                        c.borrow().props.get_str(key).is_none();
+                    if no_props_entry {
+                        return self.obj_define_data(
+                            o,
+                            PropKey::from_str(key),
+                            v,
+                        );
+                    }
+                    // ArraySetLength coercion — a.length = v runs
+                    // ToNumber → uint32 and rejects non-integral values
+                    let mut v = v;
+                    let arr_len = matches!(&c.borrow().kind, ObjKind::Arr(_))
+                        && key == "length";
+                    if arr_len && writable {
+                        let nl = self.to_num(&v)?;
+                        let nlu = to_u32(nl) as f64;
+                        if nl != nlu {
+                            return Err(self.range_err("Invalid array length"));
+                        }
+                        v = Value::Num(nlu);
+                    }
                     // update own prop
                     let mut b = c.borrow_mut();
                     if !writable {
@@ -3171,6 +3390,13 @@ impl Interp {
                                 b.props.get_str_mut(key).unwrap().val =
                                     Value::Num(n as f64);
                                 return Ok(());
+                            }
+                        }
+                        // a materialized dense element keeps items[i] in
+                        // sync — the props entry owns the attrs
+                        if let Some(i) = arr_index(key) {
+                            if i < items.len() {
+                                items[i] = v.clone();
                             }
                         }
                     }
@@ -3240,51 +3466,62 @@ impl Interp {
                     return true;
                 }
             }
-        }
-        if let ObjKind::Arr(items) = &mut b.kind {
-            if let Some(i) = arr_index(key) {
-                if i < items.len() {
-                    // trailing hole → pop; middle → record a hole so the
-                    // slot is no longer an own property
-                    let last = i == items.len() - 1;
-                    if !last {
-                        b.holes.get_or_insert_default().insert(i);
-                    }
-                    if last {
-                        if let ObjKind::Arr(items) = &mut b.kind {
-                            items.pop();
+            // materialized array indices fall through to the props path
+            // so configurable:false is honoured
+            if !materialized {
+                if let ObjKind::Arr(items) = &mut b.kind {
+                    if i < items.len() {
+                        // trailing hole → pop; middle → record a hole so the
+                        // slot is no longer an own property
+                        let last = i == items.len() - 1;
+                        if !last {
+                            b.holes.get_or_insert_default().insert(i);
                         }
-                        // trailing holes get popped too
-                        while {
-                            let tl = match &b.kind {
-                                ObjKind::Arr(it) => it.len(),
-                                _ => 0,
-                            };
-                            tl > 0
-                                && b.holes
-                                    .as_ref()
-                                    .is_some_and(|h| h.contains(&(tl - 1)))
-                        } {
+                        if last {
                             if let ObjKind::Arr(items) = &mut b.kind {
                                 items.pop();
                             }
+                            // trailing holes get popped too
+                            while {
+                                let tl = match &b.kind {
+                                    ObjKind::Arr(it) => it.len(),
+                                    _ => 0,
+                                };
+                                tl > 0
+                                    && b.holes
+                                        .as_ref()
+                                        .is_some_and(|h| h.contains(&(tl - 1)))
+                            } {
+                                if let ObjKind::Arr(items) = &mut b.kind {
+                                    items.pop();
+                                }
+                            }
                         }
+                        let new_len = match &b.kind {
+                            ObjKind::Arr(it) => it.len(),
+                            _ => 0,
+                        };
+                        if let Some(h) = &mut b.holes {
+                            h.retain(|&h| h < new_len);
+                        }
+                        return true;
                     }
-                    let new_len = match &b.kind {
-                        ObjKind::Arr(it) => it.len(),
-                        _ => 0,
-                    };
-                    if let Some(h) = &mut b.holes {
-                        h.retain(|&h| h < new_len);
-                    }
-                    return true;
                 }
             }
+        }
+        if matches!(b.kind, ObjKind::Arr(_)) && key == "length" {
+            return false;
         }
         if b.props.get_str(key).is_some_and(|p| !p.configurable) {
             return false;
         }
         b.props.remove_str(key);
+        // a deleted dense element leaves a hole in the backing store
+        if matches!(&b.kind, ObjKind::Arr(_)) {
+            if let Some(i) = arr_index(key) {
+                b.holes.get_or_insert_default().insert(i);
+            }
+        }
         // a materialized arguments index deleted from props also severs
         // the parameter link and leaves the slot a hole
         if let ObjKind::Args { map, .. } = &mut b.kind {
@@ -3413,51 +3650,64 @@ impl Interp {
                         return Ok(true);
                     }
                 }
-            }
-        }
-        if let ObjKind::Arr(items) = &mut b.kind {
-            if let PropKey::S(s) = key {
-                if let Some(i) = arr_index(s) {
-                    if i < items.len() {
-                        let last = i == items.len() - 1;
-                        if !last {
-                            b.holes.get_or_insert_default().insert(i);
-                        }
-                        if last {
-                            if let ObjKind::Arr(items) = &mut b.kind {
-                                items.pop();
+                // materialized array indices fall through to the props
+                // path so configurable:false is honoured
+                if !materialized {
+                    if let ObjKind::Arr(items) = &mut b.kind {
+                        if i < items.len() {
+                            let last = i == items.len() - 1;
+                            if !last {
+                                b.holes.get_or_insert_default().insert(i);
                             }
-                            while {
-                                let tl = match &b.kind {
-                                    ObjKind::Arr(it) => it.len(),
-                                    _ => 0,
-                                };
-                                tl > 0
-                                    && b.holes
-                                        .as_ref()
-                                        .is_some_and(|h| h.contains(&(tl - 1)))
-                            } {
+                            if last {
                                 if let ObjKind::Arr(items) = &mut b.kind {
                                     items.pop();
                                 }
+                                while {
+                                    let tl = match &b.kind {
+                                        ObjKind::Arr(it) => it.len(),
+                                        _ => 0,
+                                    };
+                                    tl > 0
+                                        && b.holes
+                                            .as_ref()
+                                            .is_some_and(|h| h.contains(&(tl - 1)))
+                                } {
+                                    if let ObjKind::Arr(items) = &mut b.kind {
+                                        items.pop();
+                                    }
+                                }
                             }
+                            let new_len = match &b.kind {
+                                ObjKind::Arr(it) => it.len(),
+                                _ => 0,
+                            };
+                            if let Some(h) = &mut b.holes {
+                                h.retain(|&h| h < new_len);
+                            }
+                            return Ok(true);
                         }
-                        let new_len = match &b.kind {
-                            ObjKind::Arr(it) => it.len(),
-                            _ => 0,
-                        };
-                        if let Some(h) = &mut b.holes {
-                            h.retain(|&h| h < new_len);
-                        }
-                        return Ok(true);
                     }
                 }
             }
+        }
+        if matches!(b.kind, ObjKind::Arr(_))
+            && matches!(&key, PropKey::S(s) if s.as_ref() == "length")
+        {
+            return Ok(false);
         }
         if b.props.get(key).is_some_and(|p| !p.configurable) {
             return Ok(false);
         }
         b.props.remove(key);
+        // a deleted dense element leaves a hole in the backing store
+        if matches!(&b.kind, ObjKind::Arr(_)) {
+            if let PropKey::S(s) = key {
+                if let Some(i) = arr_index(s) {
+                    b.holes.get_or_insert_default().insert(i);
+                }
+            }
+        }
         if let ObjKind::Args { map, .. } = &mut b.kind {
             if let PropKey::S(s) = key {
                 if let Some(i) = arr_index(s) {
@@ -3495,7 +3745,16 @@ impl Interp {
                 match &b.kind {
                     ObjKind::Arr(items) => {
                         for i in 0..items.len() {
-                            ints.push((i as u64, i.to_string()));
+                            if b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                                continue;
+                            }
+                            let k = i.to_string();
+                            // materialized indices enumerate via the props
+                            // loop so their enumerable flag applies
+                            if b.props.get_str(&k).is_some() {
+                                continue;
+                            }
+                            ints.push((i as u64, k));
                         }
                     }
                     ObjKind::Typed {
@@ -3572,10 +3831,23 @@ impl Interp {
             return out;
         };
         let b = o.borrow();
+        // [[OwnPropertyKeys]] order: integer indices ascending, then
+        // string keys in insertion order (symbols are separate)
+        let mut ints: Vec<(usize, String)> = Vec::new();
+        let mut rest: Vec<String> = Vec::new();
         match &b.kind {
             ObjKind::Arr(items) => {
                 for i in 0..items.len() {
-                    out.push(i.to_string());
+                    if b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                        continue;
+                    }
+                    let k = i.to_string();
+                    // materialized indices enumerate via the props loop
+                    // so their enumerable flag applies
+                    if b.props.get_str(&k).is_some() {
+                        continue;
+                    }
+                    ints.push((i, k));
                 }
             }
             ObjKind::Typed {
@@ -3587,7 +3859,7 @@ impl Interp {
             } => {
                 let eff = typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
                 for i in 0..eff {
-                    out.push(i.to_string());
+                    ints.push((i, i.to_string()));
                 }
             }
             ObjKind::Args { items, .. } => {
@@ -3601,15 +3873,11 @@ impl Interp {
                     if b.props.get_str(&k).is_some() {
                         continue;
                     }
-                    out.push(k);
+                    ints.push((i, k));
                 }
             }
             _ => {}
         }
-        // [[OwnPropertyKeys]] order: integer indices ascending, then
-        // string keys in insertion order (symbols are separate)
-        let mut ints: Vec<(usize, String)> = Vec::new();
-        let mut rest: Vec<String> = Vec::new();
         for (k, p) in b.props.iter() {
             if !p.enumerable {
                 continue;
@@ -3660,6 +3928,11 @@ impl Interp {
         };
         if matches!(o.borrow().kind, ObjKind::Und) {
             return Ok(Value::Und);
+        }
+        // a BigInt stand-in is already a primitive — valueOf would
+        // unwrap it to a Number and lose the type
+        if crate::binary::bigint_magnitude(v).is_some() {
+            return Ok(v.clone());
         }
         self.to_primitive_hint(v, o.clone(), "default")
     }
@@ -3769,7 +4042,16 @@ impl Interp {
             (Und, Und) | (Null, Null) => true,
             (Und, Null) | (Null, Und) => false,
             (Bool(x), Bool(y)) => x == y,
-            (Num(x), Num(y)) => x == y,
+            // spec SameValue: NaN ≈ NaN, +0/-0 are NOT the same
+            (Num(x), Num(y)) => {
+                if x.is_nan() && y.is_nan() {
+                    true
+                } else if *x == 0.0 && *y == 0.0 {
+                    x.is_sign_negative() == y.is_sign_negative()
+                } else {
+                    x == y
+                }
+            }
             (Str(x), Str(y)) => x == y,
             (Sym(x, _), Sym(y, _)) => x == y,
             (Obj(x), Obj(y)) => {
@@ -4007,8 +4289,16 @@ impl Interp {
                 def,
                 env,
                 home,
-                ctor: _,
+                ctor,
+                inst_fields: _,
             }) => {
+                // class constructors are [[Call]]-rejected per spec —
+                // only [[Construct]] is defined for them
+                if !matches!(ctor, CtorKind::NotClass) {
+                    return Err(self.type_err(
+                        "Class constructor cannot be invoked without 'new'",
+                    ));
+                }
                 // strict-mode call semantics: `this` passes through verbatim
                 // in strict code; sloppy code substitutes global for
                 // undefined/null and boxes primitives
@@ -4204,6 +4494,7 @@ impl Interp {
             ObjKind::Func(Func::User { def, home, ctor, .. }) => {
                 !def.is_arrow
                     && !def.is_gen
+                    && !def.is_async
                     && (!matches!(ctor, CtorKind::NotClass) || home.is_none())
             }
             ObjKind::Func(Func::Native { .. }) => self
@@ -4301,9 +4592,11 @@ impl Interp {
                 env,
                 home,
                 ctor,
+                inst_fields: _,
             }) => {
                 if def.is_arrow
                     || def.is_gen
+                    || def.is_async
                     || (home.is_some() && matches!(ctor, CtorKind::NotClass))
                 {
                     return Err(self.type_err("value is not a constructor"));
@@ -4363,9 +4656,21 @@ impl Interp {
                     _ => Value::Obj(Rc::new(RefCell::new(Obj::new(proto, ObjKind::Ord)))),
                 };
                 let scope = Scope::new(Some(env), true);
-                *scope.thisv.borrow_mut() = this;
-                *scope.new_target.borrow_mut() = nt;
+                *scope.thisv.borrow_mut() = this.clone();
+                *scope.new_target.borrow_mut() = nt.clone();
+                *scope.home.borrow_mut() = home;
                 *scope.ctor_fn.borrow_mut() = f.clone();
+                // derived ctor: `this` is in TDZ until super() binds it
+                if matches!(ctor, CtorKind::Derived) {
+                    scope.this_uninit.set(true);
+                }
+                // base ctor: instance fields init in BindThis — before
+                // parameters bind (InitializeInstanceElements, [[Construct]]#7)
+                if let Value::Obj(fo) = &f {
+                    if matches!(ctor, CtorKind::Base) {
+                        self.init_class_fields(&this, fo, &nt)?;
+                    }
+                }
                 let h = self.hoisted_fn(&def);
                 // `arguments` is visible inside parameter initializers —
                 // bind it before defaults evaluate
@@ -4406,6 +4711,7 @@ impl Interp {
                         scope.new_target.borrow().clone();
                     *bs.home.borrow_mut() = scope.home.borrow().clone();
                     *bs.ctor_fn.borrow_mut() = scope.ctor_fn.borrow().clone();
+                    bs.this_uninit.set(scope.this_uninit.get());
                     bs
                 } else {
                     scope.clone()
@@ -4422,7 +4728,9 @@ impl Interp {
                         Ok(v)
                     }
                     Ok(Completion::Return(_)) | Ok(_) => {
-                        if matches!(ctor, CtorKind::Derived) && matches!(this_out, Value::Und) {
+                        if matches!(ctor, CtorKind::Derived)
+                            && body_scope.this_uninit.get()
+                        {
                             Err(self.ref_err(
                                 "Must call super constructor in derived class before accessing 'this'",
                             ))
@@ -4574,6 +4882,11 @@ impl Interp {
             let Some((fscope, home)) = self.find_home(env) else {
                 return Err(self.syntax_err("'super' keyword unexpected here"));
             };
+            if fscope.this_uninit.get() {
+                return Err(self.ref_err(
+                    "Must call super constructor in derived class before accessing 'this'",
+                ));
+            }
             let this = fscope.thisv.borrow().clone();
             if let Expr::Str(s) = &**prop {
                 return Ok(LRef::Super(home, this, PropKey::from_str(s)));
@@ -4583,6 +4896,25 @@ impl Interp {
         }
         let ov = self.eval_expr(obj, env)?;
         if let Expr::Str(s) = &**prop {
+            // `o.#x` writes need the private slot to already exist —
+            // missing slot (or an accessor-less private) is a TypeError
+            if s.starts_with('#') {
+                let Value::Obj(o) = &ov else {
+                    return Err(self.type_err(format!(
+                        "Cannot write private member {s}"
+                    )));
+                };
+                let ok = o
+                    .borrow()
+                    .props
+                    .get_str(s.as_str())
+                    .is_some_and(|p| p.writable || p.set.is_some());
+                if !ok {
+                    return Err(self.type_err(format!(
+                        "Cannot write private member {s}"
+                    )));
+                }
+            }
             return Ok(LRef::Prop(ov, PropKey::from_str(s)));
         }
         let pv = self.eval_expr(prop, env)?;
@@ -4613,6 +4945,17 @@ impl Interp {
                 None => break,
             }
         }
+        // the global env's object record: an unresolved name still binds
+        // to a global-object property — `x = 1`/`x += 1` where x is a
+        // prop (or getter) on globalThis. WithObj matches
+        // ObjectEnvironmentRecord PutValue semantics (strict missing →
+        // ReferenceError, sloppy → [[Set]] creates the prop)
+        if self.has_prop(
+            &Value::Obj(self.p.global.clone()),
+            &PropKey::from_str(name),
+        )? {
+            return Ok(LRef::WithObj(self.p.global.clone(), self.intern(name)));
+        }
         Ok(LRef::Unres(self.intern(name)))
     }
 
@@ -4633,6 +4976,62 @@ impl Interp {
             )))
         } else {
             Ok(())
+        }
+    }
+
+    /// GetValue on a resolved reference — compound assignments pin the
+    /// ref before reading, so an object-env base keeps pointing at the
+    /// object even if HasProperty flips mid-operation
+    fn get_lref(&mut self, lr: &mut LRef) -> ERes {
+        match lr {
+            LRef::Prop(b, k) => self.get_prop(b, k),
+            LRef::PropV(b, kv) => {
+                // ES2019 order: a nullish base throws before the key
+                // expression is coerced; ToPropertyKey runs once — the
+                // resolved key is baked into the ref for PutValue
+                if matches!(b, Value::Und | Value::Null) {
+                    return self.get_prop(&b.clone(), &PropKey::from_str(""));
+                }
+                let k = self.to_propkey(kv)?;
+                let b = b.clone();
+                *lr = LRef::Prop(b.clone(), k.clone());
+                self.get_prop(&b, &k)
+            }
+            LRef::Super(home, this, k) => {
+                let parent = home.borrow().proto.clone();
+                match parent {
+                    Some(p) => self.obj_get(&p, k, this),
+                    None => Ok(Value::Und),
+                }
+            }
+            LRef::SuperV(home, this, kv) => {
+                let k = self.to_propkey(kv)?;
+                let (home, this) = (home.clone(), this.clone());
+                *lr = LRef::Super(home.clone(), this.clone(), k.clone());
+                let parent = home.borrow().proto.clone();
+                match parent {
+                    Some(p) => self.obj_get(&p, &k, &this),
+                    None => Ok(Value::Und),
+                }
+            }
+            LRef::Env(sc, name) => {
+                let st = sc
+                    .vars
+                    .borrow()
+                    .get(name.as_ref())
+                    .map(|b| (b.val.clone(), b.uninit));
+                match st {
+                    Some((_, true)) => Err(self.ref_err(format!(
+                        "Cannot access '{name}' before initialization"
+                    ))),
+                    Some((v, false)) => Ok(v),
+                    None => Err(self.ref_err(format!("{name} is not defined"))),
+                }
+            }
+            LRef::WithObj(o, name) => self.with_get(o, name),
+            LRef::Unres(name) => {
+                Err(self.ref_err(format!("{name} is not defined")))
+            }
         }
     }
 
@@ -4673,10 +5072,14 @@ impl Interp {
                             )));
                         }
                         if !b.mutable {
+                            let hard = b.lexical;
                             drop(vars);
-                            return Err(self.type_err(format!(
-                                "Assignment to constant variable '{name}'"
-                            )));
+                            if hard || self.cur_strict {
+                                return Err(self.type_err(format!(
+                                    "Assignment to constant variable '{name}'"
+                                )));
+                            }
+                            return Ok(());
                         }
                         let lexical = b.lexical;
                         b.val = v.clone();
@@ -4723,11 +5126,12 @@ impl Interp {
                     return Err(self.ref_err(format!("{name} is not defined")));
                 }
                 // unresolved sloppy write creates a global property
+                // (configurable — `delete x` removes it)
                 self.global.vars.borrow_mut().insert(
                     name.clone(),
                     Binding {
                         val: v.clone(), mutable: true, uninit: false,
-                        deletable: false, lexical: false,
+                        deletable: true, lexical: false,
                     },
                 );
                 self.declare_global_prop(&name, v);
@@ -5278,14 +5682,15 @@ impl Interp {
             ObjKind::Func(Func::User {
                 def: def.clone(),
                 env: env.clone(),
-                home,
+                home: home.clone(),
                 ctor,
+                inst_fields: None,
             }),
         )));
         let name = def.name.clone().unwrap_or_default();
         self.set_attr(&o, "name", Value::Str(Rc::from(name.as_str())), false, true);
         self.set_attr(&o, "length", Value::Num(param_count(&def.params) as f64), false, true);
-        if def.is_gen {
+        if def.is_gen && home.is_none() {
             // generator fns: proto is %GeneratorFunction.prototype%; the
             // `.prototype` prop is an ordinary object whose proto is
             // %GeneratorPrototype% — no `constructor` back-ref.
@@ -5295,13 +5700,20 @@ impl Interp {
             let proto = self.new_obj();
             proto.borrow_mut().proto = Some(self.p.generator.clone());
             self.set_attr(&o, "prototype", Value::Obj(proto), true, false);
-        } else if !def.is_arrow {
+        } else if def.is_gen {
+            // generator METHOD: %GeneratorFunction.prototype% proto but
+            // no `.prototype` property (methods aren't constructable)
+            o.borrow_mut().proto = Some(self.p.gen_func.clone());
+        } else if !def.is_arrow && home.is_none() {
+            // ordinary fn (or class ctor — make_class overwrites the
+            // descriptor with {!writable,!configurable} afterwards)
             let proto = self.new_obj();
             self.set_builtin(&proto, "constructor", Value::Obj(o.clone()));
             // `.prototype` on ordinary fns: {writable, !enumerable,
             // !configurable}
             self.set_attr(&o, "prototype", Value::Obj(proto), true, false);
         }
+        // methods (home set) get no `.prototype` — they aren't ctors
         Value::Obj(o)
     }
 
@@ -6276,27 +6688,56 @@ impl Interp {
 
     // -- class construction ------------------------------------------------------
     fn make_class(&mut self, c: &ClassDef, env: &EnvRef) -> ERes {
+        // the class scope exists BEFORE the heritage expression runs —
+        // the class-name binding is created uninitialized so heritage /
+        // computed member keys referencing the name hit the TDZ
+        let class_env = Scope::new(Some(env.clone()), false);
+        if let Some(n) = &c.name {
+            class_env.vars.borrow_mut().insert(
+                Rc::from(n.as_str()),
+                Binding {
+                    val: Value::Und,
+                    mutable: false, uninit: true, deletable: false, lexical: true,
+                },
+            );
+        }
         let superclass = match &c.superclass {
-            Some(e) => Some(self.eval_expr(e, env)?),
+            Some(e) => Some(self.eval_expr(e, &class_env)?),
             None => None,
         };
         let derived = superclass.is_some();
-        let (super_ctor, super_proto) = match &superclass {
-            Some(Value::Null) | None => (None, self.p.obj.clone()),
-            Some(Value::Obj(sc)) => {
-                let sp = self.get_prop(&Value::Obj(sc.clone()), &PropKey::from_str("prototype"))?;
-                let sp = match sp {
-                    Value::Obj(p) => p,
-                    _ => {
-                        return Err(
-                            self.type_err("Class extends value does not have a valid prototype")
-                        )
+        // super_proto = the new prototype's [[Prototype]] — `extends null`
+        // and a ctor whose `.prototype` is null both yield a null proto
+        let (super_ctor, super_proto): (Option<ObjRef>, Option<ObjRef>) =
+            match &superclass {
+                None => (None, Some(self.p.obj.clone())),
+                Some(Value::Null) => (None, None),
+                Some(Value::Obj(sc)) => {
+                    if !self.is_constructor(&Value::Obj(sc.clone())) {
+                        return Err(self.type_err(
+                            "Class extends value is not a constructor",
+                        ));
                     }
-                };
-                (Some(sc.clone()), sp)
-            }
-            Some(_) => return Err(self.type_err("Class extends value is not a constructor")),
-        };
+                    let sp = self.get_prop(
+                        &Value::Obj(sc.clone()),
+                        &PropKey::from_str("prototype"),
+                    )?;
+                    match sp {
+                        Value::Obj(p) => (Some(sc.clone()), Some(p)),
+                        Value::Null => (Some(sc.clone()), None),
+                        _ => {
+                            return Err(self.type_err(
+                                "Class extends value does not have a valid prototype",
+                            ))
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(self.type_err(
+                        "Class extends value is not a constructor",
+                    ))
+                }
+            };
 
         // find or synthesize constructor
         let mut ctor_def: Option<Rc<FnDef>> = None;
@@ -6330,12 +6771,9 @@ impl Interp {
             })
         });
 
-        // class scope for name binding inside methods
-        let class_env = Scope::new(Some(env.clone()), false);
-
         // prototype first — the ctor's `home` points at it so `super.prop`
         // inside the constructor resolves against the parent prototype.
-        let proto = Rc::new(RefCell::new(Obj::new(Some(super_proto), ObjKind::Ord)));
+        let proto = Rc::new(RefCell::new(Obj::new(super_proto, ObjKind::Ord)));
         let ctor_fn = self.make_fn_home(
             ctor_def,
             &class_env,
@@ -6353,12 +6791,20 @@ impl Interp {
             ctor_obj.borrow_mut().proto = Some(sc.clone());
         }
         self.set_builtin(&proto, "constructor", ctor_fn.clone());
-        self.set_builtin(&ctor_obj, "prototype", Value::Obj(proto.clone()));
-        // name
-        if let Some(n) = &c.name {
-            self.set_builtin(&ctor_obj, "name", Value::Str(Rc::from(n.as_str())));
-        }
+        // class `prototype` property: {!writable,!enumerable,!configurable}
+        self.set_attr(&ctor_obj, "prototype", Value::Obj(proto.clone()), false, false);
+        // the ctor function's name is the class name ("": anonymous)
+        let cname = c.name.clone().unwrap_or_default();
+        self.set_attr(&ctor_obj, "name", Value::Str(Rc::from(cname.as_str())), false, true);
 
+        // static elements execute in member order at class-definition
+        // time; instance fields record (key, init, env) for construct/super
+        enum StaticItem {
+            Field(PropKey, Option<ast::Expr>),
+            Block(Rc<FnDef>),
+        }
+        let mut statics: Vec<StaticItem> = Vec::new();
+        let mut inst_fields: Vec<InstElem> = Vec::new();
         for m in &c.members {
             if m.kind == MemberKind::Ctor {
                 continue;
@@ -6376,8 +6822,14 @@ impl Interp {
                     self.to_propkey(&kv)?
                 }
             };
+            let is_priv = matches!(&key, PropKey::S(s) if s.starts_with('#'));
             match m.kind {
                 MemberKind::Method => {
+                    if is_priv && !m.is_static {
+                        // private instance methods install per-instance
+                        inst_fields.push(InstElem::Method(key, m.func.clone()));
+                        continue;
+                    }
                     let f = self.make_fn_home(
                         m.func.clone(),
                         &class_env,
@@ -6388,9 +6840,46 @@ impl Interp {
                         }),
                         CtorKind::NotClass,
                     );
-                    target.borrow_mut().props.insert(key, Prop::builtin(f));
+                    if is_priv {
+                        // private static method — non-writable slot
+                        target.borrow_mut().props.insert(
+                            key,
+                            Prop {
+                                val: f,
+                                writable: false,
+                                enumerable: false,
+                                configurable: false,
+                                get: None,
+                                set: None,
+                            },
+                        );
+                    } else {
+                        target.borrow_mut().props.insert(key, Prop::builtin(f));
+                    }
                 }
                 MemberKind::Getter | MemberKind::Setter => {
+                    if is_priv && !m.is_static {
+                        // private instance accessor — a single slot per
+                        // instance; get+set share the private name
+                        let ent = inst_fields.iter_mut().find(|e| {
+                            matches!(e, InstElem::Access(k2, _, _) if *k2 == key)
+                        });
+                        if let Some(InstElem::Access(_, g, s)) = ent {
+                            if m.kind == MemberKind::Getter {
+                                *g = Some(m.func.clone());
+                            } else {
+                                *s = Some(m.func.clone());
+                            }
+                        } else {
+                            let (g, s) = if m.kind == MemberKind::Getter {
+                                (Some(m.func.clone()), None)
+                            } else {
+                                (None, Some(m.func.clone()))
+                            };
+                            inst_fields.push(InstElem::Access(key, g, s));
+                        }
+                        continue;
+                    }
                     let f = self.make_fn_home(
                         m.func.clone(),
                         &class_env,
@@ -6409,20 +6898,156 @@ impl Interp {
                         ent.set = Some(f);
                     }
                 }
+                MemberKind::Field => {
+                    if m.is_static {
+                        statics.push(StaticItem::Field(key, m.init.clone()));
+                    } else {
+                        inst_fields.push(InstElem::Field(key, m.init.clone()));
+                    }
+                }
+                MemberKind::StaticBlock => {
+                    statics.push(StaticItem::Block(m.func.clone()));
+                }
                 MemberKind::Ctor => unreachable!(),
             }
         }
 
+        // the class-name binding initializes between member definition
+        // and static-element evaluation (spec step order)
         if let Some(n) = &c.name {
-            class_env.vars.borrow_mut().insert(
-                Rc::from(n.as_str()),
-                Binding {
-                    val: ctor_fn.clone(),
-                    mutable: false, uninit: false, deletable: false, lexical: true,
-                },
-            );
+            if let Some(b) = class_env.vars.borrow_mut().get_mut(n.as_str()) {
+                b.val = ctor_fn.clone();
+                b.uninit = false;
+            }
+        }
+
+        // static elements: this = ctor, home = ctor — run in member order
+        for item in statics {
+            match item {
+                StaticItem::Field(key, init) => {
+                    let v = match init {
+                        Some(e) => {
+                            let fs = Scope::new(Some(class_env.clone()), true);
+                            *fs.thisv.borrow_mut() = ctor_fn.clone();
+                            *fs.home.borrow_mut() = Some(ctor_obj.clone());
+                            self.eval_expr(&e, &fs)?
+                        }
+                        None => Value::Und,
+                    };
+                    self.obj_define_data(&ctor_obj, key, v)?;
+                }
+                StaticItem::Block(def) => {
+                    let f = self.make_fn_home(
+                        def,
+                        &class_env,
+                        Some(ctor_obj.clone()),
+                        CtorKind::NotClass,
+                    );
+                    self.call(&f, ctor_fn.clone(), vec![])?;
+                }
+            }
+        }
+        if !inst_fields.is_empty() {
+            if let ObjKind::Func(Func::User {
+                inst_fields: slot, ..
+            }) = &mut ctor_obj.borrow_mut().kind
+            {
+                *slot = Some(Rc::new(ClassFields {
+                    elems: inst_fields,
+                    env: class_env.clone(),
+                    home: proto.clone(),
+                }));
+            }
         }
         Ok(ctor_fn)
+    }
+
+    /// 10.2.1.2 InitializeInstanceElements — install private elements
+    /// and run field initializers on `this` in declaration order (base
+    /// ctor: during BindThis; derived: right after super() binds `this`).
+    /// `nt` is the ctor's [[NewTarget]] — `new.target` in an initializer
+    /// reads it.
+    fn init_class_fields(&mut self, this: &Value, ctor: &ObjRef, nt: &Value) -> Result<(), Value> {
+        let cf = match &ctor.borrow().kind {
+            ObjKind::Func(Func::User {
+                inst_fields: Some(cf),
+                ..
+            }) => cf.clone(),
+            _ => return Ok(()),
+        };
+        let Value::Obj(to) = this else {
+            return Ok(());
+        };
+        for el in cf.elems.iter() {
+            match el {
+                InstElem::Field(key, init) => {
+                    let v = match init {
+                        Some(e) => {
+                            let fs = Scope::new(Some(cf.env.clone()), true);
+                            *fs.thisv.borrow_mut() = this.clone();
+                            *fs.new_target.borrow_mut() = nt.clone();
+                            *fs.home.borrow_mut() = Some(cf.home.clone());
+                            self.eval_expr(e, &fs)?
+                        }
+                        None => Value::Und,
+                    };
+                    self.obj_define_data(to, key.clone(), v)?;
+                }
+                InstElem::Method(key, def) => {
+                    // each instance gets its own method object — private
+                    // methods are non-writable slots (TypeError on assign)
+                    let f = self.make_fn_home(
+                        def.clone(),
+                        &cf.env,
+                        Some(cf.home.clone()),
+                        CtorKind::NotClass,
+                    );
+                    to.borrow_mut().props.insert(
+                        key.clone(),
+                        Prop {
+                            val: f,
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                            get: None,
+                            set: None,
+                        },
+                    );
+                }
+                InstElem::Access(key, get, set) => {
+                    let g = match get {
+                        Some(d) => Some(self.make_fn_home(
+                            d.clone(),
+                            &cf.env,
+                            Some(cf.home.clone()),
+                            CtorKind::NotClass,
+                        )),
+                        None => None,
+                    };
+                    let s = match set {
+                        Some(d) => Some(self.make_fn_home(
+                            d.clone(),
+                            &cf.env,
+                            Some(cf.home.clone()),
+                            CtorKind::NotClass,
+                        )),
+                        None => None,
+                    };
+                    to.borrow_mut().props.insert(
+                        key.clone(),
+                        Prop {
+                            val: Value::Und,
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                            get: g,
+                            set: s,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     // -- expressions ---------------------------------------------------------------
@@ -6456,6 +7081,11 @@ impl Interp {
             }
             Expr::This => {
                 let fs = self.find_fn_scope(env);
+                if fs.this_uninit.get() {
+                    return Err(self.ref_err(
+                        "Must call super constructor in derived class before accessing 'this'",
+                    ));
+                }
                 let v = fs.thisv.borrow().clone();
                 Ok(v)
             }
@@ -6498,12 +7128,16 @@ impl Interp {
                         PropVal::Spread(ex) | PropVal::SpreadTrail(ex) => {
                             let sv = self.eval_expr(ex, env)?;
                             if let Value::Obj(src) = &sv {
+                                // CopyDataProperties: Get per key (getters
+                                // fire) in [[OwnPropertyKeys]] order
                                 for k in self.own_keys(&sv) {
-                                    if let Some(v) = self.obj_get_raw(src, &PropKey::from_str(&k)) {
-                                        self.set_data(&o, &k, v);
-                                    }
+                                    let v = self.get_prop(
+                                        &sv,
+                                        &PropKey::from_str(&k),
+                                    )?;
+                                    self.set_data(&o, &k, v);
                                 }
-                                // symbol props
+                                // symbol props — same Get treatment
                                 let symkeys: Vec<PropKey> = src
                                     .borrow()
                                     .props
@@ -6513,9 +7147,11 @@ impl Interp {
                                     .map(|(k, _)| k.clone())
                                     .collect();
                                 for k in symkeys {
-                                    if let Some(pr) = src.borrow().props.get(&k) {
-                                        o.borrow_mut().props.insert(k, pr.clone());
-                                    }
+                                    let v = self.get_prop(&sv, &k)?;
+                                    o.borrow_mut().props.insert(
+                                        k,
+                                        Prop::data(v),
+                                    );
                                 }
                             }
                         }
@@ -6626,10 +7262,48 @@ impl Interp {
                         return Ok(Value::Num(if *prefix { new } else { old }));
                     }
                 }
-                let cur = self.eval_expr(target, env)?;
+                // resolve the reference once — GetValue/PutValue use the
+                // same lref even if the scope chain mutates mid-operation
+                let mut lr = match Self::unparen(target) {
+                    Expr::Member { .. } => Some(self.eval_lref(target, env)?),
+                    Expr::Ident(n) => Some(self.eval_lref_ident(env, n)?),
+                    _ => None,
+                };
+                let cur = match &mut lr {
+                    Some(lr) => self.get_lref(lr)?,
+                    None => self.eval_expr(target, env)?,
+                };
+                let delta = if *inc { 1.0 } else { -1.0 };
+                // `++x`/`--x` on a BigInt stays a BigInt (x ± 1n)
+                let big_n = if let Value::Obj(co) = &cur {
+                    co.borrow()
+                        .props
+                        .get_str("__bigint")
+                        .and_then(|p| match p.val {
+                            Value::Num(n) => Some(n),
+                            _ => None,
+                        })
+                } else {
+                    None
+                };
+                if let Some(bn) = big_n {
+                    let nv = self.bigint_obj(bn + delta);
+                    match lr {
+                        Some(lr) => self.put_lref(lr, nv.clone())?,
+                        None => {
+                            self.assign_target(env, target, nv.clone())?;
+                        }
+                    }
+                    return Ok(if *prefix { nv } else { cur });
+                }
                 let n = self.to_num(&cur)?;
-                let new = if *inc { n + 1.0 } else { n - 1.0 };
-                self.assign_target(env, target, Value::Num(new))?;
+                let new = n + delta;
+                match lr {
+                    Some(lr) => self.put_lref(lr, Value::Num(new))?,
+                    None => {
+                        self.assign_target(env, target, Value::Num(new))?;
+                    }
+                }
                 Ok(if *prefix {
                     Value::Num(new)
                 } else {
@@ -6637,6 +7311,22 @@ impl Interp {
                 })
             }
             Expr::Binary { op, l, r } => {
+                // `#x in obj` — private-brand check. `#x` parses as an
+                // ident whose `#` prefix keeps it disjoint from user
+                // keys; the brand is an own property on the instance
+                if matches!(op, BinOp::In) {
+                    if let Some(n) = parser::priv_name_expr(l) {
+                        let rv = self.eval_expr(r, env)?;
+                        let Value::Obj(o) = &rv else {
+                            return Err(self.type_err(
+                                "Cannot use 'in' operator on non-object",
+                            ));
+                        };
+                        let key = PropKey::from_str(n);
+                        let own = o.borrow().props.get(&key).is_some();
+                        return Ok(Value::Bool(own));
+                    }
+                }
                 let lv = self.eval_expr(l, env)?;
                 let rv = self.eval_expr(r, env)?;
                 self.binary(*op, lv, rv)
@@ -6693,6 +7383,27 @@ impl Interp {
                 // `obj.name` — the parser stores dot-props as `Expr::Str`;
                 // look the name up directly without building a PropKey
                 if let Expr::Str(s) = &**prop {
+                    // `o.#x` — a private-name read is an OWN-slot lookup:
+                    // absent → TypeError, never a proto walk
+                    if s.starts_with('#') {
+                        if let Value::Obj(o) = &ov {
+                            if let Some(p) =
+                                o.borrow().props.get_str(s.as_str())
+                            {
+                                let (v, g, acc) =
+                                    (p.val.clone(), p.get.clone(), p.is_accessor());
+                                if let Some(gf) = g {
+                                    return self.call(&gf, ov.clone(), vec![]);
+                                }
+                                if !acc {
+                                    return Ok(v);
+                                }
+                            }
+                        }
+                        return Err(self.type_err(format!(
+                            "Cannot read private member {s}"
+                        )));
+                    }
                     return self.get_prop_str(&ov, s);
                 }
                 let pv = self.eval_expr(prop, env)?;
@@ -6718,6 +7429,11 @@ impl Interp {
         let Some((fscope, home)) = self.find_home(env) else {
             return Err(self.syntax_err("'super' keyword unexpected here"));
         };
+        if fscope.this_uninit.get() {
+            return Err(self.ref_err(
+                "Must call super constructor in derived class before accessing 'this'",
+            ));
+        }
         let parent = home.borrow().proto.clone();
         let Some(parent) = parent else {
             return Ok(Value::Und);
@@ -6785,11 +7501,107 @@ impl Interp {
                     return Err(self.syntax_err("yield outside generator"));
                 };
                 let mut inner = crate::builtins::for_of_iter(self, &v)?;
+                // 27.5.3.3 yield* delegation: for a protocol iterator we
+                // drive its next/throw/return record directly so inner
+                // results pass through verbatim and sent values round-trip.
+                enum Deleg {
+                    Next(Value),
+                    Throw(Value),
+                    Ret(Value),
+                }
+                if let IterSrc::Proto { iter, next, .. } = inner.src.clone() {
+                    let mut act = Deleg::Next(Value::Und);
+                    loop {
+                        let ir = match &act {
+                            Deleg::Next(s) => self.call(
+                                &next,
+                                iter.clone(),
+                                vec![s.clone()],
+                            )?,
+                            Deleg::Throw(e) => {
+                                let tm = self.get_prop_str(&iter, "throw")?;
+                                if self.is_callable(&tm) {
+                                    self.call(
+                                        &tm,
+                                        iter.clone(),
+                                        vec![e.clone()],
+                                    )?
+                                } else if matches!(tm, Value::Und | Value::Null)
+                                {
+                                    // no throw method: IteratorClose runs
+                                    // with a NORMAL completion — a throwing
+                                    // return getter replaces the error;
+                                    // then a fresh TypeError signals the
+                                    // yield* protocol violation
+                                    crate::builtins::iter_lazy_close(
+                                        self, &mut inner,
+                                    )?;
+                                    return Err(self.type_err(
+                                        "yield*: iterator has no throw method",
+                                    ));
+                                } else {
+                                    return Err(self.type_err(
+                                        "iterator throw is not callable",
+                                    ));
+                                }
+                            }
+                            Deleg::Ret(rv) => {
+                                let rm = self.get_prop_str(&iter, "return")?;
+                                if self.is_callable(&rm) {
+                                    self.call(
+                                        &rm,
+                                        iter.clone(),
+                                        vec![rv.clone()],
+                                    )?
+                                } else if matches!(rm, Value::Und | Value::Null)
+                                {
+                                    self.gen_ret_override = Some(rv.clone());
+                                    return Err(gen_abort_v());
+                                } else {
+                                    return Err(self.type_err(
+                                        "iterator return is not callable",
+                                    ));
+                                }
+                            }
+                        };
+                        if !matches!(ir, Value::Obj(_)) {
+                            return Err(self.type_err(
+                                "iterator result is not an object",
+                            ));
+                        }
+                        let done_v = self.get_prop_str(&ir, "done")?;
+                        if self.to_bool(&done_v) {
+                            let rv = self.get_prop_str(&ir, "value")?;
+                            if matches!(act, Deleg::Ret(_)) {
+                                self.gen_ret_override = Some(rv);
+                                return Err(gen_abort_v());
+                            }
+                            return Ok(rv);
+                        }
+                        self.yieldstar_raw = true;
+                        self.gen_yielders.pop();
+                        let input = unsafe { (*y).suspend(ir) };
+                        self.gen_yielders.push(y);
+                        act = match input {
+                            GenIn::Next(s) => Deleg::Next(s),
+                            GenIn::Throw(e) => Deleg::Throw(e),
+                            GenIn::Return(v) => Deleg::Ret(v),
+                        };
+                    }
+                }
+                // non-protocol sources (arrays/strings/lists): no
+                // throw/return methods exist to delegate to, so synthesize
+                // result objects from pulled values.
                 loop {
                     match crate::builtins::iter_lazy_step(self, &mut inner) {
                         Ok(Some(x)) => {
+                            let ir = self.new_obj();
+                            self.set_data(&ir, "value", x);
+                            self.set_data(&ir, "done", Value::Bool(false));
+                            let irv = Value::Obj(ir);
+                            self.yieldstar_raw = true;
                             self.gen_yielders.pop();
-                            let input = unsafe { (*y).suspend(x) };
+                            let input = unsafe { (*y).suspend(irv) };
                             self.gen_yielders.push(y);
                             match input {
                                 GenIn::Next(_) => {}
@@ -6799,14 +7611,11 @@ impl Interp {
                                     );
                                     return Err(e);
                                 }
-                                GenIn::Return(_) => {
-                                    // IteratorClose on the delegated
-                                    // iterator — a throw from its return()
-                                    // (or a non-object result) propagates
-                                    // as the generator's own error
-                                    crate::builtins::iter_lazy_close(
+                                GenIn::Return(v) => {
+                                    let _ = crate::builtins::iter_lazy_close(
                                         self, &mut inner,
-                                    )?;
+                                    );
+                                    self.gen_ret_override = Some(v);
                                     return Err(gen_abort_v());
                                 }
                             }
@@ -6825,14 +7634,24 @@ impl Interp {
             let Value::Obj(ctor_obj) = &ctor else {
                 return Err(self.syntax_err("super() call outside constructor"));
             };
+            // a derived ctor's `this` stays uninitialized until exactly
+            // one super() call — a second call is a ReferenceError
+            if !fscope.this_uninit.get() {
+                return Err(self.ref_err(
+                    "Super constructor may only be called once",
+                ));
+            }
             let parent = ctor_obj.borrow().proto.clone();
             let Some(parent) = parent else {
                 return Err(self.type_err("super() called on non-derived class"));
             };
             let argv = self.eval_args(args, env)?;
             let nt = fscope.new_target.borrow().clone();
-            let this = self.construct(&Value::Obj(parent), argv, Some(nt))?;
+            let this = self.construct(&Value::Obj(parent), argv, Some(nt.clone()))?;
             *fscope.thisv.borrow_mut() = this.clone();
+            fscope.this_uninit.set(false);
+            // derived class fields init right after super() binds `this`
+            self.init_class_fields(&this, ctor_obj, &nt)?;
             return Ok(this);
         }
         match callee {
@@ -6846,6 +7665,11 @@ impl Interp {
                     let f = self.eval_super_member(prop, env)?;
                     let argv = self.eval_args(args, env)?;
                     let fscope = self.find_fn_scope(env);
+                    if fscope.this_uninit.get() {
+                        return Err(self.ref_err(
+                            "Must call super constructor in derived class before accessing 'this'",
+                        ));
+                    }
                     let this = fscope.thisv.borrow().clone();
                     let r = self.call(&f, this, argv);
                     return r;
@@ -6862,49 +7686,77 @@ impl Interp {
                         return self.call(&ov, Value::Und, argv);
                     }
                     let f = self.get_prop_str(&ov, s)?;
+                    // spec: ArgumentListEvaluation runs before the
+                    // IsCallable check — arg side effects still fire when
+                    // the callee turns out not to be a function
+                    let argv = self.eval_args(args, env)?;
                     if !self.is_callable(&f) {
                         let iv = self.inspect(&f, 0);
                         return Err(
                             self.type_err(format!("{s} is not a function (got {iv})"))
                         );
                     }
-                    let argv = self.eval_args(args, env)?;
                     return self.call(&f, ov, argv);
                 }
                 let pv = self.eval_expr(prop, env)?;
                 let key = self.to_propkey(&pv)?;
                 let f = self.get_prop(&ov, &key)?;
+                let argv = self.eval_args(args, env)?;
                 if !self.is_callable(&f) {
                     let ks = self.key_str(&key);
                     let iv = self.inspect(&f, 0);
                     return Err(self.type_err(format!("{ks} is not a function (got {iv})")));
                 }
-                let argv = self.eval_args(args, env)?;
                 self.call(&f, ov, argv)
             }
             _ => {
-                let f = self.eval_expr(callee, env)?;
                 // direct eval: the callee resolved to THE installed eval fn —
                 // run the source in the caller's own environment
                 if let Expr::Ident(n) = callee {
-                    if n == "eval" && self.is_eval_fn(&f) {
-                        let argv = self.eval_args(args, env)?;
-                        let Some(first) = argv.into_iter().next() else {
-                            return Ok(Value::Und);
-                        };
-                        let Value::Str(src) = &first else {
-                            return Ok(first);
-                        };
-                        let src = src.clone();
-                        return self.eval_source(&src, env.clone());
+                    if n == "eval" {
+                        let f = self.eval_expr(callee, env)?;
+                        if self.is_eval_fn(&f) {
+                            let argv = self.eval_args(args, env)?;
+                            let Some(first) = argv.into_iter().next() else {
+                                return Ok(Value::Und);
+                            };
+                            let Value::Str(src) = &first else {
+                                return Ok(first);
+                            };
+                            let src = src.clone();
+                            return self.eval_source(&src, env.clone());
+                        }
                     }
                 }
+                // idents keep their reference base — `with(obj){ method() }`
+                // calls with this = the with-object (env record's
+                // WithBaseObject); parens preserve the reference
+                let (f, this_v) = match Self::unparen(callee) {
+                    Expr::Ident(n) => {
+                        let mut lr = self.eval_lref_ident(env, n)?;
+                        let tv = match &lr {
+                            // real `with` scopes → WithBaseObject; the
+                            // global-object fallback keeps undefined
+                            // (sloppy substitution lands there anyway,
+                            // and passing global breaks ctor-vs-call
+                            // natives that sniff `this`)
+                            LRef::WithObj(o, _)
+                                if !Rc::ptr_eq(o, &self.p.global) =>
+                            {
+                                Value::Obj(o.clone())
+                            }
+                            _ => Value::Und,
+                        };
+                        (self.get_lref(&mut lr)?, tv)
+                    }
+                    _ => (self.eval_expr(callee, env)?, Value::Und),
+                };
                 let argv = self.eval_args(args, env)?;
                 if !self.is_callable(&f) {
                     let tn = self.type_name(&f);
                     return Err(self.type_err(format!("{tn} is not a function")));
                 }
-                self.call(&f, Value::Und, argv)
+                self.call(&f, this_v, argv)
             }
         }
     }
@@ -6973,12 +7825,29 @@ impl Interp {
             UnaryOp::Await => self.eval_expr(expr, env),
             UnaryOp::Delete => match Self::unparen(expr) {
                 Expr::Member { obj, prop, .. } => {
+                    // IsSuperReference → ReferenceError, thrown BEFORE
+                    // the key is evaluated
+                    if matches!(&**obj, Expr::Super) {
+                        return Err(
+                            self.ref_err("unsupported reference to 'super'")
+                        );
+                    }
                     let ov = self.eval_expr(obj, env)?;
                     let ok = if let Expr::Str(s) = &**prop {
+                        if matches!(ov, Value::Und | Value::Null) {
+                            return Err(self.type_err(
+                                "Cannot convert undefined or null to object",
+                            ));
+                        }
                         self.delete_prop_str(&ov, s)
                     } else {
                         let pv = self.eval_expr(prop, env)?;
                         let key = self.to_propkey(&pv)?;
+                        if matches!(ov, Value::Und | Value::Null) {
+                            return Err(self.type_err(
+                                "Cannot convert undefined or null to object",
+                            ));
+                        }
                         self.delete_prop(&ov, &key)?
                     };
                     if !ok && self.cur_strict {
@@ -7018,6 +7887,21 @@ impl Interp {
                         }
                         cur = sc.parent.as_ref();
                     }
+                    // global env's object record: `delete x` where x is a
+                    // global-object prop (e.g. `NaN`, or a sloppy
+                    // undeclared write)
+                    let g = self.p.global.clone();
+                    if self.has_prop(
+                        &Value::Obj(g.clone()),
+                        &PropKey::S(k.clone()),
+                    )? {
+                        let ov = Value::Obj(g);
+                        let b = self.delete_prop(&ov, &PropKey::S(k.clone()))?;
+                        if b {
+                            self.global.vars.borrow_mut().remove(k.as_ref());
+                        }
+                        return Ok(Value::Bool(b));
+                    }
                     Ok(Value::Bool(true))
                 }
                 _ => {
@@ -7028,8 +7912,74 @@ impl Interp {
         }
     }
 
+    /// BigInt arithmetic — both operands (post-ToPrimitive) must be
+    /// BigInt or it's a TypeError; `+` still concatenates when the
+    /// other operand is a String
+    fn bigint_arith(&mut self, op: BinOp, l: Value, r: Value) -> ERes {
+        let lb = crate::binary::bigint_magnitude(&l);
+        let rb = crate::binary::bigint_magnitude(&r);
+        match (lb, rb) {
+            (Some(a), Some(b)) => {
+                use BinOp::*;
+                let v = match op {
+                    Add => a + b,
+                    Sub => a - b,
+                    Mul => a * b,
+                    Div => {
+                        if b == 0.0 {
+                            return Err(self.range_err("Division by zero"));
+                        }
+                        (a / b).trunc()
+                    }
+                    Mod => {
+                        if b == 0.0 {
+                            return Err(self.range_err("Division by zero"));
+                        }
+                        a % b
+                    }
+                    Pow => {
+                        if b < 0.0 {
+                            return Err(self.range_err(
+                                "Exponent must be non-negative",
+                            ));
+                        }
+                        a.powf(b)
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(self.bigint_obj(v))
+            }
+            _ => {
+                if op == BinOp::Add
+                    && (matches!(l, Value::Str(_)) || matches!(r, Value::Str(_)))
+                {
+                    let a = self.to_str(&l)?;
+                    let b = self.to_str(&r)?;
+                    return Ok(Value::Str(Rc::from(format!("{a}{b}").as_str())));
+                }
+                Err(self.type_err(
+                    "Cannot mix BigInt and other types, use explicit conversions",
+                ))
+            }
+        }
+    }
+
     fn binary(&mut self, op: BinOp, l: Value, r: Value) -> ERes {
         use BinOp::*;
+        if matches!(op, Add | Sub | Mul | Div | Mod | Pow) {
+            let lp = self.to_primitive(&l)?;
+            // ToNumeric(lhs) runs before rhs is coerced — a Symbol lhs
+            // throws TypeError before the rhs's valueOf can run
+            if matches!(lp, Value::Sym(..)) {
+                let _ = self.to_num(&lp)?;
+            }
+            let rp = self.to_primitive(&r)?;
+            if crate::binary::bigint_magnitude(&lp).is_some()
+                || crate::binary::bigint_magnitude(&rp).is_some()
+            {
+                return self.bigint_arith(op, lp, rp);
+            }
+        }
         Ok(match op {
             Add => {
                 // numeric fast path — skips to_primitive/to_num round-trips
@@ -7055,7 +8005,17 @@ impl Interp {
                 let b = self.to_num(&r)?;
                 Value::Num(if b == 0.0 { f64::NAN } else { a % b })
             }
-            Pow => Value::Num(self.to_num(&l)?.powf(self.to_num(&r)?)),
+            Pow => {
+                let a = self.to_num(&l)?;
+                let b = self.to_num(&r)?;
+                // spec: |base| == 1 with an infinite exponent is NaN —
+                // Rust's powf returns 1
+                Value::Num(if b.is_infinite() && a.abs() == 1.0 {
+                    f64::NAN
+                } else {
+                    a.powf(b)
+                })
+            }
             Eq => Value::Bool(self.loose_eq(&l, &r)?),
             Ne => Value::Bool(!self.loose_eq(&l, &r)?),
             StrictEq => Value::Bool(self.strict_eq(&l, &r)),
@@ -7119,55 +8079,35 @@ impl Interp {
                 Value::Bool(self.has_prop(&r, &key)?)
             }
             Instanceof => {
-                let proto = match &r {
-                    Value::Obj(o) if o.borrow().is_callable() => {
-                        // bound functions → target's prototype
-                        let mut cur = r.clone();
-                        loop {
-                            let t = {
-                                let b = if let Value::Obj(co) = &cur {
-                                    co.borrow().kind.clone()
-                                } else {
-                                    break;
-                                };
-                                match b {
-                                    ObjKind::Bound { target, .. } => Some(target),
-                                    _ => None,
-                                }
-                            };
-                            match t {
-                                Some(t) => cur = t,
-                                None => break,
-                            }
-                        }
-                        self.get_prop(&cur, &PropKey::from_str("prototype"))?
-                    }
+                // 13.10.2 InstanceofOperator(O, C)
+                if !matches!(r, Value::Obj(_)) {
+                    return Err(
+                        self.type_err("Right-hand side of 'instanceof' is not an object")
+                    );
+                }
+                let hm = self.get_prop(&r, &PropKey::Sym(SYM_HASINSTANCE))?;
+                let hm = match hm {
+                    Value::Und | Value::Null => None,
+                    m if self.is_callable(&m) => Some(m),
                     _ => {
                         return Err(
-                            self.type_err("Right-hand side of 'instanceof' is not an object")
+                            self.type_err("Symbol.hasInstance is not callable")
                         )
                     }
                 };
-                let Value::Obj(want) = proto else {
-                    return Err(self.type_err("Right-hand side of 'instanceof' is not callable"));
-                };
-                let mut found = false;
-                if let Value::Obj(mut cur) = l.clone() {
-                    for _ in 0..10_000 {
-                        let next = cur.borrow().proto.clone();
-                        match next {
-                            Some(n) => {
-                                if Rc::ptr_eq(&n, &want) {
-                                    found = true;
-                                    break;
-                                }
-                                cur = n;
-                            }
-                            None => break,
-                        }
+                if let Some(hm) = hm {
+                    let res = self.call(&hm, r.clone(), vec![l.clone()])?;
+                    Value::Bool(self.to_bool(&res))
+                } else {
+                    if !self.is_callable(&r) {
+                        return Err(self.type_err(
+                            "Right-hand side of 'instanceof' is not callable",
+                        ));
                     }
+                    Value::Bool(crate::builtins::ordinary_has_instance(
+                        self, &r, &l,
+                    )?)
                 }
-                Value::Bool(found)
             }
         })
     }
@@ -7221,15 +8161,39 @@ impl Interp {
                 }
             }
         }
-        // compound assignments
-        let cur = self.eval_expr(target, env)?;
+        // compound assignments — resolve the reference ONCE: spec runs
+        // GetValue(lref) then PutValue(lref, v), so an object-env base
+        // stays pinned even if its binding disappears mid-operation
+        let mut lr = match Self::unparen(target) {
+            Expr::Member { .. } => Some(self.eval_lref(target, env)?),
+            Expr::Ident(n) => Some(self.eval_lref_ident(env, n)?),
+            _ => None,
+        };
+        let put = |this: &mut Self, lr: Option<LRef>, v: Value| -> Result<(), Value> {
+            match lr {
+                Some(lr) => this.put_lref(lr, v),
+                None => this.assign_target(env, target, v).map(|_| ()),
+            }
+        };
+        let cur = match &mut lr {
+            Some(lr) => self.get_lref(lr)?,
+            None => self.eval_expr(target, env)?,
+        };
+        // NamedEvaluation: `x ||= function(){}` names the fn `x`
+        let named = matches!(Self::unparen(target), Expr::Ident(_))
+            && Self::is_anon_fn_def(value);
         let result = match op {
             AssignOp::LogAnd => {
                 if !self.to_bool(&cur) {
                     return Ok(cur);
                 }
                 let v = self.eval_expr(value, env)?;
-                self.assign_target(env, target, v.clone())?;
+                if named {
+                    if let Expr::Ident(n) = Self::unparen(target) {
+                        self.maybe_name(&v, n);
+                    }
+                }
+                put(self, lr, v.clone())?;
                 return Ok(v);
             }
             AssignOp::LogOr => {
@@ -7237,7 +8201,12 @@ impl Interp {
                     return Ok(cur);
                 }
                 let v = self.eval_expr(value, env)?;
-                self.assign_target(env, target, v.clone())?;
+                if named {
+                    if let Expr::Ident(n) = Self::unparen(target) {
+                        self.maybe_name(&v, n);
+                    }
+                }
+                put(self, lr, v.clone())?;
                 return Ok(v);
             }
             AssignOp::Nullish => {
@@ -7245,7 +8214,12 @@ impl Interp {
                     return Ok(cur);
                 }
                 let v = self.eval_expr(value, env)?;
-                self.assign_target(env, target, v.clone())?;
+                if named {
+                    if let Expr::Ident(n) = Self::unparen(target) {
+                        self.maybe_name(&v, n);
+                    }
+                }
+                put(self, lr, v.clone())?;
                 return Ok(v);
             }
             _ => {
@@ -7268,7 +8242,7 @@ impl Interp {
                 self.binary(bop, cur, rv)?
             }
         };
-        self.assign_target(env, target, result.clone())?;
+        put(self, lr, result.clone())?;
         Ok(result)
     }
 
@@ -7814,6 +8788,7 @@ fn class_uses_arguments(c: &ClassDef) -> bool {
     }
     c.members.iter().any(|m| {
         matches!(&m.key, ast::PropKey::Computed(e) if expr_uses_arguments(e))
+            || m.init.as_ref().map_or(false, expr_uses_arguments)
             || fndef_uses_arguments(&m.func)
     })
 }

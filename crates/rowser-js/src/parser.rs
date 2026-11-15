@@ -11,6 +11,7 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
     let toks = lex(src)?;
     let mut p = Parser::new(toks);
     let stmts = p.program()?;
+    p.check_privates()?;
     validate(&stmts)?;
     Ok(stmts)
 }
@@ -36,6 +37,7 @@ pub fn parse_eval(
         p.method_depth = 1;
     }
     let stmts = p.program()?;
+    p.check_privates()?;
     validate_strict_ctx(&stmts, strict, in_fn, in_method)?;
     Ok(stmts)
 }
@@ -100,6 +102,19 @@ struct Parser {
     await_decl: usize,
     /// recursion guard for deeply nested source
     depth: usize,
+    /// `#name` declarations of each enclosing class body, tagged with a
+    /// unique scope id (a private name is only legal where a lexically-
+    /// enclosing class declares it)
+    /// per-class-body declared private names → bitmask of elements seen:
+    /// bit0 = method/field/ctor, bit1 = getter, bit2 = setter. Only a
+    /// get+set pair may share a private name (early error otherwise)
+    priv_stack: Vec<(usize, std::collections::HashMap<String, u8>)>,
+    /// next private-scope id
+    priv_next_id: usize,
+    /// `#name` uses not yet matched to a declaration, tagged with the
+    /// ids of the class scopes enclosing the use site — resolved as each
+    /// enclosing class's declared set is completed
+    priv_pending: Vec<(String, Vec<usize>)>,
 }
 
 impl Parser {
@@ -120,6 +135,9 @@ impl Parser {
             param_depth: 0,
             await_decl: 0,
             depth: 0,
+            priv_stack: Vec::new(),
+            priv_next_id: 0,
+            priv_pending: Vec::new(),
         }
     }
 
@@ -228,6 +246,10 @@ impl Parser {
         match self.peek().tok.clone() {
             Tok::Ident(s) => {
                 self.next();
+                // `obj.#x` member access — a private-name USE
+                if !computed_ok && s.starts_with('#') {
+                    self.use_private(&s)?;
+                }
                 Ok(PropKey::Ident(s))
             }
             Tok::Kw(k) => {
@@ -930,6 +952,16 @@ impl Parser {
         {
             return Err(self.err("`for (async of` is a reserved form"));
         }
+        // the for-init Expression can't start with `class`, `function`,
+        // or `async function` (lookahead restriction)
+        if self.at_kw(Kw::Class)
+            || self.at_kw(Kw::Function)
+            || (self.at_kw(Kw::Async)
+                && matches!(self.peek2().tok, Tok::Kw(Kw::Function))
+                && !self.peek2().newline_before)
+        {
+            return Err(self.err("declaration not allowed in for-init position"));
+        }
         let first = self.expression()?;
         self.no_in = false;
         if self.at_kw(Kw::Of) {
@@ -1345,23 +1377,26 @@ impl Parser {
 
     /// Method body: runs `fn_body` in method context (`super.x` legal,
     /// `super()` only when `is_ctor`) and restores the enclosing context.
-    fn method_body(&mut self, is_ctor: bool, gen: bool) -> Result<Vec<Stmt>, Error> {
+    fn method_body(&mut self, is_ctor: bool, gen: bool, is_async: bool) -> Result<Vec<Stmt>, Error> {
         let saved = (
             self.ctor_depth,
             self.method_depth,
             self.gen_depth,
             self.yield_decl,
+            self.await_decl,
         );
         self.ctor_depth = is_ctor as usize;
         self.method_depth = 1;
         self.gen_depth = gen as usize;
         self.yield_decl = gen as usize;
+        self.await_decl = is_async as usize;
         let r = self.fn_body(false);
         (
             self.ctor_depth,
             self.method_depth,
             self.gen_depth,
             self.yield_decl,
+            self.await_decl,
         ) = saved;
         r
     }
@@ -1471,15 +1506,51 @@ impl Parser {
         Ok(params)
     }
 
+    /// record a `#name` private-identifier USE — resolved once the
+    /// enclosing class bodies' declared sets are complete
+    fn use_private(&mut self, name: &str) -> Result<(), Error> {
+        if self.priv_stack.is_empty() {
+            return Err(self.err(format!("undeclared private name `{name}`")));
+        }
+        let ids = self.priv_stack.iter().map(|(id, _)| *id).collect();
+        self.priv_pending.push((name.to_string(), ids));
+        Ok(())
+    }
+
+    /// every `#name` use must be claimed by some enclosing class body —
+    /// called at end of parse when all declared sets are complete
+    fn check_privates(&self) -> Result<(), Error> {
+        if let Some((n, _)) = self.priv_pending.first() {
+            return Err(Error::new(format!("undeclared private name `{n}`"), 0, 0));
+        }
+        Ok(())
+    }
+
+    /// Resolve pending `#name` uses now that this class body's declared
+    /// set is complete: a use enclosed by this class is satisfied iff
+    /// the name is in its set; unsatisfied uses keep their outer ids —
+    /// an empty id list can never resolve and errors at end of parse.
+    fn resolve_privates(&mut self, id: usize, set: &std::collections::HashMap<String, u8>) {
+        self.priv_pending.retain_mut(|(n, ids)| {
+            if let Some(i) = ids.iter().position(|i| *i == id) {
+                if set.contains_key(n.as_str()) {
+                    return false; // claimed
+                }
+                ids.remove(i);
+            }
+            true
+        });
+    }
+
     /// class tail after `class` keyword.
     fn class_tail(&mut self, name_required: bool) -> Result<ClassDef, Error> {
         let name = match self.peek().tok.clone() {
             Tok::Ident(s) => {
+                self.check_binding_name(&s)?;
                 self.next();
                 Some(s)
             }
             _ if !name_required => None,
-            _ if self.at_kw(Kw::Extends) => None,
             _ => return Err(self.err("expected class name")),
         };
         let superclass = if self.eat_kw(Kw::Extends) {
@@ -1487,11 +1558,16 @@ impl Parser {
         } else {
             None
         };
+        let derived = superclass.is_some();
         self.expect_punct("{")?;
         // class bodies are always strict
         let saved = (self.strict, self.ctor_depth, self.method_depth);
         self.strict = true;
+        let priv_id = self.priv_next_id;
+        self.priv_next_id += 1;
+        self.priv_stack.push((priv_id, Default::default()));
         let mut members = Vec::new();
+        let mut seen_ctor = false;
         while !self.at_punct("}") {
             if self.eat_punct(";") {
                 continue;
@@ -1503,21 +1579,83 @@ impl Parser {
             let mut is_async = false;
             // modifiers — `static` and `async` can also be member names
             if self.at_kw(Kw::Static)
-                && !matches!(self.peek2().tok, Tok::Punct("(") | Tok::Punct("="))
+                && !matches!(
+                    self.peek2().tok,
+                    Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(";") | Tok::Punct("}")
+                )
             {
                 self.next();
                 is_static = true;
             }
-            // static initialization block `static { ... }` — parse + skip
+            // static initialization block `static { ... }`: a function-
+            // like body — `this`/super.prop available, no return /
+            // super() / yield / await / enclosing labels
             if is_static && self.at_punct("{") {
                 self.next();
-                let _ = self.block_body()?;
+                let bsaved = (
+                    self.fn_depth,
+                    self.ctor_depth,
+                    self.method_depth,
+                    self.gen_depth,
+                    self.yield_decl,
+                    self.await_decl,
+                    self.nonarrow_fn_depth,
+                );
+                self.fn_depth = 0;
+                self.ctor_depth = 0;
+                self.method_depth += 1;
+                self.gen_depth = 0;
+                self.yield_decl = 0;
+                self.await_decl = 0;
+                if self.nonarrow_fn_depth == 0 {
+                    self.nonarrow_fn_depth = 1;
+                }
+                let stmts = self.block_body()?;
+                (
+                    self.fn_depth,
+                    self.ctor_depth,
+                    self.method_depth,
+                    self.gen_depth,
+                    self.yield_decl,
+                    self.await_decl,
+                    self.nonarrow_fn_depth,
+                ) = bsaved;
+                if stmts_have_arguments(&stmts) {
+                    return Err(
+                        self.err("`arguments` is not allowed in class static blocks")
+                    );
+                }
+                if stmts_have_await(&stmts) {
+                    return Err(
+                        self.err("`await` is not allowed in class static blocks")
+                    );
+                }
+                members.push(ClassMember {
+                    key: PropKey::Str(String::new()),
+                    kind: MemberKind::StaticBlock,
+                    func: Rc::new(FnDef {
+                        name: None,
+                        params: Vec::new(),
+                        body: stmts,
+                        is_arrow: false,
+                        arrow_expr: None,
+                        is_async: false,
+                        is_gen: false,
+                        strict: true,
+                    }),
+                    is_static: true,
+                    init: None,
+                });
                 continue;
             }
             if self.at_kw(Kw::Async)
                 && !matches!(
                     self.peek2().tok,
-                    Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(":")
+                    Tok::Punct("(")
+                        | Tok::Punct("=")
+                        | Tok::Punct(":")
+                        | Tok::Punct(";")
+                        | Tok::Punct("}")
                 )
                 && !self.peek2().newline_before
             {
@@ -1531,9 +1669,16 @@ impl Parser {
             if is_getset_candidate
                 && !matches!(
                     self.peek2().tok,
-                    Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(";") | Tok::Punct("}")
+                    Tok::Punct("(")
+                        | Tok::Punct("=")
+                        | Tok::Punct(";")
+                        | Tok::Punct("}")
+                        | Tok::Punct(":")
                 )
             {
+                if is_async {
+                    return Err(self.err("async accessor is not allowed"));
+                }
                 kind = if self.at_kw(Kw::Get) {
                     MemberKind::Getter
                 } else {
@@ -1542,17 +1687,128 @@ impl Parser {
                 self.next();
             }
             let member_gen = self.eat_punct("*"); // generator marker
+            if member_gen && is_async {
+                // `async *m` — async generator (parsed, runtime may not
+                // support it, but the grammar is valid)
+            }
             let key = self.prop_key(true)?;
-            // field declaration `x = 1;` or bare `x;` — unsupported init → skip value
-            if self.at_punct("=") || self.at_punct(";") {
-                self.eat_punct("=");
-                if !self.at_punct(";") && !self.at_punct("}") {
-                    let _ = self.assign_expr()?; // parse + discard field init for now
+            // PropName as a static string — `constructor`/`prototype`
+            // early errors apply to literal names only, never computed
+            let keyname: Option<&str> = match &key {
+                PropKey::Ident(s) | PropKey::Str(s) => Some(s.as_str()),
+                _ => None,
+            };
+            if is_static && keyname == Some("prototype") {
+                return Err(self.err("static member may not be named `prototype`"));
+            }
+            // `#name` member — declares a private element. Duplicates
+            // error, except one getter may pair with one setter
+            if let PropKey::Ident(s) = &key {
+                if s.starts_with('#') {
+                    // mask of already-seen kinds that conflict with this
+                    // declaration; the bit this declaration contributes
+                    let (mask, bit) = match kind {
+                        MemberKind::Getter => (0b011, 0b010),
+                        MemberKind::Setter => (0b101, 0b100),
+                        _ => (0b111, 0b001),
+                    };
+                    let dup = match self.priv_stack.last_mut() {
+                        Some((_, set)) => {
+                            let e = set.entry(s.clone()).or_insert(0);
+                            let d = *e & mask != 0;
+                            *e |= bit;
+                            d
+                        }
+                        None => false,
+                    };
+                    if dup {
+                        return Err(self.err(format!("duplicate private name `{s}`")));
+                    }
                 }
+            }
+            // field declaration `x;` / `x = init;`
+            if self.at_punct("=") || self.at_punct(";") || self.at_punct("}") {
+                if is_async || member_gen {
+                    return Err(self.err("field name expected after modifier"));
+                }
+                if matches!(kind, MemberKind::Getter | MemberKind::Setter) {
+                    return Err(self.err("getter/setter must be a method"));
+                }
+                if keyname == Some("constructor") {
+                    return Err(self.err("field may not be named `constructor`"));
+                }
+                self.eat_punct("=");
+                let init = if !self.at_punct(";") && !self.at_punct("}") {
+                    // the initializer runs like a method body: this +
+                    // super.prop / new.target available; super() /
+                    // arguments / await / enclosing `yield` are not
+                    let isaved = (
+                        self.ctor_depth,
+                        self.await_decl,
+                        self.gen_depth,
+                        self.yield_decl,
+                        self.nonarrow_fn_depth,
+                    );
+                    self.ctor_depth = 0;
+                    self.await_decl = 0;
+                    self.gen_depth = 0;
+                    self.yield_decl = 0;
+                    // initializers are synthetic functions — `new.target`
+                    // is legal (and evaluates the enclosing newTarget)
+                    if self.nonarrow_fn_depth == 0 {
+                        self.nonarrow_fn_depth = 1;
+                    }
+                    self.method_depth += 1;
+                    let e = self.assign_expr();
+                    self.method_depth -= 1;
+                    (
+                        self.ctor_depth,
+                        self.await_decl,
+                        self.gen_depth,
+                        self.yield_decl,
+                        self.nonarrow_fn_depth,
+                    ) = isaved;
+                    let e = e?;
+                    if expr_has_arguments(&e) {
+                        return Err(
+                            self.err("`arguments` is not allowed in class field initializer")
+                        );
+                    }
+                    if expr_has_await(&e) {
+                        return Err(
+                            self.err("`await` is not allowed in class field initializer")
+                        );
+                    }
+                    Some(e)
+                } else {
+                    None
+                };
                 self.eat_punct(";");
+                members.push(ClassMember {
+                    key,
+                    kind: MemberKind::Field,
+                    func: Rc::new(FnDef {
+                        name: None,
+                        params: Vec::new(),
+                        body: Vec::new(),
+                        is_arrow: false,
+                        arrow_expr: None,
+                        is_async: false,
+                        is_gen: false,
+                        strict: true,
+                    }),
+                    is_static,
+                    init,
+                });
                 continue;
             }
-            let is_ctor = matches!(&key, PropKey::Ident(s) if s == "constructor") && !is_static;
+            let is_ctor = keyname == Some("constructor") && !is_static;
+            if is_ctor && (kind != MemberKind::Method || member_gen || is_async) {
+                return Err(self.err("`constructor` must be a plain method"));
+            }
+            if is_ctor && seen_ctor {
+                return Err(self.err("duplicate constructor"));
+            }
             self.expect_punct("(")?;
             let params = self.params()?;
             self.expect_punct(")")?;
@@ -1567,11 +1823,23 @@ impl Parser {
             }
             self.check_params(&params, false)?;
             self.expect_punct("{")?;
-            let body = self.method_body(is_ctor, member_gen)?;
-            let fname = match &key {
-                PropKey::Ident(s) | PropKey::Str(s) => Some(s.clone()),
-                _ => None,
+            // `super()` is only legal inside a DERIVED constructor
+            let body = self.method_body(is_ctor && derived, member_gen, is_async)?;
+            // the ctor's function name comes from the class name, not
+            // the member key — leave None so `let D = class {...}` gets
+            // NamedEvaluation
+            let fname = if is_ctor {
+                None
+            } else {
+                match &key {
+                    PropKey::Ident(s) | PropKey::Str(s) => Some(s.clone()),
+                    PropKey::Num(n) => Some(crate::interp::js_num_str(*n)),
+                    _ => None,
+                }
             };
+            if is_ctor {
+                seen_ctor = true;
+            }
             members.push(ClassMember {
                 key,
                 kind: if is_ctor { MemberKind::Ctor } else { kind },
@@ -1586,10 +1854,14 @@ impl Parser {
                     strict: self.strict,
                 }),
                 is_static,
+                init: None,
             });
         }
         self.expect_punct("}")?;
         (self.strict, self.ctor_depth, self.method_depth) = saved;
+        if let Some((id, set)) = self.priv_stack.pop() {
+            self.resolve_privates(id, &set);
+        }
         Ok(ClassDef {
             name,
             superclass,
@@ -1827,6 +2099,14 @@ impl Parser {
             if prec < min_prec {
                 break;
             }
+            if kind == BinKind::Pow && matches!(l, Expr::Unary { .. }) {
+                // UnaryExpression can't be the `**` base: `-x ** 2`,
+                // `!x ** 2`, `delete x ** 2` are early errors
+                // (UpdateExpression and parenthesized unary are fine)
+                return Err(
+                    self.err("unary expression can't be the left operand of **")
+                );
+            }
             self.next();
             // `**` is right-associative; everything else left.
             let next_min = if kind == BinKind::Pow { prec } else { prec + 1 };
@@ -1896,11 +2176,15 @@ impl Parser {
         if let Some(op) = op {
             self.next();
             let e = self.unary_expr()?;
-            if op == UnaryOp::Delete
-                && self.strict
-                && matches!(&e, Expr::Ident(_))
-            {
-                return Err(self.err("cannot delete an unqualified identifier in strict mode"));
+            if op == UnaryOp::Delete && self.strict {
+                // `delete ((ident))` counts too — walk through parens
+                let mut inner = &e;
+                while let Expr::Paren(i) = inner {
+                    inner = i;
+                }
+                if matches!(inner, Expr::Ident(_)) {
+                    return Err(self.err("cannot delete an unqualified identifier in strict mode"));
+                }
             }
             return Ok(Expr::Unary {
                 op,
@@ -2244,6 +2528,11 @@ impl Parser {
                     return Err(self.err("`yield` is not a valid identifier here"));
                 }
                 self.next();
+                // bare `#x` (only legal as `#x in obj` brand checks) —
+                // a private-name USE
+                if name.starts_with('#') {
+                    self.use_private(&name)?;
+                }
                 Ok(Expr::Ident(name))
             }
             // contextual keywords usable as identifiers in expression position
@@ -2371,7 +2660,7 @@ impl Parser {
                             return Err(self.err("setter must have exactly one parameter"));
                         }
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, false)?;
+                        let body = self.method_body(false, false, false)?;
                         let fname = match &key {
                             PropKey::Ident(s) | PropKey::Str(s) => Some(s.clone()),
                             _ => None,
@@ -2411,7 +2700,7 @@ impl Parser {
                         let params = self.params()?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, member_gen)?;
+                        let body = self.method_body(false, member_gen, true)?;
                         props.push(ObjProp {
                             key: key.clone(),
                             val: PropVal::Method(Rc::new(FnDef {
@@ -2435,7 +2724,7 @@ impl Parser {
                         let params = self.params()?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, true)?;
+                        let body = self.method_body(false, true, false)?;
                         props.push(ObjProp {
                             key: key.clone(),
                             val: PropVal::Method(Rc::new(FnDef {
@@ -2472,7 +2761,7 @@ impl Parser {
                         let params = self.params()?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, false)?;
+                        let body = self.method_body(false, false, false)?;
                         PropVal::Method(Rc::new(FnDef {
                             name: prop_key_name(&key),
                             params,
@@ -3239,9 +3528,68 @@ fn vclass(c: &ClassDef, cx: &mut VCtx) -> Result<(), Error> {
     let saved = (cx.in_method, cx.in_ctor);
     let mut r = Ok(());
     for m in &c.members {
-        if let Err(e) = vfn(&m.func, cx, Some(matches!(m.kind, MemberKind::Ctor))) {
-            r = Err(e);
+        if r.is_err() {
             break;
+        }
+        if let PropKey::Computed(e) = &m.key {
+            r = vexpr(e, cx);
+            if r.is_err() {
+                break;
+            }
+        }
+        match m.kind {
+            MemberKind::Field => {
+                // initializers are method-like: super.prop + new.target
+                // ok, super() not
+                let fnsaved = cx.in_fn;
+                cx.in_method = 1;
+                cx.in_ctor = 0;
+                cx.in_fn += 1;
+                if let Some(e) = &m.init {
+                    r = vexpr(e, cx);
+                }
+                (cx.in_method, cx.in_ctor) = saved;
+                cx.in_fn = fnsaved;
+            }
+            MemberKind::StaticBlock => {
+                // a function-like body: super.prop + new.target legal;
+                // return / super() / enclosing labels & vars are not
+                let bsaved = (
+                    std::mem::take(&mut cx.lexes),
+                    std::mem::take(&mut cx.hard),
+                    std::mem::take(&mut cx.vars),
+                    std::mem::take(&mut cx.labels),
+                    cx.in_iter,
+                    cx.in_switch,
+                    cx.in_fn,
+                    cx.in_method,
+                    cx.in_ctor,
+                );
+                cx.in_iter = 0;
+                cx.in_switch = 0;
+                cx.in_fn += 1;
+                cx.in_method = 1;
+                cx.in_ctor = 0;
+                cx.push_scope();
+                r = vstmts(&m.func.body, cx);
+                cx.pop_scope();
+                (
+                    cx.lexes,
+                    cx.hard,
+                    cx.vars,
+                    cx.labels,
+                    cx.in_iter,
+                    cx.in_switch,
+                    cx.in_fn,
+                    cx.in_method,
+                    cx.in_ctor,
+                ) = bsaved;
+            }
+            _ => {
+                if let Err(e) = vfn(&m.func, cx, Some(matches!(m.kind, MemberKind::Ctor))) {
+                    r = Err(e);
+                }
+            }
         }
     }
     (cx.in_method, cx.in_ctor) = saved;
@@ -3297,7 +3645,18 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
         }
         Expr::Paren(inner) => vexpr(inner, cx),
         Expr::Unary { expr, .. } => vexpr(expr, cx),
-        Expr::Binary { l, r, .. } | Expr::Logical { l, r, .. } => {
+        // a bare `#x` is only grammatical as the lhs of `in` (private
+        // brand check); member access `.#x` goes through Expr::Str
+        Expr::Ident(n) if n.starts_with('#') => {
+            Err(cx.err(format!("`{n}` is only valid inside `in`")))
+        }
+        Expr::Binary { op, l, r } => {
+            if !(matches!(op, BinOp::In) && priv_name_expr(l).is_some()) {
+                vexpr(l, cx)?;
+            }
+            vexpr(r, cx)
+        }
+        Expr::Logical { l, r, .. } => {
             vexpr(l, cx)?;
             vexpr(r, cx)
         }
@@ -3363,6 +3722,16 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+/// is `e` a (possibly parenthesized) bare `#name` — the private-brand
+/// lhs of an `in` check? Returns the name when so.
+pub(crate) fn priv_name_expr(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Paren(inner) => priv_name_expr(inner),
+        Expr::Ident(n) if n.starts_with('#') => Some(n.as_str()),
+        _ => None,
     }
 }
 
@@ -3529,5 +3898,373 @@ fn collect_switch_vars(stmts: &[Stmt], out: &mut Vec<String>) {
             }
             _ => {}
         }
+    }
+}
+
+// -- `arguments` / `await` containment checks ----------------------------------
+// spec `Contains` does not cross non-arrow function boundaries for
+// `arguments` (each non-arrow fn defines its own), and does not cross
+// async-function boundaries for `await`. Arrows are transparent.
+
+fn fndef_has_arguments(f: &FnDef) -> bool {
+    for p in &f.params {
+        match p {
+            Param::Rest(p) => {
+                if pat_has_arguments(p) {
+                    return true;
+                }
+            }
+            Param::Pattern(p) => {
+                if pat_has_arguments(p) {
+                    return true;
+                }
+            }
+            Param::Default(p, d) => {
+                if pat_has_arguments(p) || expr_has_arguments(d) {
+                    return true;
+                }
+            }
+            Param::Ident(_) => {}
+        }
+    }
+    if let Some(e) = &f.arrow_expr {
+        if expr_has_arguments(e) {
+            return true;
+        }
+    }
+    stmts_have_arguments(&f.body)
+}
+
+fn pat_has_arguments(p: &Pattern) -> bool {
+    match p {
+        Pattern::Target(e) => expr_has_arguments(e),
+        Pattern::Ident(_) => false,
+        Pattern::Array(elems) => elems.iter().any(|e| match e {
+            ArrayPatElem::Hole => false,
+            ArrayPatElem::Elem(p) | ArrayPatElem::Rest(p) => pat_has_arguments(p),
+            ArrayPatElem::Default(p, d) => {
+                pat_has_arguments(p) || expr_has_arguments(d)
+            }
+        }),
+        Pattern::Object(elems) => elems.iter().any(|e| {
+            matches!(&e.key, PropKey::Computed(x) if expr_has_arguments(x))
+                || e.default.as_ref().is_some_and(|d| expr_has_arguments(d))
+                || pat_has_arguments(&e.val)
+        }),
+    }
+}
+
+fn class_has_arguments(c: &ClassDef) -> bool {
+    if c.superclass.as_ref().is_some_and(|e| expr_has_arguments(e)) {
+        return true;
+    }
+    // member functions (incl. static blocks) have their own `arguments`
+    c.members.iter().any(|m| {
+        matches!(&m.key, PropKey::Computed(e) if expr_has_arguments(e))
+            || m.init.as_ref().is_some_and(|e| expr_has_arguments(e))
+    })
+}
+
+fn stmts_have_arguments(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_has_arguments)
+}
+
+fn stmt_has_arguments(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => expr_has_arguments(e),
+        Stmt::Return(None) | Stmt::Empty | Stmt::Import(_)
+        | Stmt::Break(_) | Stmt::Continue(_) => false,
+        Stmt::VarDecl { decls, .. } => decls
+            .iter()
+            .any(|(p, i)| pat_has_arguments(p) || i.as_ref().is_some_and(|e| expr_has_arguments(e))),
+        Stmt::FnDecl(_) => false,
+        Stmt::ClassDecl(c) => class_has_arguments(c),
+        Stmt::If { c, t, e } => {
+            expr_has_arguments(c)
+                || stmt_has_arguments(t)
+                || e.as_ref().is_some_and(|e| stmt_has_arguments(e))
+        }
+        Stmt::Block(b) => stmts_have_arguments(b),
+        Stmt::While { c, body } | Stmt::DoWhile { c, body } => {
+            expr_has_arguments(c) || stmt_has_arguments(body)
+        }
+        Stmt::For { init, test, update, body } => {
+            init.as_ref().is_some_and(|i| match i {
+                ForInit::Var(_, decls) => decls.iter().any(|(p, e)| {
+                    pat_has_arguments(p) || e.as_ref().is_some_and(|e| expr_has_arguments(e))
+                }),
+                ForInit::Expr(e) => expr_has_arguments(e),
+            }) || test.as_ref().is_some_and(|e| expr_has_arguments(e))
+                || update.as_ref().is_some_and(|e| expr_has_arguments(e))
+                || stmt_has_arguments(body)
+        }
+        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body } => {
+            (match left {
+                ForTarget::Var(_, p) => pat_has_arguments(p),
+                ForTarget::Expr(e) => expr_has_arguments(e),
+            }) || expr_has_arguments(right)
+                || stmt_has_arguments(body)
+        }
+        Stmt::Switch { disc, cases } => {
+            expr_has_arguments(disc)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(|e| expr_has_arguments(e))
+                        || stmts_have_arguments(&c.body)
+                })
+        }
+        Stmt::Try {
+            block,
+            param,
+            handler,
+            finally,
+        } => {
+            stmts_have_arguments(block)
+                || param.as_ref().is_some_and(|p| pat_has_arguments(p))
+                || handler.as_ref().is_some_and(|h| stmts_have_arguments(h))
+                || finally.as_ref().is_some_and(|f| stmts_have_arguments(f))
+        }
+        Stmt::Labeled(_, i) => stmt_has_arguments(i),
+        Stmt::With { obj, body } => expr_has_arguments(obj) || stmt_has_arguments(body),
+        Stmt::Export(e) => match e {
+            ExportRec::Default(x) => expr_has_arguments(x),
+            ExportRec::Decl(s) => stmt_has_arguments(s),
+            _ => false,
+        },
+    }
+}
+
+fn expr_has_arguments(e: &Expr) -> bool {
+    match e {
+        Expr::Paren(inner) => expr_has_arguments(inner),
+        Expr::Ident(n) => n == "arguments",
+        Expr::Num(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::This
+        | Expr::Super
+        | Expr::Regex { .. } => false,
+        Expr::Fn(f) => f.is_arrow && fndef_has_arguments(f),
+        Expr::Class(c) => class_has_arguments(c),
+        Expr::Template(parts) => parts
+            .iter()
+            .any(|p| matches!(p, TemplPart::Expr(e) if expr_has_arguments(e))),
+        Expr::Array(elems) => elems.iter().any(|el| match el {
+            ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => {
+                expr_has_arguments(e)
+            }
+            ArrElem::Hole => false,
+        }),
+        Expr::Object(props) | Expr::ObjDup(props) => props.iter().any(|p| {
+            matches!(&p.key, PropKey::Computed(x) if expr_has_arguments(x))
+                || match &p.val {
+                    PropVal::Expr(e) | PropVal::Spread(e) | PropVal::SpreadTrail(e) => {
+                        expr_has_arguments(e)
+                    }
+                    PropVal::Method(_) | PropVal::Get(_) | PropVal::Set(_) => false,
+                }
+        }),
+        Expr::Unary { expr, .. } => expr_has_arguments(expr),
+        Expr::Update { target, .. } => expr_has_arguments(target),
+        Expr::Binary { l, r, .. } | Expr::Logical { l, r, .. } => {
+            expr_has_arguments(l) || expr_has_arguments(r)
+        }
+        Expr::Assign { target, value, .. } => {
+            expr_has_arguments(target) || expr_has_arguments(value)
+        }
+        Expr::Cond { c, t, f } => {
+            expr_has_arguments(c) || expr_has_arguments(t) || expr_has_arguments(f)
+        }
+        Expr::Call { callee, args } | Expr::New { callee, args } => {
+            expr_has_arguments(callee)
+                || args.iter().any(|a| match a {
+                    Arg::Expr(e) | Arg::Spread(e) => expr_has_arguments(e),
+                })
+        }
+        Expr::Member { obj, prop, .. } => {
+            expr_has_arguments(obj) || expr_has_arguments(prop)
+        }
+        Expr::Seq(exprs) => exprs.iter().any(expr_has_arguments),
+    }
+}
+
+/// `await` in a class field initializer / static block is an early
+/// error — async functions own their `await`, so they stop the search.
+fn expr_has_await(e: &Expr) -> bool {
+    match e {
+        Expr::Paren(inner) => expr_has_await(inner),
+        Expr::Unary { op: UnaryOp::Await, .. } => true,
+        Expr::Fn(f) => !f.is_async && fndef_has_await(f),
+        Expr::Class(c) => {
+            c.superclass.as_ref().is_some_and(|e| expr_has_await(e))
+                || c.members.iter().any(|m| {
+                    matches!(&m.key, PropKey::Computed(e) if expr_has_await(e))
+                        || m.init.as_ref().is_some_and(|e| expr_has_await(e))
+                        || (!m.func.is_async && stmts_have_await(&m.func.body))
+                })
+        }
+        Expr::Template(parts) => parts
+            .iter()
+            .any(|p| matches!(p, TemplPart::Expr(e) if expr_has_await(e))),
+        Expr::Array(elems) => elems.iter().any(|el| match el {
+            ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => {
+                expr_has_await(e)
+            }
+            ArrElem::Hole => false,
+        }),
+        Expr::Object(props) | Expr::ObjDup(props) => props.iter().any(|p| {
+            matches!(&p.key, PropKey::Computed(x) if expr_has_await(x))
+                || match &p.val {
+                    PropVal::Expr(e) | PropVal::Spread(e) | PropVal::SpreadTrail(e) => {
+                        expr_has_await(e)
+                    }
+                    PropVal::Method(d) | PropVal::Get(d) | PropVal::Set(d) => {
+                        !d.is_async && fndef_has_await(d)
+                    }
+                }
+        }),
+        Expr::Unary { expr, .. } | Expr::Update { target: expr, .. } => expr_has_await(expr),
+        Expr::Binary { l, r, .. } | Expr::Logical { l, r, .. } => {
+            expr_has_await(l) || expr_has_await(r)
+        }
+        Expr::Assign { target, value, .. } => {
+            expr_has_await(target) || expr_has_await(value)
+        }
+        Expr::Cond { c, t, f } => {
+            expr_has_await(c) || expr_has_await(t) || expr_has_await(f)
+        }
+        Expr::Call { callee, args } | Expr::New { callee, args } => {
+            expr_has_await(callee)
+                || args.iter().any(|a| match a {
+                    Arg::Expr(e) | Arg::Spread(e) => expr_has_await(e),
+                })
+        }
+        Expr::Member { obj, prop, .. } => expr_has_await(obj) || expr_has_await(prop),
+        Expr::Seq(exprs) => exprs.iter().any(expr_has_await),
+        _ => false,
+    }
+}
+
+fn fndef_has_await(f: &FnDef) -> bool {
+    for p in &f.params {
+        match p {
+            Param::Rest(p) => {
+                if pat_has_await(p) {
+                    return true;
+                }
+            }
+            Param::Pattern(p) => {
+                if pat_has_await(p) {
+                    return true;
+                }
+            }
+            Param::Default(p, d) => {
+                if pat_has_await(p) || expr_has_await(d) {
+                    return true;
+                }
+            }
+            Param::Ident(_) => {}
+        }
+    }
+    if let Some(e) = &f.arrow_expr {
+        if expr_has_await(e) {
+            return true;
+        }
+    }
+    stmts_have_await(&f.body)
+}
+
+fn pat_has_await(p: &Pattern) -> bool {
+    match p {
+        Pattern::Target(e) => expr_has_await(e),
+        Pattern::Ident(_) => false,
+        Pattern::Array(elems) => elems.iter().any(|e| match e {
+            ArrayPatElem::Hole => false,
+            ArrayPatElem::Elem(p) | ArrayPatElem::Rest(p) => pat_has_await(p),
+            ArrayPatElem::Default(p, d) => pat_has_await(p) || expr_has_await(d),
+        }),
+        Pattern::Object(elems) => elems.iter().any(|e| {
+            matches!(&e.key, PropKey::Computed(x) if expr_has_await(x))
+                || e.default.as_ref().is_some_and(|d| expr_has_await(d))
+                || pat_has_await(&e.val)
+        }),
+    }
+}
+
+fn stmts_have_await(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::FnDecl(f) => !f.is_async && fndef_has_await(f),
+        _ => stmt_has_await(s),
+    })
+}
+
+fn stmt_has_await(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => expr_has_await(e),
+        Stmt::VarDecl { decls, .. } => decls
+            .iter()
+            .any(|(p, i)| pat_has_await(p) || i.as_ref().is_some_and(|e| expr_has_await(e))),
+        Stmt::FnDecl(f) => !f.is_async && fndef_has_await(f),
+        Stmt::ClassDecl(c) => {
+            c.superclass.as_ref().is_some_and(|e| expr_has_await(e))
+                || c.members.iter().any(|m| {
+                    matches!(&m.key, PropKey::Computed(e) if expr_has_await(e))
+                        || m.init.as_ref().is_some_and(|e| expr_has_await(e))
+                        || (!m.func.is_async && stmts_have_await(&m.func.body))
+                })
+        }
+        Stmt::If { c, t, e } => {
+            expr_has_await(c)
+                || stmt_has_await(t)
+                || e.as_ref().is_some_and(|e| stmt_has_await(e))
+        }
+        Stmt::Block(b) => stmts_have_await(b),
+        Stmt::While { c, body } | Stmt::DoWhile { c, body } => {
+            expr_has_await(c) || stmt_has_await(body)
+        }
+        Stmt::For { init, test, update, body } => {
+            init.as_ref().is_some_and(|i| match i {
+                ForInit::Var(_, decls) => decls.iter().any(|(p, e)| {
+                    pat_has_await(p) || e.as_ref().is_some_and(|e| expr_has_await(e))
+                }),
+                ForInit::Expr(e) => expr_has_await(e),
+            }) || test.as_ref().is_some_and(|e| expr_has_await(e))
+                || update.as_ref().is_some_and(|e| expr_has_await(e))
+                || stmt_has_await(body)
+        }
+        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body } => {
+            (match left {
+                ForTarget::Var(_, p) => pat_has_await(p),
+                ForTarget::Expr(e) => expr_has_await(e),
+            }) || expr_has_await(right)
+                || stmt_has_await(body)
+        }
+        Stmt::Switch { disc, cases } => {
+            expr_has_await(disc)
+                || cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(|e| expr_has_await(e))
+                        || stmts_have_await(&c.body)
+                })
+        }
+        Stmt::Try {
+            block,
+            param,
+            handler,
+            finally,
+        } => {
+            stmts_have_await(block)
+                || param.as_ref().is_some_and(|p| pat_has_await(p))
+                || handler.as_ref().is_some_and(|h| stmts_have_await(h))
+                || finally.as_ref().is_some_and(|f| stmts_have_await(f))
+        }
+        Stmt::Labeled(_, i) => stmt_has_await(i),
+        Stmt::With { obj, body } => expr_has_await(obj) || stmt_has_await(body),
+        Stmt::Export(e) => match e {
+            ExportRec::Default(x) => expr_has_await(x),
+            ExportRec::Decl(s) => stmt_has_await(s),
+            _ => false,
+        },
+        _ => false,
     }
 }

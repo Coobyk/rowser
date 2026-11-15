@@ -196,6 +196,9 @@ pub struct ClassMember {
     pub kind: MemberKind,
     pub func: Rc<FnDef>,
     pub is_static: bool,
+    /// field initializer (kind == Field); static-block bodies ride in
+    /// `func.body` (kind == StaticBlock)
+    pub init: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -204,6 +207,10 @@ pub enum MemberKind {
     Getter,
     Setter,
     Ctor,
+    /// `x;` / `x = init;` — instance or static field
+    Field,
+    /// `static { ... }`
+    StaticBlock,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
