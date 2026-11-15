@@ -333,6 +333,12 @@ pub enum ForTarget {
     Expr(Expr),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum BindMode {
+    Decl(VarKind),
+    Assign,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VarKind {
     Var,

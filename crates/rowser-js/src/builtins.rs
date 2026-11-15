@@ -1202,13 +1202,29 @@ pub(crate) fn for_of_iter(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> 
     match v {
         Value::Str(_) => iter_to_lazy(i, v, Flat::Direct),
         Value::Obj(o) => {
+            // spec order: `@@iterator` is looked up first (fires Proxy
+            // traps / getters). Fast live-view only when the lookup
+            // resolves to the builtin `arr_values` native itself (an
+            // overridden `Array.prototype[Symbol.iterator]` must run).
+            let m = i.get_prop(v, &PropKey::Sym(SYM_ITERATOR))?;
             if matches!(o.borrow().kind, ObjKind::Arr(_)) {
-                return Ok(IterLazy::id(IterSrc::Arr {
-                    arr: o.clone(),
-                    idx: 0,
-                }));
+                let builtin = matches!(
+                    &m,
+                    Value::Obj(mo)
+                        if matches!(
+                            &mo.borrow().kind,
+                            ObjKind::Func(Func::Native { f, .. })
+                                if *f == (arr_values as NativeFn)
+                        )
+                );
+                if builtin {
+                    return Ok(IterLazy::id(IterSrc::Arr {
+                        arr: o.clone(),
+                        idx: 0,
+                    }));
+                }
             }
-            match i.get_prop(v, &PropKey::Sym(SYM_ITERATOR))? {
+            match m {
                 m if i.is_callable(&m) => {
                     let it = i.call(&m, v.clone(), Vec::new())?;
                     if !is_spec_obj(&it) {

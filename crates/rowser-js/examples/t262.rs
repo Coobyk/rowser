@@ -158,9 +158,12 @@ fn main() {
         }
         if bad_inc { skip += 1; continue; }
 
+        let strict = !m.raw && m.flags.iter().any(|f| f == "onlyStrict");
         let body = if m.raw { src.clone() } else {
             format!("{sta}\n{assert}\n{inc_src}\n{src}")
         };
+        let body = if strict { format!("\"use strict\";\n{body}") } else { body };
+        let src = if strict { format!("\"use strict\";\n{src}") } else { src };
 
         // strip the frontmatter comment? harmless — it's a comment.
         let rel = f.strip_prefix(&root).unwrap_or(f).display().to_string();

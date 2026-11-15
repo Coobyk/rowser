@@ -39,6 +39,10 @@ struct Parser {
     fn_depth: usize,
     /// inside a generator body — `yield` is the yield-expression
     gen_depth: usize,
+    /// `yield` is a reserved identifier here ([Yield] static context):
+    /// function *declarations* inherit it, expressions/methods reset
+    /// it, arrows transparently share the enclosing context
+    yield_decl: usize,
     /// inside a class constructor — `super()` call validity
     ctor_depth: usize,
     /// inside any method/ctor — `super.prop` validity
@@ -58,6 +62,7 @@ impl Parser {
             strict: false,
             fn_depth: 0,
             gen_depth: 0,
+            yield_decl: 0,
             ctor_depth: 0,
             method_depth: 0,
             param_depth: 0,
@@ -243,10 +248,8 @@ impl Parser {
             self.method_depth,
         );
         self.fn_depth += 1;
-        if arrow {
-            // `yield` inside an arrow is illegal regardless of enclosing fn
-            self.gen_depth = 0;
-        }
+        // arrows are transparent to `yield` — a `yield` inside an arrow
+        // inside a generator belongs to that generator
         // strictness of this body = inherited strict or own directive —
         // peek at the first body token now so params/strict errors see it
         if self.directive_candidate() {
@@ -984,11 +987,12 @@ impl Parser {
     fn fn_tail(&mut self, name_required: bool, gen: bool) -> Result<FnDef, Error> {
         let name = {
             // the name's [Yield] context: declarations inherit the
-            // enclosing generator; expressions always use their own
-            let saved_gd = self.gen_depth;
-            if !name_required {
-                self.gen_depth = gen as usize;
-            }
+            // enclosing generator; the nested fn always uses its own
+            // a function's *name* is not yield-restricted by the [Yield]
+            // context — `function* yield(){}` is legal in sloppy code
+            let saved_gd = (self.gen_depth, self.yield_decl);
+            self.gen_depth = gen as usize;
+            self.yield_decl = 0;
             let n = match self.peek().tok.clone() {
                 Tok::Ident(s) => {
                     self.check_binding_name(&s)?;
@@ -1004,11 +1008,20 @@ impl Parser {
                 _ if !name_required => None,
                 _ => return Err(self.err("expected function name")),
             };
-            self.gen_depth = saved_gd;
+            (self.gen_depth, self.yield_decl) = saved_gd;
             n
         };
-        let old_ctx = (self.gen_depth, self.strict, self.ctor_depth, self.method_depth);
+        let old_ctx = (
+            self.gen_depth,
+            self.yield_decl,
+            self.strict,
+            self.ctor_depth,
+            self.method_depth,
+        );
+        // a nested function always gets its own [Yield] context from its
+        // own `*` marker — only arrows inherit the enclosing one
         self.gen_depth = gen as usize;
+        self.yield_decl = gen as usize;
         self.ctor_depth = 0;
         self.method_depth = 0;
         let res = (|| {
@@ -1038,7 +1051,13 @@ impl Parser {
             let body = self.fn_body(false)?;
             Ok((params, body))
         })();
-        (self.gen_depth, self.strict, self.ctor_depth, self.method_depth) = old_ctx;
+        (
+            self.gen_depth,
+            self.yield_decl,
+            self.strict,
+            self.ctor_depth,
+            self.method_depth,
+        ) = old_ctx;
         let (params, body) = res?;
         Ok(FnDef {
             name,
@@ -1054,12 +1073,23 @@ impl Parser {
     /// Method body: runs `fn_body` in method context (`super.x` legal,
     /// `super()` only when `is_ctor`) and restores the enclosing context.
     fn method_body(&mut self, is_ctor: bool, gen: bool) -> Result<Vec<Stmt>, Error> {
-        let saved = (self.ctor_depth, self.method_depth, self.gen_depth);
+        let saved = (
+            self.ctor_depth,
+            self.method_depth,
+            self.gen_depth,
+            self.yield_decl,
+        );
         self.ctor_depth = is_ctor as usize;
         self.method_depth = 1;
         self.gen_depth = gen as usize;
+        self.yield_decl = gen as usize;
         let r = self.fn_body(false);
-        (self.ctor_depth, self.method_depth, self.gen_depth) = saved;
+        (
+            self.ctor_depth,
+            self.method_depth,
+            self.gen_depth,
+            self.yield_decl,
+        ) = saved;
         r
     }
 
@@ -1100,8 +1130,8 @@ impl Parser {
     /// strict-mode binding-name restrictions (eval/arguments + strict-only
     /// reserved words).
     fn check_binding_name(&self, name: &str) -> Result<(), Error> {
-        // `yield` is reserved inside generator bodies even in sloppy mode
-        if name == "yield" && self.gen_depth > 0 {
+        // `yield` is reserved in any [Yield] context even in sloppy mode
+        if name == "yield" && self.yield_decl > 0 {
             return Err(self.err("`yield` is not a valid binding in a generator"));
         }
         if !self.strict {
@@ -1457,11 +1487,10 @@ impl Parser {
             self.check_params(&params, true)?;
             // expression body — `yield`/`super`-context rules for arrows
             // apply inside it too
-            let saved = (self.fn_depth, self.gen_depth);
+            let saved = self.fn_depth;
             self.fn_depth += 1;
-            self.gen_depth = 0;
             let res = self.assign_expr();
-            (self.fn_depth, self.gen_depth) = saved;
+            self.fn_depth = saved;
             let e = res?;
             Ok(Expr::Fn(Rc::new(FnDef {
                 name,
@@ -1926,8 +1955,8 @@ impl Parser {
                 ) =>
             {
                 // [Yield] early error: `yield` is never an
-                // IdentifierReference inside a generator body
-                if k == Kw::Yield && self.gen_depth > 0 {
+                // IdentifierReference inside a [Yield] production
+                if k == Kw::Yield && self.yield_decl > 0 {
                     return Err(self.err("`yield` is not a valid identifier here"));
                 }
                 self.next();
@@ -2193,7 +2222,7 @@ fn is_assignable(e: &Expr) -> bool {
     }
 }
 
-fn pattern_names<'a>(p: &'a Param, out: &mut Vec<&'a str>) {
+pub(crate) fn pattern_names<'a>(p: &'a Param, out: &mut Vec<&'a str>) {
     match p {
         Param::Ident(n) => out.push(n.as_str()),
         Param::Default(pat, _) | Param::Rest(pat) => collect_pat_names(pat, out),

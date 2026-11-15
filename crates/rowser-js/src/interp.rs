@@ -715,6 +715,9 @@ impl Obj {
 pub struct Binding {
     pub val: Value,
     pub mutable: bool,
+    /// in the temporal dead zone — reading throws ReferenceError
+    /// (parameter bindings instantiate uninit before defaults run)
+    pub uninit: bool,
 }
 
 pub struct Scope {
@@ -1108,11 +1111,13 @@ impl Interp {
     // -- env ops ------------------------------------------------------------
     /// Walk the scope chain by reference — no `Rc` clone per hop. Only the
     /// hit/miss results clone values.
-    pub fn env_lookup(&self, env: &EnvRef, name: &str) -> Option<Value> {
+    /// lookup + TDZ state (parameter bindings are uninit until their
+    /// initializers run — reading them is a ReferenceError).
+    pub fn env_lookup_st(&self, env: &EnvRef, name: &str) -> Option<(Value, bool)> {
         let mut cur: &EnvRef = env;
         loop {
             if let Some(b) = cur.vars.borrow().get(name) {
-                return Some(b.val.clone());
+                return Some((b.val.clone(), b.uninit));
             }
             match &cur.parent {
                 Some(p) => cur = p,
@@ -1121,6 +1126,11 @@ impl Interp {
         }
         // fall back to global object properties (globalThis.x = …)
         self.obj_get_raw_str(&self.p.global, name)
+            .map(|v| (v, false))
+    }
+
+    pub fn env_lookup(&self, env: &EnvRef, name: &str) -> Option<Value> {
+        self.env_lookup_st(env, name).map(|(v, _)| v)
     }
 
     pub fn env_assign(&mut self, env: &EnvRef, name: &str, v: Value) -> Result<(), Value> {
@@ -1136,6 +1146,7 @@ impl Interp {
                         );
                     }
                     b.val = v;
+                    b.uninit = false;
                     return Ok(());
                 }
             }
@@ -1150,7 +1161,7 @@ impl Interp {
             k.clone(),
             Binding {
                 val: v.clone(),
-                mutable: true,
+                mutable: true, uninit: false,
             },
         );
         self.p
@@ -1204,6 +1215,7 @@ impl Interp {
             Binding {
                 val: v.clone(),
                 mutable,
+                uninit: false,
             },
         );
         if Rc::ptr_eq(env, &self.global) {
@@ -1237,7 +1249,7 @@ impl Interp {
                 name.clone(),
                 Binding {
                     val: v.clone(),
-                    mutable: true,
+                    mutable: true, uninit: false,
                 },
             );
         } else if !matches!(v, Value::Und) {
@@ -2663,12 +2675,30 @@ impl Interp {
                         k,
                         Binding {
                             val: Value::Obj(arr),
-                            mutable: true,
+                            mutable: true, uninit: false,
                         },
                     );
                 }
                 self.bind_params(&scope, &def.params, &args)?;
-                self.apply_hoisted(&h, &scope);
+                // non-simple formals get a separate var environment —
+                // body `var` decls must not leak into the param scope
+                let body_scope: EnvRef = if def
+                    .params
+                    .iter()
+                    .any(|p| !matches!(p, Param::Ident(_)))
+                {
+                    let bs = Scope::new(Some(scope.clone()), true);
+                    bs.var_boundary.set(true);
+                    *bs.thisv.borrow_mut() = scope.thisv.borrow().clone();
+                    *bs.new_target.borrow_mut() =
+                        scope.new_target.borrow().clone();
+                    *bs.home.borrow_mut() = scope.home.borrow().clone();
+                    *bs.ctor_fn.borrow_mut() = scope.ctor_fn.borrow().clone();
+                    bs
+                } else {
+                    scope.clone()
+                };
+                self.apply_hoisted(&h, &body_scope);
                 if def.is_gen {
                     // lazy generator: the body runs on a coroutine stack
                     // allocated at first resume; `yield` suspends back to
@@ -2687,7 +2717,7 @@ impl Interp {
                         Some(gproto),
                         ObjKind::Gen(Rc::new(RefCell::new(GenCell {
                             coro: None,
-                            pending: Some((def, scope)),
+                            pending: Some((def, body_scope)),
                             running: false,
                             done: false,
                         }))),
@@ -2697,12 +2727,12 @@ impl Interp {
                     // `(x) => expr` — implicit return
                     let e = e.clone();
                     self.depth += 1;
-                    let r = self.eval_expr(&e, &scope);
+                    let r = self.eval_expr(&e, &body_scope);
                     self.depth -= 1;
                     return r;
                 }
                 self.depth += 1;
-                let r = self.exec_block(&def.body, &scope);
+                let r = self.exec_block(&def.body, &body_scope);
                 self.depth -= 1;
                 match r {
                     Ok(Completion::Return(v)) => Ok(v),
@@ -2880,15 +2910,31 @@ impl Interp {
                         k,
                         Binding {
                             val: Value::Obj(arr),
-                            mutable: true,
+                            mutable: true, uninit: false,
                         },
                     );
                 }
-                self.apply_hoisted(&h, &scope);
+                let body_scope: EnvRef = if def
+                    .params
+                    .iter()
+                    .any(|p| !matches!(p, Param::Ident(_)))
+                {
+                    let bs = Scope::new(Some(scope.clone()), true);
+                    bs.var_boundary.set(true);
+                    *bs.thisv.borrow_mut() = scope.thisv.borrow().clone();
+                    *bs.new_target.borrow_mut() =
+                        scope.new_target.borrow().clone();
+                    *bs.home.borrow_mut() = scope.home.borrow().clone();
+                    *bs.ctor_fn.borrow_mut() = scope.ctor_fn.borrow().clone();
+                    bs
+                } else {
+                    scope.clone()
+                };
+                self.apply_hoisted(&h, &body_scope);
                 self.depth += 1;
-                let r = self.exec_block(&def.body, &scope);
+                let r = self.exec_block(&def.body, &body_scope);
                 self.depth -= 1;
-                let this_out = scope.thisv.borrow().clone();
+                let this_out = body_scope.thisv.borrow().clone();
                 match r {
                     Ok(Completion::Return(v))
                         if self.is_callable(&v) || matches!(v, Value::Obj(_)) =>
@@ -2922,6 +2968,26 @@ impl Interp {
         params: &[Param],
         args: &[Value],
     ) -> Result<(), Value> {
+        // instantiate all parameter bindings uninitialized (TDZ) —
+        // a default initializer may not read a not-yet-bound param
+        {
+            let mut vs = scope.vars.borrow_mut();
+            for p in params {
+                let mut names: Vec<&str> = Vec::new();
+                crate::parser::pattern_names(p, &mut names);
+                for n in names {
+                    let k = self.intern(n);
+                    vs.insert(
+                        k,
+                        Binding {
+                            val: Value::Und,
+                            mutable: true,
+                            uninit: true,
+                        },
+                    );
+                }
+            }
+        }
         if params.iter().any(|p| matches!(p, Param::Default(..))) {
             // default expressions evaluate in the parameter environment —
             // flag it so direct eval there rejects `var arguments`/`var eval`
@@ -2937,7 +3003,7 @@ impl Interp {
                         k,
                         Binding {
                             val: v,
-                            mutable: true,
+                            mutable: true, uninit: false,
                         },
                     );
                     i += 1;
@@ -2947,6 +3013,13 @@ impl Interp {
                         Some(Value::Und) | None => self.eval_expr(dflt, scope)?,
                         Some(v) => v.clone(),
                     };
+                    if let Pattern::Ident(n) = pat.as_ref() {
+                        if let Some(Value::Und) | None = args.get(i) {
+                            if Self::is_anon_fn_def(dflt) {
+                                self.maybe_name(&v, n);
+                            }
+                        }
+                    }
                     self.bind_pattern(scope, pat, v, VarKind::Let, true)?;
                     i += 1;
                 }
@@ -2976,39 +3049,151 @@ impl Interp {
         kind: VarKind,
         _declare: bool,
     ) -> Result<(), Value> {
+        self.pat_bind(scope, pat, v, BindMode::Decl(kind))
+    }
+
+    /// IsAnonymousFunctionDefinition — only direct anon fn/class/arrow
+    /// exprs get NamedEvaluation (`(0, function(){})` does not).
+    fn is_anon_fn_def(e: &Expr) -> bool {
+        match e {
+            Expr::Fn(d) => d.name.is_none(),
+            Expr::Class(c) => c.name.is_none(),
+            _ => false,
+        }
+    }
+
+    /// NamedEvaluation — an anonymous fn/class bound to a name takes it,
+    /// unless it already has an own `name` (e.g. `static name` members).
+    fn maybe_name(&mut self, v: &Value, name: &str) {
+        if let Value::Obj(o) = v {
+            let b = o.borrow();
+            let needs = match &b.kind {
+                ObjKind::Func(Func::User { def, .. }) => {
+                    def.name.is_none()
+                        && matches!(
+                            b.props.get(&PropKey::from_str("name")),
+                            Some(p) if matches!(&p.val, Value::Str(s) if s.is_empty())
+                        )
+                }
+                _ => false,
+            };
+            drop(b);
+            if needs {
+                self.set_attr(
+                    o,
+                    "name",
+                    Value::Str(Rc::from(name)),
+                    false,
+                    true,
+                );
+            }
+        }
+    }
+
+    fn pat_bind(
+        &mut self,
+        scope: &EnvRef,
+        pat: &Pattern,
+        v: Value,
+        mode: BindMode,
+    ) -> Result<(), Value> {
         match pat {
-            Pattern::Ident(name) => match kind {
-                VarKind::Var => self.declare_var(scope, name, v),
-                _ => self.declare(scope, name, v, kind != VarKind::Const),
+            Pattern::Ident(name) => match mode {
+                BindMode::Assign => self.env_assign(scope, name, v)?,
+                BindMode::Decl(VarKind::Var) => {
+                    self.declare_var(scope, name, v)
+                }
+                BindMode::Decl(kind) => {
+                    self.declare(scope, name, v, kind != VarKind::Const)
+                }
             },
             Pattern::Array(elems) => {
-                let items = self.iter_values(&v)?;
-                let mut idx = 0;
-                for e in elems {
-                    match e {
-                        ArrayPatElem::Hole => idx += 1,
-                        ArrayPatElem::Elem(p) => {
-                            let it = items.get(idx).cloned().unwrap_or(Value::Und);
-                            self.bind_pattern(scope, p, it, kind, true)?;
-                            idx += 1;
+                // lazy protocol pulls — IteratorClose on early completion
+                // (an infinite source must not be drained) and on abrupt
+                let mut it = crate::builtins::for_of_iter(self, &v)?;
+                let mut done = false;
+                let res = (|| -> Result<(), Value> {
+                    for e in elems {
+                        macro_rules! pull {
+                            () => {{
+                                if done {
+                                    Value::Und
+                                } else {
+                                    match crate::builtins::iter_lazy_step(
+                                        self, &mut it,
+                                    ) {
+                                        Ok(Some(x)) => x,
+                                        Ok(None) => {
+                                            done = true;
+                                            Value::Und
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                            }};
                         }
-                        ArrayPatElem::Default(p, d) => {
-                            let it = match items.get(idx) {
-                                Some(Value::Und) | None => self.eval_expr(d, scope)?,
-                                Some(v) => v.clone(),
-                            };
-                            self.bind_pattern(scope, p, it, kind, true)?;
-                            idx += 1;
-                        }
-                        ArrayPatElem::Rest(p) => {
-                            let rest: Vec<Value> = items.iter().skip(idx).cloned().collect();
-                            let arr = Value::Obj(self.new_arr(rest));
-                            self.bind_pattern(scope, p, arr, kind, true)?;
+                        match e {
+                            ArrayPatElem::Hole => {
+                                let _ = pull!();
+                            }
+                            ArrayPatElem::Elem(p) => {
+                                let x = pull!();
+                                self.pat_bind(scope, p, x, mode)?;
+                            }
+                            ArrayPatElem::Default(p, d) => {
+                                let x = pull!();
+                                let x = if matches!(x, Value::Und) {
+                                    let x = self.eval_expr(d, scope)?;
+                                    if let Pattern::Ident(n) = p {
+                                        if Self::is_anon_fn_def(d) {
+                                            self.maybe_name(&x, n);
+                                        }
+                                    }
+                                    x
+                                } else {
+                                    x
+                                };
+                                self.pat_bind(scope, p, x, mode)?;
+                            }
+                            ArrayPatElem::Rest(p) => {
+                                // rest drains the iterator — it ends done
+                                let mut rest = Vec::new();
+                                loop {
+                                    match crate::builtins::iter_lazy_step(
+                                        self, &mut it,
+                                    ) {
+                                        Ok(Some(x)) => rest.push(x),
+                                        Ok(None) => {
+                                            done = true;
+                                            break;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                let arr = Value::Obj(self.new_arr(rest));
+                                self.pat_bind(scope, p, arr, mode)?;
+                            }
                         }
                     }
+                    Ok(())
+                })();
+                if !done {
+                    // pattern finished while the iterator is still open —
+                    // IteratorClose (normal completion). On abrupt the
+                    // close error is swallowed per spec.
+                    match (&res, crate::builtins::iter_lazy_close(self, &mut it)) {
+                        (Ok(()), Err(ce)) => return Err(ce),
+                        _ => {}
+                    }
                 }
+                res?;
             }
             Pattern::Object(elems) => {
+                if matches!(v, Value::Und | Value::Null) {
+                    return Err(self.type_err(
+                        "cannot destructure null or undefined",
+                    ));
+                }
                 for e in elems {
                     if let ast::PropKey::Str(s) = &e.key {
                         if s.as_str() == REST_PAT_KEY {
@@ -3029,14 +3214,16 @@ impl Interp {
                                     .collect();
                                 for k in keys {
                                     if !taken.contains(&k) {
-                                        let val = self
-                                            .obj_get_raw(src, &PropKey::from_str(&k))
-                                            .unwrap_or(Value::Und);
+                                        // CopyDataProperties uses [[Get]]
+                                        let val = self.get_prop(
+                                            &v,
+                                            &PropKey::from_str(&k),
+                                        )?;
                                         self.set_data(&rest, &k, val);
                                     }
                                 }
                             }
-                            self.bind_pattern(scope, &e.val, Value::Obj(rest), kind, true)?;
+                            self.pat_bind(scope, &e.val, Value::Obj(rest), mode)?;
                             continue;
                         }
                     }
@@ -3050,10 +3237,18 @@ impl Interp {
                     };
                     let got = self.get_prop(&v, &key)?;
                     let val = match (&got, &e.default) {
-                        (Value::Und, Some(d)) => self.eval_expr(d, scope)?,
+                        (Value::Und, Some(d)) => {
+                            let val = self.eval_expr(d, scope)?;
+                            if let Pattern::Ident(n) = &e.val {
+                                if Self::is_anon_fn_def(d) {
+                                    self.maybe_name(&val, n.as_str());
+                                }
+                            }
+                            val
+                        }
                         _ => got,
                     };
-                    self.bind_pattern(scope, &e.val, val, kind, true)?;
+                    self.pat_bind(scope, &e.val, val, mode)?;
                 }
             }
         }
@@ -3062,88 +3257,7 @@ impl Interp {
 
     /// assignment-mode destructuring (`[a,b] = arr`, `{x,y} = obj`)
     fn assign_pattern(&mut self, scope: &EnvRef, pat: &Pattern, v: Value) -> Result<(), Value> {
-        match pat {
-            Pattern::Ident(name) => self.env_assign(scope, name, v),
-            Pattern::Array(elems) => {
-                let items = self.iter_values(&v)?;
-                let mut idx = 0;
-                for e in elems {
-                    match e {
-                        ArrayPatElem::Hole => idx += 1,
-                        ArrayPatElem::Elem(p) => {
-                            let it = items.get(idx).cloned().unwrap_or(Value::Und);
-                            self.assign_pattern(scope, p, it)?;
-                            idx += 1;
-                        }
-                        ArrayPatElem::Default(p, d) => {
-                            let it = match items.get(idx) {
-                                Some(Value::Und) | None => self.eval_expr(d, scope)?,
-                                Some(v) => v.clone(),
-                            };
-                            self.assign_pattern(scope, p, it)?;
-                            idx += 1;
-                        }
-                        ArrayPatElem::Rest(p) => {
-                            let rest: Vec<Value> = items.iter().skip(idx).cloned().collect();
-                            let arr = Value::Obj(self.new_arr(rest));
-                            self.assign_pattern(scope, p, arr)?;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            Pattern::Object(elems) => {
-                for e in elems {
-                    if let ast::PropKey::Str(s) = &e.key {
-                        if s.as_str() == REST_PAT_KEY {
-                            let rest = self.new_obj();
-                            if let Value::Obj(src) = &v {
-                                let keys = self.own_keys(&v);
-                                let taken: HashSet<String> = elems
-                                    .iter()
-                                    .filter_map(|x| match &x.key {
-                                        ast::PropKey::Str(s) | ast::PropKey::Ident(s)
-                                            if s.as_str() != REST_PAT_KEY =>
-                                        {
-                                            Some(s.to_string())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect();
-                                for k in keys {
-                                    if !taken.contains(&k) {
-                                        let val = self
-                                            .obj_get_raw(src, &PropKey::from_str(&k))
-                                            .unwrap_or(Value::Und);
-                                        self.set_data(&rest, &k, val);
-                                    }
-                                }
-                            }
-                            self.assign_pattern(scope, &e.val, Value::Obj(rest))?;
-                            continue;
-                        }
-                    }
-                    let key = match &e.key {
-                        ast::PropKey::Ident(s) | ast::PropKey::Str(s) => PropKey::from_str(s),
-                        ast::PropKey::Num(n) => PropKey::from_str(&js_num_str(*n)),
-                        ast::PropKey::Computed(ex) => {
-                            let kv = self.eval_expr(ex, scope)?;
-                            self.to_propkey(&kv)?
-                        }
-                    };
-                    let got = self.get_prop(&v, &key)?;
-                    let val = match (&got, &e.default) {
-                        (Value::Und, Some(d)) => self.eval_expr(d, scope)?,
-                        _ => got,
-                    };
-                    match &e.val {
-                        Pattern::Ident(name) => self.env_assign(scope, name, val)?,
-                        other => self.assign_pattern(scope, other, val)?,
-                    }
-                }
-                Ok(())
-            }
-        }
+        self.pat_bind(scope, pat, v, BindMode::Assign)
     }
 
     /// Convert an iterable to a Vec of values (for-of, spread, destructuring).
@@ -3394,6 +3508,11 @@ impl Interp {
                         Some(e) => self.eval_expr(e, env)?,
                         None => Value::Und,
                     };
+                    if let (Pattern::Ident(n), Some(ie)) = (pat, init) {
+                        if Self::is_anon_fn_def(ie) {
+                            self.maybe_name(&v, n);
+                        }
+                    }
                     match pat {
                         Pattern::Ident(name) => match kind {
                             VarKind::Var => self.declare_var(env, name, v.clone()),
@@ -3843,7 +3962,7 @@ impl Interp {
                             k,
                             Binding {
                                 val: v,
-                                mutable: *kind != VarKind::Const,
+                                mutable: *kind != VarKind::Const, uninit: false,
                             },
                         );
                         Ok(())
@@ -3876,7 +3995,7 @@ impl Interp {
                     k,
                     Binding {
                         val: v,
-                        mutable: kind != VarKind::Const,
+                        mutable: kind != VarKind::Const, uninit: false,
                     },
                 );
                 Ok(())
@@ -3910,6 +4029,11 @@ impl Interp {
                 Ok(())
             }
             Pattern::Object(elems) => {
+                if matches!(v, Value::Und | Value::Null) {
+                    return Err(self.type_err(
+                        "cannot destructure null or undefined",
+                    ));
+                }
                 for e in elems {
                     let key = match &e.key {
                         ast::PropKey::Ident(s) | ast::PropKey::Str(s) => PropKey::from_str(s),
@@ -4074,7 +4198,7 @@ impl Interp {
                 Rc::from(n.as_str()),
                 Binding {
                     val: ctor_fn.clone(),
-                    mutable: false,
+                    mutable: false, uninit: false,
                 },
             );
         }
@@ -4096,8 +4220,11 @@ impl Interp {
                     let v = fs.new_target.borrow().clone();
                     return Ok(v);
                 }
-                match self.env_lookup(env, name) {
-                    Some(v) => Ok(v),
+                match self.env_lookup_st(env, name) {
+                    Some((_, true)) => Err(self.ref_err(format!(
+                        "cannot access '{name}' before initialization"
+                    ))),
+                    Some((v, false)) => Ok(v),
                     None => {
                         if name == "undefined" || name == "$import_meta" {
                             return Ok(Value::Und);
@@ -4239,7 +4366,7 @@ impl Interp {
                             Rc::from(n.as_str()),
                             Binding {
                                 val: Value::Und,
-                                mutable: false,
+                                mutable: false, uninit: false,
                             },
                         );
                         e
@@ -4253,7 +4380,7 @@ impl Interp {
                             Rc::from(n.as_str()),
                             Binding {
                                 val: f.clone(),
-                                mutable: false,
+                                mutable: false, uninit: false,
                             },
                         );
                     }
@@ -4576,8 +4703,13 @@ impl Interp {
             UnaryOp::Typeof => {
                 // `typeof undefinedIdent` must not throw
                 if let Expr::Ident(n) = expr {
-                    match self.env_lookup(env, n) {
-                        Some(v) => {
+                    match self.env_lookup_st(env, n) {
+                        Some((_, true)) => {
+                            return Err(self.ref_err(format!(
+                                "cannot access '{n}' before initialization"
+                            )))
+                        }
+                        Some((v, false)) => {
                             let tn = self.type_name(&v);
                             return Ok(Value::Str(self.intern(tn)));
                         }
@@ -4771,6 +4903,11 @@ impl Interp {
                 }
                 _ => {
                     let v = self.eval_expr(value, env)?;
+                    if let Expr::Ident(n) = target {
+                        if Self::is_anon_fn_def(value) {
+                            self.maybe_name(&v, n);
+                        }
+                    }
                     self.assign_target(env, target, v.clone())?;
                     return Ok(v);
                 }
