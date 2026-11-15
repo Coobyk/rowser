@@ -75,7 +75,20 @@ fn mk_ctor_len(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef, len: f64
 
 fn gdef(i: &mut Interp, name: &str, v: Value) {
     let g = i.global.clone();
-    i.declare(&g, name, v, true);
+    i.declare(&g, name, v.clone(), true);
+    // also an own property on the global object — builtin globals are
+    // {W:true, E:false, C:true} per spec 18.3
+    i.p.global.borrow_mut().props.insert(
+        PropKey::from_str(name),
+        Prop {
+            val: v,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            get: None,
+            set: None,
+        },
+    );
 }
 
 /// `Ctor.prototype` looked up from the global scope (for objects created
@@ -574,7 +587,7 @@ fn ta_elem(i: &mut Interp, this: &Value, k: usize) -> Result<Value, Value> {
 
 /// wrap a raw element value for JS visibility — bigint-kind arrays
 /// expose bigint stand-in objects; everything else passes through.
-fn ta_pubify(i: &mut Interp, this: &Value, v: Value) -> Value {
+pub(crate) fn ta_pubify(i: &mut Interp, this: &Value, v: Value) -> Value {
     if let Value::Num(n) = &v {
         if ta_is_big(this) {
             return i.bigint_obj(*n);
@@ -654,7 +667,7 @@ fn to_index(i: &mut Interp, v: &Value) -> Result<usize, Value> {
 
 /// magnitude of a bigint stand-in object (the non-enumerable
 /// `__bigint` slot installed by `Interp::bigint_obj`).
-fn bigint_magnitude(v: &Value) -> Option<f64> {
+pub(crate) fn bigint_magnitude(v: &Value) -> Option<f64> {
     if let Value::Obj(o) = v {
         if let Some(Value::Num(n)) =
             o.borrow().props.get_str("__bigint").map(|p| p.val.clone())
@@ -712,7 +725,7 @@ fn str_to_bigint_num(i: &mut Interp, s: &str) -> Result<f64, Value> {
 /// a ToBigInt approximation for bigint-kind ones (stand-in objects
 /// carry their magnitude in `__bigint`; real engines throw TypeError
 /// converting BigInt↔Number, which we emulate).
-fn ta_elem_num(i: &mut Interp, v: &Value, big: bool) -> Result<f64, Value> {
+pub(crate) fn ta_elem_num(i: &mut Interp, v: &Value, big: bool) -> Result<f64, Value> {
     if big {
         return match v {
             Value::Num(_) | Value::Und | Value::Null | Value::Sym(..) => {
@@ -736,11 +749,34 @@ fn ta_elem_num(i: &mut Interp, v: &Value, big: bool) -> Result<f64, Value> {
     i.to_num(v)
 }
 
+/// coerce a value for a (possibly bigint-kind) typed-array element
+/// write — ToNumber/ToBigInt + the ToBigInt64/ToBigUint64 mod-2^64 wrap.
+pub(crate) fn ta_elem_write(
+    i: &mut Interp,
+    this: &Value,
+    v: &Value,
+) -> Result<f64, Value> {
+    let big = ta_is_big(this);
+    let n = ta_elem_num(i, v, big)?;
+    Ok(if big {
+        // f64 stand-ins approximate the arbitrary-precision spec: the
+        // wrap keeps at least the magnitude's sign/parity right.
+        const M: f64 = 18446744073709551616.0; // 2^64
+        let mut r = n.rem_euclid(M);
+        if ta_intrinsic_name(this, TAK::F64) == "BigInt64Array" && r >= M / 2.0 {
+            r -= M;
+        }
+        r
+    } else {
+        n
+    })
+}
+
 /// spec [[ContentType]] check — bigint-kind TypedArrays carry the
 /// hidden `__name` slot either directly (installed by `big_ta_ctor`)
 /// or on their prototype (installed at bootstrap for the intrinsic
 /// names); a proto-chain walk covers both plus subclasses.
-fn ta_is_big(v: &Value) -> bool {
+pub(crate) fn ta_is_big(v: &Value) -> bool {
     let Value::Obj(o) = v else {
         return false;
     };
@@ -1000,49 +1036,67 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bo
                     // or null means "not iterable"; a non-callable
                     // method is a TypeError.
                     let iterm = i.get_prop(&src, &PropKey::Sym(SYM_ITERATOR))?;
-                    let items = if matches!(iterm, Value::Und | Value::Null) {
-                        // engine-internal array/iterator kinds may carry
-                        // elements without a `length` prop — reuse the
-                        // shared drain for those.
-                        let internal = matches!(&src, Value::Obj(o) if matches!(
-                            o.borrow().kind,
-                            ObjKind::Arr(_) | ObjKind::Iter { .. } | ObjKind::IterLazy(_)
-                        ));
-                        if internal {
-                            to_elems(i, &src)?
-                        } else {
-                            // spec InitializeTypedArrayFromArrayLike:
-                            // LengthOfArrayLike feeds AllocateTypedArrayBuffer —
-                            // a length beyond the host element cap is a
-                            // RangeError before any element is read. `to_elems`
-                            // would silently clamp, so the generic length is
-                            // read and bounded here instead.
-                            let len =
-                                i.get_prop(&src, &PropKey::from_str("length"))?;
-                            let n = i.to_num(&len)?;
-                            if n.is_nan() || n <= 0.0 {
-                                Vec::new()
-                            } else if !n.is_finite() || n > 8_000_000.0 {
-                                return Err(i.range_err("Invalid typed array length"));
-                            } else {
-                                let n = n.trunc() as usize;
-                                let mut items = Vec::with_capacity(n.min(1_000_000));
-                                for k in 0..n {
-                                    items.push(i.get_prop(&src, &ta_elem_key(k))?);
-                                }
-                                items
-                            }
+                    // spec IterableToList + InitializeTypedArrayFromList
+                    // collect every value before the per-element number
+                    // conversions; converting inline is equivalent.
+                    let convert = |items: Vec<Value>,
+                                   i: &mut Interp|
+                     -> Result<Vec<f64>, Value> {
+                        let mut elems = Vec::with_capacity(items.len());
+                        for it in items {
+                            elems.push(ta_elem_num(i, &it, target_big)?);
                         }
-                    } else {
-                        if !i.is_callable(&iterm) {
-                            return Err(i.type_err("value is not iterable"));
-                        }
-                        i.iter_values(&src)?
+                        Ok(elems)
                     };
-                    let mut elems = Vec::with_capacity(items.len());
-                    for it in items {
-                        elems.push(ta_elem_num(i, &it, target_big)?);
-                    }
+                    let elems: Vec<f64> =
+                        if matches!(iterm, Value::Und | Value::Null) {
+                            // engine-internal array/iterator kinds may carry
+                            // elements without a `length` prop — reuse the
+                            // shared drain for those.
+                            let internal =
+                                matches!(&src, Value::Obj(o) if matches!(
+                                    o.borrow().kind,
+                                    ObjKind::Arr(_)
+                                        | ObjKind::Iter { .. }
+                                        | ObjKind::IterLazy(_)
+                                ));
+                            if internal {
+                                convert(to_elems(i, &src)?, i)?
+                            } else {
+                                // spec InitializeTypedArrayFromArrayLike:
+                                // LengthOfArrayLike feeds
+                                // AllocateTypedArrayBuffer — a length beyond
+                                // the host element cap is a RangeError before
+                                // any element is read (`to_elems` would
+                                // silently clamp). Each Get then interleaves
+                                // with its ToNumber/ToBigInt — a valueOf on
+                                // element k may mutate element k+1.
+                                let len =
+                                    i.get_prop(&src, &PropKey::from_str("length"))?;
+                                let n = i.to_num(&len)?;
+                                if n.is_nan() || n <= 0.0 {
+                                    Vec::new()
+                                } else if !n.is_finite() || n > 8_000_000.0 {
+                                    return Err(
+                                        i.range_err("Invalid typed array length")
+                                    );
+                                } else {
+                                    let n = n.trunc() as usize;
+                                    let mut elems =
+                                        Vec::with_capacity(n.min(1_000_000));
+                                    for k in 0..n {
+                                        let it = i.get_prop(&src, &ta_elem_key(k))?;
+                                        elems.push(ta_elem_num(i, &it, target_big)?);
+                                    }
+                                    elems
+                                }
+                            }
+                        } else {
+                            if !i.is_callable(&iterm) {
+                                return Err(i.type_err("value is not iterable"));
+                            }
+                            convert(i.iter_values(&src)?, i)?
+                        };
                     let (buf, n) = mk_buf_of(i, &elems, kind);
                     (buf, 0, n, false)
                 }
@@ -1092,10 +1146,8 @@ fn ta_static_of(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
     if tp.eff().unwrap_or(0) < args.len() {
         return Err(i.type_err("of result is too short"));
     }
-    let big = ta_is_big(&obj);
     for (k, v) in args.iter().enumerate() {
-        let cv = Value::Num(ta_elem_num(i, v, big)?);
-        i.set_prop(&obj, ta_elem_key(k), cv)?;
+        i.set_prop(&obj, ta_elem_key(k), v.clone())?;
     }
     Ok(obj)
 }
@@ -1142,15 +1194,13 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
         if ta_parts(&obj).is_none() {
             return Err(i.type_err("from result is not a TypedArray"));
         }
-        let big = ta_is_big(&obj);
         for (k, it) in items.into_iter().enumerate() {
             let v = if use_map {
                 i.call(&mapf, this_arg.clone(), vec![it, Value::Num(k as f64)])?
             } else {
                 it
             };
-            let cv = Value::Num(ta_elem_num(i, &v, big)?);
-            i.set_prop(&obj, ta_elem_key(k), cv)?;
+            i.set_prop(&obj, ta_elem_key(k), v)?;
         }
         return Ok(obj);
     }
@@ -1175,8 +1225,7 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
         } else {
             kv
         };
-        let cv = Value::Num(ta_elem_num(i, &v, big)?);
-        i.set_prop(&obj, ta_elem_key(k), cv)?;
+        i.set_prop(&obj, ta_elem_key(k), v)?;
     }
     Ok(obj)
 }
@@ -1717,9 +1766,12 @@ fn m_ta_at(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     } else {
         n.min(i64::MAX as f64) as i64
     };
-    if idx < 0 || idx >= len as i64 {
+    if idx < 0 {
         return Ok(Value::Und);
     }
+    // spec checks IsValidIntegerIndex against LIVE bounds — coercion
+    // may have resized the buffer, so defer to the integer-indexed
+    // [[Get]] (out-of-bounds reads as undefined either way).
     ta_pub_elem(i, this, idx as usize)
 }
 
@@ -2157,8 +2209,8 @@ fn install_array_buffer(i: &mut Interp) {
     met_a(i, &p, "slice", m_ab_slice, 2.0);
     met_a(i, &p, "sliceToImmutable", m_ab_slice_to_immutable, 2.0);
     met_a(i, &p, "resize", m_ab_resize, 1.0);
-    met_a(i, &p, "transfer", m_ab_transfer, 1.0);
-    met_a(i, &p, "transferToFixedLength", m_ab_transfer_fixed, 1.0);
+    met_a(i, &p, "transfer", m_ab_transfer, 0.0);
+    met_a(i, &p, "transferToFixedLength", m_ab_transfer_fixed, 0.0);
     met_a(i, &p, "transferToImmutable", m_ab_transfer_immutable, 0.0);
     acc(i, &p, "byteLength", Some(ab_get_byte_len), None);
     acc(i, &p, "detached", Some(ab_get_detached), None);
@@ -2167,7 +2219,14 @@ fn install_array_buffer(i: &mut Interp) {
     acc(i, &p, "immutable", Some(ab_get_immutable), None);
     p.borrow_mut().props.insert(
         PropKey::Sym(SYM_TOSTRINGTAG),
-        Prop::builtin(Value::Str(Rc::from("ArrayBuffer"))),
+        Prop {
+            val: Value::Str(Rc::from("ArrayBuffer")),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            get: None,
+            set: None,
+        },
     );
     let ctor = mk_ctor_len(i, "ArrayBuffer", ab_ctor, &p.clone(), 1.0);
     if let Value::Obj(co) = &ctor {
@@ -2651,7 +2710,14 @@ fn install_data_view(i: &mut Interp) {
     acc(i, &p, "byteOffset", Some(dv_get_byte_off), None);
     p.borrow_mut().props.insert(
         PropKey::Sym(SYM_TOSTRINGTAG),
-        Prop::builtin(Value::Str(Rc::from("DataView"))),
+        Prop {
+            val: Value::Str(Rc::from("DataView")),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            get: None,
+            set: None,
+        },
     );
     let ctor = mk_ctor_len(i, "DataView", dv_ctor, &p, 1.0);
     gdef(i, "DataView", ctor);

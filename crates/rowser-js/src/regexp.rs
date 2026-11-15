@@ -488,9 +488,6 @@ impl ReParser {
         let (min, max) = if self.eat(',') {
             if self.peek().is_some_and(|c| c.is_ascii_digit()) {
                 let hi = self.digits().unwrap();
-                if hi < lo {
-                    return Err("numbers out of order in {} quantifier".into());
-                }
                 (lo, hi)
             } else {
                 (lo, u32::MAX)
@@ -500,6 +497,11 @@ impl ReParser {
         };
         if self.peek() == Some('}') {
             self.i += 1;
+            // out-of-order only errors when the whole `{n,m}` shape
+            // matched — `a{2,1` without the brace stays a literal
+            if max < min {
+                return Err("numbers out of order in {} quantifier".into());
+            }
             Ok(Some((min, max)))
         } else {
             self.i = save;
@@ -2011,6 +2013,7 @@ fn canon_nonu(cp: u32) -> u32 {
 /// (`ΐ`→`ΐ`, `ΰ`→`ΰ`, `ﬅ`→`ﬆ`).
 fn scf_cp(cp: u32) -> u32 {
     match cp {
+        0x00B5 => 0x03BC, // µ micro sign → μ (CaseFolding; no lowercase)
         0x017F => 0x0073, // ſ → s
         0x0345 => 0x03B9, // ͅ combining ypogegrammeni → ι
         0x037B..=0x037D => 0x03C3, // ͻ/ͼ/ͽ lunate sigmas → σ
@@ -2024,6 +2027,10 @@ fn scf_cp(cp: u32) -> u32 {
         0x03F2 => 0x03F9, // ϲ → Ϲ
         0x03F3 => 0x037F, // ϳ → Ϳ
         0x03F5 => 0x03B5, // ϵ → ε
+        // Georgian Nuskhuri → Mkhedruli (the fold target — the case
+        // pair is actually Asomtavruli, which folds to Nuskhuri instead)
+        0x2D00..=0x2D25 => cp - 0x1C30,
+        0x2D27 => 0x10F7, // ⴧ yn → ჷ
         // Cyrillic small variants → base letters
         0x1C80 => 0x0432,
         0x1C81 => 0x0434,
@@ -2033,13 +2040,23 @@ fn scf_cp(cp: u32) -> u32 {
         0x1C86 => 0x044A,
         0x1C87 => 0x0463,
         0x1C88 => 0xA64A,
+        // Cherokee capitals are simple-fold *fixpoints* — the smalls
+        // fold up to them, so toLowercase must not be applied here
+        0x13A0..=0x13F5 => cp,
+        0x13F8..=0x13FD => cp - 8, // Cherokee smalls ᏸ–ᏽ → 13F0–13F5
         0x1E9B => 0x1E61, // ẛ → ṡ
+        // Greek capitals with prosgegrammeni: only *full* (multi-char)
+        // folds exist, so the simple fold is the identity — toLowercase
+        // would wrongly give the corresponding small letter
+        0x1F88..=0x1F8F => cp,
+        0x1F98..=0x1F9F => cp,
+        0x1FA8..=0x1FAF => cp,
+        0x1FBC | 0x1FCC | 0x1FFC => cp,
         0x1FBE => 0x03B9, // ι prosgegrammeni → ι
         0x214E => 0x2132, // ⅎ → Ⅎ
         0xA7F8 => 0x0126, // ꟸ → Ħ
         0xA7F9 => 0x0153, // ꟹ → œ
         0xAB70..=0xABBF => cp - 0x97D0, // Cherokee smalls ꭰ–ꮿ → 13A0–13EF
-        0x13F8..=0x13FD => cp - 8,      // Cherokee smalls ᏸ–ᏽ → 13F0–13F5
         0x1FD3 => 0x0390, // ΐ → ΐ
         0x1FE3 => 0x03B0, // ΰ → ΰ
         0xFB05 => 0xFB06, // ﬅ → ﬆ
@@ -2125,37 +2142,71 @@ fn class_match(items: &[ClassItem], cp: u32, icase: bool, umatch: bool) -> bool 
 /// their lowercase pre-images.)
 fn range_icase_match(lo: u32, hi: u32, cp: u32, umatch: bool) -> bool {
     let q = canon_cp(cp, umatch);
-    let inside = |v: u32| lo <= v && v <= hi;
+    // every candidate is re-verified through `canon` — the tables below
+    // are best-effort but only true pre-images (canon(v) == q) count
+    let hit = |v: u32| lo <= v && v <= hi && canon_cp(v, umatch) == q;
     // `q` itself, when it is a canonical fixpoint (a char can always
     // pre-image itself)
-    if canon_cp(q, umatch) == q && inside(q) {
+    if hit(q) {
         return true;
     }
     // `q`'s case-variant — `u` folds toward lowercase so the pre-image
     // is the uppercase form; non-`u` folds toward uppercase so it is
     // the lowercase form
     if let Some(v) = case_variant(q, umatch) {
-        if canon_cp(v, umatch) == q && inside(v) {
+        if hit(v) {
             return true;
         }
     }
     // chars with asymmetric/special folds that land on `q`
-    if fold_preimages(q, umatch).iter().any(|&v| inside(v)) {
+    if fold_preimages(q, umatch).iter().any(|&v| hit(v)) {
         return true;
     }
-    // Cherokee (u-mode): the smalls fold *up* to capitals, so pre-images
-    // of capital fold-targets sit in the AB70–ABBF / 13F8–13FD blocks
-    if umatch {
-        let v = match q {
-            0x13A0..=0x13EF => q + 0x97D0,
-            0x13F0..=0x13F5 => q + 8,
-            0x13FD => 0x13F5,
-            _ => return false,
-        };
-        inside(v)
+    // affine fold blocks — scripts whose fold relation jumps by a fixed
+    // offset rather than forming an upper/lowercase pair:
+    // Cherokee smalls fold *up* to capitals (u-mode only — in non-u mode
+    // toUppercase gives the same capital so the case-variant path works);
+    // Georgian Nuskhuri simple-folds to Mkhedruli and Asomtavruli to
+    // Nuskhuri (u-mode); in non-u mode toUppercase maps Nuskhuri up to
+    // Asomtavruli instead
+    let mut buf = [u32::MAX; 2];
+    let vs: &[u32] = if umatch {
+        match q {
+            0x13A0..=0x13EF => {
+                buf[0] = q + 0x97D0;
+                &buf[..1]
+            }
+            0x13F0..=0x13F5 => {
+                buf[0] = q + 8;
+                &buf[..1]
+            }
+            0x10D0..=0x10F5 => {
+                buf[0] = q + 0x1C30; // Nuskhuri
+                buf[1] = q + 0x7C0; // Mtavruli (harmless when unpaired)
+                &buf[..2]
+            }
+            0x2D00..=0x2D25 => {
+                buf[0] = q - 0x1C60; // Asomtavruli
+                &buf[..1]
+            }
+            _ => &[],
+        }
     } else {
-        false
-    }
+        match q {
+            // toUppercase maps Nuskhuri to Asomtavruli (UnicodeData) —
+            // the guard keeps only mappings that actually apply
+            0x10A0..=0x10C5 => {
+                buf[0] = q + 0x1C60;
+                &buf[..1]
+            }
+            0x10D0..=0x10F5 => {
+                buf[0] = q + 0x1C30;
+                &buf[..1]
+            }
+            _ => &[],
+        }
+    };
+    vs.iter().any(|&v| hit(v))
 }
 
 /// the single-char case-variant of `q` used as a canonical pre-image:
@@ -2222,34 +2273,37 @@ fn fold_preimages(q: u32, umatch: bool) -> &'static [u32] {
             0x1E61 => &[0x1E9B],
             0x2132 => &[0x214E],
             0xA64A => &[0x1C88],
+            0x10F7 => &[0x2D27],
             0xFB06 => &[0xFB05],
             _ => &[],
         }
     } else {
         // c ≥ 0x80 with toUppercase(c) == q (non-u canon pre-images) —
-        // folds to ASCII are excluded by the ≥128 rule in canon_nonu
+        // non-u canonicalization targets the *uppercase* member, folds
+        // to ASCII are excluded by the ≥128 rule in canon_nonu, and the
+        // Greek *symbol* letters (03D0/03D1/03D5/03D6/03F0/03F1) are
+        // Lu-category: toUppercase maps them to themselves, so they are
+        // never pre-images of the capitals (only ϵ/ϲ, which are Ll,
+        // qualify)
         match q {
+            0x0126 => &[0xA7F8], // ꟸ modifier Ħ
+            0x0152 => &[0xA7F9], // ꟹ modifier Œ
             0x01C4 => &[0x01C5],
             0x01C7 => &[0x01C8],
             0x01CA => &[0x01CB],
             0x01F1 => &[0x01F2],
-            0x0392 => &[0x03D0],
             0x0395 => &[0x03F5],
-            0x0398 => &[0x03D1],
             0x0399 => &[0x0345, 0x1FBE],
-            0x039A => &[0x03F0],
             0x039C => &[0x00B5],
-            0x03A0 => &[0x03D6],
-            0x03A1 => &[0x03F1],
             0x03A3 => &[0x03C2],
-            0x03A6 => &[0x03D5],
-            0x0432 => &[0x1C80],
-            0x0434 => &[0x1C81],
-            0x043E => &[0x1C82],
-            0x0441 => &[0x1C83],
-            0x0442 => &[0x1C84, 0x1C85],
-            0x044A => &[0x1C86],
-            0x0463 => &[0x1C87],
+            0x03F9 => &[0x03F2],
+            0x0412 => &[0x1C80],
+            0x0414 => &[0x1C81],
+            0x041E => &[0x1C82],
+            0x0421 => &[0x1C83],
+            0x0422 => &[0x1C84, 0x1C85],
+            0x042A => &[0x1C86],
+            0x0462 => &[0x1C87],
             0x1E60 => &[0x1E9B],
             0xA64A => &[0x1C88],
             _ => &[],

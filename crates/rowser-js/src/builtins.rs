@@ -244,8 +244,8 @@ fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Value> {
                 ints.push(k);
             }
         }
-        ObjKind::Typed { len, .. } => {
-            ints.extend(0..*len);
+        ObjKind::Typed { buf, off, len, kind, track } => {
+            ints.extend(0..typed_state(buf, *off, *len, *kind, *track).unwrap_or(0));
         }
         _ => {}
     }
@@ -254,6 +254,9 @@ fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Value> {
         match k {
             PropKey::Sym(_) => syms.push(k.clone()),
             PropKey::S(s) => {
+                if is_internal_key(i, &b, s) {
+                    continue;
+                }
                 if let Some(n) = arr_index(s) {
                     ints.push(n);
                 } else if seen_strs.insert(k.clone()) {
@@ -3854,8 +3857,11 @@ fn obj_assign(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 }
 
 fn read_desc_prop(i: &mut Interp, desc: &Value, name: &str) -> Result<(bool, Value), Value> {
+    // spec ToPropertyDescriptor reads via HasProperty — a present
+    // `value: undefined`/`writable: undefined` IS part of the descriptor
+    let present = i.has_prop(desc, &PropKey::from_str(name))?;
     let v = i.get_prop_str(desc, name)?;
-    Ok((!matches!(v, Value::Und), v))
+    Ok((present, v))
 }
 
 fn obj_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -3883,14 +3889,18 @@ fn obj_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             }
             None => match &tg {
                 Value::Obj(to) => {
-                    define_prop_from_desc(i, to, key, &arg(args, 2))?;
+                    if !define_prop_from_desc(i, to, key, &arg(args, 2))? {
+                        return Err(i.type_err("Cannot define property"));
+                    }
                     Ok(target)
                 }
                 _ => Err(i.type_err("proxy target is not an object")),
             },
         };
     }
-    define_prop_from_desc(i, &o, key, &desc)?;
+    if !define_prop_from_desc(i, &o, key, &desc)? {
+        return Err(i.type_err("Cannot define property"));
+    }
     Ok(target)
 }
 
@@ -3899,7 +3909,7 @@ fn define_prop_from_desc(
     o: &ObjRef,
     key: PropKey,
     desc: &Value,
-) -> Result<(), Value> {
+) -> Result<bool, Value> {
     let (has_get, gv) = read_desc_prop(i, desc, "get")?;
     let (has_set, sv) = read_desc_prop(i, desc, "set")?;
     let (has_val, vv) = read_desc_prop(i, desc, "value")?;
@@ -3918,6 +3928,65 @@ fn define_prop_from_desc(
     }
     if has_set && !matches!(sv, Value::Und) && !i.is_callable(&sv) {
         return Err(i.type_err("Setter must be a function"));
+    }
+
+    // 10.4.5.x integer-indexed [[DefineOwnProperty]]: canonical numeric
+    // strings never become ordinary props — a valid index validates the
+    // requested attrs then writes the element store; an invalid one
+    // (detached, -0, negative, fractional, past the end) fails the
+    // define outright.
+    let ta_cni = match &key {
+        PropKey::S(s) if matches!(&o.borrow().kind, ObjKind::Typed { .. }) => {
+            canonical_numeric_index(s)
+        }
+        _ => None,
+    };
+    if let Some(ni) = ta_cni {
+        let (buf, off, len, kind, track) = match &o.borrow().kind {
+            ObjKind::Typed { buf, off, len, kind, track } => {
+                (buf.clone(), *off, *len, *kind, *track)
+            }
+            _ => unreachable!(),
+        };
+        if !typed_state(&buf, off, len, kind, track)
+            .is_some_and(|eff| valid_int_index(ni, eff))
+        {
+            return Ok(false);
+        }
+        if (has_c && !i.to_bool(&cv))
+            || (has_e && !i.to_bool(&ev))
+            || is_acc
+            || (has_w && !i.to_bool(&wv))
+        {
+            return Ok(false);
+        }
+        if has_val {
+            let n = crate::binary::ta_elem_write(
+                i,
+                &Value::Obj(o.clone()),
+                &vv,
+            )?;
+            // coercion ran side-effects — revalidate before writing so a
+            // detach/resize during valueOf drops the write (the define
+            // still reports success, spec IntegerIndexedElementSet)
+            if typed_state(&buf, off, len, kind, track)
+                .is_some_and(|eff| valid_int_index(ni, eff))
+            {
+                if buf.borrow().immutable {
+                    return Err(i.type_err(
+                        "Cannot write to an immutable ArrayBuffer",
+                    ));
+                }
+                if let Some(bytes) = buffer_bytes(&buf) {
+                    kind.write(
+                        &mut bytes.borrow_mut(),
+                        off + ni as usize * kind.size(),
+                        n,
+                    );
+                }
+            }
+        }
+        return Ok(true);
     }
 
     // array element / length targets live in the dense store, not props
@@ -3999,7 +4068,7 @@ fn define_prop_from_desc(
                                 set: if has_set { Some(sv.clone()) } else { None },
                             },
                         );
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
             }
@@ -4060,7 +4129,7 @@ fn define_prop_from_desc(
                         items.resize(idx + 1, Value::Und);
                         items[idx] = vv;
                     }
-                    return Ok(());
+                    return Ok(true);
                 }
                 if s.as_ref() == "length" {
                     if let (Value::Num(n), true) = (&vv, has_val) {
@@ -4083,7 +4152,7 @@ fn define_prop_from_desc(
                             },
                         );
                     }
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -4097,36 +4166,39 @@ fn define_prop_from_desc(
     // non-configurable existing prop — ValidateAndApplyPropertyDescriptor
     // constraints (spec 10.1.6.3): attribute changes, data↔accessor kind
     // changes, and writes to non-writable values all throw.
+    // ValidateAndApplyPropertyDescriptor's non-configurable constraints
+    // all *return false* — Object.defineProperty throws via the caller,
+    // Reflect.defineProperty reports the boolean (spec 10.1.6.3)
     if let Some(old) = &existing {
         if !old.configurable {
             if has_c && i.to_bool(&cv) {
-                return Err(i.type_err("Cannot redefine property"));
+                return Ok(false);
             }
             if has_e && i.to_bool(&ev) != old.enumerable {
-                return Err(i.type_err("Cannot redefine property"));
+                return Ok(false);
             }
             if is_acc != old.is_accessor() {
-                return Err(i.type_err("Cannot redefine property"));
+                return Ok(false);
             }
             if old.is_accessor() {
                 if has_get && !i.same_value(&gv, old.get.as_ref().unwrap_or(&Value::Und))? {
-                    return Err(i.type_err("Cannot redefine property"));
+                    return Ok(false);
                 }
                 if has_set && !i.same_value(&sv, old.set.as_ref().unwrap_or(&Value::Und))? {
-                    return Err(i.type_err("Cannot redefine property"));
+                    return Ok(false);
                 }
             } else if !old.writable {
                 if has_w && i.to_bool(&wv) {
-                    return Err(i.type_err("Cannot redefine property"));
+                    return Ok(false);
                 }
                 if has_val && !i.same_value(&vv, &old.val)? {
-                    return Err(i.type_err("Cannot redefine property"));
+                    return Ok(false);
                 }
             }
         }
     }
     if existing.is_none() && !o.borrow().extensible {
-        return Err(i.type_err("Cannot define property: object is not extensible"));
+        return Ok(false);
     }
     let mut prop = existing.unwrap_or(Prop {
         // NEW property: attributes absent from the desc default to false
@@ -4217,7 +4289,7 @@ fn define_prop_from_desc(
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn obj_define_properties(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -4231,7 +4303,9 @@ fn obj_define_properties(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
             Some(v) => v,
             None => i.get_prop(&descs, &k)?,
         };
-        define_prop_from_desc(i, o, k, &d)?;
+        if !define_prop_from_desc(i, o, k, &d)? {
+            return Err(i.type_err("Cannot define property"));
+        }
     }
     Ok(target)
 }
@@ -4310,6 +4384,39 @@ fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
                         return Ok(Value::Obj(d));
                     }
                 }
+            }
+        }
+    }
+    // integer-indexed exotic [[GetOwnProperty]]: canonical numeric
+    // strings describe the element store — never props or the proto.
+    if let PropKey::S(sk) = &key {
+        if matches!(&o.borrow().kind, ObjKind::Typed { .. }) {
+            if let Some(ni) = canonical_numeric_index(sk) {
+                let (buf, off, len, kind, track) = match &o.borrow().kind {
+                    ObjKind::Typed { buf, off, len, kind, track } => {
+                        (buf.clone(), *off, *len, *kind, *track)
+                    }
+                    _ => unreachable!(),
+                };
+                if !typed_state(&buf, off, len, kind, track)
+                    .is_some_and(|eff| valid_int_index(ni, eff))
+                {
+                    return Ok(Value::Und);
+                }
+                let Some(bytes) = buffer_bytes(&buf) else {
+                    return Ok(Value::Und);
+                };
+                let n = kind.read(
+                    &bytes.borrow(),
+                    off + ni as usize * kind.size(),
+                );
+                let elem = crate::binary::ta_pubify(i, &v, Value::Num(n));
+                let d = i.new_obj();
+                i.set_data(&d, "value", elem);
+                i.set_data(&d, "writable", Value::Bool(true));
+                i.set_data(&d, "enumerable", Value::Bool(true));
+                i.set_data(&d, "configurable", Value::Bool(true));
+                return Ok(Value::Obj(d));
             }
         }
     }
@@ -8815,11 +8922,18 @@ fn reflect_set(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let target = arg(args, 0);
     let receiver = arg(args, 3);
     let receiver = if matches!(receiver, Value::Und) { target.clone() } else { receiver };
-    match &target {
-        Value::Obj(o) => i.obj_set(o, k, arg(args, 2), &receiver)?,
-        _ => i.set_prop(&target, k, arg(args, 2))?,
-    }
-    Ok(Value::Bool(true))
+    // spec [[Set]] returns a boolean — run the write non-strict so a
+    // failed assignment flags `false` instead of throwing
+    i.set_failed = false;
+    let st = std::mem::replace(&mut i.cur_strict, false);
+    let r = match &target {
+        Value::Obj(o) => i.obj_set(o, k, arg(args, 2), &receiver),
+        _ => i.set_prop(&target, k, arg(args, 2)),
+    };
+    i.cur_strict = st;
+    let failed = std::mem::replace(&mut i.set_failed, false);
+    r?;
+    Ok(Value::Bool(!failed))
 }
 
 fn reflect_has(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -8833,11 +8947,32 @@ fn reflect_delete(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 }
 
 // Reflect.defineProperty/setPrototypeOf return booleans instead of throwing
-fn reflect_define_property(i: &mut Interp, t: &Value, args: &[Value]) -> NResult {
-    match obj_define_property(i, t, args) {
-        Ok(_) => Ok(Value::Bool(true)),
-        Err(_) => Ok(Value::Bool(false)),
+fn reflect_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let target = arg(args, 0);
+    let Value::Obj(o) = target.clone() else {
+        return Err(i.type_err("Reflect.defineProperty called on non-object"));
+    };
+    let key = i.to_propkey(&arg(args, 1))?;
+    let desc = arg(args, 2);
+    if !matches!(desc, Value::Obj(_)) {
+        return Err(i.type_err("Property description must be an object"));
     }
+    if let ObjKind::Proxy { target: tg, handler } = o.borrow().kind.clone() {
+        let (tg, h) = (tg, handler);
+        return match i.proxy_trap(&h, "defineProperty")? {
+            Some(trap) => {
+                let r = i.call(&trap, h, vec![tg, i.key_to_value(&key), desc])?;
+                Ok(Value::Bool(i.to_bool(&r)))
+            }
+            None => match &tg {
+                Value::Obj(to) => {
+                    Ok(Value::Bool(define_prop_from_desc(i, to, key, &desc)?))
+                }
+                _ => Err(i.type_err("proxy target is not an object")),
+            },
+        };
+    }
+    Ok(Value::Bool(define_prop_from_desc(i, &o, key, &desc)?))
 }
 
 fn reflect_set_prototype_of(i: &mut Interp, t: &Value, args: &[Value]) -> NResult {

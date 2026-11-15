@@ -637,7 +637,7 @@ impl TAK {
                 } else if v >= 255.0 {
                     255
                 } else {
-                    v.round() as u8
+                    v.round_ties_even() as u8
                 };
             }
             TAK::I8 => b[boff] = to_i32(v) as i8 as u8,
@@ -696,7 +696,7 @@ pub(crate) fn typed_state(
 /// `byteOffset`/`buffer` and integer-indexed reads. Returns `Some` when
 /// `key` resolves on the object kind itself (before stored props).
 /// `&str` version so literal member lookups never build a `PropKey`.
-fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
+fn view_own_prop_str(i: &Interp, o: &ObjRef, key: &str) -> Option<Value> {
     let b = o.borrow();
     match &b.kind {
         ObjKind::Arr(items) => {
@@ -759,12 +759,16 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
                 let eff =
                     typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
                 let idx = ni as usize;
-                if ni.fract() == 0.0 && ni >= 0.0 && idx < eff {
+                if valid_int_index(ni, eff) {
                     if let Some(bytes) = buffer_bytes(buf) {
                         let bb = bytes.borrow();
-                        return Some(Value::Num(
-                            kind.read(&bb, *off + idx * kind.size()),
-                        ));
+                        let n = kind.read(&bb, *off + idx * kind.size());
+                        // [[ContentType]]: bigint-kind TAs surface bigint
+                        // stand-in objects, not raw numbers
+                        if crate::binary::ta_is_big(&Value::Obj(o.clone())) {
+                            return Some(i.bigint_obj(n));
+                        }
+                        return Some(Value::Num(n));
                     }
                 }
                 return Some(Value::Und);
@@ -776,9 +780,61 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
     }
 }
 
-fn view_own_prop(o: &ObjRef, key: &PropKey) -> Option<Value> {
+/// bigint stand-in objects (the `__bigint` slot) compare by magnitude —
+/// `8n === 8n` even across distinct object identities.
+pub(crate) fn bigint_mag_eq(a: &Value, b: &Value) -> bool {
+    match (
+        crate::binary::bigint_magnitude(a),
+        crate::binary::bigint_magnitude(b),
+    ) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// engine-internal slot names — present as props for engine bookkeeping
+/// but never surface as JS-visible own property keys. Gated on the
+/// object's kind or the slot's value so ordinary user props that happen
+/// to share the name still enumerate.
+pub(crate) fn is_internal_key(i: &Interp, b: &Obj, s: &str) -> bool {
+    match s {
+        // TypedArray-iterator bookkeeping (`mk_ta_iter`) — the __src+__m
+        // pair is the object's signature
+        "__src" | "__i" | "__m" | "__done" => {
+            b.props.contains_key(&PropKey::from_str("__src"))
+                && b.props.contains_key(&PropKey::from_str("__m"))
+        }
+        // bigint-kind marker on TAs/protos — the stored value is the
+        // intrinsic name
+        "__name" => b.props.get_str("__name").is_some_and(|p| {
+            matches!(&p.val,
+                Value::Str(s) if matches!(s.as_ref(),
+                    "BigInt64Array" | "BigUint64Array"))
+        }),
+        "__shared" => matches!(b.kind, ObjKind::Bytes(_)),
+        // bigint stand-ins carry the magnitude; the proto pins identity
+        "__bigint" => b
+            .proto
+            .as_ref()
+            .is_some_and(|p| Rc::ptr_eq(p, &i.p.bigint)),
+        // the lazy-installed iterator proto hangs off Object.prototype
+        "__taIterProto" => true,
+        _ => false,
+    }
+}
+
+/// spec IsValidIntegerIndex — canonical integer, non-negative, not -0,
+/// in bounds against the live element capacity.
+pub(crate) fn valid_int_index(ni: f64, eff: usize) -> bool {
+    ni.fract() == 0.0
+        && ni >= 0.0
+        && !(ni == 0.0 && ni.is_sign_negative())
+        && (ni as usize) < eff
+}
+
+fn view_own_prop(i: &Interp, o: &ObjRef, key: &PropKey) -> Option<Value> {
     match key {
-        PropKey::S(s) => view_own_prop_str(o, s),
+        PropKey::S(s) => view_own_prop_str(i, o, s),
         PropKey::Sym(_) => None,
     }
 }
@@ -1004,6 +1060,9 @@ pub struct Interp {
     pub interrupted: bool,
     /// wall-clock bound for the current embedder turn; `None` = unbounded
     pub deadline: Option<std::time::Instant>,
+    /// a `[[Set]]` that completed without effect (sloppy-mode silent
+    /// failure) — lets `Reflect.set` report the spec boolean
+    pub set_failed: bool,
     /// strict-mode of the currently executing code (function bodies set it
     /// from `FnDef.strict`; script/eval set it from the directive prologue)
     pub cur_strict: bool,
@@ -1118,6 +1177,7 @@ impl Interp {
             typeof_reads: Vec::new(),
             steps: 0,
             interrupted: false,
+            set_failed: false,
             deadline: None,
             interrupt_site: None,
             trace_calls: std::env::var_os("ROWSER_CALL_TRACE").is_some(),
@@ -1271,7 +1331,7 @@ impl Interp {
         let mut c = Some(o.clone());
         while let Some(cur) = c {
             if let PropKey::S(k) = key {
-                if let Some(v) = view_own_prop_str(&cur, k.as_ref()) {
+                if let Some(v) = view_own_prop_str(self, &cur, k.as_ref()) {
                     return Some(v);
                 }
             }
@@ -1803,7 +1863,7 @@ impl Interp {
 
     /// raw own-prop lookup (no proto walk, no getters)
     pub fn obj_get_raw(&self, o: &ObjRef, key: &PropKey) -> Option<Value> {
-        if let Some(v) = view_own_prop(o, key) {
+        if let Some(v) = view_own_prop(self, o, key) {
             return Some(v);
         }
         o.borrow().props.get(key).map(|p| p.val.clone())
@@ -1811,7 +1871,7 @@ impl Interp {
 
     /// `obj_get_raw` by borrowed string key — no key allocation.
     pub fn obj_get_raw_str(&self, o: &ObjRef, key: &str) -> Option<Value> {
-        if let Some(v) = view_own_prop_str(o, key) {
+        if let Some(v) = view_own_prop_str(self, o, key) {
             return Some(v);
         }
         o.borrow().props.get_str(key).map(|p| p.val.clone())
@@ -2044,7 +2104,7 @@ impl Interp {
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
             {
-                if let Some(v) = view_own_prop(&c, key) {
+                if let Some(v) = view_own_prop(self, &c, key) {
                     return Ok(v);
                 }
                 let b = c.borrow();
@@ -2090,7 +2150,7 @@ impl Interp {
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
             {
-                if let Some(v) = view_own_prop_str(&c, key) {
+                if let Some(v) = view_own_prop_str(self, &c, key) {
                     return Ok(v);
                 }
                 let b = c.borrow();
@@ -2218,40 +2278,50 @@ impl Interp {
                         // a valid index with a distinct receiver falls
                         // through to OrdinarySet (shadows on receiver).
                         if let Some(ni) = canonical_numeric_index(s) {
-                            let idx = ni as usize;
-                            let valid = ni.fract() == 0.0 && ni >= 0.0
-                                && typed_state(buf, *off, *len, *kind, *track)
-                                    .is_some_and(|eff| idx < eff);
                             let same_recv = matches!(receiver,
                                 Value::Obj(ro) if Rc::ptr_eq(ro, o));
-                            if !(valid && !same_recv) {
                             let (buf, off, len, kind, track) =
                                 (buf.clone(), *off, *len, *kind, *track);
                             drop(b);
-                            // spec IntegerIndexedElementSet: ToNumber
-                            // runs before the bounds check — a valueOf
-                            // that resizes/detaches the buffer makes the
-                            // write silently vanish instead of throwing.
-                            let n = self.to_num(&v)?;
-                            if valid
-                                && typed_state(&buf, off, len, kind, track)
-                                    .is_some_and(|eff| idx < eff)
+                            if same_recv {
+                                // IntegerIndexedElementSet: the value
+                                // conversion runs even when the index is
+                                // out of bounds (a valueOf may detach /
+                                // resize), then a still-valid index
+                                // writes the element store.
+                                let n = crate::binary::ta_elem_write(
+                                    self,
+                                    &Value::Obj(o.clone()),
+                                    &v,
+                                )?;
+                                if typed_state(&buf, off, len, kind, track)
+                                    .is_some_and(|eff| valid_int_index(ni, eff))
+                                {
+                                    if buf.borrow().immutable {
+                                        return Err(self.type_err(
+                                            "Cannot write to an immutable ArrayBuffer",
+                                        ));
+                                    }
+                                    if let Some(bytes) = buffer_bytes(&buf) {
+                                        kind.write(
+                                            &mut bytes.borrow_mut(),
+                                            off + ni as usize * kind.size(),
+                                            n,
+                                        );
+                                    }
+                                }
+                                return Ok(());
+                            }
+                            // distinct receiver: a valid index falls
+                            // through to OrdinarySet → receiver shadows;
+                            // an invalid one is simply ignored.
+                            if !typed_state(&buf, off, len, kind, track)
+                                .is_some_and(|eff| valid_int_index(ni, eff))
                             {
-                                if buf.borrow().immutable {
-                                    return Err(self.type_err(
-                                        "Cannot write to an immutable ArrayBuffer",
-                                    ));
-                                }
-                                if let Some(bytes) = buffer_bytes(&buf) {
-                                    kind.write(
-                                        &mut bytes.borrow_mut(),
-                                        off + idx * kind.size(),
-                                        n,
-                                    );
-                                }
+                                return Ok(());
                             }
-                            return Ok(());
-                            }
+                            let mut b = o.borrow_mut();
+                            let _ = &mut b;
                         }
                         if matches!(
                             s.as_ref(),
@@ -2328,9 +2398,8 @@ impl Interp {
                     {
                         if let Some(ni) = canonical_numeric_index(sk) {
                             let idx = ni as usize;
-                            let valid = ni.fract() == 0.0 && ni >= 0.0
-                                && typed_state(buf, *off, *len, *kind, *track)
-                                    .is_some_and(|eff| idx < eff);
+                            let valid = typed_state(buf, *off, *len, *kind, *track)
+                                .is_some_and(|eff| valid_int_index(ni, eff));
                             let same = matches!(receiver,
                                 Value::Obj(ro) if Rc::ptr_eq(ro, &c));
                             (
@@ -2351,7 +2420,11 @@ impl Interp {
                 if ta_hit {
                     match write_elem {
                         Some((buf, off, len, kind, track, idx)) => {
-                            let n = self.to_num(&v)?;
+                            let n = crate::binary::ta_elem_write(
+                                self,
+                                &Value::Obj(c.clone()),
+                                &v,
+                            )?;
                             if typed_state(&buf, off, len, kind, track)
                                 .is_some_and(|eff| idx < eff)
                             {
@@ -2365,28 +2438,36 @@ impl Interp {
                             }
                             return Ok(());
                         }
-                        // valid index + distinct receiver: the element
-                        // desc is writable → receiver shadows via its
-                        // own [[DefineOwnProperty]] (the tail handles it)
+                        // same receiver + invalid index: the coercion
+                        // still runs (element-set semantics) then the
+                        // write is dropped; a distinct receiver with an
+                        // invalid index is left untouched entirely;
+                        // a distinct receiver + valid index falls
+                        // through so OrdinarySet shadows the receiver.
                         None => {
                             let ni = canonical_numeric_index(sk).unwrap();
                             let idx = ni as usize;
-                            let valid = ni.fract() == 0.0 && ni >= 0.0;
-                            if !valid {
-                                return Ok(());
-                            }
                             let eff_ok = {
                                 let b = c.borrow();
                                 if let ObjKind::Typed { buf, off, len, kind, track } =
                                     &b.kind
                                 {
                                     typed_state(buf, *off, *len, *kind, *track)
-                                        .is_some_and(|eff| idx < eff)
+                                        .is_some_and(|eff| valid_int_index(ni, eff))
                                 } else {
                                     false
                                 }
                             };
                             if !eff_ok {
+                                if matches!(receiver,
+                                    Value::Obj(ro) if Rc::ptr_eq(ro, &c))
+                                {
+                                    crate::binary::ta_elem_write(
+                                        self,
+                                        &Value::Obj(c.clone()),
+                                        &v,
+                                    )?;
+                                }
                                 return Ok(());
                             }
                             break;
@@ -2525,6 +2606,50 @@ impl Interp {
             }
             _ => {}
         }
+        let ta_cni = match (&b.kind, &key) {
+            (ObjKind::Typed { .. }, PropKey::S(s)) => {
+                canonical_numeric_index(s)
+            }
+            _ => None,
+        };
+        if let Some(ni) = ta_cni {
+            let (buf, off, len, kind, track) = match &b.kind {
+                ObjKind::Typed { buf, off, len, kind, track } => {
+                    (buf.clone(), *off, *len, *kind, *track)
+                }
+                _ => unreachable!(),
+            };
+            drop(b);
+            // integer-indexed define of a full data desc: invalid index
+            // fails the define; valid index coerces + writes
+            if !typed_state(&buf, off, len, kind, track)
+                .is_some_and(|eff| valid_int_index(ni, eff))
+            {
+                return self.set_fail(&self.key_to_name(&key));
+            }
+            let n = crate::binary::ta_elem_write(
+                self,
+                &Value::Obj(o.clone()),
+                &v,
+            )?;
+            if typed_state(&buf, off, len, kind, track)
+                .is_some_and(|eff| valid_int_index(ni, eff))
+            {
+                if buf.borrow().immutable {
+                    return Err(self.type_err(
+                        "Cannot write to an immutable ArrayBuffer",
+                    ));
+                }
+                if let Some(bytes) = buffer_bytes(&buf) {
+                    kind.write(
+                        &mut bytes.borrow_mut(),
+                        off + ni as usize * kind.size(),
+                        n,
+                    );
+                }
+            }
+            return Ok(());
+        }
         if let ObjKind::Arr(items) = &mut b.kind {
             if let PropKey::S(s) = &key {
                 if let Some(i) = arr_index(s) {
@@ -2626,7 +2751,10 @@ impl Interp {
                         ObjKind::Arr(items) => i < items.len(),
                         ObjKind::Args { items, .. } => i < items.len()
                             && !b.holes.as_ref().is_some_and(|h| h.contains(&i)),
-                        ObjKind::Typed { len, .. } => i < *len,
+                        ObjKind::Typed { buf, off, len, kind, track } => {
+                            typed_state(buf, *off, *len, *kind, *track)
+                                .is_some_and(|eff| i < eff)
+                        }
                         _ => false,
                     };
                     if virt {
@@ -2784,9 +2912,8 @@ impl Interp {
                 } => {
                     if let Some(ni) = canonical_numeric_index(key) {
                         let idx = ni as usize;
-                        let valid = ni.fract() == 0.0 && ni >= 0.0
-                            && typed_state(buf, *off, *len, *kind, *track)
-                                .is_some_and(|eff| idx < eff);
+                        let valid = typed_state(buf, *off, *len, *kind, *track)
+                            .is_some_and(|eff| valid_int_index(ni, eff));
                         let same_recv = matches!(receiver,
                             Value::Obj(ro) if Rc::ptr_eq(ro, o));
                         if !(valid && !same_recv) {
@@ -2873,9 +3000,8 @@ impl Interp {
                     {
                         if let Some(ni) = canonical_numeric_index(key) {
                             let idx = ni as usize;
-                            let valid = ni.fract() == 0.0 && ni >= 0.0
-                                && typed_state(buf, *off, *len, *kind, *track)
-                                    .is_some_and(|eff| idx < eff);
+                            let valid = typed_state(buf, *off, *len, *kind, *track)
+                                .is_some_and(|eff| valid_int_index(ni, eff));
                             let same = matches!(receiver,
                                 Value::Obj(ro) if Rc::ptr_eq(ro, &c));
                             (
@@ -2896,7 +3022,11 @@ impl Interp {
                 if ta_hit {
                     match write_elem {
                         Some((buf, off, len, kind, track, idx)) => {
-                            let n = self.to_num(&v)?;
+                            let n = crate::binary::ta_elem_write(
+                                self,
+                                &Value::Obj(c.clone()),
+                                &v,
+                            )?;
                             if typed_state(&buf, off, len, kind, track)
                                 .is_some_and(|eff| idx < eff)
                             {
@@ -2913,21 +3043,27 @@ impl Interp {
                         None => {
                             let ni = canonical_numeric_index(key).unwrap();
                             let idx = ni as usize;
-                            if !(ni.fract() == 0.0 && ni >= 0.0) {
-                                return Ok(());
-                            }
                             let eff_ok = {
                                 let b = c.borrow();
                                 if let ObjKind::Typed { buf, off, len, kind, track } =
                                     &b.kind
                                 {
                                     typed_state(buf, *off, *len, *kind, *track)
-                                        .is_some_and(|eff| idx < eff)
+                                        .is_some_and(|eff| valid_int_index(ni, eff))
                                 } else {
                                     false
                                 }
                             };
                             if !eff_ok {
+                                if matches!(receiver,
+                                    Value::Obj(ro) if Rc::ptr_eq(ro, &c))
+                                {
+                                    crate::binary::ta_elem_write(
+                                        self,
+                                        &Value::Obj(c.clone()),
+                                        &v,
+                                    )?;
+                                }
                                 return Ok(());
                             }
                             break;
@@ -3023,6 +3159,12 @@ impl Interp {
             return true;
         };
         let mut b = o.borrow_mut();
+        if let ObjKind::Typed { buf, off, len, kind, track } = &b.kind {
+            if let Some(ni) = canonical_numeric_index(key) {
+                return !typed_state(buf, *off, *len, *kind, *track)
+                    .is_some_and(|eff| valid_int_index(ni, eff));
+            }
+        }
         if let Some(i) = arr_index(key) {
             let hole = b.holes.as_ref().is_some_and(|h| h.contains(&i));
             let materialized = b.props.get_str(key).is_some();
@@ -3143,11 +3285,8 @@ impl Interp {
                                 // spec [[HasProperty]]: a canonical
                                 // numeric index answers solely with
                                 // IsValidIntegerIndex — never props/proto.
-                                let i = ni as usize;
-                                return Ok(ni.fract() == 0.0
-                                    && ni >= 0.0
-                                    && typed_state(buf, *off, *len, *kind, *track)
-                                        .is_some_and(|eff| i < eff));
+                                return Ok(typed_state(buf, *off, *len, *kind, *track)
+                                    .is_some_and(|eff| valid_int_index(ni, eff)));
                             }
                         }
                     }
@@ -3193,6 +3332,15 @@ impl Interp {
         }
         let mut b = o.borrow_mut();
         if let PropKey::S(s) = key {
+            if let ObjKind::Typed { buf, off, len, kind, track } = &b.kind {
+                // 10.4.5.x integer-indexed [[Delete]]: a valid element
+                // index is non-configurable → false; an invalid
+                // canonical key deletes nothing → true.
+                if let Some(ni) = canonical_numeric_index(s) {
+                    return Ok(!typed_state(buf, *off, *len, *kind, *track)
+                        .is_some_and(|eff| valid_int_index(ni, eff)));
+                }
+            }
             if let Some(i) = arr_index(s) {
                 let hole = b.holes.as_ref().is_some_and(|h| h.contains(&i));
                 let materialized = b.props.get(&key).is_some();
@@ -3435,7 +3583,14 @@ impl Interp {
             Value::Num(n) => *n != 0.0 && !n.is_nan(),
             Value::Str(s) => !s.is_empty(),
             Value::Sym(..) => true,
-            Value::Obj(o) => !matches!(o.borrow().kind, ObjKind::Und),
+            Value::Obj(o) => {
+                if let Some(Value::Num(n)) =
+                    o.borrow().props.get_str("__bigint").map(|p| p.val.clone())
+                {
+                    return n != 0.0;
+                }
+                !matches!(o.borrow().kind, ObjKind::Und)
+            }
         }
     }
 
@@ -3458,7 +3613,9 @@ impl Interp {
         if self.is_callable(&stp) {
             let hint = Value::Str(Rc::from(hint));
             let r = self.call(&stp, v.clone(), vec![hint])?;
-            if !matches!(r, Value::Obj(_)) {
+            if !matches!(r, Value::Obj(_))
+                || crate::binary::bigint_magnitude(&r).is_some()
+            {
                 return Ok(r);
             }
             return Err(self.type_err("Cannot convert object to primitive value"));
@@ -3473,7 +3630,9 @@ impl Interp {
             let m = self.get_prop(v, &PropKey::from_str(name))?;
             if self.is_callable(&m) {
                 let r = self.call(&m, v.clone(), Vec::new())?;
-                if !matches!(r, Value::Obj(_)) {
+                if !matches!(r, Value::Obj(_))
+                    || crate::binary::bigint_magnitude(&r).is_some()
+                {
                     return Ok(r);
                 }
             }
@@ -3553,7 +3712,13 @@ impl Interp {
             (Num(x), Num(y)) => x == y,
             (Str(x), Str(y)) => x == y,
             (Sym(x, _), Sym(y, _)) => x == y,
-            (Obj(x), Obj(y)) => Rc::ptr_eq(x, y),
+            (Obj(x), Obj(y)) => {
+                Rc::ptr_eq(x, y)
+                    || bigint_mag_eq(
+                        &Value::Obj(x.clone()),
+                        &Value::Obj(y.clone()),
+                    )
+            }
             _ => false,
         })
     }
@@ -3572,7 +3737,13 @@ impl Interp {
             (Str(x), Str(y)) => x == y,
             (Bool(x), Bool(y)) => x == y,
             (Sym(x, _), Sym(y, _)) => x == y,
-            (Obj(x), Obj(y)) => Rc::ptr_eq(x, y),
+            (Obj(x), Obj(y)) => {
+                Rc::ptr_eq(x, y)
+                    || bigint_mag_eq(
+                        &Value::Obj(x.clone()),
+                        &Value::Obj(y.clone()),
+                    )
+            }
             (Num(_), Str(_)) => {
                 let bn = self.to_num(b)?;
                 self.loose_eq(a, &Num(bn))?
@@ -3609,7 +3780,13 @@ impl Interp {
             (Num(x), Num(y)) => x == y, // NaN != NaN naturally
             (Str(x), Str(y)) => x == y,
             (Sym(x, _), Sym(y, _)) => x == y,
-            (Obj(x), Obj(y)) => Rc::ptr_eq(x, y),
+            (Obj(x), Obj(y)) => {
+                Rc::ptr_eq(x, y)
+                    || bigint_mag_eq(
+                        &Value::Obj(x.clone()),
+                        &Value::Obj(y.clone()),
+                    )
+            }
             _ => false,
         }
     }
@@ -3624,6 +3801,9 @@ impl Interp {
             Value::Sym(..) => "symbol",
             Value::Obj(o) => {
                 let b = o.borrow();
+                if b.props.contains_key(&PropKey::from_str("__bigint")) {
+                    return "bigint";
+                }
                 if matches!(b.kind, ObjKind::Und) {
                     "undefined"
                 } else if b.is_callable() {
@@ -4364,6 +4544,7 @@ impl Interp {
 
     /// A [[Set]] that spec-returns false: silent in sloppy, TypeError in strict.
     fn set_fail(&mut self, key: &str) -> Result<(), Value> {
+        self.set_failed = true;
         if self.cur_strict {
             Err(self.type_err(format!(
                 "Cannot assign to read only property '{key}'"
@@ -5143,13 +5324,24 @@ impl Interp {
             Stmt::Block(stmts) => self.exec_hoisted_block(stmts, env),
             Stmt::If { c, t, e } => {
                 let cv = self.eval_expr(c, env)?;
-                if self.to_bool(&cv) {
-                    self.exec_stmt(t, env)
+                let r = if self.to_bool(&cv) {
+                    self.exec_stmt(t, env)?
                 } else if let Some(e) = e {
-                    self.exec_stmt(e, env)
+                    self.exec_stmt(e, env)?
                 } else {
-                    Ok(Completion::Normal(Value::Und))
-                }
+                    Completion::Empty
+                };
+                // spec 14.6.2: `UpdateEmpty(stmtCompletion, undefined)` —
+                // an empty value materializes as `undefined` even on
+                // abrupt completions
+                Ok(match r {
+                    Completion::Empty => Completion::Normal(Value::Und),
+                    Completion::Break(l, v) => Completion::Break(l, v.or(Some(Value::Und))),
+                    Completion::Continue(l, v) => {
+                        Completion::Continue(l, v.or(Some(Value::Und)))
+                    }
+                    r => r,
+                })
             }
             Stmt::While { c, body } => {
                 let my_label = self.pending_label.take();
@@ -5660,7 +5852,14 @@ impl Interp {
                                     }
                                     break 'cases;
                                 }
-                                other @ Completion::Break(_, _) => return Ok(other),
+                                // UpdateEmpty(R, V): a propagating abrupt
+                                // picks up the accumulated value when empty
+                                Completion::Break(l, v) => {
+                                    return Ok(Completion::Break(l, v.or(Some(last))))
+                                }
+                                Completion::Continue(l, v) => {
+                                    return Ok(Completion::Continue(l, v.or(Some(last))))
+                                }
                                 other => return Ok(other),
                             }
                         }
@@ -5717,10 +5916,29 @@ impl Interp {
                     match fres {
                         Err(e) => return Err(e),
                         Ok(Completion::Normal(_)) | Ok(Completion::Empty) => {}
+                        // UpdateEmpty(F, undefined): an abrupt finally keeps
+                        // its abruptness; an empty value becomes undefined
+                        Ok(Completion::Break(l, v)) => {
+                            return Ok(Completion::Break(l, v.or(Some(Value::Und))))
+                        }
+                        Ok(Completion::Continue(l, v)) => {
+                            return Ok(Completion::Continue(l, v.or(Some(Value::Und))))
+                        }
                         Ok(abrupt) => return Ok(abrupt),
                     }
                 }
-                res
+                // UpdateEmpty(C, undefined): the try/catch result's empty
+                // completion materializes as `undefined`
+                Ok(match res? {
+                    Completion::Empty => Completion::Normal(Value::Und),
+                    Completion::Break(l, v) => {
+                        Completion::Break(l, v.or(Some(Value::Und)))
+                    }
+                    Completion::Continue(l, v) => {
+                        Completion::Continue(l, v.or(Some(Value::Und)))
+                    }
+                    r => r,
+                })
             }
             Stmt::Throw(e) => {
                 let v = self.eval_expr(e, env)?;
@@ -6560,10 +6778,16 @@ impl Interp {
         match op {
             UnaryOp::Neg => {
                 let v = self.eval_expr(expr, env)?;
+                if let Some(n) = crate::binary::bigint_magnitude(&v) {
+                    return Ok(self.bigint_obj(-n));
+                }
                 Ok(Value::Num(-self.to_num(&v)?))
             }
             UnaryOp::Pos => {
                 let v = self.eval_expr(expr, env)?;
+                if crate::binary::bigint_magnitude(&v).is_some() {
+                    return Err(self.type_err("Cannot convert a BigInt value to a number"));
+                }
                 Ok(Value::Num(self.to_num(&v)?))
             }
             UnaryOp::Not => {
@@ -6572,6 +6796,9 @@ impl Interp {
             }
             UnaryOp::BitNot => {
                 let v = self.eval_expr(expr, env)?;
+                if let Some(n) = crate::binary::bigint_magnitude(&v) {
+                    return Ok(self.bigint_obj(-(n + 1.0)));
+                }
                 Ok(Value::Num(!(to_i32(self.to_num(&v)?)) as f64))
             }
             UnaryOp::Typeof => {
@@ -7066,6 +7293,12 @@ impl Interp {
                 }
                 match self.exec_stmt(s, env) {
                     Ok(Completion::Normal(v)) | Ok(Completion::Return(v)) => last = v,
+                    // a break/continue escaping the eval'd program resolves
+                    // to its carried value and stops the program
+                    Ok(Completion::Break(_, v)) | Ok(Completion::Continue(_, v)) => {
+                        last = v.unwrap_or(Value::Und);
+                        break;
+                    }
                     Ok(_) => {}
                     Err(v) => return Err(v),
                 }
@@ -7091,6 +7324,10 @@ impl Interp {
             match self.exec_stmt(s, &g) {
                 Ok(Completion::Normal(v)) => last = v,
                 Ok(Completion::Return(v)) => last = v,
+                Ok(Completion::Break(_, v)) | Ok(Completion::Continue(_, v)) => {
+                    last = v.unwrap_or(Value::Und);
+                    break;
+                }
                 Ok(_) => {}
                 Err(v) => return Err(self.throw_to_error(v)),
             }
