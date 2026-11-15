@@ -3157,7 +3157,33 @@ fn install_globals(i: &mut Interp) {
     // -- Function --
     {
         let ctor = make_ctor(i, "Function", function_ctor, i.p.func.clone());
-        define_global(i, "Function", ctor);
+        define_global(i, "Function", ctor.clone());
+        // %GeneratorFunction% — not a global binding; reached via
+        // `Object.getPrototypeOf(function*(){}).constructor`. Its
+        // [[Prototype]] is %Function%, `.prototype` is
+        // %GeneratorFunction.prototype%, and it is [[Construct]]-able:
+        // `class G extends GeneratorFunction {}` subclasses it.
+        let gfc = Rc::new(RefCell::new(Obj::new(
+            match &ctor {
+                Value::Obj(o) => Some(o.clone()),
+                _ => unreachable!(),
+            },
+            ObjKind::Func(Func::Native {
+                name: Rc::from("GeneratorFunction"),
+                f: gen_function_ctor,
+                ctor: true,
+            }),
+        )));
+        i.set_attr(&gfc, "name", Value::Str(Rc::from("GeneratorFunction")), false, true);
+        i.set_attr(&gfc, "length", Value::Num(1.0), false, true);
+        i.set_attr(
+            &gfc,
+            "prototype",
+            Value::Obj(i.p.gen_func.clone()),
+            false,
+            false,
+        );
+        i.set_builtin(&i.p.gen_func.clone(), "constructor", Value::Obj(gfc));
     }
 
     // -- Symbol --
@@ -3314,13 +3340,13 @@ fn install_globals(i: &mut Interp) {
             ObjKind::Func(Func::Native {
                 name: Rc::from("Proxy"),
                 f: proxy_ctor,
+                ctor: true,
             }),
         )));
         i.set_attr(&o, "name", Value::Str(Rc::from("Proxy")), false, true);
         i.set_attr(&o, "length", Value::Num(2.0), false, true);
-        // IsConstructor marker for `new Proxy()` — a throwaway object
-        let pmark = i.new_obj();
-        i.set_attr(&o, "prototype", Value::Obj(pmark), false, false);
+        // spec: Proxy has NO `prototype` property (ctor flag set on
+        // Func::Native carries [[Construct]])
         define_global(i, "Proxy", Value::Obj(o));
     }
 
@@ -3475,32 +3501,62 @@ fn install_globals(i: &mut Interp) {
     // -- errors --
     {
         let err = make_ctor(i, "Error", error_ctor, i.p.error.clone());
-        define_global(i, "Error", err);
+        i.set_attr(
+            match &err {
+                Value::Obj(o) => o,
+                _ => unreachable!(),
+            },
+            "length",
+            Value::Num(1.0),
+            false,
+            true,
+        );
+        define_global(i, "Error", err.clone());
+        // NativeError ctors' [[Prototype]] is %Error% (19.5.6.2)
+        let err_ref = match &err {
+            Value::Obj(o) => o.clone(),
+            _ => unreachable!(),
+        };
         let te = make_ctor(i, "TypeError", type_error_ctor, i.p.type_error.clone());
-        define_global(i, "TypeError", te);
         let re = make_ctor(i, "RangeError", range_error_ctor, i.p.range_error.clone());
-        define_global(i, "RangeError", re);
         let se = make_ctor(
             i,
             "SyntaxError",
             syntax_error_ctor,
             i.p.syntax_error.clone(),
         );
-        define_global(i, "SyntaxError", se);
         let fe = make_ctor(i, "ReferenceError", ref_error_ctor, i.p.ref_error.clone());
-        define_global(i, "ReferenceError", fe);
         let ee = make_ctor(i, "EvalError", eval_error_ctor, i.p.eval_error.clone());
-        define_global(i, "EvalError", ee);
         let ue = make_ctor(i, "URIError", uri_error_ctor, i.p.uri_error.clone());
-        define_global(i, "URIError", ue);
         let ae = make_ctor(i, "AggregateError", agg_error_ctor, i.p.agg_error.clone());
-        define_global(i, "AggregateError", ae);
         let su = make_ctor(
             i,
             "SuppressedError",
             suppressed_error_ctor,
             i.p.suppressed_error.clone(),
         );
+        for (v, len) in [
+            (&te, 1.0),
+            (&re, 1.0),
+            (&se, 1.0),
+            (&fe, 1.0),
+            (&ee, 1.0),
+            (&ue, 1.0),
+            (&ae, 2.0),
+            (&su, 3.0),
+        ] {
+            if let Value::Obj(o) = v {
+                o.borrow_mut().proto = Some(err_ref.clone());
+                i.set_attr(o, "length", Value::Num(len), false, true);
+            }
+        }
+        define_global(i, "TypeError", te);
+        define_global(i, "RangeError", re);
+        define_global(i, "SyntaxError", se);
+        define_global(i, "ReferenceError", fe);
+        define_global(i, "EvalError", ee);
+        define_global(i, "URIError", ue);
+        define_global(i, "AggregateError", ae);
         define_global(i, "SuppressedError", su);
     }
 
@@ -3843,6 +3899,40 @@ fn install_globals(i: &mut Interp) {
 
     // binary views + web-platform surface (TextEncoder, URL, Blob, …)
     crate::binary::install(i);
+
+    // spec ctor lengths (make_ctor defaults to 0) — after binary::install
+    // so ArrayBuffer/DataView/TypedArray globals exist
+    for (n, len) in [
+        ("Object", 1.0),
+        ("Function", 1.0),
+        ("Array", 1.0),
+        ("String", 1.0),
+        ("Number", 1.0),
+        ("Boolean", 1.0),
+        ("Promise", 1.0),
+        ("RegExp", 2.0),
+        ("Map", 0.0),
+        ("Set", 0.0),
+        ("WeakMap", 0.0),
+        ("WeakSet", 0.0),
+        ("Date", 7.0),
+        ("Symbol", 0.0),
+        ("BigInt", 0.0),
+        ("ArrayBuffer", 1.0),
+        ("SharedArrayBuffer", 1.0),
+        ("DataView", 3.0),
+    ] {
+        let v = i
+            .p
+            .global
+            .borrow()
+            .props
+            .get_str(n)
+            .map(|p| p.val.clone());
+        if let Some(Value::Obj(o)) = v {
+            i.set_attr(&o, "length", Value::Num(len), false, true);
+        }
+    }
 }
 
 fn make_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: ObjRef) -> Value {
@@ -3851,6 +3941,7 @@ fn make_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: ObjRef) -> Value {
         ObjKind::Func(Func::Native {
             name: Rc::from(name),
             f,
+            ctor: true,
         }),
     )));
     i.set_attr(&o, "name", Value::Str(Rc::from(name)), false, true);
@@ -5941,9 +6032,9 @@ fn fn_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 // natives: array
 // ===========================================================================
 
-fn array_ctor(i: &mut Interp, _this: &Value, args: &[Value]) -> NResult {
+fn array_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     // Array(n) → length-n array of holes; Array(a,b,..) → [a,b,..]
-    if args.len() == 1 {
+    let items = if args.len() == 1 {
         if let Value::Num(n) = args[0] {
             if n >= 0.0 && n == n.trunc() && n < 4294967295.0 {
                 // dense Vec backing — can't honor holey arrays past a
@@ -5951,12 +6042,24 @@ fn array_ctor(i: &mut Interp, _this: &Value, args: &[Value]) -> NResult {
                 if n > 8_000_000.0 {
                     return Err(i.range_err("Invalid array length"));
                 }
-                return Ok(Value::Obj(i.new_arr(vec![Value::Und; n as usize])));
+                vec![Value::Und; n as usize]
+            } else {
+                return Err(i.range_err("Invalid array length"));
             }
-            return Err(i.range_err("Invalid array length"));
+        } else {
+            args.to_vec()
         }
+    } else {
+        args.to_vec()
+    };
+    // [[Construct]] via super(): `this` was allocated with
+    // newTarget.prototype — convert it in place so the subclass proto
+    // survives (`class Sub extends Array {}`)
+    if let Value::Obj(o) = this {
+        o.borrow_mut().kind = ObjKind::Arr(items);
+        return Ok(this.clone());
     }
-    Ok(Value::Obj(i.new_arr(args.to_vec())))
+    Ok(Value::Obj(i.new_arr(items)))
 }
 
 fn array_is_array(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -7735,10 +7838,59 @@ fn function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     // `\n` after the params keeps `<!--`/`-->` HTML comments in the
     // parameter source from swallowing the closing paren (spec B.x)
     let src = format!("(function anonymous({params}\n) {{\n{body}\n}})");
-    match i.run(&src) {
-        Ok(v) => Ok(v),
-        Err(e) => Err(i.syntax_err(format!("{e}"))),
+    let v = match i.run(&src) {
+        Ok(v) => v,
+        Err(e) => return Err(i.syntax_err(format!("{e}"))),
+    };
+    // OrdinaryCreateFromConstructor: newTarget.prototype wins
+    // (`class F extends Function {}` → fn proto is F.prototype)
+    let nt = i.new_target_native.clone().unwrap_or(Value::Und);
+    if matches!(nt, Value::Obj(_)) {
+        if let Ok(Value::Obj(p)) =
+            i.get_prop(&nt, &PropKey::from_str("prototype"))
+        {
+            if let Value::Obj(o) = &v {
+                o.borrow_mut().proto = Some(p);
+            }
+        }
     }
+    Ok(v)
+}
+
+/// `%GeneratorFunction%` ctor — `CreateDynamicFunction` for `function*`:
+/// compiles the source, then OrdinaryCreateFromConstructor semantics —
+/// the fn's [[Prototype]] comes from newTarget.prototype, falling back
+/// to %GeneratorFunction.prototype%.
+fn gen_function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let (params, body) = match args.split_last() {
+        None => (String::new(), String::new()),
+        Some((b, ps)) => {
+            let mut names = Vec::with_capacity(ps.len());
+            for p in ps {
+                names.push(i.to_str(p)?);
+            }
+            (names.join(","), i.to_str(b)?)
+        }
+    };
+    let src = format!("(function* anonymous({params}\n) {{\n{body}\n}})");
+    let v = match i.run(&src) {
+        Ok(v) => v,
+        Err(e) => return Err(i.syntax_err(format!("{e}"))),
+    };
+    // newTarget.prototype wins over %GeneratorFunction.prototype%
+    // (subclassing: `class G extends GeneratorFunction {}`)
+    let nt = i.new_target_native.clone().unwrap_or(Value::Und);
+    if let Value::Obj(nto) = &nt {
+        if let Ok(Value::Obj(p)) =
+            i.get_prop(&nt, &PropKey::from_str("prototype"))
+        {
+            let _ = nto;
+            if let Value::Obj(o) = &v {
+                o.borrow_mut().proto = Some(p);
+            }
+        }
+    }
+    Ok(v)
 }
 
 fn symbol_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -7819,50 +7971,80 @@ fn sym_get_description(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 // natives: errors
 // ===========================================================================
 
+/// InstallErrorCause(O, options): if `options` is an object with an own
+/// or inherited `cause` property, define own `cause` on O.
+fn install_error_cause(i: &mut Interp, o: &ObjRef, options: &Value) -> Result<(), Value> {
+    if let Value::Obj(_) = options {
+        if i.has_prop(options, &PropKey::from_str("cause"))? {
+            let cv = i.get_prop_str(options, "cause")?;
+            i.set_attr(o, "cause", cv, true, true);
+        }
+    }
+    Ok(())
+}
+
 fn error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let msg = match arg(args, 0) {
-        Value::Und => String::new(),
-        v => i.to_str(&v)?,
+        Value::Und => None,
+        v => Some(i.to_str(&v)?),
     };
     if let Value::Obj(o) = this {
         o.borrow_mut().kind = ObjKind::Err;
-        i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
-        i.set_attr(o, "name", Value::Str(Rc::from("Error")), true, true);
+        // spec: own `message` only when a message arg was provided;
+        // `name` is never an own prop (resolves via the prototype)
+        if let Some(m) = &msg {
+            i.set_attr(o, "message", Value::Str(Rc::from(m.as_str())), true, true);
+        }
+        install_error_cause(i, o, &arg(args, 1))?;
         i.set_attr(
             o,
             "stack",
-            Value::Str(Rc::from(format!("Error: {msg}").as_str())),
+            Value::Str(Rc::from(
+                format!("Error: {}", msg.as_deref().unwrap_or("")).as_str(),
+            )),
             true,
             true,
         );
         return Ok(this.clone());
     }
     let p = i.p.error.clone();
-    Ok(i.err_obj(&p, "Error", &msg))
+    let e = i.err_obj_opt(&p, "Error", msg.as_deref());
+    if let Value::Obj(o) = &e {
+        install_error_cause(i, o, &arg(args, 1))?;
+    }
+    Ok(e)
 }
 
 macro_rules! sub_err_ctor {
     ($name:ident, $field:ident, $jname:literal) => {
         fn $name(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             let msg = match arg(args, 0) {
-                Value::Und => String::new(),
-                v => i.to_str(&v)?,
+                Value::Und => None,
+                v => Some(i.to_str(&v)?),
             };
             if let Value::Obj(o) = this {
                 o.borrow_mut().kind = ObjKind::Err;
-                i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
-                i.set_attr(o, "name", Value::Str(Rc::from($jname)), true, true);
+                if let Some(m) = &msg {
+                    i.set_attr(o, "message", Value::Str(Rc::from(m.as_str())), true, true);
+                }
+                install_error_cause(i, o, &arg(args, 1))?;
                 i.set_attr(
                     o,
                     "stack",
-                    Value::Str(Rc::from(format!("{}: {}", $jname, msg).as_str())),
+                    Value::Str(Rc::from(
+                        format!("{}: {}", $jname, msg.as_deref().unwrap_or("")).as_str(),
+                    )),
                     true,
                     true,
                 );
                 return Ok(this.clone());
             }
             let p = i.p.$field.clone();
-            Ok(i.err_obj(&p, $jname, &msg))
+            let e = i.err_obj_opt(&p, $jname, msg.as_deref());
+            if let Value::Obj(o) = &e {
+                install_error_cause(i, o, &arg(args, 1))?;
+            }
+            Ok(e)
         }
     };
 }
@@ -7875,21 +8057,30 @@ sub_err_ctor!(syntax_error_ctor, syntax_error, "SyntaxError");
 sub_err_ctor!(ref_error_ctor, ref_error, "ReferenceError");
 
 fn err_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    if let Value::Obj(o) = this {
-        let name = i
-            .obj_get_raw_str(o, "name")
-            .map(|v| i.to_str(&v).unwrap_or_else(|_| "Error".into()))
-            .unwrap_or_else(|| "Error".into());
-        let msg = i
-            .obj_get_raw_str(o, "message")
-            .map(|v| i.to_str(&v).unwrap_or_default())
-            .unwrap_or_default();
-        if msg.is_empty() {
-            return Ok(Value::Str(Rc::from(name.as_str())));
-        }
-        return Ok(Value::Str(Rc::from(format!("{name}: {msg}").as_str())));
+    // spec 20.5.5.5: TypeError on non-object receiver; `name`/`message`
+    // fetched via Get (proto walk + getter invocation)
+    if !matches!(this, Value::Obj(_)) {
+        return Err(i.type_err("Error.prototype.toString called on non-object"));
     }
-    Ok(Value::Str(Rc::from("Error")))
+    let name_v = i.get_prop_str(this, "name")?;
+    let name = if matches!(name_v, Value::Und) {
+        "Error".to_string()
+    } else {
+        i.to_str(&name_v)?
+    };
+    let msg_v = i.get_prop_str(this, "message")?;
+    let msg = if matches!(msg_v, Value::Und) {
+        String::new()
+    } else {
+        i.to_str(&msg_v)?
+    };
+    if name.is_empty() {
+        return Ok(Value::Str(Rc::from(msg.as_str())));
+    }
+    if msg.is_empty() {
+        return Ok(Value::Str(Rc::from(name.as_str())));
+    }
+    Ok(Value::Str(Rc::from(format!("{name}: {msg}").as_str())))
 }
 
 
@@ -7908,13 +8099,21 @@ fn agg_error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
         o.borrow_mut().kind = ObjKind::Err;
         i.set_attr(o, "errors", arr, true, true);
-        i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
-        i.set_attr(o, "name", Value::Str(Rc::from("AggregateError")), true, true);
+        if !matches!(arg(args, 1), Value::Und) {
+            i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
+        }
+        install_error_cause(i, o, &arg(args, 2))?;
         return Ok(this.clone());
     }
-    let e = i.err_obj(&i.p.agg_error.clone(), "AggregateError", &msg);
+    let has_msg = !matches!(args.get(1), None | Some(Value::Und));
+    let e = i.err_obj_opt(
+        &i.p.agg_error.clone(),
+        "AggregateError",
+        if has_msg { Some(&msg) } else { None },
+    );
     if let Value::Obj(o) = &e {
         i.set_attr(o, "errors", arr, true, true);
+        install_error_cause(i, o, &arg(args, 2))?;
     }
     Ok(e)
 }
@@ -7931,14 +8130,17 @@ fn suppressed_error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResul
         o.borrow_mut().kind = ObjKind::Err;
         i.set_attr(o, "error", err, true, true);
         i.set_attr(o, "suppressed", supp, true, true);
-        i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
-        i.set_attr(o, "name", Value::Str(Rc::from("SuppressedError")), true, true);
+        if !matches!(arg(args, 2), Value::Und) {
+            i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
+        }
+        install_error_cause(i, o, &arg(args, 3))?;
         return Ok(this.clone());
     }
     let e = i.err_obj(&i.p.suppressed_error.clone(), "SuppressedError", &msg);
     if let Value::Obj(o) = &e {
         i.set_attr(o, "error", err, true, true);
         i.set_attr(o, "suppressed", supp, true, true);
+        install_error_cause(i, o, &arg(args, 3))?;
     }
     Ok(e)
 }
@@ -8461,7 +8663,11 @@ fn promise_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     // handlers queue on a prop
     i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
     let executor = arg(args, 0);
-    if i.is_callable(&executor) {
+    // spec: non-callable executor → TypeError (incl. no-arg call)
+    if !i.is_callable(&executor) {
+        return Err(i.type_err("Promise resolver is not a function"));
+    }
+    {
         let pv = Value::Obj(p.clone());
         let res_fn = i.native("resolve", promise_resolve_inner);
         let rej_fn = i.native("reject", promise_reject_inner);

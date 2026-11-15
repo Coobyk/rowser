@@ -73,7 +73,7 @@ const SKIP_FEATURES: &[&str] = &[
     "SharedArrayBuffer", "Atomics", "FinalizationRegistry", "WeakRef",
     "Intl", "Temporal", "Float16Array", "import.meta", "dynamic-import",
     "import-attributes", "explicit-resource-management",
-    "Decorators", "RegExp.escape", "regexp-duplicate-named-groups",
+    "decorators", "RegExp.escape", "regexp-duplicate-named-groups",
     "tail-call-optimization", "async-functions",
     "async-iteration", "regexp-v-flag",
     "set-methods", "promise-with-resolvers", "array-grouping",
@@ -86,6 +86,8 @@ const SKIP_FEATURES: &[&str] = &[
     "caller",
     // $262.createRealm / Error.isError — APIs we don't expose
     "cross-realm", "Error.isError", "host-gc-required",
+    // stage-3 Error.prototype.stack accessor proposal — unimplemented
+    "error-stack-accessor",
     "CanBlockIsFalse", "SharedArrayBuffer",
 ];
 

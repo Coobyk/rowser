@@ -54,6 +54,7 @@ fn mk_ctor_len(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef, len: f64
         ObjKind::Func(Func::Native {
             name: Rc::from(name),
             f,
+            ctor: true,
         }),
     )));
     i.set_attr(&o, "name", Value::Str(Rc::from(name)), false, true);
@@ -369,6 +370,7 @@ fn install_typed_arrays(i: &mut Interp) {
         ObjKind::Func(Func::Native {
             name: Rc::from("TypedArray"),
             f: ta_intr_ctor,
+            ctor: true,
         }),
     )));
     i.set_attr(&ta_intr, "length", Value::Num(0.0), false, true);
@@ -411,6 +413,10 @@ fn install_typed_arrays(i: &mut Interp) {
         let proto = plain(Some(shared.clone()));
         let ctor = i.native(name, *cf);
         if let Value::Obj(co) = &ctor {
+            // every concrete TA ctor has [[Construct]]
+            if let ObjKind::Func(Func::Native { ctor, .. }) = &mut co.borrow_mut().kind {
+                *ctor = true;
+            }
             co.borrow_mut().proto = Some(ta_intr.clone());
             co.borrow_mut().props.insert(
                 PropKey::from_str("prototype"),
@@ -468,6 +474,9 @@ fn install_typed_arrays(i: &mut Interp) {
         hid(i, &proto, "__name", Value::Str(Rc::from(name)));
         let ctor = i.native(name, cf);
         if let Value::Obj(co) = &ctor {
+            if let ObjKind::Func(Func::Native { ctor, .. }) = &mut co.borrow_mut().kind {
+                *ctor = true;
+            }
             co.borrow_mut().proto = Some(ta_intr.clone());
             co.borrow_mut().props.insert(
                 PropKey::from_str("prototype"),

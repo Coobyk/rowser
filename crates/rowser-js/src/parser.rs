@@ -90,6 +90,7 @@ fn parse_expr_src(src: &str, ctx: &mut Parser) -> Result<Expr, Error> {
     p.await_decl = ctx.await_decl;
     p.priv_stack = ctx.priv_stack.clone();
     p.priv_next_id = ctx.priv_next_id;
+    p.in_static_block = ctx.in_static_block;
     let e = p.expression()?;
     if !matches!(p.peek().tok, Tok::Eof) {
         return Err(p.err("trailing tokens in expression"));
@@ -150,6 +151,9 @@ struct Parser {
     /// ids of the class scopes enclosing the use site — resolved as each
     /// enclosing class's declared set is completed
     priv_pending: Vec<(String, Vec<usize>)>,
+    /// inside a class `static {}` block — `await` is a reserved
+    /// BindingIdentifier here (early error; function boundaries reset it)
+    in_static_block: bool,
 }
 
 impl Parser {
@@ -173,6 +177,7 @@ impl Parser {
             priv_stack: Vec::new(),
             priv_next_id: 0,
             priv_pending: Vec::new(),
+            in_static_block: false,
         }
     }
 
@@ -303,7 +308,12 @@ impl Parser {
             }
             Tok::Punct("[") if computed_ok => {
                 self.next();
-                let e = self.expression()?;
+                // ComputedPropertyName is AssignmentExpression[+In] —
+                // `for (x = o['a' in b];;)` parses the `in` as an operator
+                let no_in = std::mem::replace(&mut self.no_in, false);
+                let e = self.expression();
+                self.no_in = no_in;
+                let e = e?;
                 self.expect_punct("]")?;
                 Ok(PropKey::Computed(e))
             }
@@ -349,14 +359,16 @@ impl Parser {
     /// Function body `{ stmts }`: handles the directive prologue and
     /// saves/restores the context flags that reset at function boundaries.
     /// `arrow`: arrows inherit super/new.target context (but never `yield`).
-    fn fn_body(&mut self, arrow: bool) -> Result<Vec<Stmt>, Error> {
+    fn fn_body(&mut self, arrow: bool, params: &[Param]) -> Result<Vec<Stmt>, Error> {
         let saved = (
             self.strict,
             self.fn_depth,
             self.gen_depth,
             self.ctor_depth,
             self.method_depth,
+            self.in_static_block,
         );
+        self.in_static_block = false;
         self.fn_depth += 1;
         if !arrow {
             self.nonarrow_fn_depth += 1;
@@ -369,6 +381,17 @@ impl Parser {
             if let Tok::Str(t) = &self.peek().tok {
                 if t == "use strict" {
                     self.strict = true;
+                    // early error: a non-simple parameter list can't get
+                    // its strictness from an explicit directive — applies
+                    // to methods AND arrows, not just function decls
+                    let simple = params
+                        .iter()
+                        .all(|p| matches!(p, Param::Ident(_)));
+                    if !simple {
+                        return Err(self.err(
+                            "\"use strict\" not allowed with non-simple parameters",
+                        ));
+                    }
                 }
             }
         }
@@ -390,6 +413,7 @@ impl Parser {
             self.gen_depth,
             self.ctor_depth,
             self.method_depth,
+            self.in_static_block,
         ) = saved;
         if !arrow {
             self.nonarrow_fn_depth -= 1;
@@ -1391,7 +1415,7 @@ impl Parser {
                 }
             }
             self.check_params(&params, false)?;
-            let body = self.fn_body(false)?;
+            let body = self.fn_body(false, &params)?;
             Ok((params, body))
         })();
         (
@@ -1417,7 +1441,7 @@ impl Parser {
 
     /// Method body: runs `fn_body` in method context (`super.x` legal,
     /// `super()` only when `is_ctor`) and restores the enclosing context.
-    fn method_body(&mut self, is_ctor: bool, gen: bool, is_async: bool) -> Result<Vec<Stmt>, Error> {
+    fn method_body(&mut self, is_ctor: bool, gen: bool, is_async: bool, params: &[Param]) -> Result<Vec<Stmt>, Error> {
         let saved = (
             self.ctor_depth,
             self.method_depth,
@@ -1430,7 +1454,7 @@ impl Parser {
         self.gen_depth = gen as usize;
         self.yield_decl = gen as usize;
         self.await_decl = is_async as usize;
-        let r = self.fn_body(false);
+        let r = self.fn_body(false, params);
         (
             self.ctor_depth,
             self.method_depth,
@@ -1444,14 +1468,23 @@ impl Parser {
     /// strict-mode + non-simple-parameter-list duplicate check.
     /// `dup_always`: arrows never allow duplicate params (no sloppy form).
     fn check_params(&mut self, params: &[Param], dup_always: bool) -> Result<(), Error> {
-        let simple = params.iter().all(|p| matches!(p, Param::Ident(_)));
-        for p in params {
-            let mut names = Vec::new();
-            pattern_names(p, &mut names);
-            for n in names {
-                self.check_binding_name(n)?;
+        // param names live across the function boundary — the
+        // static-block `await` ban doesn't reach them (this re-check
+        // happens after `params()` restored the flag)
+        let sb = std::mem::replace(&mut self.in_static_block, false);
+        let r = (|s: &mut Self| -> Result<(), Error> {
+            for p in params {
+                let mut names = Vec::new();
+                pattern_names(p, &mut names);
+                for n in names {
+                    s.check_binding_name(n)?;
+                }
             }
-        }
+            Ok(())
+        })(self);
+        self.in_static_block = sb;
+        r?;
+        let simple = params.iter().all(|p| matches!(p, Param::Ident(_)));
         if self.strict || !simple || dup_always {
             let mut seen = std::collections::HashSet::new();
             for p in params {
@@ -1490,6 +1523,11 @@ impl Parser {
         if name == "await" && self.await_decl > 0 {
             return Err(self.err("`await` is not a valid binding in an async function"));
         }
+        // `await` is a reserved BindingIdentifier inside class `static {}`
+        // blocks (early error; resets at function boundaries)
+        if name == "await" && self.in_static_block {
+            return Err(self.err("`await` is not a valid binding in a class static block"));
+        }
         // `let` is never a valid lexical-decl binding name (sloppy `var let`
         // stays legal — gated on the declaration kind, not strictness)
         if name == "let" && self.lex_decl > 0 {
@@ -1521,8 +1559,12 @@ impl Parser {
 
     fn params(&mut self) -> Result<Vec<Param>, Error> {
         self.param_depth += 1;
+        // formal parameters are a function boundary — the static-block
+        // `await` binding ban doesn't reach inside them
+        let sb = std::mem::replace(&mut self.in_static_block, false);
         let r = self.params_inner();
         self.param_depth -= 1;
+        self.in_static_block = sb;
         r
     }
 
@@ -1590,9 +1632,31 @@ impl Parser {
     fn class_tail(&mut self, name_required: bool) -> Result<ClassDef, Error> {
         let name = match self.peek().tok.clone() {
             Tok::Ident(s) => {
-                // the class name is always a LEXICAL binding — `eval` /
-                // `arguments` / `let` are banned even in sloppy code
-                if matches!(s.as_str(), "eval" | "arguments" | "let") {
+                // class bodies are always strict — the name follows strict
+                // binding rules even in sloppy surrounding code (`yield`,
+                // `static`, `eval`, `arguments`, `let`, the strict-only
+                // reserved words); `await` stays legal in scripts
+                if matches!(
+                    s.as_str(),
+                    "eval" | "arguments" | "let" | "implements" | "interface"
+                        | "package" | "private" | "protected" | "public"
+                        | "static" | "yield"
+                ) {
+                    return Err(self.err(format!("`{s}` is not a valid class name")));
+                }
+                self.check_binding_name(&s)?;
+                self.next();
+                Some(s)
+            }
+            // contextual keywords name classes too — `class await {}`
+            // is legal in scripts; `yield`/`static`/`let` follow the
+            // same strict-reserved rules as ordinary idents
+            Tok::Kw(k) if is_contextual_ident_kw(&k) => {
+                let s = k.name().to_string();
+                if matches!(
+                    s.as_str(),
+                    "let" | "static" | "yield"
+                ) {
                     return Err(self.err(format!("`{s}` is not a valid class name")));
                 }
                 self.check_binding_name(&s)?;
@@ -1603,7 +1667,14 @@ impl Parser {
             _ => return Err(self.err("expected class name")),
         };
         let superclass = if self.eat_kw(Kw::Extends) {
-            Some(self.left_hand_side()?)
+            // the heritage expression is part of the class — always
+            // strict code (`with` inside a heritage IIFE is a
+            // SyntaxError, `arguments.callee` poisons)
+            let hs = self.strict;
+            self.strict = true;
+            let h = self.left_hand_side();
+            self.strict = hs;
+            Some(h?)
         } else {
             None
         };
@@ -1649,6 +1720,7 @@ impl Parser {
                     self.yield_decl,
                     self.await_decl,
                     self.nonarrow_fn_depth,
+                    self.in_static_block,
                 );
                 self.fn_depth = 0;
                 self.ctor_depth = 0;
@@ -1656,6 +1728,7 @@ impl Parser {
                 self.gen_depth = 0;
                 self.yield_decl = 0;
                 self.await_decl = 0;
+                self.in_static_block = true;
                 if self.nonarrow_fn_depth == 0 {
                     self.nonarrow_fn_depth = 1;
                 }
@@ -1668,6 +1741,7 @@ impl Parser {
                     self.yield_decl,
                     self.await_decl,
                     self.nonarrow_fn_depth,
+                    self.in_static_block,
                 ) = bsaved;
                 if stmts_have_arguments(&stmts) {
                     return Err(
@@ -1781,11 +1855,17 @@ impl Parser {
             if let PropKey::Ident(s) = &key {
                 if s.starts_with('#') {
                     // mask of already-seen kinds that conflict with this
-                    // declaration; the bit this declaration contributes
-                    let (mask, bit) = match kind {
-                        MemberKind::Getter => (0b011, 0b010),
-                        MemberKind::Setter => (0b101, 0b100),
-                        _ => (0b111, 0b001),
+                    // declaration; the bit this declaration contributes.
+                    // bits: inst {m:0b1,g:0b10,s:0b100} static {m,g,s}
+                    // at 0b1000/0b10000/0b100000 — a get+set pair is
+                    // legal ONLY when both halves share staticness
+                    let (mask, bit) = match (kind, is_static) {
+                        (MemberKind::Getter, false) => (0b111011, 0b000010),
+                        (MemberKind::Setter, false) => (0b111101, 0b000100),
+                        (MemberKind::Getter, true) => (0b011111, 0b010000),
+                        (MemberKind::Setter, true) => (0b101111, 0b100000),
+                        (_, false) => (0b111111, 0b000001),
+                        (_, true) => (0b111111, 0b001000),
                     };
                     let dup = match self.priv_stack.last_mut() {
                         Some((_, set)) => {
@@ -1905,12 +1985,26 @@ impl Parser {
             self.expect_punct("(")?;
             // no super of either kind inside FormalParameters — `super()`
             // is only legal in the ctor BODY, `super.prop` only in the
-            // method body
-            let psaved = (self.ctor_depth, self.method_depth);
+            // method body. FormalParameters parses under the member's own
+            // [Yield]/[Await]: `async m(await)` and `*m(yield)` are early
+            // errors
+            let psaved = (
+                self.ctor_depth,
+                self.method_depth,
+                self.await_decl,
+                self.yield_decl,
+            );
             self.ctor_depth = 0;
             self.method_depth = 0;
+            self.await_decl = is_async as usize;
+            self.yield_decl = member_gen as usize;
             let params = self.params();
-            (self.ctor_depth, self.method_depth) = psaved;
+            (
+                self.ctor_depth,
+                self.method_depth,
+                self.await_decl,
+                self.yield_decl,
+            ) = psaved;
             let params = params?;
             self.expect_punct(")")?;
             match kind {
@@ -1925,7 +2019,7 @@ impl Parser {
             self.check_params(&params, false)?;
             self.expect_punct("{")?;
             // `super()` is only legal inside a DERIVED constructor
-            let body = self.method_body(is_ctor && derived, member_gen, is_async)?;
+            let body = self.method_body(is_ctor && derived, member_gen, is_async, &params)?;
             // the ctor's function name comes from the class name, not
             // the member key — leave None so `let D = class {...}` gets
             // NamedEvaluation
@@ -2139,7 +2233,7 @@ impl Parser {
                 }
             }
             self.check_params(&params, true)?;
-            let body = self.fn_body(true)?;
+            let body = self.fn_body(true, &params)?;
             Ok(Expr::Fn(Rc::new(FnDef {
                 name,
                 params,
@@ -2271,7 +2365,10 @@ impl Parser {
             Tok::Kw(Kw::Typeof) => Some(UnaryOp::Typeof),
             Tok::Kw(Kw::Void) => Some(UnaryOp::Void),
             Tok::Kw(Kw::Delete) => Some(UnaryOp::Delete),
-            Tok::Kw(Kw::Await) => Some(UnaryOp::Await),
+            // `await` is a unary op only in an async context — elsewhere
+            // it's an ordinary identifier (`var await = 1`, `x = await`
+            // inside a non-async fn)
+            Tok::Kw(Kw::Await) if self.await_decl > 0 => Some(UnaryOp::Await),
             _ => None,
         };
         if let Some(op) = op {
@@ -2765,7 +2862,7 @@ impl Parser {
                             return Err(self.err("setter must have exactly one parameter"));
                         }
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, false, false)?;
+                        let body = self.method_body(false, false, false, &params)?;
                         let fname = match &key {
                             PropKey::Ident(s) | PropKey::Str(s) => Some(s.clone()),
                             _ => None,
@@ -2805,7 +2902,7 @@ impl Parser {
                         let params = self.params()?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, member_gen, true)?;
+                        let body = self.method_body(false, member_gen, true, &params)?;
                         props.push(ObjProp {
                             key: key.clone(),
                             val: PropVal::Method(Rc::new(FnDef {
@@ -2829,7 +2926,7 @@ impl Parser {
                         let params = self.params()?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, true, false)?;
+                        let body = self.method_body(false, true, false, &params)?;
                         props.push(ObjProp {
                             key: key.clone(),
                             val: PropVal::Method(Rc::new(FnDef {
@@ -2866,7 +2963,7 @@ impl Parser {
                         let params = self.params()?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, false, false)?;
+                        let body = self.method_body(false, false, false, &params)?;
                         PropVal::Method(Rc::new(FnDef {
                             name: prop_key_name(&key),
                             params,

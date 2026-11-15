@@ -3503,6 +3503,7 @@ fn dom_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef) -> Value {
         ObjKind::Func(Func::Native {
             name: Rc::from(name),
             f,
+            ctor: true,
         }),
     )));
     set_bk(&o, "name", Value::Str(Rc::from(name)));

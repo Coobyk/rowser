@@ -359,6 +359,10 @@ impl Lexer {
             let (octal, escaped) = (self.tok_octal, self.tok_escaped);
             self.tok_octal = false;
             self.tok_escaped = false;
+            // newlines seen INSIDE the token (line continuations in
+            // strings, template bodies) don't count for ASI — only real
+            // inter-token line breaks set the next token's flag
+            self.newline = false;
             out.push(Token {
                 tok,
                 line,

@@ -406,6 +406,9 @@ pub enum Func {
     Native {
         name: Rc<str>,
         f: NativeFn,
+        /// has [[Construct]] — independent of an own `prototype` prop
+        /// (Proxy is a ctor with NO `prototype` property)
+        ctor: bool,
     },
 }
 
@@ -1205,6 +1208,7 @@ impl Interp {
             ObjKind::Func(Func::Native {
                 name: Rc::from(""),
                 f: empty_fn,
+                ctor: false,
             }),
         )));
         let iterator = mk(Some(obj.clone()));
@@ -1366,6 +1370,17 @@ impl Interp {
 
     // -- error helpers ------------------------------------------------------
     pub fn err_obj(&mut self, proto: &ObjRef, name: &str, msg: &str) -> Value {
+        self.err_obj_opt(proto, name, Some(msg))
+    }
+
+    /// `msg: None` — the Error ctor was called with `undefined` message:
+    /// spec does not install an own `message` prop in that case.
+    pub fn err_obj_opt(
+        &mut self,
+        proto: &ObjRef,
+        name: &str,
+        msg: Option<&str>,
+    ) -> Value {
         let o = Rc::new(RefCell::new(Obj::new(Some(proto.clone()), ObjKind::Err)));
         // spec: error own props are writable+configurable, non-enumerable
         let p = |v: Value| Prop {
@@ -1376,15 +1391,18 @@ impl Interp {
             get: None,
             set: None,
         };
-        o.borrow_mut()
-            .props
-            .insert(PropKey::from_str("message"), p(Value::Str(Rc::from(msg))));
-        o.borrow_mut()
-            .props
-            .insert(PropKey::from_str("name"), p(Value::Str(Rc::from(name))));
+        if let Some(msg) = msg {
+            o.borrow_mut()
+                .props
+                .insert(PropKey::from_str("message"), p(Value::Str(Rc::from(msg))));
+        }
+        // spec installs no own `name` — it resolves via
+        // Error.prototype.name / <Sub>Error.prototype.name
         o.borrow_mut().props.insert(
             PropKey::from_str("stack"),
-            p(Value::Str(Rc::from(format!("{name}: {msg}")))),
+            p(Value::Str(Rc::from(
+                format!("{name}: {}", msg.unwrap_or("")).as_str(),
+            ))),
         );
         Value::Obj(o)
     }
@@ -2022,6 +2040,7 @@ impl Interp {
             ObjKind::Func(Func::Native {
                 name: Rc::from(name),
                 f,
+                ctor: false,
             }),
         )));
         // fn .length/.name: {writable:false, enumerable:false, configurable:true}
@@ -4580,7 +4599,7 @@ impl Interp {
         };
         let kind = o.borrow().kind.clone();
         match kind {
-            ObjKind::Func(Func::Native { f: nf, name }) => {
+            ObjKind::Func(Func::Native { f: nf, name, .. }) => {
                 self.depth += 1;
                 let r = nf(self, &this, &args);
                 self.depth -= 1;
@@ -4829,9 +4848,7 @@ impl Interp {
                     && !def.is_async
                     && (!matches!(ctor, CtorKind::NotClass) || home.is_none())
             }
-            ObjKind::Func(Func::Native { .. }) => self
-                .obj_get_raw(o, &PropKey::from_str("prototype"))
-                .is_some_and(|p| !matches!(p, Value::Und)),
+            ObjKind::Func(Func::Native { ctor, .. }) => *ctor,
             ObjKind::Bound { target, .. } => self.is_constructor(target),
             ObjKind::Proxy { target, .. } => self.is_constructor(target),
             _ => false,
@@ -4874,14 +4891,15 @@ impl Interp {
                     None => self.construct(&target, args, new_target),
                 }
             }
-            ObjKind::Func(Func::Native { f: nf, name }) => {
+            ObjKind::Func(Func::Native { f: nf, name, ctor: nctor }) => {
                 // natives act as their own ctor (Error, Array(1,2), etc.)
-                // — but only ctors (make_ctor sets `.prototype`); plain
-                // methods like Math.abs are not [[Construct]]-able
+                // — but only ctors; plain methods like Math.abs are not
+                // [[Construct]]-able. `ctor` is authoritative — Proxy has
+                // [[Construct]] but NO own `prototype` prop.
                 let proto_prop = self
                     .obj_get_raw(&o.clone(), &PropKey::from_str("prototype"))
                     .unwrap_or(Value::Und);
-                if matches!(proto_prop, Value::Und) {
+                if !nctor {
                     return Err(self.type_err(format!("{name} is not a constructor")));
                 }
                 // OrdinaryCreateFromConstructor: new_target.prototype wins
@@ -5054,13 +5072,26 @@ impl Interp {
                 let r = self.exec_block(&def.body, &body_scope);
                 self.depth -= 1;
                 let this_out = body_scope.thisv.borrow().clone();
+                // derived ctor: `return <primitive ≠ undefined>` is a
+                // TypeError ([[Construct]] 9.2.2#13c); base ctors
+                // silently ignore primitive returns
+                let bad_prim = matches!(
+                    &r,
+                    Ok(Completion::Return(v)) if !matches!(v, Value::Und | Value::Obj(_))
+                        && !self.is_callable(v)
+                );
                 match r {
                     Ok(Completion::Return(v))
                         if self.is_callable(&v) || matches!(v, Value::Obj(_)) =>
                     {
                         Ok(v)
                     }
-                    Ok(Completion::Return(_)) | Ok(_) => {
+                    Ok(_) => {
+                        if matches!(ctor, CtorKind::Derived) && bad_prim {
+                            return Err(self.type_err(
+                                "Derived constructors may only return object or undefined",
+                            ));
+                        }
                         if matches!(ctor, CtorKind::Derived)
                             && body_scope.this_uninit.get()
                         {
@@ -6015,6 +6046,20 @@ impl Interp {
         }
     }
 
+    /// spec SetFunctionName: `name` {writable:false, enumerable:false,
+    /// configurable:true}; `prefix` is "get "/"set " for accessors
+    pub fn set_fn_name(&self, f: &Value, name: &str, prefix: &str) {
+        if let Value::Obj(o) = f {
+            self.set_attr(
+                o,
+                "name",
+                Value::Str(Rc::from(format!("{prefix}{name}").as_str())),
+                false,
+                true,
+            );
+        }
+    }
+
     pub fn make_fn(&mut self, def: Rc<FnDef>, env: &EnvRef, ctor: CtorKind) -> Value {
         self.make_fn_home(def, env, None, ctor)
     }
@@ -6038,8 +6083,10 @@ impl Interp {
             }),
         )));
         let name = def.name.clone().unwrap_or_default();
-        self.set_attr(&o, "name", Value::Str(Rc::from(name.as_str())), false, true);
+        // insertion order matters for getOwnPropertyNames — spec order
+        // is `length` then `name` then `prototype`
         self.set_attr(&o, "length", Value::Num(param_count(&def.params) as f64), false, true);
+        self.set_attr(&o, "name", Value::Str(Rc::from(name.as_str())), false, true);
         if def.is_gen && home.is_none() {
             // generator fns: proto is %GeneratorFunction.prototype%; the
             // `.prototype` prop is an ordinary object whose proto is
@@ -6192,8 +6239,10 @@ impl Interp {
             Stmt::ClassDecl(c) => {
                 let v = self.make_class(c, env)?;
                 if let Some(n) = &c.name {
-                    // class bindings are const-like — assignment throws
-                    self.declare(env, n, v, false);
+                    // the outer class binding is a mutable `let`-style
+                    // binding — only the class-scope inner binding is
+                    // immutable
+                    self.declare(env, n, v, true);
                 }
                 Ok(Completion::Empty)
             }
@@ -6670,7 +6719,10 @@ impl Interp {
                             }
                         }
                         Ok(r) => {
-                            let _ = crate::builtins::iter_lazy_close(self, &mut lz);
+                            // non-throw abrupt (return): a close error
+                            // REPLACES the completion; throw completions
+                            // keep the original error (Err arm below)
+                            crate::builtins::iter_lazy_close(self, &mut lz)?;
                             return Ok(r);
                         }
                         Err(e) => {
@@ -7140,7 +7192,11 @@ impl Interp {
             let body = if derived {
                 vec![Stmt::Expr(Expr::Call {
                     callee: Box::new(Expr::Super),
-                    args: vec![Arg::Spread(Expr::Ident("args".into()))],
+                    // `\u{E000}` can't appear in a source identifier —
+                    // unforgeable marker so eval_args forwards the rest
+                    // array's items WITHOUT observable @@iterator (the
+                    // default ctor does not use argument evaluation)
+                    args: vec![Arg::Spread(Expr::Ident("\u{e000}args".into()))],
                 })]
             } else {
                 Vec::new()
@@ -7148,7 +7204,9 @@ impl Interp {
             Rc::new(FnDef {
                 name: c.name.clone(),
                 params: if derived {
-                    vec![Param::Rest(Box::new(Pattern::Ident("args".into())))]
+                    vec![Param::Rest(Box::new(Pattern::Ident(
+                        "\u{e000}args".into(),
+                    )))]
                 } else {
                     Vec::new()
                 },
@@ -7210,15 +7268,19 @@ impl Interp {
             // still install as ordinary symbol-keyed props
             let is_priv =
                 matches!(&m.key, ast::PropKey::Ident(s) if s.starts_with('#'));
-            let key = match &m.key {
+            let (key, key_val) = match &m.key {
                 ast::PropKey::Ident(s) if s.starts_with('#') => {
-                    PropKey::Sym(priv_names[s.as_str()])
+                    (PropKey::Sym(priv_names[s.as_str()]), None)
                 }
-                ast::PropKey::Ident(s) | ast::PropKey::Str(s) => PropKey::from_str(s),
-                ast::PropKey::Num(n) => PropKey::from_str(&js_num_str(*n)),
+                ast::PropKey::Ident(s) | ast::PropKey::Str(s) => {
+                    (PropKey::from_str(s), None)
+                }
+                ast::PropKey::Num(n) => {
+                    (PropKey::from_str(&js_num_str(*n)), None)
+                }
                 ast::PropKey::Computed(e) => {
                     let kv = self.eval_expr(e, &class_env)?;
-                    self.to_propkey(&kv)?
+                    (self.to_propkey(&kv)?, Some(kv))
                 }
             };
             // a computed static key resolving to `prototype` is a
@@ -7233,7 +7295,15 @@ impl Interp {
             let fname: Rc<str> = match &m.key {
                 ast::PropKey::Ident(s) | ast::PropKey::Str(s) => Rc::from(s.as_str()),
                 ast::PropKey::Num(n) => Rc::from(js_num_str(*n).as_str()),
-                ast::PropKey::Computed(_) => Rc::from(self.key_to_name(&key).as_str()),
+                ast::PropKey::Computed(_) => match &key_val {
+                    // SetFunctionName: symbol key → `[desc]`; a symbol
+                    // with no description yields the empty name
+                    Some(Value::Sym(_, d)) if !d.is_empty() => {
+                        Rc::from(format!("[{d}]"))
+                    }
+                    Some(Value::Sym(_, _)) => Rc::from(""),
+                    _ => Rc::from(self.key_to_name(&key).as_str()),
+                },
             };
             match m.kind {
                 MemberKind::Method => {
@@ -7246,6 +7316,7 @@ impl Interp {
                             Some(proto.clone()),
                             CtorKind::NotClass,
                         );
+                        self.set_fn_name(&f, &fname, "");
                         inst_fields.push(InstElem::Method(key, f));
                         continue;
                     }
@@ -7259,6 +7330,7 @@ impl Interp {
                         }),
                         CtorKind::NotClass,
                     );
+                    self.set_fn_name(&f, &fname, "");
                     if is_priv {
                         // private static method — non-writable slot
                         target.borrow_mut().props.insert(
@@ -7285,6 +7357,11 @@ impl Interp {
                             &class_env,
                             Some(proto.clone()),
                             CtorKind::NotClass,
+                        );
+                        self.set_fn_name(
+                            &f,
+                            &fname,
+                            if m.kind == MemberKind::Getter { "get " } else { "set " },
                         );
                         let ent = inst_fields.iter_mut().find(|e| {
                             matches!(e, InstElem::Access(k2, _, _) if *k2 == key)
@@ -7314,6 +7391,11 @@ impl Interp {
                             proto.clone()
                         }),
                         CtorKind::NotClass,
+                    );
+                    self.set_fn_name(
+                        &f,
+                        &fname,
+                        if m.kind == MemberKind::Getter { "get " } else { "set " },
                     );
                     let mut b = target.borrow_mut();
                     let ent = b.props.or_insert_with(key, || Prop::accessor(None, None));
@@ -7906,6 +7988,19 @@ impl Interp {
                 Arg::Expr(e) => out.push(self.eval_expr(e, env)?),
                 Arg::Spread(e) => {
                     let v = self.eval_expr(e, env)?;
+                    // default derived ctor's `super(...\u{e000}args)`:
+                    // forward the rest array's items directly — no
+                    // observable @@iterator (ClassDefinitionEvaluation:
+                    // the default ctor does not use argument evaluation)
+                    if matches!(e, Expr::Ident(n) if n.starts_with('\u{e000}')) {
+                        if let Value::Obj(o) = &v {
+                            let b = o.borrow();
+                            if let ObjKind::Arr(items) = &b.kind {
+                                out.extend(items.iter().cloned());
+                                continue;
+                            }
+                        }
+                    }
                     out.extend(self.iter_values(&v)?);
                 }
             }
