@@ -150,6 +150,8 @@ const NATIVE_ARITY: &[(&str, f64)] = &[
     ("reduceRight", 1.0), ("slice", 2.0), ("some", 1.0), ("sort", 1.0),
     ("splice", 2.0), ("unshift", 1.0), ("with", 2.0), ("toSorted", 1.0),
     ("toSpliced", 2.0), ("from", 1.0), ("isArray", 1.0),
+    // Iterator helpers (unique names)
+    ("chunks", 1.0), ("windows", 1.0),
     // Object
     ("assign", 2.0), ("create", 2.0), ("defineProperties", 2.0),
     ("defineProperty", 3.0), ("entries", 1.0), ("freeze", 1.0),
@@ -248,6 +250,9 @@ pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
             if let ObjKind::Iter { items, .. } = &o.borrow().kind {
                 return Ok(items.clone());
             }
+            if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
+                return iter_drain_lazy(i, v);
+            }
         }
         // ToObject(undefined/null) is a TypeError — every caller here is a
         // spec operation that requires it
@@ -296,6 +301,10 @@ pub(crate) fn to_elems_sparse(
             }
             if let ObjKind::Iter { items, .. } = &o.borrow().kind {
                 return Ok(items.iter().cloned().enumerate().collect());
+            }
+            if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
+                let items = iter_drain_lazy(i, v)?;
+                return Ok(items.into_iter().enumerate().collect());
             }
         }
         Value::Und | Value::Null => {
@@ -591,14 +600,38 @@ fn install_protos(i: &mut Interp) {
             ("find", iter_find),
             ("toArray", iter_to_array),
             ("indexed", iter_indexed),
+            ("includes", iter_includes),
+            ("join", iter_join),
+            ("windows", iter_windows),
+            ("chunks", iter_chunks),
         ] {
             method(i, &p, name, f);
         }
-        // Iterator ctor (abstract) + from/concat statics
+        // %IteratorHelperPrototype% — lazy helper results get own
+        // next/return (return closes the underlying source chain)
+        let hp = i.p.iter_helper.clone();
+        method(i, &hp, "next", iter_next);
+        method(i, &hp, "return", iter_lazy_ret);
+        // %GeneratorPrototype% — eager generators step a snapshot, so
+        // `next` is the Iter stepper; `return`/`throw` finish the snapshot
+        let gp = i.p.generator.clone();
+        method(i, &gp, "next", iter_next);
+        method(i, &gp, "return", gen_return);
+        method(i, &gp, "throw", gen_throw);
+        // Iterator ctor (abstract) + statics
         let itctor = make_ctor(i, "Iterator", iter_ctor, p.clone());
         if let Value::Obj(o) = &itctor {
             method(i, o, "from", iter_from);
             method(i, o, "concat", iter_concat);
+            method(i, o, "zip", iter_zip);
+            method(i, o, "zipKeyed", iter_zip_keyed);
+            // spec arities differ from the same-named Array entries
+            for (name, len) in [("concat", 0.0), ("zip", 1.0), ("zipKeyed", 1.0)] {
+                let f = i.get_prop_str(&itctor, name).unwrap_or(Value::Und);
+                if let Value::Obj(fo) = f {
+                    i.set_attr(&fo, "length", Value::Num(len), false, true);
+                }
+            }
         }
         i.set_builtin(&p, "constructor", itctor.clone());
         define_global(i, "Iterator", itctor);
@@ -648,9 +681,19 @@ fn iter_self(_i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let mut v = Value::Und;
-    let mut done = true;
     if let Value::Obj(o) = this {
+        if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
+            let mut lz = take_lazy(o).expect("checked IterLazy above");
+            let r = iter_lazy_step(i, &mut lz);
+            put_lazy(o, lz);
+            return match r {
+                Ok(Some(v)) => iter_result(i, v, false),
+                Ok(None) => iter_result(i, Value::Und, true),
+                Err(e) => Err(e),
+            };
+        }
+        let mut v = Value::Und;
+        let mut done = true;
         if let ObjKind::Iter { items, idx } = &mut o.borrow_mut().kind {
             if *idx < items.len() {
                 v = items[*idx].clone();
@@ -658,19 +701,21 @@ fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
                 done = false;
             }
         }
+        return iter_result(i, v, done);
     }
-    let r = i.new_obj();
-    i.set_data(&r, "value", v);
-    i.set_data(&r, "done", Value::Bool(done));
-    Ok(Value::Obj(r))
+    iter_result(i, Value::Und, true)
 }
 
 pub(crate) fn make_iter(i: &mut Interp, items: Vec<Value>) -> Value {
-    let o = Rc::new(RefCell::new(Obj::new(
-        Some(i.p.iterator.clone()),
+    make_iter_in(items, i.p.iterator.clone())
+}
+
+/// iterator object with an explicit prototype (per-source iter protos)
+pub(crate) fn make_iter_in(items: Vec<Value>, proto: ObjRef) -> Value {
+    Value::Obj(Rc::new(RefCell::new(Obj::new(
+        Some(proto),
         ObjKind::Iter { items, idx: 0 },
-    )));
-    Value::Obj(o)
+    ))))
 }
 
 /// `this` must be an object — Iterator helpers require it.
@@ -687,117 +732,744 @@ fn iter_drain(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
     i.iter_values(this)
 }
 
-fn iter_ctor(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
-    Err(i.type_err("The Iterator constructor cannot be constructed directly"))
+// -- lazy iterator machinery ---------------------------------------------------
+
+/// hard bound on collected elements / pulls — infinite sources error
+/// out instead of OOMing (spec has no limit; real engines can't either)
+const ITER_LIMIT: usize = 200_000;
+
+/// Move the lazy state out of the RefCell so stepping can call back into
+/// JS (`next`/`return`/callbacks) without holding the borrow.
+fn take_lazy(o: &ObjRef) -> Option<IterLazy> {
+    let mut b = o.borrow_mut();
+    match &mut b.kind {
+        ObjKind::IterLazy(l) => Some(std::mem::replace(l, IterLazy::id(IterSrc::Empty))),
+        _ => None,
+    }
 }
 
-/// `Iterator.from(obj)` — object with `next` is wrapped (returned as-is when
-/// it's already one of ours); iterable values are drained to a snapshot.
+fn put_lazy(o: &ObjRef, lz: IterLazy) {
+    let mut b = o.borrow_mut();
+    if let ObjKind::IterLazy(l) = &mut b.kind {
+        *l = lz;
+    }
+}
+
+/// iterator object wrapping a lazy state, proto `iter_helper` or explicit
+fn make_lazy_in(lz: IterLazy, proto: ObjRef) -> Value {
+    Value::Obj(Rc::new(RefCell::new(Obj::new(
+        Some(proto),
+        ObjKind::IterLazy(lz),
+    ))))
+}
+
+fn make_lazy(i: &mut Interp, lz: IterLazy) -> Value {
+    make_lazy_in(lz, i.p.iter_helper.clone())
+}
+
+/// Wrap a value as a lazy source. `flattenable` selects the spec op:
+///   false = GetIteratorDirect — read `next` directly (helpers/terminals)
+///   true  = GetIteratorFlattenable — call `@@iterator` once when present,
+///           then direct-check the result (from/concat/zip/flatMap-inner).
+/// `next` is stored so every pull shares the object's own consumption state.
+pub(crate) fn iter_to_lazy(i: &mut Interp, v: &Value, flattenable: bool) -> Result<IterLazy, Value> {
+    let mut target = v.clone();
+    if flattenable {
+        if let Value::Obj(_) = &target {
+            let m = i.get_prop(&target, &PropKey::Sym(SYM_ITERATOR))?;
+            if i.is_callable(&m) {
+                target = i.call(&m, target.clone(), Vec::new())?;
+                if !matches!(target, Value::Obj(_)) {
+                    return Err(i.type_err("@@iterator result is not an object"));
+                }
+            }
+        }
+    }
+    iter_direct(i, &target)
+}
+
+/// GetIteratorDirect: read `next`, require callable, wrap the object itself.
+fn iter_direct(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
+    match v {
+        Value::Str(s) => {
+            let items: Vec<Value> = s
+                .chars()
+                .map(|c| Value::Str(Rc::from(c.to_string().as_str())))
+                .collect();
+            return Ok(IterLazy::id(IterSrc::List { items, idx: 0 }));
+        }
+        Value::Obj(_) => {}
+        _ => return Err(i.type_err("value is not iterable")),
+    }
+    let next = i.get_prop(v, &PropKey::from_str("next"))?;
+    if !i.is_callable(&next) {
+        return Err(i.type_err("value is not iterable"));
+    }
+    Ok(IterLazy::id(IterSrc::Proto {
+        iter: v.clone(),
+        next,
+        done: false,
+    }))
+}
+
+/// `Return ? IteratorClose(record, err)` — a close error replaces `err`.
+fn iter_close_err(i: &mut Interp, it: &Value, err: Value) -> Value {
+    match i.iter_close_obj(it) {
+        Err(close_err) => close_err,
+        _ => err,
+    }
+}
+
+/// pull one value from a source
+fn iter_src_step(i: &mut Interp, src: &mut IterSrc) -> Result<Option<Value>, Value> {
+    match src {
+        IterSrc::Empty => Ok(None),
+        IterSrc::List { items, idx } => {
+            if *idx < items.len() {
+                let v = items[*idx].clone();
+                *idx += 1;
+                Ok(Some(v))
+            } else {
+                Ok(None)
+            }
+        }
+        IterSrc::Proto { iter, next, done } => {
+            if *done {
+                return Ok(None);
+            }
+            let (iter, next) = (iter.clone(), next.clone());
+            let r = i.call(&next, iter.clone(), Vec::new())?;
+            if !matches!(r, Value::Obj(_)) {
+                *done = true;
+                return Err(i.type_err("iterator result is not an object"));
+            }
+            let d = i.get_prop(&r, &PropKey::from_str("done"))?;
+            if i.to_bool(&d) {
+                *done = true;
+                return Ok(None);
+            }
+            Ok(Some(i.get_prop(&r, &PropKey::from_str("value"))?))
+        }
+    }
+}
+
+/// IteratorClose on a source — calls `return` on protocol iterators.
+fn iter_src_close(i: &mut Interp, src: &mut IterSrc) -> Result<(), Value> {
+    if let IterSrc::Proto { iter, done, .. } = src {
+        if *done {
+            return Ok(());
+        }
+        *done = true;
+        return i.iter_close_obj(iter);
+    }
+    Ok(())
+}
+
+/// close a lazy state: inner flatMap source, chained sources, own source
+pub(crate) fn iter_lazy_close(i: &mut Interp, lz: &mut IterLazy) -> Result<(), Value> {
+    if let IterOp::FlatMap { inner: Some(in_lz), .. } = &mut lz.op {
+        iter_lazy_close(i, in_lz)?;
+    }
+    match &mut lz.op {
+        IterOp::Cat { rest } => {
+            for s in rest.iter_mut() {
+                iter_lazy_close(i, s)?;
+            }
+        }
+        IterOp::Zip { srcs, .. } => {
+            for s in srcs.iter_mut() {
+                iter_lazy_close(i, s)?;
+            }
+        }
+        IterOp::ZipKeyed { cols } => {
+            for (_, s) in cols.iter_mut() {
+                iter_lazy_close(i, s)?;
+            }
+        }
+        _ => {}
+    }
+    iter_src_close(i, &mut lz.src)
+}
+
+/// pull the next transformed value from a lazy iterator
+pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option<Value>, Value> {
+    let mut pulls = 0usize;
+    loop {
+        pulls += 1;
+        if pulls > ITER_LIMIT {
+            let _ = iter_lazy_close(i, lz);
+            return Err(i.range_err("iteration limit exceeded"));
+        }
+        // zip/zipKeyed own their sources — `lz.src` is unused for them
+        match &mut lz.op {
+            IterOp::Zip {
+                srcs,
+                mode,
+                padding,
+            } => {
+                let mut row = Vec::with_capacity(srcs.len());
+                let mut short = false;
+                for (k, s) in srcs.iter_mut().enumerate() {
+                    match iter_lazy_step(i, s)? {
+                        Some(x) => row.push(x),
+                        None => match mode {
+                            ZipMode::Shortest => {
+                                short = true;
+                                break;
+                            }
+                            ZipMode::Longest => {
+                                let p = i.get_prop(padding, &idx_key(k))?;
+                                row.push(p);
+                            }
+                            ZipMode::Strict => {
+                                if k == 0 {
+                                    for s2 in srcs.iter_mut().skip(1) {
+                                        if iter_lazy_step(i, s2)?.is_some() {
+                                            return Err(i.range_err(
+                                                "Iterator.zip strict mode: iterables differ in length",
+                                            ));
+                                        }
+                                    }
+                                    return Ok(None);
+                                }
+                                return Err(i.range_err(
+                                    "Iterator.zip strict mode: iterables differ in length",
+                                ));
+                            }
+                        },
+                    }
+                }
+                if short {
+                    return Ok(None);
+                }
+                let a = i.new_arr(row);
+                return Ok(Some(Value::Obj(a)));
+            }
+            IterOp::ZipKeyed { cols } => {
+                let o = i.new_obj();
+                let mut short = false;
+                for (k, s) in cols.iter_mut() {
+                    match iter_lazy_step(i, s)? {
+                        Some(x) => i.set_prop(&Value::Obj(o.clone()), k.clone(), x)?,
+                        None => {
+                            short = true;
+                            break;
+                        }
+                    }
+                }
+                if short {
+                    return Ok(None);
+                }
+                return Ok(Some(Value::Obj(o)));
+            }
+            _ => {}
+        }
+        // flatMap drains its inner source before pulling the outer one
+        if let IterOp::FlatMap { inner: Some(in_lz), .. } = &mut lz.op {
+            match iter_lazy_step(i, in_lz)? {
+                Some(v) => return Ok(Some(v)),
+                None => {
+                    if let IterOp::FlatMap { inner, .. } = &mut lz.op {
+                        *inner = None;
+                    }
+                    continue;
+                }
+            }
+        }
+        let v = match iter_src_step(i, &mut lz.src)? {
+            Some(v) => v,
+            None => {
+                if let IterOp::Cat { rest } = &mut lz.op {
+                    if let Some(nx) = rest.pop_front() {
+                        *lz = nx;
+                        continue;
+                    }
+                }
+                return Ok(None);
+            }
+        };
+        match &mut lz.op {
+            IterOp::Id | IterOp::Cat { .. } => return Ok(Some(v)),
+            IterOp::Map { f, n } => {
+                let (f, idx) = (f.clone(), *n);
+                *n += 1.0;
+                match i.call(&f, Value::Und, vec![v, Value::Num(idx)]) {
+                    Ok(r) => return Ok(Some(r)),
+                    Err(e) => {
+                        let _ = iter_lazy_close(i, lz);
+                        return Err(e);
+                    }
+                }
+            }
+            IterOp::Filter { f, n } => {
+                let (f, idx) = (f.clone(), *n);
+                *n += 1.0;
+                match i.call(&f, Value::Und, vec![v.clone(), Value::Num(idx)]) {
+                    Ok(r) if i.to_bool(&r) => return Ok(Some(v)),
+                    Ok(_) => continue,
+                    Err(e) => {
+                        let _ = iter_lazy_close(i, lz);
+                        return Err(e);
+                    }
+                }
+            }
+            IterOp::FlatMap { f, n, inner } => {
+                let (f, idx) = (f.clone(), *n);
+                *n += 1.0;
+                let r = match i.call(&f, Value::Und, vec![v, Value::Num(idx)]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = iter_lazy_close(i, lz);
+                        return Err(e);
+                    }
+                };
+                match iter_to_lazy(i, &r, true) {
+                    Ok(nl) => *inner = Some(Box::new(nl)),
+                    Err(e) => {
+                        let _ = iter_lazy_close(i, lz);
+                        return Err(e);
+                    }
+                }
+            }
+            IterOp::Take { left } => {
+                if *left == 0 {
+                    iter_lazy_close(i, lz)?;
+                    return Ok(None);
+                }
+                *left -= 1;
+                return Ok(Some(v));
+            }
+            IterOp::Drop { left } => {
+                if *left > 0 {
+                    *left -= 1;
+                    continue;
+                }
+                return Ok(Some(v));
+            }
+            IterOp::Indexed { n } => {
+                let idx = *n;
+                *n += 1.0;
+                let pair = i.new_arr(vec![Value::Num(idx), v]);
+                return Ok(Some(Value::Obj(pair)));
+            }
+            IterOp::Chunks { size } => {
+                let mut c = vec![v];
+                while c.len() < *size {
+                    if c.len() >= ITER_LIMIT {
+                        let _ = iter_lazy_close(i, lz);
+                        return Err(i.range_err("chunk size limit exceeded"));
+                    }
+                    match iter_src_step(i, &mut lz.src)? {
+                        Some(x) => c.push(x),
+                        None => break,
+                    }
+                }
+                let a = i.new_arr(c);
+                return Ok(Some(Value::Obj(a)));
+            }
+            IterOp::Windows {
+                size,
+                partial,
+                buf,
+            } => {
+                buf.push_back(v);
+                while buf.len() < *size {
+                    if buf.len() >= ITER_LIMIT {
+                        let _ = iter_lazy_close(i, lz);
+                        return Err(i.range_err("window size limit exceeded"));
+                    }
+                    match iter_src_step(i, &mut lz.src)? {
+                        Some(x) => buf.push_back(x),
+                        None => break,
+                    }
+                }
+                if buf.len() == *size || (*partial && !buf.is_empty()) {
+                    let w: Vec<Value> = buf.iter().cloned().collect();
+                    buf.pop_front();
+                    let a = i.new_arr(w);
+                    return Ok(Some(Value::Obj(a)));
+                }
+                return Ok(None);
+            }
+            IterOp::Zip { .. } | IterOp::ZipKeyed { .. } => unreachable!(),
+        }
+    }
+}
+
+/// drain a lazy iterator to a Vec — spec IteratorClose on abrupt errors
+pub fn iter_drain_lazy(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
+    let Value::Obj(o) = v else {
+        return Err(i.type_err("not an iterator object"));
+    };
+    let Some(mut lz) = take_lazy(o) else {
+        return Err(i.type_err("not a lazy iterator"));
+    };
+    let mut out = Vec::new();
+    let r = loop {
+        if out.len() >= ITER_LIMIT {
+            let _ = iter_lazy_close(i, &mut lz);
+            break Err(i.range_err("iteration limit exceeded"));
+        }
+        match iter_lazy_step(i, &mut lz) {
+            Ok(Some(x)) => out.push(x),
+            Ok(None) => break Ok(out),
+            Err(e) => {
+                let ce = iter_lazy_close(i, &mut lz);
+                break Err(match ce {
+                    Err(ce) => ce,
+                    Ok(()) => e,
+                });
+            }
+        }
+    };
+    put_lazy(o, lz);
+    r
+}
+
+/// `this` as a lazy state, stepping each element through `f` until it
+/// returns `Break` or the source ends. Callback errors and breaks close
+/// the iterator per spec.
+fn iter_each<F>(i: &mut Interp, this: &Value, mut f: F) -> Result<(), Value>
+where
+    F: FnMut(&mut Interp, Value) -> Result<bool, Value>,
+{
+    iter_this(i, this)?;
+    let mut lz = iter_to_lazy(i, this, false)?;
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps >= ITER_LIMIT {
+            let _ = iter_lazy_close(i, &mut lz);
+            return Err(i.range_err("iteration limit exceeded"));
+        }
+        match iter_lazy_step(i, &mut lz) {
+            Ok(Some(v)) => match f(i, v) {
+                Ok(true) => {}
+                Ok(false) => {
+                    iter_lazy_close(i, &mut lz)?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    iter_lazy_close(i, &mut lz)?;
+                    return Err(e);
+                }
+            },
+            Ok(None) => return Ok(()),
+            // spec: errors from the iterator itself (`next` throwing,
+            // protocol violations) propagate without closing
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `{value, done}` result object
+fn iter_result(i: &mut Interp, v: Value, done: bool) -> NResult {
+    let r = i.new_obj();
+    i.set_data(&r, "value", v);
+    i.set_data(&r, "done", Value::Bool(done));
+    Ok(Value::Obj(r))
+}
+
+/// `new Iterator()` / `class X extends Iterator` — base iterator object
+/// (proto comes from new_target via `construct`); it has no own `next`
+/// so calling `.next()` is a TypeError, per spec.
+fn iter_ctor(_i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    Ok(this.clone())
+}
+
+/// `%GeneratorPrototype%.return(v)` — eager gen: exhaust the snapshot.
+fn gen_return(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    if let Value::Obj(o) = this {
+        if let ObjKind::Iter { items, idx } = &mut o.borrow_mut().kind {
+            *idx = items.len();
+        }
+    }
+    iter_result(i, arg(args, 0), true)
+}
+
+/// `%GeneratorPrototype%.throw(e)` — eager gen: exhaust + propagate.
+fn gen_throw(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    if let Value::Obj(o) = this {
+        if let ObjKind::Iter { items, idx } = &mut o.borrow_mut().kind {
+            *idx = items.len();
+        }
+    }
+    Err(arg(args, 0))
+}
+
+/// `Iterator.from(obj)` — iterators pass through; `{next}` objects and
+/// iterables get a lazy protocol wrap (spec %WrapForValidIteratorPrototype%).
 fn iter_from(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
-    let Value::Obj(o) = &v else {
-        return Err(i.type_err("Iterator.from requires an object"));
-    };
-    // already an iterator object → spec wraps; ours can return directly
-    if matches!(o.borrow().kind, ObjKind::Iter { .. }) {
-        return Ok(v.clone());
-    }
-    // has a `next` method → treat as an iterator: drain via protocol now
-    // (eager snapshot keeps Vec-backed semantics consistent)
-    let next = i.get_prop(&v, &PropKey::from_str("next"))?;
-    if i.is_callable(&next) {
-        let mut out = Vec::new();
-        loop {
-            if out.len() > 100_000 {
-                return Err(i.range_err("iteration limit exceeded"));
-            }
-            let r = i.call(&next, v.clone(), vec![])?;
-            let done = i.get_prop(&r, &PropKey::from_str("done"))?;
-            if i.to_bool(&done) {
-                break;
-            }
-            out.push(i.get_prop(&r, &PropKey::from_str("value"))?);
-        }
-        return Ok(make_iter(i, out));
-    }
-    // iterable → Symbol.iterator
-    let items = i.iter_values(&v)?;
-    Ok(make_iter(i, items))
+    let lz = iter_to_lazy(i, &v, true)?;
+    Ok(make_lazy(i, lz))
 }
 
-/// `Iterator.concat(...iters)` — lazy spec concat; we eagerly concatenate.
+/// `Iterator.concat(...iters)` — lazy chain over each argument's iterator
 fn iter_concat(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let mut out = Vec::new();
+    let mut srcs = std::collections::VecDeque::with_capacity(args.len());
     for a in args {
-        out.extend(i.iter_values(a)?);
+        srcs.push_back(iter_to_lazy(i, a, true)?);
     }
-    Ok(make_iter(i, out))
+    let first = srcs.pop_front().unwrap_or_else(|| IterLazy::id(IterSrc::Empty));
+    Ok(make_lazy(i, IterLazy {
+        src: first.src,
+        op: IterOp::Cat { rest: srcs },
+    }))
+}
+
+/// `Iterator.zip(options)` — options.iterables[] zipped lazily; mode
+/// "shortest"|"longest"|"strict" (+options.padding for longest).
+fn iter_zip(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let opts = arg(args, 0);
+    let iters_v = i.get_prop_str(&opts, "iterables")?;
+    let iters = to_elems(i, &iters_v)?;
+    let mode = match i.get_prop_str(&opts, "mode")? {
+        Value::Str(s) if s.as_ref() == "longest" => ZipMode::Longest,
+        Value::Str(s) if s.as_ref() == "strict" => ZipMode::Strict,
+        _ => ZipMode::Shortest,
+    };
+    let mut srcs = Vec::with_capacity(iters.len());
+    for it in &iters {
+        srcs.push(iter_to_lazy(i, it, true)?);
+    }
+    let padding = i.get_prop_str(&opts, "padding").unwrap_or(Value::Und);
+    Ok(make_lazy(i, IterLazy {
+        src: IterSrc::Empty,
+        op: IterOp::Zip { srcs, mode, padding },
+    }))
+}
+
+/// `Iterator.zipKeyed(options)` — {key: iterable} → objects {key: value}
+fn iter_zip_keyed(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let opts = arg(args, 0);
+    let entries = own_enum_entries(&opts);
+    let mut cols: Vec<(PropKey, IterLazy)> = Vec::with_capacity(entries.len());
+    for (k, slot) in entries {
+        if let Some(v) = slot {
+            cols.push((k, iter_to_lazy(i, &v, true)?));
+        }
+    }
+    Ok(make_lazy(i, IterLazy {
+        src: IterSrc::Empty,
+        op: IterOp::ZipKeyed { cols },
+    }))
+}
+
+/// spec: placeholder record on `this` → validate `skippedElements` with
+/// IteratorClose → GetIteratorDirect → skip → SameValueZero search.
+fn iter_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let needle = arg(args, 0);
+    let to_skip = match arg(args, 1) {
+        Value::Und => 0.0,
+        Value::Num(n) if n.is_infinite() || n.fract() == 0.0 => n,
+        _ => {
+            let e = i.type_err("skippedElements must be an integer or infinity");
+            return Err(iter_close_err(i, this, e));
+        }
+    };
+    if to_skip < 0.0 || (to_skip.is_finite() && to_skip > 9007199254740991.0) {
+        let e = i.range_err("skippedElements out of range");
+        return Err(iter_close_err(i, this, e));
+    }
+    let mut lz = iter_to_lazy(i, this, false)?;
+    if to_skip > 0.0 {
+        lz.op = IterOp::Drop { left: to_skip.min(usize::MAX as f64) as usize };
+    }
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps >= ITER_LIMIT {
+            let _ = iter_lazy_close(i, &mut lz);
+            return Err(i.range_err("iteration limit exceeded"));
+        }
+        match iter_lazy_step(i, &mut lz)? {
+            Some(v) if same_value_zero(&v, &needle) => {
+                iter_lazy_close(i, &mut lz)?;
+                return Ok(Value::Bool(true));
+            }
+            Some(_) => {}
+            None => return Ok(Value::Bool(false)),
+        }
+    }
+}
+
+/// spec: placeholder record → ToString(separator) closes on coercion
+/// error → GetIteratorDirect (next lookup after toString) → join;
+/// iterator errors propagate raw, content coercion closes.
+fn iter_join(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let sep = match arg(args, 0) {
+        Value::Und => ",".to_string(),
+        v => match i.to_str(&v) {
+            Ok(s) => s.to_string(),
+            Err(e) => return Err(iter_close_err(i, this, e)),
+        },
+    };
+    let mut lz = iter_to_lazy(i, this, false)?;
+    let mut out = String::new();
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps >= ITER_LIMIT {
+            let _ = iter_lazy_close(i, &mut lz);
+            return Err(i.range_err("iteration limit exceeded"));
+        }
+        let v = match iter_lazy_step(i, &mut lz)? {
+            Some(v) => v,
+            None => break,
+        };
+        if !out.is_empty() {
+            out.push_str(&sep);
+        }
+        match v {
+            Value::Und | Value::Null => {}
+            Value::Str(s) => out.push_str(&s),
+            Value::Num(n) => out.push_str(&js_num_str(n)),
+            Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+            v => match i.to_str(&v) {
+                Ok(s) => out.push_str(&s),
+                Err(e) => return Err(iter_close_err(i, this, e)),
+            },
+        }
+    }
+    Ok(Value::Str(Rc::from(out.as_str())))
+}
+
+/// helpers: GetIteratorDirect happens BEFORE arg validation; a validation
+/// failure closes the record (IfAbruptCloseIterator) — so wrap first, then
+/// validate, closing `lz` on error.
+fn helper_close_err(i: &mut Interp, lz: &mut IterLazy, err: Value) -> Value {
+    match iter_lazy_close(i, lz) {
+        Err(ce) => ce,
+        _ => err,
+    }
+}
+
+fn helper_num(i: &mut Interp, lz: &mut IterLazy, v: &Value) -> Result<f64, Value> {
+    match i.to_num(v) {
+        Ok(n) => Ok(n),
+        Err(e) => Err(helper_close_err(i, lz, e)),
+    }
+}
+
+/// windows/chunks sizes: must already be a Number — `valueOf`/`toString`
+/// are never invoked; integral 1..2^32-1 or RangeError. Close on failure.
+fn helper_window_size(i: &mut Interp, lz: &mut IterLazy, v: &Value) -> Result<usize, Value> {
+    let Value::Num(n) = v else {
+        let e = i.type_err("size must be a Number");
+        return Err(helper_close_err(i, lz, e));
+    };
+    if n.fract() != 0.0 || !(1.0..=4294967295.0).contains(n) {
+        let e = i.range_err("size out of range");
+        return Err(helper_close_err(i, lz, e));
+    }
+    Ok(*n as usize)
+}
+
+/// `Iterator.prototype.windows(size[, undersized])` — lazy sliding windows;
+/// `undersized` is "only-full" (default) or "allow-partial".
+fn iter_windows(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let mut lz = iter_to_lazy(i, this, false)?;
+    let size = helper_window_size(i, &mut lz, &arg(args, 0))?;
+    let partial = match arg(args, 1) {
+        Value::Und => false,
+        Value::Str(s) if s.as_ref() == "allow-partial" => true,
+        Value::Str(s) if s.as_ref() == "only-full" => false,
+        _ => {
+            let e = i.type_err("undersized must be \"only-full\" or \"allow-partial\"");
+            return Err(helper_close_err(i, &mut lz, e));
+        }
+    };
+    lz.op = IterOp::Windows {
+        size,
+        partial,
+        buf: std::collections::VecDeque::new(),
+    };
+    Ok(make_lazy(i, lz))
+}
+
+/// `Iterator.prototype.chunks(size)` — lazy non-overlapping chunks
+fn iter_chunks(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    iter_this(i, this)?;
+    let mut lz = iter_to_lazy(i, this, false)?;
+    let size = helper_window_size(i, &mut lz, &arg(args, 0))?;
+    lz.op = IterOp::Chunks { size };
+    Ok(make_lazy(i, lz))
 }
 
 fn iter_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
+    let mut lz = iter_to_lazy(i, this, false)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
-        return Err(i.type_err("mapper is not a function"));
+        let e = i.type_err("mapper is not a function");
+        return Err(helper_close_err(i, &mut lz, e));
     }
-    let items = iter_drain(i, this)?;
-    let mut out = Vec::with_capacity(items.len());
-    for (idx, v) in items.into_iter().enumerate() {
-        out.push(i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?);
-    }
-    Ok(make_iter(i, out))
+    lz.op = IterOp::Map { f, n: 0.0 };
+    Ok(make_lazy(i, lz))
 }
 
 fn iter_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
+    let mut lz = iter_to_lazy(i, this, false)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
-        return Err(i.type_err("predicate is not a function"));
+        let e = i.type_err("predicate is not a function");
+        return Err(helper_close_err(i, &mut lz, e));
     }
-    let items = iter_drain(i, this)?;
-    let mut out = Vec::new();
-    for (idx, v) in items.into_iter().enumerate() {
-        let keep = i.call(&f, Value::Und, vec![v.clone(), Value::Num(idx as f64)])?;
-        if i.to_bool(&keep) {
-            out.push(v);
-        }
-    }
-    Ok(make_iter(i, out))
+    lz.op = IterOp::Filter { f, n: 0.0 };
+    Ok(make_lazy(i, lz))
 }
 
 fn iter_flat_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
+    let mut lz = iter_to_lazy(i, this, false)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
-        return Err(i.type_err("mapper is not a function"));
+        let e = i.type_err("mapper is not a function");
+        return Err(helper_close_err(i, &mut lz, e));
     }
-    let items = iter_drain(i, this)?;
-    let mut out = Vec::new();
-    for (idx, v) in items.into_iter().enumerate() {
-        let r = i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?;
-        out.extend(i.iter_values(&r)?);
+    lz.op = IterOp::FlatMap { f, n: 0.0, inner: None };
+    Ok(make_lazy(i, lz))
+}
+
+/// take/drop `limit`: ToNumber → NaN → RangeError; >2^53-1 → RangeError;
+/// ToIntegerOrInfinity → <0 → RangeError. All close the record.
+fn helper_limit(i: &mut Interp, lz: &mut IterLazy, v: &Value) -> Result<usize, Value> {
+    let n = helper_num(i, lz, v)?;
+    if n.is_nan() {
+        let e = i.range_err("limit must be a number");
+        return Err(helper_close_err(i, lz, e));
     }
-    Ok(make_iter(i, out))
+    if n.is_finite() && n > 9007199254740991.0 {
+        let e = i.range_err("limit out of range");
+        return Err(helper_close_err(i, lz, e));
+    }
+    let int = n.trunc();
+    if int < 0.0 {
+        let e = i.range_err("limit must be non-negative");
+        return Err(helper_close_err(i, lz, e));
+    }
+    Ok(int.min(usize::MAX as f64) as usize)
 }
 
 fn iter_take(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let n = i.to_num(&arg(args, 0))?;
-    if n.is_nan() || n < 0.0 {
-        return Err(i.range_err("take limit must be a non-negative number"));
-    }
-    let items = iter_drain(i, this)?;
-    Ok(make_iter(i, items.into_iter().take(n as usize).collect()))
+    let mut lz = iter_to_lazy(i, this, false)?;
+    let left = helper_limit(i, &mut lz, &arg(args, 0))?;
+    lz.op = IterOp::Take { left };
+    Ok(make_lazy(i, lz))
 }
 
 fn iter_drop(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let n = i.to_num(&arg(args, 0))?;
-    if n.is_nan() || n < 0.0 {
-        return Err(i.range_err("drop limit must be a non-negative number"));
-    }
-    let items = iter_drain(i, this)?;
-    Ok(make_iter(i, items.into_iter().skip(n as usize).collect()))
+    let mut lz = iter_to_lazy(i, this, false)?;
+    let left = helper_limit(i, &mut lz, &arg(args, 0))?;
+    lz.op = IterOp::Drop { left };
+    Ok(make_lazy(i, lz))
 }
 
 fn iter_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -806,18 +1478,25 @@ fn iter_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !i.is_callable(&f) {
         return Err(i.type_err("reducer is not a function"));
     }
-    let items = iter_drain(i, this)?;
-    let mut it = items.into_iter();
-    let (mut acc, mut idx) = match args.get(1) {
-        Some(v) => (v.clone(), 0usize),
-        None => match it.next() {
-            Some(v) => (v, 1),
-            None => return Err(i.type_err("Reduce of empty iterator with no initial value")),
-        },
-    };
-    for v in it {
-        acc = i.call(&f, Value::Und, vec![acc, v, Value::Num(idx as f64)])?;
-        idx += 1;
+    let mut acc = Value::Und;
+    let mut have_acc = false;
+    let mut idx = 0.0f64;
+    if let Some(v) = args.get(1) {
+        acc = v.clone();
+        have_acc = true;
+    }
+    iter_each(i, this, |i, v| {
+        if !have_acc {
+            acc = v;
+            have_acc = true;
+            return Ok(true);
+        }
+        acc = i.call(&f, Value::Und, vec![acc.clone(), v, Value::Num(idx)])?;
+        idx += 1.0;
+        Ok(true)
+    })?;
+    if !have_acc {
+        return Err(i.type_err("Reduce of empty iterator with no initial value"));
     }
     Ok(acc)
 }
@@ -828,9 +1507,12 @@ fn iter_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !i.is_callable(&f) {
         return Err(i.type_err("callback is not a function"));
     }
-    for (idx, v) in iter_drain(i, this)?.into_iter().enumerate() {
-        i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?;
-    }
+    let mut idx = 0.0f64;
+    iter_each(i, this, |i, v| {
+        i.call(&f, Value::Und, vec![v, Value::Num(idx)])?;
+        idx += 1.0;
+        Ok(true)
+    })?;
     Ok(Value::Und)
 }
 
@@ -840,13 +1522,18 @@ fn iter_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !i.is_callable(&f) {
         return Err(i.type_err("predicate is not a function"));
     }
-    for (idx, v) in iter_drain(i, this)?.into_iter().enumerate() {
-        let r = i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?;
+    let mut idx = 0.0f64;
+    let mut all = true;
+    iter_each(i, this, |i, v| {
+        let r = i.call(&f, Value::Und, vec![v, Value::Num(idx)])?;
+        idx += 1.0;
         if !i.to_bool(&r) {
-            return Ok(Value::Bool(false));
+            all = false;
+            return Ok(false);
         }
-    }
-    Ok(Value::Bool(true))
+        Ok(true)
+    })?;
+    Ok(Value::Bool(all))
 }
 
 fn iter_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -855,13 +1542,18 @@ fn iter_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !i.is_callable(&f) {
         return Err(i.type_err("predicate is not a function"));
     }
-    for (idx, v) in iter_drain(i, this)?.into_iter().enumerate() {
-        let r = i.call(&f, Value::Und, vec![v, Value::Num(idx as f64)])?;
+    let mut idx = 0.0f64;
+    let mut any = false;
+    iter_each(i, this, |i, v| {
+        let r = i.call(&f, Value::Und, vec![v, Value::Num(idx)])?;
+        idx += 1.0;
         if i.to_bool(&r) {
-            return Ok(Value::Bool(true));
+            any = true;
+            return Ok(false);
         }
-    }
-    Ok(Value::Bool(false))
+        Ok(true)
+    })?;
+    Ok(Value::Bool(any))
 }
 
 fn iter_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -870,32 +1562,47 @@ fn iter_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !i.is_callable(&f) {
         return Err(i.type_err("predicate is not a function"));
     }
-    for (idx, v) in iter_drain(i, this)?.into_iter().enumerate() {
-        let r = i.call(&f, Value::Und, vec![v.clone(), Value::Num(idx as f64)])?;
+    let mut idx = 0.0f64;
+    let mut found = Value::Und;
+    iter_each(i, this, |i, v| {
+        let r = i.call(&f, Value::Und, vec![v.clone(), Value::Num(idx)])?;
+        idx += 1.0;
         if i.to_bool(&r) {
-            return Ok(v);
+            found = v;
+            return Ok(false);
         }
-    }
-    Ok(Value::Und)
+        Ok(true)
+    })?;
+    Ok(found)
 }
 
 fn iter_to_array(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let items = iter_drain(i, this)?;
+    let mut items = Vec::new();
+    iter_each(i, this, |_i, v| {
+        items.push(v);
+        Ok(true)
+    })?;
     Ok(Value::Obj(i.new_arr(items)))
 }
 
 fn iter_indexed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let items = iter_drain(i, this)?;
-    let out: Vec<Value> = items
-        .into_iter()
-        .enumerate()
-        .map(|(idx, v)| {
-            Value::Obj(i.new_arr(vec![Value::Num(idx as f64), v]))
-        })
-        .collect();
-    Ok(make_iter(i, out))
+    let mut lz = iter_to_lazy(i, this, false)?;
+    lz.op = IterOp::Indexed { n: 0.0 };
+    Ok(make_lazy(i, lz))
+}
+
+/// `%IteratorHelperPrototype%.return` — closes the underlying source
+fn iter_lazy_ret(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    if let Value::Obj(o) = this {
+        if let Some(mut lz) = take_lazy(o) {
+            let r = iter_lazy_close(i, &mut lz);
+            put_lazy(o, lz);
+            r?;
+        }
+    }
+    iter_result(i, Value::Und, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -2945,15 +3652,15 @@ fn arr_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn arr_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let items = to_elems(i, this)?;
-    Ok(make_iter(
-        i,
+    Ok(make_iter_in(
         (0..items.len()).map(|k| Value::Num(k as f64)).collect(),
+        i.p.array_iter.clone(),
     ))
 }
 
 fn arr_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let items = to_elems(i, this)?;
-    Ok(make_iter(i, items))
+    Ok(make_iter_in(items, i.p.array_iter.clone()))
 }
 
 fn arr_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -2962,7 +3669,7 @@ fn arr_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     for (k, v) in items.into_iter().enumerate() {
         out.push(Value::Obj(i.new_arr(vec![Value::Num(k as f64), v])));
     }
-    Ok(make_iter(i, out))
+    Ok(make_iter_in(out, i.p.array_iter.clone()))
 }
 
 // ===========================================================================
@@ -3548,7 +4255,10 @@ fn str_locale_compare(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn str_iter(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
-    Ok(make_iter(i, s.chars().map(char_val).collect()))
+    Ok(make_iter_in(
+        s.chars().map(char_val).collect(),
+        i.p.string_iter.clone(),
+    ))
 }
 
 fn string_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -5365,20 +6075,20 @@ fn map_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
         if let ObjKind::Map(items) = &o.borrow().kind {
             let ks: Vec<Value> = items.iter().map(|(k, _)| k.clone()).collect();
-            return Ok(make_iter(i, ks));
+            return Ok(make_iter_in(ks, i.p.map_iter.clone()));
         }
     }
-    Ok(make_iter(i, vec![]))
+    Ok(make_iter_in(vec![], i.p.map_iter.clone()))
 }
 
 fn map_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
         if let ObjKind::Map(items) = &o.borrow().kind {
             let vs: Vec<Value> = items.iter().map(|(_, v)| v.clone()).collect();
-            return Ok(make_iter(i, vs));
+            return Ok(make_iter_in(vs, i.p.map_iter.clone()));
         }
     }
-    Ok(make_iter(i, vec![]))
+    Ok(make_iter_in(vec![], i.p.map_iter.clone()))
 }
 
 fn map_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -5389,10 +6099,10 @@ fn map_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             for (k, v) in items {
                 out.push(Value::Obj(i.new_arr(vec![k, v])));
             }
-            return Ok(make_iter(i, out));
+            return Ok(make_iter_in(out, i.p.map_iter.clone()));
         }
     }
-    Ok(make_iter(i, vec![]))
+    Ok(make_iter_in(vec![], i.p.map_iter.clone()))
 }
 
 fn map_size(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -5494,10 +6204,10 @@ fn set_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn set_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
         if let ObjKind::Set(items) = &o.borrow().kind {
-            return Ok(make_iter(i, items.clone()));
+            return Ok(make_iter_in(items.clone(), i.p.set_iter.clone()));
         }
     }
-    Ok(make_iter(i, vec![]))
+    Ok(make_iter_in(vec![], i.p.set_iter.clone()))
 }
 
 fn set_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -5508,10 +6218,10 @@ fn set_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             for v in items {
                 out.push(Value::Obj(i.new_arr(vec![v.clone(), v])));
             }
-            return Ok(make_iter(i, out));
+            return Ok(make_iter_in(out, i.p.set_iter.clone()));
         }
     }
-    Ok(make_iter(i, vec![]))
+    Ok(make_iter_in(vec![], i.p.set_iter.clone()))
 }
 
 fn set_size(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {

@@ -1023,6 +1023,7 @@ impl Parser {
             is_arrow: false,
             arrow_expr: None,
             is_async: false,
+            is_gen: gen,
         })
     }
 
@@ -1232,6 +1233,7 @@ impl Parser {
                     is_arrow: false,
                     arrow_expr: None,
                     is_async,
+                    is_gen: member_gen,
                 }),
                 is_static,
             });
@@ -1264,18 +1266,30 @@ impl Parser {
             return Ok(e);
         }
         if self.at_kw(Kw::Yield) && self.gen_depth > 0 {
-            // `yield expr` inside a generator
+            // `yield` — encoded as a call to the `$yield` intrinsic; the
+            // interp collects these per running `function*` (see
+            // `Interp::gen_stack`). `yield*` → `$yieldstar`.
             self.next();
+            let star = self.eat_punct("*");
             if !self.at_punct(")")
                 && !self.at_punct("]")
                 && !self.at_punct("}")
                 && !self.at_punct(",")
                 && !self.at_punct(";")
+                && !self.at_punct(":")
                 && !self.at_eof()
             {
-                return self.assign_expr();
+                let inner = self.assign_expr()?;
+                let tag = if star { "$yieldstar" } else { "$yield" };
+                return Ok(Expr::Call {
+                    callee: Box::new(Expr::Ident(tag.into())),
+                    args: vec![Arg::Expr(inner)],
+                });
             }
-            return Ok(Expr::Ident("undefined".into()));
+            return Ok(Expr::Call {
+                callee: Box::new(Expr::Ident("$yield".into())),
+                args: vec![],
+            });
         }
         let lhs = self.cond_expr()?;
         let op = match self.peek().tok {
@@ -1393,6 +1407,7 @@ impl Parser {
                 is_arrow: true,
                 arrow_expr: None,
                 is_async,
+                is_gen: false,
             })))
         } else {
             self.check_params(&params, true)?;
@@ -1408,6 +1423,7 @@ impl Parser {
                 name,
                 params,
                 body: Vec::new(),
+                is_gen: false,
                 is_arrow: true,
                 arrow_expr: Some(e),
                 is_async,
@@ -1942,6 +1958,7 @@ impl Parser {
                             is_arrow: false,
                             arrow_expr: None,
                             is_async: false,
+                            is_gen: false,
                         });
                         props.push(ObjProp {
                             key,
@@ -1978,6 +1995,7 @@ impl Parser {
                                 is_arrow: false,
                                 arrow_expr: None,
                                 is_async: true,
+                                is_gen: member_gen,
                             })),
                         });
                         self.eat_punct(",");
@@ -2000,6 +2018,7 @@ impl Parser {
                                 is_arrow: false,
                                 arrow_expr: None,
                                 is_async: false,
+                                is_gen: true,
                             })),
                         });
                         self.eat_punct(",");
@@ -2029,6 +2048,7 @@ impl Parser {
                             is_arrow: false,
                             arrow_expr: None,
                             is_async: false,
+                            is_gen: false,
                         }))
                     } else {
                         // shorthand / shorthand with default (destructuring pos)

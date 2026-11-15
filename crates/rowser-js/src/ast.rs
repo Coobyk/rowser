@@ -125,6 +125,9 @@ pub struct FnDef {
     pub arrow_expr: Option<Expr>,
     /// parsed `async` — treated as sync for now.
     pub is_async: bool,
+    /// `function*` — body runs eagerly at call time, yields collected
+    /// into a snapshot iterator (see `Interp::gen_stack`).
+    pub is_gen: bool,
 }
 
 #[derive(Debug, Clone)]

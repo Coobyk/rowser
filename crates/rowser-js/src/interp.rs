@@ -377,6 +377,9 @@ pub enum ObjKind {
         items: Vec<Value>,
         idx: usize,
     },
+    /// lazy protocol iterator — Iterator helpers, `Iterator.from` wraps,
+    /// zip/concat. Steps the source's own `next` per pull.
+    IterLazy(IterLazy),
     /// opaque host data bag (dates etc.)
     Host(Rc<str>),
     Map(Vec<(Value, Value)>),
@@ -399,6 +402,59 @@ pub enum ObjKind {
         off: usize,
         len: usize,
     },
+}
+
+/// Lazy-iterator state machine. `src` pulls raw values; `op` transforms.
+/// Helpers keep the *source iterator object* (not a snapshot) so pulls
+/// share consumption state and `return` closes propagate correctly.
+#[derive(Clone)]
+pub struct IterLazy {
+    pub src: IterSrc,
+    pub op: IterOp,
+}
+
+impl IterLazy {
+    pub fn id(src: IterSrc) -> Self {
+        IterLazy { src, op: IterOp::Id }
+    }
+}
+
+/// Where a lazy iterator pulls values from.
+#[derive(Clone)]
+pub enum IterSrc {
+    /// always done (used as a swap-out placeholder)
+    Empty,
+    /// materialized list (strings / already-drained values)
+    List { items: Vec<Value>, idx: usize },
+    /// protocol iterator — `next.call(iter)` per step; close calls
+    /// `iter.return()` when present
+    Proto { iter: Value, next: Value, done: bool },
+}
+
+/// The transform a lazy iterator applies to its source stream.
+#[derive(Clone)]
+pub enum IterOp {
+    Id,
+    Map { f: Value, n: f64 },
+    Filter { f: Value, n: f64 },
+    FlatMap { f: Value, n: f64, inner: Option<Box<IterLazy>> },
+    Take { left: usize },
+    Drop { left: usize },
+    /// `[index, value]` pairs
+    Indexed { n: f64 },
+    Chunks { size: usize },
+    Windows { size: usize, partial: bool, buf: std::collections::VecDeque<Value> },
+    /// remaining sources after the current one exhausts
+    Cat { rest: std::collections::VecDeque<IterLazy> },
+    Zip { srcs: Vec<IterLazy>, mode: ZipMode, padding: Value },
+    ZipKeyed { cols: Vec<(PropKey, IterLazy)> },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ZipMode {
+    Shortest,
+    Longest,
+    Strict,
 }
 
 /// TypedArray element kind.
@@ -666,6 +722,18 @@ pub struct Protos {
     pub ref_error: ObjRef,
     pub promise: ObjRef,
     pub iterator: ObjRef,
+    /// %ArrayIteratorPrototype% — proto of array/typed-array iterators
+    pub array_iter: ObjRef,
+    /// %MapIteratorPrototype%
+    pub map_iter: ObjRef,
+    /// %SetIteratorPrototype%
+    pub set_iter: ObjRef,
+    /// %StringIteratorPrototype%
+    pub string_iter: ObjRef,
+    /// %GeneratorPrototype% — proto of objects `function*` calls return
+    pub generator: ObjRef,
+    /// %IteratorHelperPrototype% — proto of lazy map/filter/take/… results
+    pub iter_helper: ObjRef,
     pub regexp: ObjRef,
     pub arraybuffer: ObjRef,
     pub global: ObjRef,
@@ -726,6 +794,15 @@ pub struct Interp {
     /// the installed `eval` function — direct `eval(...)` calls compare
     /// against this to pick the caller-environment evaluation path
     pub eval_fn: Option<Value>,
+    /// eager-generator yield collectors: `function*` bodies push one Vec
+    /// per running generator call; `$yield` appends to the top.
+    pub gen_stack: Vec<Vec<Value>>,
+    /// step budget for the innermost running generator body (infinite
+    /// `for(;;) yield` bodies are cut off); `u64::MAX` = no active gen.
+    gen_cap: u64,
+    /// set when `gen_cap` tripped — the gen call boundary converts the
+    /// resulting unwind into "return what was collected"
+    gen_cap_hit: bool,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -733,11 +810,16 @@ pub struct Interp {
 /// large stack (e.g. 32+ MiB) if deep recursion is expected.
 const MAX_DEPTH: usize = 400;
 
+/// Statement budget per eager `function*` body — bounds infinite
+/// `for(;;) yield` sources at ~1M statements (~500K collected items).
+const GEN_STEP_BUDGET: u64 = 1_000_000;
+
 impl Interp {
     pub fn new() -> Interp {
         let mk = |proto: Option<ObjRef>| Rc::new(RefCell::new(Obj::new(proto, ObjKind::Ord)));
         let obj = mk(None);
         let func = mk(Some(obj.clone()));
+        let iterator = mk(Some(obj.clone()));
         Interp {
             global: Scope::new(None, true),
             p: Protos {
@@ -752,7 +834,13 @@ impl Interp {
                 syntax_error: mk(Some(obj.clone())),
                 ref_error: mk(Some(obj.clone())),
                 promise: mk(Some(obj.clone())),
-                iterator: mk(Some(obj.clone())),
+                array_iter: mk(Some(iterator.clone())),
+                map_iter: mk(Some(iterator.clone())),
+                set_iter: mk(Some(iterator.clone())),
+                string_iter: mk(Some(iterator.clone())),
+                generator: mk(Some(iterator.clone())),
+                iter_helper: mk(Some(iterator.clone())),
+                iterator,
                 regexp: mk(Some(obj.clone())),
                 arraybuffer: mk(Some(obj.clone())),
                 global: mk(Some(obj.clone())),
@@ -784,6 +872,9 @@ impl Interp {
             fn_hoist: FxMap::default(),
             slice_hoist: FxMap::default(),
             eval_fn: None,
+            gen_stack: Vec::new(),
+            gen_cap: u64::MAX,
+            gen_cap_hit: false,
         }
     }
 
@@ -808,6 +899,12 @@ impl Interp {
             return Err(self.interrupt_err());
         }
         self.steps = self.steps.wrapping_add(1);
+        if self.steps >= self.gen_cap {
+            // eager-generator budget: unwind the body; stays tripped
+            // (like `interrupted`) until the gen call boundary resets it
+            self.gen_cap_hit = true;
+            return Err(self.range_err("generator step budget exceeded"));
+        }
         if self.steps & 0x3ff == 0 {
             if let Some(d) = self.deadline {
                 if std::time::Instant::now() >= d {
@@ -821,6 +918,25 @@ impl Interp {
 
     fn interrupt_err(&mut self) -> Value {
         self.range_err("script execution budget exceeded")
+    }
+
+    /// spec IteratorClose — call `iter.return()` when present; a
+    /// non-callable non-null `return` is a TypeError, a non-object
+    /// result likewise. Errors propagate (they replace the original
+    /// completion per spec).
+    pub fn iter_close_obj(&mut self, v: &Value) -> Result<(), Value> {
+        let m = self.get_prop(v, &PropKey::from_str("return"))?;
+        if matches!(m, Value::Und | Value::Null) {
+            return Ok(());
+        }
+        if !self.is_callable(&m) {
+            return Err(self.type_err("iterator return is not a function"));
+        }
+        let r = self.call(&m, v.clone(), Vec::new())?;
+        if !matches!(r, Value::Obj(_)) {
+            return Err(self.type_err("iterator return must return an object"));
+        }
+        Ok(())
     }
 
     /// Arm a wall-clock budget for the next turn; clears a prior trip.
@@ -2102,7 +2218,7 @@ impl Interp {
                         };
                         format!("/{src}/{}", re.flags)
                     }
-                    ObjKind::Iter { .. } => "[Iterator]".into(),
+                    ObjKind::Iter { .. } | ObjKind::IterLazy(_) => "[Iterator]".into(),
                     ObjKind::Map(m) => format!("Map({})", m.len()),
                     ObjKind::Set(s) => format!("Set({})", s.len()),
                     ObjKind::Host(tag) => format!("[{tag}]"),
@@ -2187,6 +2303,31 @@ impl Interp {
                     );
                 }
                 self.apply_hoisted(&h, &scope);
+                if def.is_gen {
+                    // eager generator: run the body now, collecting every
+                    // `$yield` into a snapshot. A step budget cuts off
+                    // infinite `for(;;) yield` bodies — the partial
+                    // snapshot still satisfies consumers that stop early.
+                    let (ocap, ohit) = (self.gen_cap, self.gen_cap_hit);
+                    self.gen_cap = self.steps.saturating_add(GEN_STEP_BUDGET);
+                    self.gen_cap_hit = false;
+                    self.gen_stack.push(Vec::new());
+                    self.depth += 1;
+                    let r = self.exec_block(&def.body, &scope);
+                    self.depth -= 1;
+                    let items = self.gen_stack.pop().unwrap_or_default();
+                    let hit = std::mem::replace(&mut self.gen_cap_hit, ohit);
+                    self.gen_cap = ocap;
+                    if let Err(e) = r {
+                        if !hit {
+                            return Err(e);
+                        }
+                    }
+                    return Ok(crate::builtins::make_iter_in(
+                        items,
+                        self.p.generator.clone(),
+                    ));
+                }
                 if let Some(e) = &def.arrow_expr {
                     // `(x) => expr` — implicit return
                     let e = e.clone();
@@ -2224,6 +2365,7 @@ impl Interp {
         match &o.borrow().kind {
             ObjKind::Func(Func::User { def, home, ctor, .. }) => {
                 !def.is_arrow
+                    && !def.is_gen
                     && (!matches!(ctor, CtorKind::NotClass) || home.is_none())
             }
             ObjKind::Func(Func::Native { .. }) => self
@@ -2260,7 +2402,19 @@ impl Interp {
                 if matches!(proto_prop, Value::Und) {
                     return Err(self.type_err(format!("{name} is not a constructor")));
                 }
-                let this = if let Value::Obj(proto) = &proto_prop {
+                // OrdinaryCreateFromConstructor: new_target.prototype wins
+                let nt_proto = match &new_target {
+                    Some(Value::Obj(nto)) => self
+                        .obj_get_raw(nto, &PropKey::from_str("prototype"))
+                        .unwrap_or(Value::Und),
+                    _ => Value::Und,
+                };
+                let proto_v = if matches!(nt_proto, Value::Obj(_)) {
+                    nt_proto
+                } else {
+                    proto_prop
+                };
+                let this = if let Value::Obj(proto) = &proto_v {
                     Value::Obj(Rc::new(RefCell::new(Obj::new(
                         Some(proto.clone()),
                         ObjKind::Ord,
@@ -2600,6 +2754,10 @@ impl Interp {
                 .map(|c| Value::Str(Rc::from(c.to_string().as_str())))
                 .collect()),
             Value::Obj(o) => {
+                // lazy iterators drain through their state machine
+                if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
+                    return crate::builtins::iter_drain_lazy(self, v);
+                }
                 // Symbol.iterator protocol
                 let m = self.get_prop(v, &PropKey::Sym(SYM_ITERATOR))?;
                 if self.is_callable(&m) {
@@ -2613,13 +2771,30 @@ impl Interp {
                         if !self.is_callable(&next) {
                             return Err(self.type_err("iterator.next is not a function"));
                         }
-                        let r = self.call(&next, iter.clone(), Vec::new())?;
-                        let done = self.get_prop(&r, &PropKey::from_str("done"))?;
+                        let r = match self.call(&next, iter.clone(), Vec::new()) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let _ = self.iter_close_obj(&iter);
+                                return Err(e);
+                            }
+                        };
+                        let done = match self.get_prop(&r, &PropKey::from_str("done")) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                let _ = self.iter_close_obj(&iter);
+                                return Err(e);
+                            }
+                        };
                         if self.to_bool(&done) {
                             break;
                         }
-                        let val = self.get_prop(&r, &PropKey::from_str("value"))?;
-                        out.push(val);
+                        match self.get_prop(&r, &PropKey::from_str("value")) {
+                            Ok(val) => out.push(val),
+                            Err(e) => {
+                                let _ = self.iter_close_obj(&iter);
+                                return Err(e);
+                            }
+                        }
                     }
                     return Ok(out);
                 }
@@ -2741,7 +2916,13 @@ impl Interp {
         let name = def.name.clone().unwrap_or_default();
         self.set_attr(&o, "name", Value::Str(Rc::from(name.as_str())), false, true);
         self.set_attr(&o, "length", Value::Num(param_count(&def.params) as f64), false, true);
-        if !def.is_arrow {
+        if def.is_gen {
+            // generator fns: `.prototype` is an ordinary object whose
+            // proto is %GeneratorPrototype% — no `constructor` back-ref
+            let proto = self.new_obj();
+            proto.borrow_mut().proto = Some(self.p.generator.clone());
+            self.set_builtin(&o, "prototype", Value::Obj(proto));
+        } else if !def.is_arrow {
             let proto = self.new_obj();
             self.set_builtin(&proto, "constructor", Value::Obj(o.clone()));
             self.set_builtin(&o, "prototype", Value::Obj(proto));
@@ -2770,6 +2951,10 @@ impl Interp {
             return Err(self.interrupt_err());
         }
         self.steps = self.steps.wrapping_add(1);
+        if self.steps >= self.gen_cap {
+            self.gen_cap_hit = true;
+            return Err(self.range_err("generator step budget exceeded"));
+        }
         if self.steps & 0x3ff == 0 {
             if let Some(d) = self.deadline {
                 if std::time::Instant::now() >= d {
@@ -3353,6 +3538,7 @@ impl Interp {
                 is_arrow: false,
                 arrow_expr: None,
                 is_async: false,
+                is_gen: false,
             })
         });
 
@@ -3551,7 +3737,18 @@ impl Interp {
                             match &p.val {
                                 PropVal::Expr(ex) => {
                                     let v = self.eval_expr(ex, env)?;
-                                    o.borrow_mut().props.insert(key, Prop::data(v));
+                                    // `{__proto__: v}` sets the prototype
+                                    // instead of creating a property
+                                    if matches!(&p.key, ast::PropKey::Ident(s) | ast::PropKey::Str(s) if s == "__proto__")
+                                    {
+                                        if let Value::Obj(pv) = &v {
+                                            o.borrow_mut().proto = Some(pv.clone());
+                                        } else if matches!(v, Value::Null) {
+                                            o.borrow_mut().proto = None;
+                                        }
+                                    } else {
+                                        o.borrow_mut().props.insert(key, Prop::data(v));
+                                    }
                                 }
                                 PropVal::Method(def) => {
                                     let f = self.make_fn_home(
@@ -3758,6 +3955,32 @@ impl Interp {
                 self.call_trace.pop_front();
             }
             self.call_trace.push_back(callee_tag(callee));
+        }
+        // `yield`/`yield*` intrinsics (parser emits calls to `$yield*`)
+        if let Expr::Ident(n) = callee {
+            if n == "$yield" {
+                let v = match args.first() {
+                    Some(Arg::Expr(e)) => self.eval_expr(e, env)?,
+                    _ => Value::Und,
+                };
+                match self.gen_stack.last_mut() {
+                    Some(top) => top.push(v),
+                    None => return Err(self.syntax_err("yield outside generator")),
+                }
+                return Ok(Value::Und);
+            }
+            if n == "$yieldstar" {
+                let v = match args.first() {
+                    Some(Arg::Expr(e)) => self.eval_expr(e, env)?,
+                    _ => Value::Und,
+                };
+                let items = self.iter_values(&v)?;
+                match self.gen_stack.last_mut() {
+                    Some(top) => top.extend(items),
+                    None => return Err(self.syntax_err("yield outside generator")),
+                }
+                return Ok(Value::Und);
+            }
         }
         // super(args) — derived-class parent ctor call
         if matches!(callee, Expr::Super) {
