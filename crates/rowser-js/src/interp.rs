@@ -430,6 +430,14 @@ pub enum ObjKind {
     /// suspended generator — the body runs on a coroutine stack and
     /// `yield` parks it mid-execution
     Gen(Rc<RefCell<GenCell>>),
+    /// `arguments` object — indexed slots like an array; `map` links
+    /// index i to a parameter binding in `env` (sloppy simple-param
+    /// functions only — `env`/`map` empty for strict/unmapped)
+    Args {
+        items: Vec<Value>,
+        env: Option<EnvRef>,
+        map: Vec<Option<Rc<str>>>,
+    },
 }
 
 /// what `next(v)`/`return(v)`/`throw(e)` send into a suspended generator
@@ -671,6 +679,21 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
                     return None; // hole → not an own prop
                 }
                 return Some(items.get(i).cloned().unwrap_or(Value::Und));
+            }
+            None
+        }
+        ObjKind::Args { items, env, map } => {
+            if let Some(i) = arr_index(key) {
+                if i >= items.len() || b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                    return None;
+                }
+                // mapped index → the parameter binding is the source of truth
+                if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
+                    if let Some(b) = e.vars.borrow().get(name.as_ref()) {
+                        return Some(b.val.clone());
+                    }
+                }
+                return Some(items[i].clone());
             }
             None
         }
@@ -1474,6 +1497,95 @@ impl Interp {
             ObjKind::Arr(items),
         )))
     }
+    /// `arguments` object. Mapped (sloppy, simple-ident params): indexed
+    /// props alias the parameter bindings in `scope`; unmapped (strict
+    /// fns, or any param that's not a bare identifier): exotic object
+    /// with throwing `caller`/`callee` accessors and no aliasing.
+    pub fn new_args_obj(
+        &mut self,
+        args: &[Value],
+        scope: &EnvRef,
+        def: &FnDef,
+        callee: &Value,
+    ) -> ObjRef {
+        fn throw_type_err(i: &mut Interp, _t: &Value, _a: &[Value]) -> ERes {
+            Err(i.type_err("'caller' and 'arguments' are restricted"))
+        }
+        let strict = def.strict || crate::parser::stmts_strict(&def.body);
+        let mut map: Vec<Option<Rc<str>>> = Vec::new();
+        if !strict {
+            // spec: index i maps to the parameter name when i < param
+            // count, the param is a bare identifier, and the name hasn't
+            // already been claimed by an earlier parameter
+            let mut seen: std::collections::HashSet<Rc<str>> = Default::default();
+            map = vec![None; args.len()];
+            for (i, p) in def.params.iter().enumerate() {
+                if i >= args.len() {
+                    break;
+                }
+                if let Param::Ident(n) = p {
+                    if n == "arguments" {
+                        continue;
+                    }
+                    let k = self.intern(n);
+                    if seen.insert(k.clone()) {
+                        map[i] = Some(k);
+                    }
+                }
+            }
+        }
+        let o = Rc::new(RefCell::new(Obj::new(
+            Some(self.p.obj.clone()),
+            ObjKind::Args {
+                items: args.to_vec(),
+                env: Some(scope.clone()),
+                map,
+            },
+        )));
+        // length — spec attrs {writable, configurable, !enumerable}
+        o.borrow_mut()
+            .props
+            .insert(PropKey::from_str("length"), Prop::builtin(Value::Num(args.len() as f64)));
+        if strict {
+            // unmapped: throwing caller/callee accessors (own props,
+            // non-configurable)
+            let thrower = self.native("ThrowTypeError", throw_type_err);
+            for k in ["caller", "callee"] {
+                o.borrow_mut().props.insert(
+                    PropKey::from_str(k),
+                    Prop {
+                        val: Value::Und,
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                        get: Some(thrower.clone()),
+                        set: Some(thrower.clone()),
+                    },
+                );
+            }
+        } else {
+            // sloppy mapped: callee = the function itself
+            o.borrow_mut().props.insert(
+                PropKey::from_str("callee"),
+                Prop::builtin(callee.clone()),
+            );
+        }
+        // @@iterator → Array.prototype.values (same native as arrays)
+        let itv = self
+            .p
+            .array
+            .borrow()
+            .props
+            .get(&PropKey::Sym(SYM_ITERATOR))
+            .map(|p| p.val.clone());
+        if let Some(pv) = itv {
+            o.borrow_mut()
+                .props
+                .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(pv));
+        }
+        o
+    }
+
     /// Compile `pattern`/`flags` and build a RegExp object.
     pub fn make_regexp(&mut self, pattern: &str, flags: &str) -> ERes {
         match crate::regexp::Regex::compile(pattern, flags) {
@@ -2025,6 +2137,28 @@ impl Interp {
         if !b.extensible {
             return Ok(());
         }
+        match &mut b.kind {
+            ObjKind::Args { items, env, map } => {
+                if let PropKey::S(s) = &key {
+                    if let Some(i) = arr_index(s) {
+                        if i < items.len() {
+                            items[i] = v.clone();
+                            // mapped index → write through to the param binding
+                            if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
+                                let name = name.clone();
+                                if let Some(bnd) =
+                                    e.vars.borrow_mut().get_mut(name.as_ref())
+                                {
+                                    bnd.val = v;
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
         if let ObjKind::Arr(items) = &mut b.kind {
             if let PropKey::S(s) = &key {
                 if let Some(i) = arr_index(s) {
@@ -2213,6 +2347,25 @@ impl Interp {
         if !b.extensible {
             return Ok(());
         }
+        match &mut b.kind {
+            ObjKind::Args { items, env, map } => {
+                if let Some(i) = arr_index(key) {
+                    if i < items.len() {
+                        items[i] = v.clone();
+                        if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
+                            let name = name.clone();
+                            if let Some(bnd) =
+                                e.vars.borrow_mut().get_mut(name.as_ref())
+                            {
+                                bnd.val = v;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {}
+        }
         if let ObjKind::Arr(items) = &mut b.kind {
             if let Some(i) = arr_index(key) {
                 if i >= items.len() && i <= 8_000_000 {
@@ -2260,6 +2413,19 @@ impl Interp {
             return true;
         };
         let mut b = o.borrow_mut();
+        if let ObjKind::Args { items, map, .. } = &mut b.kind {
+            if let Some(i) = arr_index(key) {
+                if i < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                    // delete: unmap the param link, mark the slot gone —
+                    // `length` is a separate data prop and stays
+                    if let Some(m) = map.get_mut(i) {
+                        *m = None;
+                    }
+                    b.holes.get_or_insert_default().insert(i);
+                    return true;
+                }
+            }
+        }
         if let ObjKind::Arr(items) = &mut b.kind {
             if let Some(i) = arr_index(key) {
                 if i < items.len() {
@@ -2359,6 +2525,20 @@ impl Interp {
                             }
                         }
                     }
+                    ObjKind::Args { items, .. } => {
+                        if let PropKey::S(s) = key {
+                            if s.as_ref() == "length" {
+                                return Ok(true);
+                            }
+                            if let Some(i) = arr_index(s) {
+                                if i < items.len()
+                                    && !b.holes.as_ref().is_some_and(|h| h.contains(&i))
+                                {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 if b.props.contains_key(key) {
@@ -2386,6 +2566,19 @@ impl Interp {
             };
         }
         let mut b = o.borrow_mut();
+        if let ObjKind::Args { items, map, .. } = &mut b.kind {
+            if let PropKey::S(s) = key {
+                if let Some(i) = arr_index(s) {
+                    if i < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                        if let Some(m) = map.get_mut(i) {
+                            *m = None;
+                        }
+                        b.holes.get_or_insert_default().insert(i);
+                        return Ok(true);
+                    }
+                }
+            }
+        }
         if let ObjKind::Arr(items) = &mut b.kind {
             if let PropKey::S(s) = key {
                 if let Some(i) = arr_index(s) {
@@ -2474,6 +2667,17 @@ impl Interp {
                             }
                         }
                     }
+                    ObjKind::Args { items, .. } => {
+                        for i in 0..items.len() {
+                            if b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                                continue;
+                            }
+                            let k = i.to_string();
+                            if seen.insert(k.clone()) {
+                                out.push(k);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 for (k, p) in b.props.iter() {
@@ -2514,6 +2718,14 @@ impl Interp {
             } => {
                 let eff = typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
                 for i in 0..eff {
+                    out.push(i.to_string());
+                }
+            }
+            ObjKind::Args { items, .. } => {
+                for i in 0..items.len() {
+                    if b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                        continue;
+                    }
                     out.push(i.to_string());
                 }
             }
@@ -2770,6 +2982,13 @@ impl Interp {
                     }
                     ObjKind::Bound { .. } => "[Function bound]".into(),
                     ObjKind::Und => "undefined".into(),
+                    ObjKind::Args { items, .. } => {
+                        let inner: Vec<String> = items
+                            .iter()
+                            .map(|v| self.inspect(v, depth + 1))
+                            .collect();
+                        format!("[{}]", inner.join(", "))
+                    }
                     ObjKind::Proxy { target, .. } => self.inspect(&target, depth),
             ObjKind::Gen(_) => "[object Generator]".to_string(),
                     ObjKind::Err => {
@@ -2923,7 +3142,7 @@ impl Interp {
                 // `arguments` is visible inside parameter initializers —
                 // bind it before defaults evaluate
                 if !def.is_arrow && h.uses_arguments {
-                    let arr = self.new_arr(args.clone());
+                    let arr = self.new_args_obj(&args, &scope, &def, f);
                     let k = self.intern("arguments");
                     scope.vars.borrow_mut().insert(
                         k,
@@ -3218,7 +3437,7 @@ impl Interp {
                 }
                 let h = self.hoisted_fn(&def);
                 if h.uses_arguments {
-                    let arr = self.new_arr(args.clone());
+                    let arr = self.new_args_obj(&args, &scope, &def, f);
                     let k = self.intern("arguments");
                     scope.vars.borrow_mut().insert(
                         k,
@@ -4002,16 +4221,16 @@ impl Interp {
                 body,
             } => {
                 let my_label = self.pending_label.take();
-                // `let`/`const` in the init needs a per-loop scope, as does
-                // a lexical decl in single-statement body position; `var`
-                // and expression inits resolve identically on `env`.
+                // `let`/`const` in the init needs a per-iteration scope
+                // (CreatePerIterationEnvironment): each iteration's env is
+                // seeded from the previous one's for-head bindings so
+                // closures capture per-iteration values. `var`/expr inits
+                // resolve identically on `env`.
+                let per_iter =
+                    matches!(init, Some(ForInit::Var(kind, _)) if *kind != VarKind::Var);
                 let loop_scope;
                 let scope: &EnvRef = match init {
-                    Some(ForInit::Var(kind, _)) if *kind != VarKind::Var => {
-                        loop_scope = Scope::new(Some(env.clone()), false);
-                        &loop_scope
-                    }
-                    _ if stmt_binds_lexically(body) => {
+                    _ if per_iter || stmt_binds_lexically(body) => {
                         loop_scope = Scope::new(Some(env.clone()), false);
                         &loop_scope
                     }
@@ -4039,15 +4258,26 @@ impl Interp {
                         }
                     }
                 }
+                let head_names: Vec<Rc<str>> = match init {
+                    Some(ForInit::Var(kind, decls)) if *kind != VarKind::Var => {
+                        let mut out = Vec::new();
+                        for (p, _) in decls {
+                            collect_pattern_names(p, &mut out);
+                        }
+                        out.iter().map(|n| self.intern(n)).collect()
+                    }
+                    _ => Vec::new(),
+                };
                 let mut last = Value::Und;
+                let mut env_i = scope.clone();
                 loop {
                     if let Some(t) = test {
-                        let tv = self.eval_expr(t, scope)?;
+                        let tv = self.eval_expr(t, &env_i)?;
                         if !self.to_bool(&tv) {
                             break;
                         }
                     }
-                    match self.exec_stmt(body, scope)? {
+                    match self.exec_stmt(body, &env_i)? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
@@ -4064,7 +4294,31 @@ impl Interp {
                         r => return Ok(r),
                     }
                     if let Some(u) = update {
-                        self.eval_expr(u, scope)?;
+                        self.eval_expr(u, &env_i)?;
+                    }
+                    if per_iter {
+                        // next iteration's env copies the (post-update)
+                        // for-head bindings
+                        let s = Scope::new(Some(env.clone()), false);
+                        {
+                            let pv = env_i.vars.borrow();
+                            let mut cur = s.vars.borrow_mut();
+                            for n in &head_names {
+                                if let Some(b) = pv.get(n.as_ref()) {
+                                    cur.insert(
+                                        n.clone(),
+                                        Binding {
+                                            val: b.val.clone(),
+                                            mutable: b.mutable,
+                                            uninit: b.uninit,
+                                            deletable: false,
+                                            lexical: true,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        env_i = s;
                     }
                 }
                 Ok(Completion::Normal(last))
@@ -4073,25 +4327,62 @@ impl Interp {
                 let my_label = self.pending_label.take();
                 let rv = self.eval_expr(right, env)?;
                 let keys = self.enum_keys(&rv);
-                // `let`/`const` loop targets need a per-loop scope, as does
-                // a lexical decl in single-statement body position; `var`
-                // and expression targets resolve identically on `env`.
+                // `let`/`const` loop targets need a per-iteration scope
+                // (CreatePerIterationEnvironment), seeded from the previous
+                // iteration's for-head bindings; `var`/expr targets resolve
+                // on `env`.
+                let per_iter = matches!(left, ForTarget::Var(kind, _) if *kind != VarKind::Var);
                 let loop_scope;
                 let scope: &EnvRef = match left {
-                    ForTarget::Var(kind, _) if *kind != VarKind::Var => {
-                        loop_scope = Scope::new(Some(env.clone()), false);
-                        &loop_scope
-                    }
-                    _ if stmt_binds_lexically(body) => {
+                    _ if per_iter || stmt_binds_lexically(body) => {
                         loop_scope = Scope::new(Some(env.clone()), false);
                         &loop_scope
                     }
                     _ => env,
                 };
+                let head_names: Vec<Rc<str>> = match left {
+                    ForTarget::Var(_, pat) => {
+                        let mut out = Vec::new();
+                        collect_pattern_names(pat, &mut out);
+                        out.iter().map(|n| self.intern(n)).collect()
+                    }
+                    _ => Vec::new(),
+                };
                 let mut last = Value::Und;
+                let mut prev_iter: Option<EnvRef> = None;
                 for k in keys {
+                    let mut iter_scope: Option<EnvRef> = None;
+                    let scope: &EnvRef = if per_iter {
+                        let s = Scope::new(Some(env.clone()), false);
+                        if let Some(pe) = &prev_iter {
+                            let pv = pe.vars.borrow();
+                            let mut cur = s.vars.borrow_mut();
+                            for n in &head_names {
+                                if let Some(b) = pv.get(n.as_ref()) {
+                                    cur.insert(
+                                        n.clone(),
+                                        Binding {
+                                            val: b.val.clone(),
+                                            mutable: b.mutable,
+                                            uninit: b.uninit,
+                                            deletable: false,
+                                            lexical: true,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        iter_scope = Some(s);
+                        iter_scope.as_ref().unwrap()
+                    } else {
+                        scope
+                    };
                     self.bind_for_target(scope, left, Value::Str(Rc::from(k.as_str())))?;
-                    match self.exec_stmt(body, scope)? {
+                    let r = self.exec_stmt(body, scope);
+                    if per_iter {
+                        prev_iter = iter_scope;
+                    }
+                    match r? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
                         Completion::Break(l) => {
@@ -4116,22 +4407,30 @@ impl Interp {
                 // spec: lazy protocol iteration — `next()` per step,
                 // IteratorClose on every abrupt completion
                 let mut lz = crate::builtins::for_of_iter(self, &rv)?;
-                // `let`/`const` loop targets need a per-loop scope, as does
-                // a lexical decl in single-statement body position; `var`
-                // and expression targets resolve identically on `env`.
+                // `let`/`const` loop targets need a per-iteration scope
+                // (CreatePerIterationEnvironment): each iteration gets a
+                // fresh env seeded with the previous iteration's for-head
+                // bindings so closures capture distinct values. `var` and
+                // expression targets resolve identically on `env`.
+                let per_iter = matches!(left, ForTarget::Var(kind, _) if *kind != VarKind::Var);
                 let loop_scope;
                 let scope: &EnvRef = match left {
-                    ForTarget::Var(kind, _) if *kind != VarKind::Var => {
-                        loop_scope = Scope::new(Some(env.clone()), false);
-                        &loop_scope
-                    }
-                    _ if stmt_binds_lexically(body) => {
+                    _ if per_iter || stmt_binds_lexically(body) => {
                         loop_scope = Scope::new(Some(env.clone()), false);
                         &loop_scope
                     }
                     _ => env,
                 };
+                let head_names: Vec<Rc<str>> = match left {
+                    ForTarget::Var(_, pat) => {
+                        let mut out = Vec::new();
+                        collect_pattern_names(pat, &mut out);
+                        out.iter().map(|n| self.intern(n)).collect()
+                    }
+                    _ => Vec::new(),
+                };
                 let mut last = Value::Und;
+                let mut prev_iter: Option<EnvRef> = None;
                 loop {
                     let it = match crate::builtins::iter_lazy_step(self, &mut lz) {
                         Ok(Some(v)) => v,
@@ -4142,11 +4441,41 @@ impl Interp {
                             return Err(e);
                         }
                     };
+                    let mut iter_scope: Option<EnvRef> = None;
+                    let scope: &EnvRef = if per_iter {
+                        let s = Scope::new(Some(env.clone()), false);
+                        if let Some(pe) = &prev_iter {
+                            let pv = pe.vars.borrow();
+                            let mut cur = s.vars.borrow_mut();
+                            for n in &head_names {
+                                if let Some(b) = pv.get(n.as_ref()) {
+                                    cur.insert(
+                                        n.clone(),
+                                        Binding {
+                                            val: b.val.clone(),
+                                            mutable: b.mutable,
+                                            uninit: b.uninit,
+                                            deletable: false,
+                                            lexical: true,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        iter_scope = Some(s);
+                        iter_scope.as_ref().unwrap()
+                    } else {
+                        scope
+                    };
                     if let Err(e) = self.bind_for_target(scope, left, it) {
                         let _ = crate::builtins::iter_lazy_close(self, &mut lz);
                         return Err(e);
                     }
-                    match self.exec_stmt(body, scope) {
+                    let r = self.exec_stmt(body, scope);
+                    if per_iter {
+                        prev_iter = iter_scope;
+                    }
+                    match r {
                         Ok(Completion::Normal(v)) => last = v,
                         Ok(Completion::Empty) => {}
                         Ok(Completion::Break(l)) => {
@@ -4369,7 +4698,7 @@ impl Interp {
                             k,
                             Binding {
                                 val: v,
-                                mutable: *kind != VarKind::Const, uninit: false, deletable: false, lexical: false,
+                                mutable: *kind != VarKind::Const, uninit: false, deletable: false, lexical: true,
                             },
                         );
                         Ok(())
@@ -4402,7 +4731,8 @@ impl Interp {
                     k,
                     Binding {
                         val: v,
-                        mutable: kind != VarKind::Const, uninit: false, deletable: false, lexical: false,
+                        mutable: kind != VarKind::Const, uninit: false, deletable: false,
+                        lexical: kind != VarKind::Var,
                     },
                 );
                 Ok(())
@@ -4606,7 +4936,7 @@ impl Interp {
                 Rc::from(n.as_str()),
                 Binding {
                     val: ctor_fn.clone(),
-                    mutable: false, uninit: false, deletable: false, lexical: false,
+                    mutable: false, uninit: false, deletable: false, lexical: true,
                 },
             );
         }
