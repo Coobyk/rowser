@@ -99,6 +99,28 @@ fn char_val(c: char) -> Value {
 /// `Interp::own_keys` (array/typed-array indices first). `Some(v)` is a
 /// plain data value (no getter needed); `None` marks an accessor or a
 /// virtual index the caller must resolve via `get_prop`.
+/// `[[Enumerable]]` flag of an own prop *right now* — dense array elements
+/// and typed-array indices are enumerable; holes/deleted props are not.
+fn own_prop_enumerable(v: &Value, k: &PropKey) -> bool {
+    let Value::Obj(o) = v else {
+        return false;
+    };
+    let b = o.borrow();
+    if let PropKey::S(s) = k {
+        if let Some(n) = arr_index(s) {
+            return match &b.kind {
+                ObjKind::Arr(items) => {
+                    n < items.len()
+                        && !b.holes.as_ref().is_some_and(|h| h.contains(&n))
+                }
+                ObjKind::Typed { len, .. } => n < *len,
+                _ => b.props.get(k).map(|p| p.enumerable).unwrap_or(false),
+            };
+        }
+    }
+    b.props.get(k).map(|p| p.enumerable).unwrap_or(false)
+}
+
 fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
     let Value::Obj(o) = v else {
         return Vec::new();
@@ -109,6 +131,9 @@ fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
         ObjKind::Arr(items) => {
             out.reserve(items.len());
             for (k, it) in items.iter().enumerate() {
+                if b.holes.as_ref().is_some_and(|h| h.contains(&k)) {
+                    continue; // deleted slot — not an own prop
+                }
                 out.push((idx_key(k), Some(it.clone())));
             }
         }
@@ -120,7 +145,7 @@ fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
         _ => {}
     }
     for (k, p) in b.props.iter() {
-        if !p.enumerable || !matches!(k, PropKey::S(_)) {
+        if !p.enumerable {
             continue;
         }
         let val = if p.is_accessor() {
@@ -130,6 +155,52 @@ fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
         };
         out.push((k.clone(), val));
     }
+    out
+}
+
+/// `[[OwnPropertyKeys]]` — all own keys incl non-enumerable, in spec order:
+/// integer-ascending, then strings insertion-order, then symbols.
+fn own_keys_all(v: &Value) -> Vec<PropKey> {
+    let Value::Obj(o) = v else {
+        return Vec::new();
+    };
+    let b = o.borrow();
+    let mut ints: Vec<usize> = Vec::new();
+    let mut strs: Vec<PropKey> = Vec::new();
+    let mut syms: Vec<PropKey> = Vec::new();
+    match &b.kind {
+        ObjKind::Arr(items) => {
+            for k in 0..items.len() {
+                if b.holes.as_ref().is_some_and(|h| h.contains(&k)) {
+                    continue;
+                }
+                ints.push(k);
+            }
+            strs.push(PropKey::from_str("length"));
+        }
+        ObjKind::Typed { len, .. } => {
+            ints.extend(0..*len);
+        }
+        _ => {}
+    }
+    let mut seen_strs = std::collections::HashSet::new();
+    for (k, _) in b.props.iter() {
+        match k {
+            PropKey::Sym(_) => syms.push(k.clone()),
+            PropKey::S(s) => {
+                if let Some(n) = arr_index(s) {
+                    ints.push(n);
+                } else if seen_strs.insert(k.clone()) {
+                    strs.push(k.clone());
+                }
+            }
+        }
+    }
+    ints.sort_unstable();
+    ints.dedup();
+    let mut out: Vec<PropKey> = ints.into_iter().map(idx_key).collect();
+    out.extend(strs);
+    out.extend(syms);
     out
 }
 
@@ -223,6 +294,23 @@ fn method(i: &Interp, proto: &ObjRef, name: &str, f: NativeFn) {
 
 // -- helpers used by natives --------------------------------------------------
 
+/// declared `length` for arrays — a shadow prop holds a declared length
+/// larger than the dense backing; effective length is the max of the two.
+fn arr_declared_len(o: &ObjRef) -> usize {
+    let b = o.borrow();
+    let items_n = match &b.kind {
+        ObjKind::Arr(items) => items.len(),
+        _ => return 0,
+    };
+    match b.props.get(&PropKey::from_str("length")) {
+        Some(p) => match &p.val {
+            Value::Num(n) => (*n as usize).max(items_n),
+            _ => items_n,
+        },
+        None => items_n,
+    }
+}
+
 fn arr_clone(this: &Value) -> Vec<Value> {
     if let Value::Obj(o) = this {
         if let ObjKind::Arr(items) = &o.borrow().kind {
@@ -244,8 +332,20 @@ fn with_arr(this: &Value, f: impl FnOnce(&mut Vec<Value>)) {
 pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
     match v {
         Value::Obj(o) => {
-            if let ObjKind::Arr(items) = &o.borrow().kind {
-                return Ok(items.clone());
+            if matches!(&o.borrow().kind, ObjKind::Arr(_)) {
+                let len = arr_declared_len(o);
+                if len > 8_000_000 {
+                    return Err(i.range_err("array too large"));
+                }
+                let b = o.borrow();
+                if let ObjKind::Arr(items) = &b.kind {
+                    if len == items.len() {
+                        return Ok(items.clone());
+                    }
+                    return Ok((0..len)
+                        .map(|k| items.get(k).cloned().unwrap_or(Value::Und))
+                        .collect());
+                }
             }
             if let ObjKind::Iter { items, .. } = &o.borrow().kind {
                 return Ok(items.clone());
@@ -364,6 +464,9 @@ fn create_data_prop(
                 items.resize(k + 1, Value::Und);
             }
             items[k] = v;
+            if let Some(h) = &mut b.holes {
+                h.remove(&k);
+            }
             return Ok(());
         }
         let key = PropKey::from_str(&k.to_string());
@@ -618,6 +721,16 @@ fn install_protos(i: &mut Interp) {
         method(i, &gp, "next", iter_next);
         method(i, &gp, "return", gen_return);
         method(i, &gp, "throw", gen_throw);
+        // Iterator.prototype[@@toStringTag] — accessor: get → "Iterator",
+        // set → CreateDataProperty on the receiver
+        {
+            let g = native(i, "get [Symbol.toStringTag]", tag_get_iterator);
+            let s = native(i, "set [Symbol.toStringTag]", tag_set_iterator);
+            p.borrow_mut().props.insert(
+                PropKey::Sym(SYM_TOSTRINGTAG),
+                Prop::accessor(Some(g), Some(s)),
+            );
+        }
         // Iterator ctor (abstract) + statics
         let itctor = make_ctor(i, "Iterator", iter_ctor, p.clone());
         if let Value::Obj(o) = &itctor {
@@ -680,11 +793,38 @@ fn iter_self(_i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     Ok(this.clone())
 }
 
+/// `Iterator.prototype[@@toStringTag]` — get → "Iterator";
+/// set → CreateDataPropertyOrThrow on the receiver.
+fn tag_get_iterator(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
+    Ok(Value::Str(Rc::from("Iterator")))
+}
+
+fn tag_set_iterator(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    if let Value::Obj(o) = this {
+        o.borrow_mut().props.insert(
+            PropKey::Sym(SYM_TOSTRINGTAG),
+            Prop::data(arg(args, 0)),
+        );
+    }
+    Ok(Value::Und)
+}
+
 fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
+        if matches!(o.borrow().kind, ObjKind::IterBusy) {
+            return Err(iter_busy_err(i));
+        }
         if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
             let mut lz = take_lazy(o).expect("checked IterLazy above");
             let r = iter_lazy_step(i, &mut lz);
+            if let Ok(Some(_)) = &r {
+                lz.started = true;
+            }
+            if r.is_err() {
+                // spec: an abrupt step completes the helper — later
+                // next() → done, return() not forwarded to the source
+                lz.src = IterSrc::Empty;
+            }
             put_lazy(o, lz);
             return match r {
                 Ok(Some(v)) => iter_result(i, v, false),
@@ -739,20 +879,33 @@ fn iter_drain(i: &mut Interp, this: &Value) -> Result<Vec<Value>, Value> {
 const ITER_LIMIT: usize = 200_000;
 
 /// Move the lazy state out of the RefCell so stepping can call back into
-/// JS (`next`/`return`/callbacks) without holding the borrow.
+/// JS (`next`/`return`/callbacks) without holding the borrow. Leaves a
+/// `IterBusy` sentinel so reentrant calls can be rejected per spec.
 fn take_lazy(o: &ObjRef) -> Option<IterLazy> {
     let mut b = o.borrow_mut();
     match &mut b.kind {
-        ObjKind::IterLazy(l) => Some(std::mem::replace(l, IterLazy::id(IterSrc::Empty))),
+        ObjKind::IterLazy(l) => {
+            let st = std::mem::replace(l, IterLazy::id(IterSrc::Empty));
+            b.kind = ObjKind::IterBusy;
+            Some(st)
+        }
         _ => None,
     }
 }
 
 fn put_lazy(o: &ObjRef, lz: IterLazy) {
     let mut b = o.borrow_mut();
-    if let ObjKind::IterLazy(l) = &mut b.kind {
+    if matches!(b.kind, ObjKind::IterBusy) {
+        b.kind = ObjKind::IterLazy(lz);
+    } else if let ObjKind::IterLazy(l) = &mut b.kind {
         *l = lz;
     }
+}
+
+/// `%GeneratorPrototype%`-style guard: calling next/return on an iterator
+/// whose next/return is already executing → TypeError.
+fn iter_busy_err(i: &mut Interp) -> Value {
+    i.type_err("Generator is already running")
 }
 
 /// iterator object wrapping a lazy state, proto `iter_helper` or explicit
@@ -776,19 +929,53 @@ pub(crate) fn iter_to_lazy(i: &mut Interp, v: &Value, flattenable: bool) -> Resu
     let mut target = v.clone();
     if flattenable {
         if let Value::Obj(_) = &target {
-            let m = i.get_prop(&target, &PropKey::Sym(SYM_ITERATOR))?;
-            if i.is_callable(&m) {
-                target = i.call(&m, target.clone(), Vec::new())?;
-                if !matches!(target, Value::Obj(_)) {
-                    return Err(i.type_err("@@iterator result is not an object"));
+            // GetMethod: nullish → absent; non-callable non-nullish → TypeError
+            match i.get_prop(&target, &PropKey::Sym(SYM_ITERATOR))? {
+                Value::Und | Value::Null => {}
+                m if i.is_callable(&m) => {
+                    target = i.call(&m, target.clone(), Vec::new())?;
+                    if !matches!(target, Value::Obj(_)) {
+                        return Err(i.type_err("@@iterator result is not an object"));
+                    }
                 }
+                _ => return Err(i.type_err("@@iterator is not callable")),
             }
         }
     }
     iter_direct(i, &target)
 }
 
-/// GetIteratorDirect: read `next`, require callable, wrap the object itself.
+/// `for..of` iterable acquisition — spec `GetIterator(obj, sync)`:
+/// `@@iterator` is required (unlike helpers' flattenable path); arrays
+/// get a live-view source, strings iterate chars.
+pub(crate) fn for_of_iter(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
+    match v {
+        Value::Str(_) => iter_to_lazy(i, v, false),
+        Value::Obj(o) => {
+            if matches!(o.borrow().kind, ObjKind::Arr(_)) {
+                return Ok(IterLazy::id(IterSrc::Arr {
+                    arr: o.clone(),
+                    idx: 0,
+                }));
+            }
+            match i.get_prop(v, &PropKey::Sym(SYM_ITERATOR))? {
+                m if i.is_callable(&m) => {
+                    let it = i.call(&m, v.clone(), Vec::new())?;
+                    if !matches!(it, Value::Obj(_)) {
+                        return Err(i.type_err("@@iterator result is not an object"));
+                    }
+                    iter_direct(i, &it)
+                }
+                _ => Err(i.type_err("value is not iterable")),
+            }
+        }
+        _ => Err(i.type_err("value is not iterable")),
+    }
+}
+
+/// GetIteratorDirect: read `next` once (errors propagate); callability is
+/// checked lazily when the record is stepped — per spec a `{next: 0}`
+/// receiver yields a valid helper whose first `next()` throws.
 fn iter_direct(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
     match v {
         Value::Str(s) => {
@@ -802,9 +989,6 @@ fn iter_direct(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
         _ => return Err(i.type_err("value is not iterable")),
     }
     let next = i.get_prop(v, &PropKey::from_str("next"))?;
-    if !i.is_callable(&next) {
-        return Err(i.type_err("value is not iterable"));
-    }
     Ok(IterLazy::id(IterSrc::Proto {
         iter: v.clone(),
         next,
@@ -820,7 +1004,8 @@ fn iter_close_err(i: &mut Interp, it: &Value, err: Value) -> Value {
     }
 }
 
-/// pull one value from a source
+/// pull one value from a source — spec `? IteratorStep(Value)`: every
+/// step error propagates raw; IteratorClose is the *caller's* business.
 fn iter_src_step(i: &mut Interp, src: &mut IterSrc) -> Result<Option<Value>, Value> {
     match src {
         IterSrc::Empty => Ok(None),
@@ -840,7 +1025,6 @@ fn iter_src_step(i: &mut Interp, src: &mut IterSrc) -> Result<Option<Value>, Val
             let (iter, next) = (iter.clone(), next.clone());
             let r = i.call(&next, iter.clone(), Vec::new())?;
             if !matches!(r, Value::Obj(_)) {
-                *done = true;
                 return Err(i.type_err("iterator result is not an object"));
             }
             let d = i.get_prop(&r, &PropKey::from_str("done"))?;
@@ -849,6 +1033,23 @@ fn iter_src_step(i: &mut Interp, src: &mut IterSrc) -> Result<Option<Value>, Val
                 return Ok(None);
             }
             Ok(Some(i.get_prop(&r, &PropKey::from_str("value"))?))
+        }
+        IterSrc::Arr { arr, idx } => {
+            let b = arr.borrow();
+            let ObjKind::Arr(items) = &b.kind else {
+                return Ok(None);
+            };
+            let len = arr_declared_len(arr);
+            if *idx >= len {
+                return Ok(None);
+            }
+            let v = if b.holes.as_ref().is_some_and(|h| h.contains(idx)) {
+                Value::Und
+            } else {
+                items.get(*idx).cloned().unwrap_or(Value::Und)
+            };
+            *idx += 1;
+            Ok(Some(v))
         }
     }
 }
@@ -872,26 +1073,84 @@ pub(crate) fn iter_lazy_close(i: &mut Interp, lz: &mut IterLazy) -> Result<(), V
     }
     match &mut lz.op {
         IterOp::Cat { rest } => {
-            for s in rest.iter_mut() {
-                iter_lazy_close(i, s)?;
-            }
+            // unstarted args hold raw values — nothing to close
+            rest.clear();
         }
-        IterOp::Zip { srcs, .. } => {
-            for s in srcs.iter_mut() {
-                iter_lazy_close(i, s)?;
-            }
+        IterOp::Zip { srcs, done, .. } => {
+            // spec: open iterators close in reverse; a close error during a
+            // normal completion propagates but all closes still run
+            iter_zip_close_srcs(i, srcs, done)?;
         }
-        IterOp::ZipKeyed { cols } => {
-            for (_, s) in cols.iter_mut() {
-                iter_lazy_close(i, s)?;
-            }
+        IterOp::ZipKeyed { cols, done, .. } => {
+            iter_zip_keyed_close_srcs(i, cols, done)?;
         }
         _ => {}
     }
     iter_src_close(i, &mut lz.src)
 }
 
-/// pull the next transformed value from a lazy iterator
+/// close all still-open zip columns in reverse — normal completion:
+/// every close runs, the first error propagates
+fn iter_zip_close_srcs(
+    i: &mut Interp,
+    srcs: &mut [IterLazy],
+    done: &mut [bool],
+) -> Result<(), Value> {
+    let mut first_err = None;
+    for idx in (0..srcs.len()).rev() {
+        if !done[idx] {
+            done[idx] = true;
+            if let Err(e) = iter_lazy_close(i, &mut srcs[idx]) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// abrupt completion during a zip step: close all still-open columns in
+/// reverse; close errors are swallowed (a Throw completion is in flight)
+fn iter_zip_abrupt(i: &mut Interp, srcs: &mut [IterLazy], done: &mut [bool]) {
+    let _ = iter_zip_close_srcs(i, srcs, done);
+}
+
+fn iter_zip_keyed_close_srcs(
+    i: &mut Interp,
+    cols: &mut [(PropKey, IterLazy)],
+    done: &mut [bool],
+) -> Result<(), Value> {
+    let mut first_err = None;
+    for idx in (0..cols.len()).rev() {
+        if !done[idx] {
+            done[idx] = true;
+            if let Err(e) = iter_lazy_close(i, &mut cols[idx].1) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn iter_zip_keyed_abrupt(
+    i: &mut Interp,
+    cols: &mut [(PropKey, IterLazy)],
+    done: &mut [bool],
+) {
+    let _ = iter_zip_keyed_close_srcs(i, cols, done);
+}
+
+/// pull the next transformed value from a lazy iterator — spec
+/// `? IteratorStepValue` on the source: errors propagate raw.
 pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option<Value>, Value> {
     let mut pulls = 0usize;
     loop {
@@ -904,60 +1163,147 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
         match &mut lz.op {
             IterOp::Zip {
                 srcs,
+                done,
                 mode,
                 padding,
             } => {
+                if srcs.is_empty() {
+                    return Ok(None);
+                }
                 let mut row = Vec::with_capacity(srcs.len());
-                let mut short = false;
-                for (k, s) in srcs.iter_mut().enumerate() {
-                    match iter_lazy_step(i, s)? {
-                        Some(x) => row.push(x),
-                        None => match mode {
-                            ZipMode::Shortest => {
-                                short = true;
-                                break;
-                            }
-                            ZipMode::Longest => {
-                                let p = i.get_prop(padding, &idx_key(k))?;
-                                row.push(p);
-                            }
-                            ZipMode::Strict => {
-                                if k == 0 {
-                                    for s2 in srcs.iter_mut().skip(1) {
-                                        if iter_lazy_step(i, s2)?.is_some() {
-                                            return Err(i.range_err(
-                                                "Iterator.zip strict mode: iterables differ in length",
-                                            ));
-                                        }
-                                    }
-                                    return Ok(None);
-                                }
-                                return Err(i.range_err(
+                let mut seen_done = false;
+                let mut seen_live = false;
+                let len = srcs.len();
+                for idx in 0..len {
+                    if done[idx] {
+                        seen_done = true;
+                        if *mode == ZipMode::Longest {
+                            row.push(padding.get(idx).cloned().unwrap_or(Value::Und));
+                        }
+                        continue;
+                    }
+                    match iter_lazy_step(i, &mut srcs[idx]) {
+                        Err(e) => {
+                            // spec: remove `iter` from openIters first, then
+                            // close the rest in reverse (errors swallowed)
+                            done[idx] = true;
+                            iter_zip_abrupt(i, srcs, done);
+                            return Err(e);
+                        }
+                        Ok(Some(x)) => {
+                            if *mode == ZipMode::Strict && seen_done {
+                                // strict: a live value after a done source →
+                                // length mismatch; close all still-open
+                                let _ = iter_zip_close_srcs(i, srcs, done);
+                                return Err(i.type_err(
                                     "Iterator.zip strict mode: iterables differ in length",
                                 ));
                             }
-                        },
+                            seen_live = true;
+                            row.push(x);
+                        }
+                        Ok(None) => {
+                            done[idx] = true;
+                            match mode {
+                                ZipMode::Shortest => {
+                                    // normal completion — close errors propagate
+                                    iter_zip_close_srcs(i, srcs, done)?;
+                                    return Ok(None);
+                                }
+                                ZipMode::Longest => {
+                                    row.push(padding.get(idx).cloned().unwrap_or(Value::Und));
+                                }
+                                ZipMode::Strict => {
+                                    if seen_live {
+                                        let _ = iter_zip_close_srcs(i, srcs, done);
+                                        return Err(i.type_err(
+                                            "Iterator.zip strict mode: iterables differ in length",
+                                        ));
+                                    }
+                                }
+                            }
+                            seen_done = true;
+                        }
                     }
                 }
-                if short {
+                if seen_done && !seen_live {
+                    // all columns done → complete (longest/strict)
                     return Ok(None);
                 }
                 let a = i.new_arr(row);
                 return Ok(Some(Value::Obj(a)));
             }
-            IterOp::ZipKeyed { cols } => {
-                let o = i.new_obj();
-                let mut short = false;
-                for (k, s) in cols.iter_mut() {
-                    match iter_lazy_step(i, s)? {
-                        Some(x) => i.set_prop(&Value::Obj(o.clone()), k.clone(), x)?,
-                        None => {
-                            short = true;
-                            break;
+            IterOp::ZipKeyed {
+                cols,
+                done,
+                mode,
+                padding,
+            } => {
+                if cols.is_empty() {
+                    return Ok(None);
+                }
+                // spec: zipKeyed rows are null-prototype mutable objects
+                let o: ObjRef = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
+                let mut seen_done = false;
+                let mut seen_live = false;
+                let len = cols.len();
+                for idx in 0..len {
+                    if done[idx] {
+                        seen_done = true;
+                        if *mode == ZipMode::Longest {
+                            let p = padding.get(idx).cloned().unwrap_or(Value::Und);
+                            let k = cols[idx].0.clone();
+                            i.set_prop(&Value::Obj(o.clone()), k, p)?;
+                        }
+                        continue;
+                    }
+                    match iter_lazy_step(i, &mut cols[idx].1) {
+                        Err(e) => {
+                            // spec: remove `iter` from openIters first, then
+                            // close the rest in reverse (errors swallowed)
+                            done[idx] = true;
+                            iter_zip_keyed_abrupt(i, cols, done);
+                            return Err(e);
+                        }
+                        Ok(Some(x)) => {
+                            if *mode == ZipMode::Strict && seen_done {
+                                let _ = iter_zip_keyed_close_srcs(i, cols, done);
+                                return Err(i.type_err(
+                                    "Iterator.zipKeyed strict mode: iterables differ in length",
+                                ));
+                            }
+                            seen_live = true;
+                            let k = cols[idx].0.clone();
+                            i.set_prop(&Value::Obj(o.clone()), k, x)?;
+                        }
+                        Ok(None) => {
+                            done[idx] = true;
+                            match mode {
+                                ZipMode::Shortest => {
+                                    iter_zip_keyed_close_srcs(i, cols, done)?;
+                                    return Ok(None);
+                                }
+                                ZipMode::Longest => {
+                                    let p =
+                                        padding.get(idx).cloned().unwrap_or(Value::Und);
+                                    let k = cols[idx].0.clone();
+                                    i.set_prop(&Value::Obj(o.clone()), k, p)?;
+                                }
+                                ZipMode::Strict => {
+                                    if seen_live {
+                                        let _ =
+                                            iter_zip_keyed_close_srcs(i, cols, done);
+                                        return Err(i.type_err(
+                                            "Iterator.zipKeyed strict mode: iterables differ in length",
+                                        ));
+                                    }
+                                }
+                            }
+                            seen_done = true;
                         }
                     }
                 }
-                if short {
+                if seen_done && !seen_live {
                     return Ok(None);
                 }
                 return Ok(Some(Value::Obj(o)));
@@ -976,12 +1322,20 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
                 }
             }
         }
+        // take(0): `? IteratorClose` BEFORE any pull — close errors
+        // (e.g. ReturnCalledError) propagate; the helper is then completed
+        if let IterOp::Take { left: 0 } = lz.op {
+            iter_lazy_close(i, lz)?;
+            return Ok(None);
+        }
         let v = match iter_src_step(i, &mut lz.src)? {
             Some(v) => v,
             None => {
                 if let IterOp::Cat { rest } = &mut lz.op {
                     if let Some(nx) = rest.pop_front() {
-                        *lz = nx;
+                        // concat: wrap each arg's iterator as it's reached
+                        let wrapped = iter_to_lazy(i, &nx, true)?;
+                        lz.src = wrapped.src;
                         continue;
                     }
                 }
@@ -1032,10 +1386,6 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
                 }
             }
             IterOp::Take { left } => {
-                if *left == 0 {
-                    iter_lazy_close(i, lz)?;
-                    return Ok(None);
-                }
                 *left -= 1;
                 return Ok(Some(v));
             }
@@ -1207,52 +1557,205 @@ fn iter_from(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 /// `Iterator.concat(...iters)` — lazy chain over each argument's iterator
 fn iter_concat(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let mut srcs = std::collections::VecDeque::with_capacity(args.len());
+    // spec: args must be objects (checked at call time); each arg's
+    // @@iterator is invoked lazily as the chain reaches it — `return()`
+    // before that point must not touch the iterable
+    let mut rest = std::collections::VecDeque::with_capacity(args.len());
     for a in args {
-        srcs.push_back(iter_to_lazy(i, a, true)?);
+        if !matches!(a, Value::Obj(_)) {
+            return Err(i.type_err("Iterator.concat argument is not an object"));
+        }
+        rest.push_back(a.clone());
     }
-    let first = srcs.pop_front().unwrap_or_else(|| IterLazy::id(IterSrc::Empty));
     Ok(make_lazy(i, IterLazy {
-        src: first.src,
-        op: IterOp::Cat { rest: srcs },
+        src: IterSrc::Empty,
+        op: IterOp::Cat { rest },
+        started: false,
     }))
 }
 
-/// `Iterator.zip(options)` — options.iterables[] zipped lazily; mode
-/// "shortest"|"longest"|"strict" (+options.padding for longest).
-fn iter_zip(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let opts = arg(args, 0);
-    let iters_v = i.get_prop_str(&opts, "iterables")?;
-    let iters = to_elems(i, &iters_v)?;
-    let mode = match i.get_prop_str(&opts, "mode")? {
+/// shared zip/zipKeyed options handling: GetOptionsObject → mode check →
+/// padding read (longest only, must be undefined|Object).
+fn iter_zip_mode(i: &mut Interp, opts: &Value) -> Result<(ZipMode, Value), Value> {
+    match opts {
+        Value::Und => return Ok((ZipMode::Shortest, Value::Und)),
+        Value::Obj(_) => {}
+        _ => return Err(i.type_err("options must be an object")),
+    }
+    let mode = match i.get_prop_str(opts, "mode")? {
+        Value::Und => ZipMode::Shortest,
+        Value::Str(s) if s.as_ref() == "shortest" => ZipMode::Shortest,
         Value::Str(s) if s.as_ref() == "longest" => ZipMode::Longest,
         Value::Str(s) if s.as_ref() == "strict" => ZipMode::Strict,
-        _ => ZipMode::Shortest,
+        _ => return Err(i.type_err("invalid zip mode")),
     };
-    let mut srcs = Vec::with_capacity(iters.len());
-    for it in &iters {
-        srcs.push(iter_to_lazy(i, it, true)?);
+    let padding = if mode == ZipMode::Longest {
+        let p = i.get_prop_str(opts, "padding")?;
+        if !matches!(p, Value::Und | Value::Obj(_)) {
+            return Err(i.type_err("padding must be an object"));
+        }
+        p
+    } else {
+        Value::Und
+    };
+    Ok((mode, padding))
+}
+
+/// longest-mode padding: pull `count` values through the padding object's
+/// own @@iterator (GetIterator — the method is required), then close it.
+fn iter_zip_padding(
+    i: &mut Interp,
+    padding: &Value,
+    count: usize,
+) -> Result<Vec<Value>, Value> {
+    if !matches!(padding, Value::Obj(_)) {
+        return Ok(Vec::new());
     }
-    let padding = i.get_prop_str(&opts, "padding").unwrap_or(Value::Und);
+    let m = i.get_prop(padding, &PropKey::Sym(SYM_ITERATOR))?;
+    if !i.is_callable(&m) {
+        return Err(i.type_err("padding is not iterable"));
+    }
+    let pit = i.call(&m, padding.clone(), Vec::new())?;
+    let mut plz = iter_direct(i, &pit)?;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        match iter_lazy_step(i, &mut plz) {
+            // spec: on abrupt the padding iterator is NOT closed — the error
+            // propagates and the caller closes the acquired sources
+            Err(e) => return Err(e),
+            Ok(Some(v)) => out.push(v),
+            Ok(None) => break,
+        }
+    }
+    // normal completion → IteratorClose(paddingIter, NormalCompletion): the
+    // return() call is required and a close error propagates
+    iter_lazy_close(i, &mut plz)?;
+    Ok(out)
+}
+
+/// `IfAbruptCloseIterators(iters)` during zip acquisition: close acquired
+/// inner sources in reverse, return `e`. The outer iterator is not in the
+/// list — its own step errors propagate without closing it.
+fn zip_close_inners(i: &mut Interp, srcs: &mut [IterLazy], e: Value) -> Value {
+    let mut d = vec![false; srcs.len()];
+    let _ = iter_zip_close_srcs(i, srcs, &mut d);
+    e
+}
+
+/// `IfAbruptCloseIterators(«inputIter» ++ iters)`: close inner sources in
+/// reverse order, then the outer iterable last.
+fn zip_close_all(i: &mut Interp, outer: &mut IterLazy, srcs: &mut [IterLazy], e: Value) -> Value {
+    let e = zip_close_inners(i, srcs, e);
+    let _ = iter_lazy_close(i, outer);
+    e
+}
+
+/// `Iterator.zip(iterables[, options])` — outer via GetIterator, each item
+/// must be an object (GetIteratorFlattenable per item).
+fn iter_zip(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let iterables = arg(args, 0);
+    if !matches!(iterables, Value::Obj(_)) {
+        return Err(i.type_err("zip argument is not an object"));
+    }
+    let (mode, padding_v) = iter_zip_mode(i, &arg(args, 1))?;
+    let mut outer = for_of_iter(i, &iterables)?;
+    let mut srcs: Vec<IterLazy> = Vec::new();
+    loop {
+        let it = match iter_lazy_step(i, &mut outer) {
+            Ok(Some(v)) => v,
+            Ok(None) => break,
+            // outer's own step error → close only the acquired inners
+            Err(e) => return Err(zip_close_inners(i, &mut srcs, e)),
+        };
+        if !matches!(it, Value::Obj(_)) {
+            let e = i.type_err("zip iterable is not an object");
+            return Err(zip_close_all(i, &mut outer, &mut srcs, e));
+        }
+        let s = match iter_to_lazy(i, &it, true) {
+            Ok(s) => s,
+            // GetIteratorFlattenable abrupt → close inners reverse, outer last
+            Err(e) => return Err(zip_close_all(i, &mut outer, &mut srcs, e)),
+        };
+        srcs.push(s);
+    }
+    let padding = match iter_zip_padding(i, &padding_v, srcs.len()) {
+        Ok(p) => p,
+        Err(e) => {
+            let mut d = vec![false; srcs.len()];
+            let _ = iter_zip_close_srcs(i, &mut srcs, &mut d);
+            return Err(e);
+        }
+    };
+    let n = srcs.len();
     Ok(make_lazy(i, IterLazy {
         src: IterSrc::Empty,
-        op: IterOp::Zip { srcs, mode, padding },
+        op: IterOp::Zip { srcs, done: vec![false; n], mode, padding },
+        started: false,
     }))
 }
 
-/// `Iterator.zipKeyed(options)` — {key: iterable} → objects {key: value}
+/// `Iterator.zipKeyed(obj[, options])` — own enumerable {key: iterable}
+/// pairs zipped into objects; values must be objects.
 fn iter_zip_keyed(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let opts = arg(args, 0);
-    let entries = own_enum_entries(&opts);
-    let mut cols: Vec<(PropKey, IterLazy)> = Vec::with_capacity(entries.len());
-    for (k, slot) in entries {
-        if let Some(v) = slot {
-            cols.push((k, iter_to_lazy(i, &v, true)?));
+    let obj = arg(args, 0);
+    if !matches!(obj, Value::Obj(_)) {
+        return Err(i.type_err("zipKeyed argument is not an object"));
+    }
+    let (mode, padding_v) = iter_zip_mode(i, &arg(args, 1))?;
+    // spec: [[OwnPropertyKeys]] snapshot, then per key GetOwnProperty for the
+    // enumerable flag *at that moment* — mutations in earlier getters are seen
+    let keys = own_keys_all(&obj);
+    let mut cols: Vec<(PropKey, IterLazy)> = Vec::with_capacity(keys.len());
+    for k in keys {
+        if !own_prop_enumerable(&obj, &k) {
+            continue; // deleted or non-enumerable at check time
+        }
+        let v = match i.get_prop(&obj, &k) {
+            Ok(v) => v,
+            Err(e) => {
+                let mut d = vec![false; cols.len()];
+                let _ = iter_zip_keyed_close_srcs(i, &mut cols, &mut d);
+                return Err(e);
+            }
+        };
+        if matches!(v, Value::Und) {
+            continue; // spec: undefined-valued keys produce no column
+        }
+        if !matches!(v, Value::Obj(_)) {
+            let e = i.type_err("zipKeyed value is not an object");
+            let mut d = vec![false; cols.len()];
+            let _ = iter_zip_keyed_close_srcs(i, &mut cols, &mut d);
+            return Err(e);
+        }
+        match iter_to_lazy(i, &v, true) {
+            Ok(s) => cols.push((k, s)),
+            Err(e) => {
+                let mut d = vec![false; cols.len()];
+                let _ = iter_zip_keyed_close_srcs(i, &mut cols, &mut d);
+                return Err(e);
+            }
         }
     }
+    // spec: zipKeyed padding is per-key `Get(paddingOption, key)` — no
+    // iterator; each Get's abrupt closes the acquired columns in reverse
+    let mut padding = Vec::with_capacity(cols.len());
+    if mode == ZipMode::Longest && matches!(padding_v, Value::Obj(_)) {
+        for (k, _) in &cols {
+            match i.get_prop(&padding_v, k) {
+                Ok(p) => padding.push(p),
+                Err(e) => {
+                    let mut d = vec![false; cols.len()];
+                    let _ = iter_zip_keyed_close_srcs(i, &mut cols, &mut d);
+                    return Err(e);
+                }
+            }
+        }
+    }
+    let n = cols.len();
     Ok(make_lazy(i, IterLazy {
         src: IterSrc::Empty,
-        op: IterOp::ZipKeyed { cols },
+        op: IterOp::ZipKeyed { cols, done: vec![false; n], mode, padding },
+        started: false,
     }))
 }
 
@@ -1594,15 +2097,32 @@ fn iter_indexed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 /// `%IteratorHelperPrototype%.return` — closes the underlying source
-fn iter_lazy_ret(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+fn iter_lazy_ret(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
+    let v = arg(a, 0);
     if let Value::Obj(o) = this {
+        if matches!(o.borrow().kind, ObjKind::IterBusy) {
+            return Err(iter_busy_err(i));
+        }
         if let Some(mut lz) = take_lazy(o) {
+            if !lz.started {
+                // suspended-start: mark completed BEFORE closing so a
+                // reentrant next()/return() sees a finished generator
+                // ({done: true}), not an executing one
+                put_lazy(o, IterLazy::id(IterSrc::Empty));
+            }
+            // suspended-yield: the IterBusy sentinel stays while sources
+            // close — reentrant calls throw TypeError (executing gen)
             let r = iter_lazy_close(i, &mut lz);
-            put_lazy(o, lz);
-            r?;
+            if lz.started {
+                put_lazy(o, IterLazy::id(IterSrc::Empty));
+            }
+            if let Err(e) = r {
+                return Err(e);
+            }
+            return iter_result(i, v, true);
         }
     }
-    iter_result(i, Value::Und, true)
+    iter_result(i, v, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1656,7 +2176,7 @@ fn install_globals(i: &mut Interp) {
             ("defineProperties", obj_define_properties),
             ("getOwnPropertyDescriptor", obj_get_own_prop_desc),
             ("getOwnPropertyDescriptors", obj_get_own_prop_descs),
-            ("getOwnPropertyNames", obj_keys),
+            ("getOwnPropertyNames", obj_get_own_prop_names),
             ("getPrototypeOf", obj_get_prototype_of),
             ("setPrototypeOf", obj_set_prototype_of),
             ("create", obj_create),
@@ -2132,7 +2652,7 @@ fn install_globals(i: &mut Interp) {
         method(i, &r, "set", reflect_set);
         method(i, &r, "has", reflect_has);
         method(i, &r, "deleteProperty", reflect_delete);
-        method(i, &r, "ownKeys", obj_keys);
+        method(i, &r, "ownKeys", reflect_own_keys);
         method(i, &r, "getPrototypeOf", obj_get_prototype_of);
         method(i, &r, "setPrototypeOf", obj_set_prototype_of);
         method(i, &r, "apply", reflect_apply);
@@ -2173,7 +2693,10 @@ fn obj_has_own(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                         return Ok(Value::Bool(true));
                     }
                     if let Some(idx) = arr_index(s) {
-                        return Ok(Value::Bool(idx < items.len()));
+                        return Ok(Value::Bool(
+                            idx < items.len()
+                                && !b.holes.as_ref().is_some_and(|h| h.contains(&idx)),
+                        ));
                     }
                 }
             }
@@ -2302,12 +2825,36 @@ fn obj_set_proto(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(Value::Und)
 }
 
+/// `Object.getOwnPropertyNames` — own string keys incl non-enumerable.
+fn obj_get_own_prop_names(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let keys = own_keys_all(&arg(args, 0))
+        .into_iter()
+        .filter_map(|k| match k {
+            PropKey::S(s) => Some(Value::Str(s)),
+            _ => None,
+        })
+        .collect();
+    Ok(Value::Obj(i.new_arr(keys)))
+}
+
+/// `Reflect.ownKeys` — all own keys incl symbols.
+fn reflect_own_keys(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let keys = own_keys_all(&arg(args, 0))
+        .into_iter()
+        .map(|k| match k {
+            PropKey::S(s) => Value::Str(s),
+            PropKey::Sym(id) => Value::Sym(id, Rc::from("")),
+        })
+        .collect();
+    Ok(Value::Obj(i.new_arr(keys)))
+}
+
 fn obj_keys(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let keys = own_enum_entries(&arg(args, 0))
         .into_iter()
-        .map(|(k, _)| match k {
-            PropKey::S(s) => Value::Str(s),
-            _ => Value::Und,
+        .filter_map(|(k, _)| match k {
+            PropKey::S(s) => Some(Value::Str(s)),
+            _ => None, // string keys only
         })
         .collect();
     Ok(Value::Obj(i.new_arr(keys)))
@@ -2317,6 +2864,9 @@ fn obj_values(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
     let mut out = Vec::new();
     for (k, slot) in own_enum_entries(&v) {
+        if !matches!(k, PropKey::S(_)) {
+            continue; // string keys only
+        }
         out.push(match slot {
             Some(val) => val,
             None => i.get_prop(&v, &k)?,
@@ -2335,7 +2885,7 @@ fn obj_entries(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         };
         let ks = match k {
             PropKey::S(s) => Value::Str(s),
-            _ => Value::Und,
+            _ => continue, // string keys only
         };
         out.push(Value::Obj(i.new_arr(vec![ks, val])));
     }
@@ -2435,6 +2985,9 @@ fn define_prop_from_desc(
                     if idx < items.len() {
                         if has_val {
                             items[idx] = vv;
+                            if let Some(h) = &mut b.holes {
+                                h.remove(&idx);
+                            }
                         }
                     } else if has_val && idx <= 8_000_000 {
                         items.resize(idx + 1, Value::Und);
@@ -2444,8 +2997,24 @@ fn define_prop_from_desc(
                 }
                 if s.as_ref() == "length" {
                     if let (Value::Num(n), true) = (&vv, has_val) {
-                        let n = (n.max(0.0) as usize).min(8_000_000);
-                        items.resize(n, Value::Und);
+                        let n = n.max(0.0).min(4294967295.0) as usize;
+                        if n < items.len() {
+                            items.truncate(n);
+                            if let Some(h) = &mut b.holes {
+                                h.retain(|&h| h < n);
+                            }
+                        }
+                        b.props.insert(
+                            PropKey::from_str("length"),
+                            Prop {
+                                val: Value::Num(n as f64),
+                                writable: true,
+                                enumerable: false,
+                                configurable: false,
+                                get: None,
+                                set: None,
+                            },
+                        );
                     }
                     return Ok(());
                 }
@@ -2517,8 +3086,13 @@ fn define_prop_from_desc(
         if has_w {
             prop.writable = i.to_bool(&wv);
         }
-        prop.get = None;
-        prop.set = None;
+        // only an explicit data-kind desc (value/writable present) converts an
+        // existing accessor to a data prop — attribute-only descs keep the
+        // accessor pair (spec ValidateAndApplyPropertyDescriptor)
+        if has_val || has_w {
+            prop.get = None;
+            prop.set = None;
+        }
     }
     if has_e {
         prop.enumerable = i.to_bool(&ev);
@@ -2555,8 +3129,25 @@ fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
     // array index/length
     if let ObjKind::Arr(items) = &o.borrow().kind {
         if let PropKey::S(s) = &key {
+            if s.as_ref() == "length" {
+                let n = match o.borrow().props.get(&PropKey::from_str("length")) {
+                    Some(p) => match &p.val {
+                        Value::Num(n) => (*n as usize).max(items.len()),
+                        _ => items.len(),
+                    },
+                    None => items.len(),
+                };
+                let d = i.new_obj();
+                i.set_data(&d, "value", Value::Num(n as f64));
+                i.set_data(&d, "writable", Value::Bool(true));
+                i.set_data(&d, "enumerable", Value::Bool(false));
+                i.set_data(&d, "configurable", Value::Bool(false));
+                return Ok(Value::Obj(d));
+            }
             if let Some(idx) = arr_index(s) {
-                if idx < items.len() {
+                if idx < items.len()
+                    && !o.borrow().holes.as_ref().is_some_and(|h| h.contains(&idx))
+                {
                     let d = i.new_obj();
                     i.set_data(&d, "value", items[idx].clone());
                     i.set_data(&d, "writable", Value::Bool(true));
@@ -2925,21 +3516,65 @@ fn array_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 fn arr_push(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let _ = i;
-    let mut len = 0;
-    with_arr(this, |items| {
-        items.extend(args.iter().cloned());
-        len = items.len();
-    });
-    Ok(Value::Num(len as f64))
+    if let Value::Obj(o) = this {
+        let mut b = o.borrow_mut();
+        if let ObjKind::Arr(items) = &b.kind {
+            // spec: push starts at the *declared* length
+            let declared = match b.props.get(&PropKey::from_str("length")) {
+                Some(p) => match &p.val {
+                    Value::Num(n) => *n as usize,
+                    _ => 0,
+                },
+                None => 0,
+            };
+            let start = declared.max(items.len());
+            if let ObjKind::Arr(items) = &mut b.kind {
+                if start > items.len() && start <= 8_000_000 {
+                    items.resize(start, Value::Und);
+                }
+                items.extend(args.iter().cloned());
+                return Ok(Value::Num(items.len() as f64));
+            }
+        }
+    }
+    Ok(Value::Und)
 }
 
 fn arr_pop(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let _ = i;
-    let mut out = Value::Und;
-    with_arr(this, |items| {
-        out = items.pop().unwrap_or(Value::Und);
-    });
-    Ok(out)
+    if let Value::Obj(o) = this {
+        let mut b = o.borrow_mut();
+        if let ObjKind::Arr(items) = &b.kind {
+            let declared = match b.props.get(&PropKey::from_str("length")) {
+                Some(p) => match &p.val {
+                    Value::Num(n) => *n as usize,
+                    _ => 0,
+                },
+                None => 0,
+            };
+            let len = declared.max(items.len());
+            if len == 0 {
+                return Ok(Value::Und);
+            }
+            let idx = len - 1;
+            let out = if let ObjKind::Arr(items) = &mut b.kind {
+                if idx < items.len() {
+                    let v = items.get(idx).cloned().unwrap_or(Value::Und);
+                    items.truncate(idx);
+                    v
+                } else {
+                    Value::Und // trailing hole
+                }
+            } else {
+                Value::Und
+            };
+            if let Some(p) = b.props.get_mut(&PropKey::from_str("length")) {
+                p.val = Value::Num(idx as f64);
+            }
+            return Ok(out);
+        }
+    }
+    Ok(Value::Und)
 }
 
 fn arr_shift(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {

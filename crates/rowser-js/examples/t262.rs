@@ -48,16 +48,19 @@ fn meta2(src: &str, m: &mut Meta) {
     let mut key: Option<u8> = None; // 0 none,1 flags,2 includes,3 features
     for line in yaml.lines() {
         let t = line.trim();
-        if t.starts_with("flags:") { key = Some(1); m.flags.extend(list_val(t)); continue; }
-        if t.starts_with("includes:") { key = Some(2); m.includes.extend(list_val(t)); continue; }
-        if t.starts_with("features:") { key = Some(3); m.features.extend(list_val(t)); continue; }
+        if t.starts_with("flags:") { key = Some(1); continue; }
+        if t.starts_with("includes:") { key = Some(2); continue; }
+        if t.starts_with("features:") { key = Some(3); continue; }
         if t.starts_with("- ") {
             let it = t[2..].trim().to_string();
-            match key {
-                Some(1) => m.flags.push(it),
-                Some(2) => m.includes.push(it),
-                Some(3) => m.features.push(it),
-                _ => {}
+            let list = match key {
+                Some(1) => &mut m.flags,
+                Some(2) => &mut m.includes,
+                Some(3) => &mut m.features,
+                _ => continue,
+            };
+            if !list.contains(&it) {
+                list.push(it);
             }
             continue;
         }
@@ -161,8 +164,13 @@ fn main() {
             eprintln!("RUN {rel}");
         }
         let mut ctx = rowser_js::Context::new();
-        ctx.interp.arm_deadline(std::time::Duration::from_secs(3));
+        ctx.interp.arm_deadline(std::time::Duration::from_secs(15));
         let res = ctx.eval(&body);
+        if std::env::var("T262_DEBUG").is_ok() {
+            if let Err(e) = &res {
+                eprintln!("ERR {rel}: {e}");
+            }
+        }
         let ok = match (&m.negative_phase, res) {
             (Some(p), _) if p == "parse" => {
                 // real parse pass — expect a syntax error

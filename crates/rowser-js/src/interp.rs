@@ -330,6 +330,8 @@ pub struct Obj {
     pub kind: ObjKind,
     /// spec [[Extensible]] — false after preventExtensions/seal/freeze
     pub extensible: bool,
+    /// deleted indices on array kinds (holes); `None` when dense
+    pub holes: Option<std::collections::HashSet<usize>>,
 }
 
 #[derive(Clone)]
@@ -380,6 +382,9 @@ pub enum ObjKind {
     /// lazy protocol iterator — Iterator helpers, `Iterator.from` wraps,
     /// zip/concat. Steps the source's own `next` per pull.
     IterLazy(IterLazy),
+    /// sentinel while a lazy iterator's next()/return() is executing —
+    /// reentrant calls throw TypeError (GeneratorResume on running gen)
+    IterBusy,
     /// opaque host data bag (dates etc.)
     Host(Rc<str>),
     Map(Vec<(Value, Value)>),
@@ -411,11 +416,15 @@ pub enum ObjKind {
 pub struct IterLazy {
     pub src: IterSrc,
     pub op: IterOp,
+    /// helper has yielded at least once (suspended-yield) — `return()` on it
+    /// closes while "executing"; before the first yield it closes while
+    /// "completed" (generator state semantics)
+    pub started: bool,
 }
 
 impl IterLazy {
     pub fn id(src: IterSrc) -> Self {
-        IterLazy { src, op: IterOp::Id }
+        IterLazy { src, op: IterOp::Id, started: false }
     }
 }
 
@@ -429,6 +438,8 @@ pub enum IterSrc {
     /// protocol iterator — `next.call(iter)` per step; close calls
     /// `iter.return()` when present
     Proto { iter: Value, next: Value, done: bool },
+    /// live-view array iteration (for-of over arrays reflects mutation)
+    Arr { arr: ObjRef, idx: usize },
 }
 
 /// The transform a lazy iterator applies to its source stream.
@@ -445,9 +456,10 @@ pub enum IterOp {
     Chunks { size: usize },
     Windows { size: usize, partial: bool, buf: std::collections::VecDeque<Value> },
     /// remaining sources after the current one exhausts
-    Cat { rest: std::collections::VecDeque<IterLazy> },
-    Zip { srcs: Vec<IterLazy>, mode: ZipMode, padding: Value },
-    ZipKeyed { cols: Vec<(PropKey, IterLazy)> },
+    /// `Iterator.concat` — arg values wrap lazily as reached
+    Cat { rest: std::collections::VecDeque<Value> },
+    Zip { srcs: Vec<IterLazy>, done: Vec<bool>, mode: ZipMode, padding: Vec<Value> },
+    ZipKeyed { cols: Vec<(PropKey, IterLazy)>, done: Vec<bool>, mode: ZipMode, padding: Vec<Value> },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -549,9 +561,21 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
     match &b.kind {
         ObjKind::Arr(items) => {
             if key == "length" {
-                return Some(Value::Num(items.len() as f64));
+                // sparse arrays: a declared length > items.len() lives as a
+                // shadow prop; effective length is the max of the two
+                let n = match b.props.get(&PropKey::from_str("length")) {
+                    Some(p) => match &p.val {
+                        Value::Num(n) => (*n as usize).max(items.len()),
+                        _ => items.len(),
+                    },
+                    None => items.len(),
+                };
+                return Some(Value::Num(n as f64));
             }
             if let Some(i) = arr_index(key) {
+                if b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                    return None; // hole → not an own prop
+                }
                 return Some(items.get(i).cloned().unwrap_or(Value::Und));
             }
             None
@@ -621,6 +645,7 @@ impl Obj {
             props: PropMap::new(),
             kind,
             extensible: true,
+            holes: None,
         }
     }
     pub fn is_callable(&self) -> bool {
@@ -1604,6 +1629,21 @@ impl Interp {
                     if !writable {
                         return Ok(()); // non-writable: sloppy no-op
                     }
+                    if let ObjKind::Arr(items) = &mut b.kind {
+                        if let PropKey::S(s) = &key {
+                            if s.as_ref() == "length" {
+                                if let Value::Num(n) = v {
+                                    let n = n.max(0.0).min(4294967295.0) as usize;
+                                    if n < items.len() {
+                                        items.truncate(n);
+                                    }
+                                    b.props.get_mut(&key).unwrap().val =
+                                        Value::Num(n as f64);
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
                     b.props.get_mut(&key).unwrap().val = v;
                     return Ok(());
                 }
@@ -1629,13 +1669,31 @@ impl Interp {
                     }
                     if i < items.len() {
                         items[i] = v;
+                        if let Some(h) = &mut b.holes {
+                            h.remove(&i);
+                        }
                     }
                     return Ok(());
                 }
                 if s.as_ref() == "length" {
                     if let Value::Num(n) = v {
-                        let n = (n.max(0.0) as usize).min(8_000_000);
-                        items.resize(n, Value::Und);
+                        let n = n.max(0.0).min(4294967295.0) as usize;
+                        if n < items.len() {
+                            items.truncate(n);
+                        }
+                        // n > items.len() → holes: record the declared
+                        // length without dense allocation
+                        b.props.insert(
+                            PropKey::from_str("length"),
+                            Prop {
+                                val: Value::Num(n as f64),
+                                writable: true,
+                                enumerable: false,
+                                configurable: false,
+                                get: None,
+                                set: None,
+                            },
+                        );
                         return Ok(());
                     }
                 }
@@ -1747,6 +1805,19 @@ impl Interp {
                     if !writable {
                         return Ok(()); // non-writable: sloppy no-op
                     }
+                    if let ObjKind::Arr(items) = &mut b.kind {
+                        if key == "length" {
+                            if let Value::Num(n) = v {
+                                let n = n.max(0.0).min(4294967295.0) as usize;
+                                if n < items.len() {
+                                    items.truncate(n);
+                                }
+                                b.props.get_str_mut(key).unwrap().val =
+                                    Value::Num(n as f64);
+                                return Ok(());
+                            }
+                        }
+                    }
                     b.props.get_str_mut(key).unwrap().val = v;
                     return Ok(());
                 }
@@ -1768,13 +1839,32 @@ impl Interp {
                 }
                 if i < items.len() {
                     items[i] = v;
+                    if let Some(h) = &mut b.holes {
+                        h.remove(&i);
+                    }
                 }
                 return Ok(());
             }
             if key == "length" {
                 if let Value::Num(n) = v {
-                    let n = (n.max(0.0) as usize).min(8_000_000);
-                    items.resize(n, Value::Und);
+                    let n = n.max(0.0).min(4294967295.0) as usize;
+                    if n < items.len() {
+                        items.truncate(n);
+                        if let Some(h) = &mut b.holes {
+                            h.retain(|&h| h < n);
+                        }
+                    }
+                    b.props.insert_str(
+                        "length",
+                        Prop {
+                            val: Value::Num(n as f64),
+                            writable: true,
+                            enumerable: false,
+                            configurable: false,
+                            get: None,
+                            set: None,
+                        },
+                    );
                     return Ok(());
                 }
             }
@@ -1792,7 +1882,39 @@ impl Interp {
         if let ObjKind::Arr(items) = &mut b.kind {
             if let Some(i) = arr_index(key) {
                 if i < items.len() {
-                    items[i] = Value::Und;
+                    // trailing hole → pop; middle → record a hole so the
+                    // slot is no longer an own property
+                    let last = i == items.len() - 1;
+                    if !last {
+                        b.holes.get_or_insert_default().insert(i);
+                    }
+                    if last {
+                        if let ObjKind::Arr(items) = &mut b.kind {
+                            items.pop();
+                        }
+                        // trailing holes get popped too
+                        while {
+                            let tl = match &b.kind {
+                                ObjKind::Arr(it) => it.len(),
+                                _ => 0,
+                            };
+                            tl > 0
+                                && b.holes
+                                    .as_ref()
+                                    .is_some_and(|h| h.contains(&(tl - 1)))
+                        } {
+                            if let ObjKind::Arr(items) = &mut b.kind {
+                                items.pop();
+                            }
+                        }
+                    }
+                    let new_len = match &b.kind {
+                        ObjKind::Arr(it) => it.len(),
+                        _ => 0,
+                    };
+                    if let Some(h) = &mut b.holes {
+                        h.retain(|&h| h < new_len);
+                    }
                     return true;
                 }
             }
@@ -1819,7 +1941,9 @@ impl Interp {
                                 return true;
                             }
                             if let Some(i) = arr_index(s) {
-                                if i < items.len() {
+                                if i < items.len()
+                                    && !b.holes.as_ref().is_some_and(|h| h.contains(&i))
+                                {
                                     return true;
                                 }
                             }
@@ -1874,7 +1998,36 @@ impl Interp {
             if let PropKey::S(s) = key {
                 if let Some(i) = arr_index(s) {
                     if i < items.len() {
-                        items[i] = Value::Und;
+                        let last = i == items.len() - 1;
+                        if !last {
+                            b.holes.get_or_insert_default().insert(i);
+                        }
+                        if last {
+                            if let ObjKind::Arr(items) = &mut b.kind {
+                                items.pop();
+                            }
+                            while {
+                                let tl = match &b.kind {
+                                    ObjKind::Arr(it) => it.len(),
+                                    _ => 0,
+                                };
+                                tl > 0
+                                    && b.holes
+                                        .as_ref()
+                                        .is_some_and(|h| h.contains(&(tl - 1)))
+                            } {
+                                if let ObjKind::Arr(items) = &mut b.kind {
+                                    items.pop();
+                                }
+                            }
+                        }
+                        let new_len = match &b.kind {
+                            ObjKind::Arr(it) => it.len(),
+                            _ => 0,
+                        };
+                        if let Some(h) = &mut b.holes {
+                            h.retain(|&h| h < new_len);
+                        }
                         return true;
                     }
                 }
@@ -2218,7 +2371,9 @@ impl Interp {
                         };
                         format!("/{src}/{}", re.flags)
                     }
-                    ObjKind::Iter { .. } | ObjKind::IterLazy(_) => "[Iterator]".into(),
+                    ObjKind::Iter { .. } | ObjKind::IterLazy(_) | ObjKind::IterBusy => {
+                        "[Iterator]".into()
+                    }
                     ObjKind::Map(m) => format!("Map({})", m.len()),
                     ObjKind::Set(s) => format!("Set({})", s.len()),
                     ObjKind::Host(tag) => format!("[{tag}]"),
@@ -3186,7 +3341,9 @@ impl Interp {
             Stmt::ForOf { left, right, body } => {
                 let my_label = self.pending_label.take();
                 let rv = self.eval_expr(right, env)?;
-                let items = self.iter_values(&rv)?;
+                // spec: lazy protocol iteration — `next()` per step,
+                // IteratorClose on every abrupt completion
+                let mut lz = crate::builtins::for_of_iter(self, &rv)?;
                 // `let`/`const` loop targets need a per-loop scope, as does
                 // a lexical decl in single-statement body position; `var`
                 // and expression targets resolve identically on `env`.
@@ -3203,23 +3360,44 @@ impl Interp {
                     _ => env,
                 };
                 let mut last = Value::Und;
-                for it in items {
-                    self.bind_for_target(scope, left, it)?;
-                    match self.exec_stmt(body, scope)? {
-                        Completion::Normal(v) => last = v,
-                        Completion::Empty => {}
-                        Completion::Break(l) => {
+                loop {
+                    let it = match crate::builtins::iter_lazy_step(self, &mut lz) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => break,
+                        Err(e) => {
+                            // IfAbruptCloseIterator — close errors swallowed
+                            let _ = crate::builtins::iter_lazy_close(self, &mut lz);
+                            return Err(e);
+                        }
+                    };
+                    if let Err(e) = self.bind_for_target(scope, left, it) {
+                        let _ = crate::builtins::iter_lazy_close(self, &mut lz);
+                        return Err(e);
+                    }
+                    match self.exec_stmt(body, scope) {
+                        Ok(Completion::Normal(v)) => last = v,
+                        Ok(Completion::Empty) => {}
+                        Ok(Completion::Break(l)) => {
+                            let _ = crate::builtins::iter_lazy_close(self, &mut lz);
                             if l.is_some() {
                                 return Ok(Completion::Break(l));
                             }
                             return Ok(Completion::Normal(last));
                         }
-                        Completion::Continue(l) => {
+                        Ok(Completion::Continue(l)) => {
                             if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
+                                let _ = crate::builtins::iter_lazy_close(self, &mut lz);
                                 return Ok(Completion::Continue(l));
                             }
                         }
-                        r => return Ok(r),
+                        Ok(r) => {
+                            let _ = crate::builtins::iter_lazy_close(self, &mut lz);
+                            return Ok(r);
+                        }
+                        Err(e) => {
+                            let _ = crate::builtins::iter_lazy_close(self, &mut lz);
+                            return Err(e);
+                        }
                     }
                 }
                 Ok(Completion::Normal(last))
@@ -3769,6 +3947,8 @@ impl Interp {
                                     let mut b = o.borrow_mut();
                                     let ent =
                                         b.props.or_insert_with(key, || Prop::accessor(None, None));
+                                    // literal accessors are enumerable
+                                    ent.enumerable = true;
                                     if matches!(&p.val, PropVal::Get(_)) {
                                         ent.get = Some(f);
                                     } else {
