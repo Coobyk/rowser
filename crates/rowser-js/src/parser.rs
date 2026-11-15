@@ -129,6 +129,7 @@ impl Parser {
             Tok::Kw(k) => format!("`{}`", k.name()),
             Tok::Punct(p) => format!("`{p}`"),
             Tok::Num(n) => format!("`{n}`"),
+            Tok::BigInt(n) => format!("`{n}n`"),
             Tok::Str(s) => format!("`\"{s}\"`"),
             Tok::Template(_) => "template literal".into(),
             Tok::Regex { pattern, flags } => format!("`/{pattern}/{flags}`"),
@@ -1775,6 +1776,10 @@ impl Parser {
                 self.check_octal()?;
                 self.next();
                 Ok(Expr::Num(n))
+            }
+            Tok::BigInt(n) => {
+                self.next();
+                Ok(Expr::BigInt(n))
             }
             Tok::Str(s) => {
                 self.check_octal()?;

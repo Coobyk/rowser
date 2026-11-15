@@ -317,7 +317,7 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
                 }
                 _ => {
                     // array-like / iterable
-                    let items = if i.has_prop(&src, &PropKey::Sym(SYM_ITERATOR)) {
+                    let items = if i.has_prop(&src, &PropKey::Sym(SYM_ITERATOR))? {
                         i.iter_values(&src)?
                     } else {
                         to_elems(i, &src)?
@@ -397,7 +397,7 @@ fn ta_kind_of_proto(i: &mut Interp, proto: &Option<ObjRef>) -> Option<TAK> {
 fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
     let proto = _t_proto_of_ctor(i, t);
     let kind = ta_kind_of_proto(i, &proto).unwrap_or(TAK::U8);
-    let items = if i.has_prop(&arg(args, 0), &PropKey::Sym(SYM_ITERATOR)) {
+    let items = if i.has_prop(&arg(args, 0), &PropKey::Sym(SYM_ITERATOR))? {
         i.iter_values(&arg(args, 0))?
     } else {
         to_elems(i, &arg(args, 0))?
@@ -2255,7 +2255,7 @@ fn sp_ctor_f(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         }
         Value::Obj(_) => {
             // iterable of pairs or record
-            if i.has_prop(&src, &PropKey::Sym(SYM_ITERATOR)) {
+            if i.has_prop(&src, &PropKey::Sym(SYM_ITERATOR))? {
                 let mut pairs = Vec::new();
                 for e in i.iter_values(&src)? {
                     let kv = to_elems(i, &e)?;

@@ -70,7 +70,7 @@ fn meta2(src: &str, m: &mut Meta) {
 }
 
 const SKIP_FEATURES: &[&str] = &[
-    "BigInt", "Proxy", "TypedArray",
+    "TypedArray",
     "SharedArrayBuffer", "Atomics", "FinalizationRegistry", "WeakRef",
     "Intl", "Temporal", "Float16Array", "import.meta", "dynamic-import",
     "import-attributes", "explicit-resource-management",

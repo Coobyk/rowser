@@ -5,6 +5,8 @@ use crate::Error;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Num(f64),
+    /// bigint literal `123n` (magnitude kept as f64 — no true BigInt yet)
+    BigInt(f64),
     Str(String),
     /// template literal: alternating string parts and raw expression sources
     Template(Vec<TemplPart>),
@@ -289,7 +291,7 @@ impl Lexer {
             } else if c.is_ascii_digit()
                 || (c == '.' && self.peek2().is_some_and(|d| d.is_ascii_digit()))
             {
-                Tok::Num(self.number()?)
+                self.number()?
             } else if is_ident_start(c) || c == '\\' {
                 let name = self.ident()?;
                 match keyword(&name) {
@@ -446,7 +448,7 @@ impl Lexer {
         Some(v)
     }
 
-    fn number(&mut self) -> Result<f64, Error> {
+    fn number(&mut self) -> Result<Tok, Error> {
         let mut s = String::new();
         if self.peek() == Some('0') {
             match self.peek2() {
@@ -465,7 +467,7 @@ impl Lexer {
                         }
                     }
                     return u64::from_str_radix(&v, 16)
-                        .map(|n| n as f64)
+                        .map(|n| Tok::Num(n as f64))
                         .map_err(|_| self.err("bad hex literal"));
                 }
                 Some('o') | Some('O') => {
@@ -482,7 +484,7 @@ impl Lexer {
                         }
                     }
                     return u64::from_str_radix(&v, 8)
-                        .map(|n| n as f64)
+                        .map(|n| Tok::Num(n as f64))
                         .map_err(|_| self.err("bad octal literal"));
                 }
                 Some('b') | Some('B') => {
@@ -499,7 +501,7 @@ impl Lexer {
                         }
                     }
                     return u64::from_str_radix(&v, 2)
-                        .map(|n| n as f64)
+                        .map(|n| Tok::Num(n as f64))
                         .map_err(|_| self.err("bad binary literal"));
                 }
                 _ => {}
@@ -567,7 +569,7 @@ impl Lexer {
                 digits.parse::<f64>().ok()
             };
             return match v {
-                Some(n) => self.number_tail_ok(n),
+                Some(n) => self.number_tail_ok(Tok::Num(n)),
                 None => Err(self.err("bad number literal")),
             };
         }
@@ -597,9 +599,15 @@ impl Lexer {
                     }
                 }
                 'n' => {
-                    // bigint literal — treat as number for now
+                    // bigint literal — decimal integers only
                     self.bump();
-                    break;
+                    if seen_dot || seen_exp {
+                        return Err(self.err("bigint literal must be an integer"));
+                    }
+                    return s
+                        .parse::<f64>()
+                        .map(Tok::BigInt)
+                        .map_err(|_| self.err("bad bigint literal"));
                 }
                 _ => break,
             }
@@ -607,15 +615,15 @@ impl Lexer {
         self.number_tail(s)
     }
 
-    fn number_tail(&mut self, s: String) -> Result<f64, Error> {
+    fn number_tail(&mut self, s: String) -> Result<Tok, Error> {
         let n = s
             .parse::<f64>()
             .map_err(|_| self.err(format!("bad number literal `{s}`")))?;
-        self.number_tail_ok(n)
+        self.number_tail_ok(Tok::Num(n))
     }
 
     /// after any numeric literal: a letter directly abutting it is an error
-    fn number_tail_ok(&mut self, n: f64) -> Result<f64, Error> {
+    fn number_tail_ok(&mut self, n: Tok) -> Result<Tok, Error> {
         if self.peek().is_some_and(is_ident_start) {
             return Err(self.err("identifier directly after number"));
         }
@@ -1061,6 +1069,7 @@ fn slash_is_regex(prev: Option<&Token>) -> bool {
         None => true,
         // literals / identifiers / `)` `]` `}` `++` `--` end expressions → division
         Some(Tok::Num(_))
+        | Some(Tok::BigInt(_))
         | Some(Tok::Str(_))
         | Some(Tok::Template(_))
         | Some(Tok::Ident(_))

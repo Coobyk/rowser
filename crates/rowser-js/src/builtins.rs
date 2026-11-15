@@ -101,24 +101,48 @@ fn char_val(c: char) -> Value {
 /// virtual index the caller must resolve via `get_prop`.
 /// `[[Enumerable]]` flag of an own prop *right now* — dense array elements
 /// and typed-array indices are enumerable; holes/deleted props are not.
-fn own_prop_enumerable(v: &Value, k: &PropKey) -> bool {
+fn own_prop_enumerable(
+    i: &mut Interp,
+    v: &Value,
+    k: &PropKey,
+) -> Result<bool, Value> {
     let Value::Obj(o) = v else {
-        return false;
+        return Ok(false);
     };
+    if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+        let (t, h) = (target.clone(), handler.clone());
+        return match i.proxy_trap(&h, "getOwnPropertyDescriptor")? {
+            Some(trap) => {
+                let kv = i.key_to_value(k);
+                let r = i.call(&trap, h, vec![t, kv])?;
+                match r {
+                    Value::Und => Ok(false),
+                    Value::Obj(_) => {
+                        let e = i.get_prop_str(&r, "enumerable")?;
+                        Ok(i.to_bool(&e))
+                    }
+                    _ => Err(i.type_err(
+                        "proxy gOPD trap must return object or undefined",
+                    )),
+                }
+            }
+            None => own_prop_enumerable(i, &t, k),
+        };
+    }
     let b = o.borrow();
     if let PropKey::S(s) = k {
         if let Some(n) = arr_index(s) {
-            return match &b.kind {
+            return Ok(match &b.kind {
                 ObjKind::Arr(items) => {
                     n < items.len()
                         && !b.holes.as_ref().is_some_and(|h| h.contains(&n))
                 }
                 ObjKind::Typed { len, .. } => n < *len,
                 _ => b.props.get(k).map(|p| p.enumerable).unwrap_or(false),
-            };
+            });
         }
     }
-    b.props.get(k).map(|p| p.enumerable).unwrap_or(false)
+    Ok(b.props.get(k).map(|p| p.enumerable).unwrap_or(false))
 }
 
 fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
@@ -160,10 +184,32 @@ fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
 
 /// `[[OwnPropertyKeys]]` — all own keys incl non-enumerable, in spec order:
 /// integer-ascending, then strings insertion-order, then symbols.
-fn own_keys_all(v: &Value) -> Vec<PropKey> {
+fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Value> {
     let Value::Obj(o) = v else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+        let (t, h) = (target.clone(), handler.clone());
+        return match i.proxy_trap(&h, "ownKeys")? {
+            Some(trap) => {
+                let r = i.call(&trap, h, vec![t])?;
+                let mut out = Vec::new();
+                for k in i.iter_values(&r)? {
+                    match k {
+                        Value::Str(s) => out.push(PropKey::S(s)),
+                        Value::Sym(id, _) => out.push(PropKey::Sym(id)),
+                        _ => {
+                            return Err(i.type_err(
+                                "proxy ownKeys must return strings or symbols",
+                            ))
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            None => own_keys_all(i, &t),
+        };
+    }
     let b = o.borrow();
     let mut ints: Vec<usize> = Vec::new();
     let mut strs: Vec<PropKey> = Vec::new();
@@ -201,7 +247,7 @@ fn own_keys_all(v: &Value) -> Vec<PropKey> {
     let mut out: Vec<PropKey> = ints.into_iter().map(idx_key).collect();
     out.extend(strs);
     out.extend(syms);
-    out
+    Ok(out)
 }
 
 fn arg(args: &[Value], i: usize) -> Value {
@@ -417,7 +463,7 @@ pub(crate) fn to_elems_sparse(
     let mut out = Vec::new();
     for k in 0..n {
         let key = idx_key(k);
-        if i.has_prop(v, &key) {
+        if i.has_prop(v, &key)? {
             out.push((k, i.get_prop(v, &key)?));
         }
     }
@@ -880,10 +926,66 @@ fn iter_ctor_set(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     )
 }
 
+/// `GeneratorResume` — resume the suspended coroutine with `input`.
+/// A per-resume step budget bounds bodies that loop without yielding;
+/// a `return()` injected as GenAbort unwinds the body to completion.
+fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NResult {
+    let mut coro = {
+        let mut c = cell.borrow_mut();
+        if c.running {
+            return Err(i.type_err("generator is already running"));
+        }
+        if c.done {
+            return match input {
+                GenIn::Return(v) => iter_result(i, v, true),
+                GenIn::Throw(e) => Err(e),
+                GenIn::Next(_) => iter_result(i, Value::Und, true),
+            };
+        }
+        c.running = true;
+        c.coro.take()
+    };
+    let Some(mut coro) = coro else {
+        return iter_result(i, Value::Und, true);
+    };
+    let ret_v = match &input {
+        GenIn::Return(v) => Some(v.clone()),
+        _ => None,
+    };
+    let (ocap, ohit) = (i.gen_cap, i.gen_cap_hit);
+    i.gen_cap = i.steps.saturating_add(crate::interp::GEN_STEP_BUDGET);
+    i.gen_cap_hit = false;
+    let res = coro.resume(input);
+    i.gen_cap = ocap;
+    i.gen_cap_hit = ohit;
+    let mut c = cell.borrow_mut();
+    c.running = false;
+    match res {
+        corosensei::CoroutineResult::Yield(v) => {
+            c.coro = Some(coro);
+            iter_result(i, v, false)
+        }
+        corosensei::CoroutineResult::Return(r) => {
+            c.done = true;
+            match r {
+                Ok(v) => iter_result(i, v, true),
+                Err(e) if is_gen_abort(&e) => {
+                    iter_result(i, ret_v.unwrap_or(Value::Und), true)
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
 fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
         if matches!(o.borrow().kind, ObjKind::IterBusy) {
             return Err(iter_busy_err(i));
+        }
+        if let ObjKind::Gen(cell) = &o.borrow().kind {
+            let cell = cell.clone();
+            return gen_resume(i, &cell, GenIn::Next(arg(_a, 0)));
         }
         if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
             let mut lz = take_lazy(o).expect("checked IterLazy above");
@@ -934,8 +1036,17 @@ pub(crate) fn make_iter_in(items: Vec<Value>, proto: ObjRef) -> Value {
 }
 
 /// `this` must be an object — Iterator helpers require it.
+/// true when `v` is an Object per the spec — our BigInt stand-ins are
+/// primitive values and must not pass object checks
+fn is_spec_obj(v: &Value) -> bool {
+    match v {
+        Value::Obj(o) => !o.borrow().props.contains_key(&PropKey::from_str("__bigint")),
+        _ => false,
+    }
+}
+
 fn iter_this(i: &mut Interp, this: &Value) -> Result<(), Value> {
-    if !matches!(this, Value::Obj(_)) {
+    if !is_spec_obj(this) {
         return Err(i.type_err("Iterator.prototype method called on non-object"));
     }
     Ok(())
@@ -1012,7 +1123,7 @@ pub(crate) enum Flat {
 pub(crate) fn iter_to_lazy(i: &mut Interp, v: &Value, flat: Flat) -> Result<IterLazy, Value> {
     let mut target = v.clone();
     if flat != Flat::Direct {
-        if !matches!(target, Value::Obj(_))
+        if !is_spec_obj(&target)
             && (flat == Flat::RejectStrings || !matches!(target, Value::Str(_)))
         {
             return Err(i.type_err("value is not iterable"));
@@ -1022,7 +1133,7 @@ pub(crate) fn iter_to_lazy(i: &mut Interp, v: &Value, flat: Flat) -> Result<Iter
             Value::Und | Value::Null => {}
             m if i.is_callable(&m) => {
                 target = i.call(&m, target.clone(), Vec::new())?;
-                if !matches!(target, Value::Obj(_)) {
+                if !is_spec_obj(&target) {
                     return Err(i.type_err("@@iterator result is not an object"));
                 }
             }
@@ -1048,7 +1159,7 @@ pub(crate) fn for_of_iter(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> 
             match i.get_prop(v, &PropKey::Sym(SYM_ITERATOR))? {
                 m if i.is_callable(&m) => {
                     let it = i.call(&m, v.clone(), Vec::new())?;
-                    if !matches!(it, Value::Obj(_)) {
+                    if !is_spec_obj(&it) {
                         return Err(i.type_err("@@iterator result is not an object"));
                     }
                     iter_direct(i, &it)
@@ -1061,7 +1172,7 @@ pub(crate) fn for_of_iter(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> 
             match i.get_prop(v, &PropKey::Sym(SYM_ITERATOR))? {
                 m if i.is_callable(&m) => {
                     let it = i.call(&m, v.clone(), Vec::new())?;
-                    if !matches!(it, Value::Obj(_)) {
+                    if !is_spec_obj(&it) {
                         return Err(i.type_err("@@iterator result is not an object"));
                     }
                     iter_direct(i, &it)
@@ -1084,7 +1195,7 @@ fn iter_direct(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
                 .collect();
             return Ok(IterLazy::id(IterSrc::List { items, idx: 0 }));
         }
-        Value::Obj(_) => {}
+        Value::Obj(o) if !o.borrow().props.contains_key(&PropKey::from_str("__bigint")) => {}
         _ => return Err(i.type_err("value is not iterable")),
     }
     let next = i.get_prop(v, &PropKey::from_str("next"))?;
@@ -1675,6 +1786,10 @@ fn iter_ctor(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 /// `%GeneratorPrototype%.return(v)` — eager gen: exhaust the snapshot.
 fn gen_return(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
+        if let ObjKind::Gen(cell) = &o.borrow().kind {
+            let cell = cell.clone();
+            return gen_resume(i, &cell, GenIn::Return(arg(args, 0)));
+        }
         if let ObjKind::Iter { items, idx } = &mut o.borrow_mut().kind {
             *idx = items.len();
         }
@@ -1685,6 +1800,10 @@ fn gen_return(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 /// `%GeneratorPrototype%.throw(e)` — eager gen: exhaust + propagate.
 fn gen_throw(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
+        if let ObjKind::Gen(cell) = &o.borrow().kind {
+            let cell = cell.clone();
+            return gen_resume(i, &cell, GenIn::Throw(arg(args, 0)));
+        }
         if let ObjKind::Iter { items, idx } = &mut o.borrow_mut().kind {
             *idx = items.len();
         }
@@ -1782,7 +1901,7 @@ fn iter_concat(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 fn iter_zip_mode(i: &mut Interp, opts: &Value) -> Result<(ZipMode, Value), Value> {
     match opts {
         Value::Und => return Ok((ZipMode::Shortest, Value::Und)),
-        Value::Obj(_) => {}
+        _ if is_spec_obj(opts) => {}
         _ => return Err(i.type_err("options must be an object")),
     }
     let mode = match i.get_prop_str(opts, "mode")? {
@@ -1794,7 +1913,7 @@ fn iter_zip_mode(i: &mut Interp, opts: &Value) -> Result<(ZipMode, Value), Value
     };
     let padding = if mode == ZipMode::Longest {
         let p = i.get_prop_str(opts, "padding")?;
-        if !matches!(p, Value::Und | Value::Obj(_)) {
+        if !matches!(p, Value::Und) && !is_spec_obj(&p) {
             return Err(i.type_err("padding must be an object"));
         }
         p
@@ -1811,7 +1930,7 @@ fn iter_zip_padding(
     padding: &Value,
     count: usize,
 ) -> Result<Vec<Value>, Value> {
-    if !matches!(padding, Value::Obj(_)) {
+    if !is_spec_obj(padding) {
         return Ok(Vec::new());
     }
     let m = i.get_prop(padding, &PropKey::Sym(SYM_ITERATOR))?;
@@ -1857,7 +1976,7 @@ fn zip_close_all(i: &mut Interp, outer: &mut IterLazy, srcs: &mut [IterLazy], e:
 /// must be an object (GetIteratorFlattenable per item).
 fn iter_zip(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let iterables = arg(args, 0);
-    if !matches!(iterables, Value::Obj(_)) {
+    if !is_spec_obj(&iterables) {
         return Err(i.type_err("zip argument is not an object"));
     }
     let (mode, padding_v) = iter_zip_mode(i, &arg(args, 1))?;
@@ -1870,7 +1989,7 @@ fn iter_zip(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             // outer's own step error → close only the acquired inners
             Err(e) => return Err(zip_close_inners(i, &mut srcs, e)),
         };
-        if !matches!(it, Value::Obj(_)) {
+        if !is_spec_obj(&it) {
             let e = i.type_err("zip iterable is not an object");
             return Err(zip_close_all(i, &mut outer, &mut srcs, e));
         }
@@ -1901,16 +2020,26 @@ fn iter_zip(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 /// pairs zipped into objects; values must be objects.
 fn iter_zip_keyed(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let obj = arg(args, 0);
-    if !matches!(obj, Value::Obj(_)) {
+    if !is_spec_obj(&obj) {
         return Err(i.type_err("zipKeyed argument is not an object"));
     }
     let (mode, padding_v) = iter_zip_mode(i, &arg(args, 1))?;
     // spec: [[OwnPropertyKeys]] snapshot, then per key GetOwnProperty for the
     // enumerable flag *at that moment* — mutations in earlier getters are seen
-    let keys = own_keys_all(&obj);
+    let keys = own_keys_all(i, &obj)?;
     let mut cols: Vec<(PropKey, IterLazy)> = Vec::with_capacity(keys.len());
     for k in keys {
-        if !own_prop_enumerable(&obj, &k) {
+        let enumerable = match own_prop_enumerable(i, &obj, &k) {
+            Ok(b) => b,
+            // IfAbruptCloseIterators(desc, iters): gOPD abrupt closes the
+            // columns acquired so far, in reverse
+            Err(e) => {
+                let mut d = vec![false; cols.len()];
+                let _ = iter_zip_keyed_close_srcs(i, &mut cols, &mut d);
+                return Err(e);
+            }
+        };
+        if !enumerable {
             continue; // deleted or non-enumerable at check time
         }
         let v = match i.get_prop(&obj, &k) {
@@ -1924,7 +2053,7 @@ fn iter_zip_keyed(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         if matches!(v, Value::Und) {
             continue; // spec: undefined-valued keys produce no column
         }
-        if !matches!(v, Value::Obj(_)) {
+        if !is_spec_obj(&v) {
             let e = i.type_err("zipKeyed value is not an object");
             let mut d = vec![false; cols.len()];
             let _ = iter_zip_keyed_close_srcs(i, &mut cols, &mut d);
@@ -1942,7 +2071,7 @@ fn iter_zip_keyed(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     // spec: zipKeyed padding is per-key `Get(paddingOption, key)` — no
     // iterator; each Get's abrupt closes the acquired columns in reverse
     let mut padding = Vec::with_capacity(cols.len());
-    if mode == ZipMode::Longest && matches!(padding_v, Value::Obj(_)) {
+    if mode == ZipMode::Longest && is_spec_obj(&padding_v) {
         for (k, _) in &cols {
             match i.get_prop(&padding_v, k) {
                 Ok(p) => padding.push(p),
@@ -2554,6 +2683,55 @@ fn install_globals(i: &mut Interp) {
         define_global(i, "Symbol", ctor);
     }
 
+    // -- BigInt -- minimal: `BigInt(x)`/`123n` yield a %BigInt.prototype%
+    // object carrying the magnitude; no bigint arithmetic yet
+    {
+        fn bigint_ctor(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
+            let n = match a.first() {
+                Some(Value::Num(n)) => *n,
+                Some(Value::Str(s)) => {
+                    s.trim().parse::<f64>().unwrap_or(f64::NAN)
+                }
+                _ => f64::NAN,
+            };
+            if n.is_nan() {
+                return Err(i.type_err("cannot convert to BigInt"));
+            }
+            Ok(i.bigint_obj(n))
+        }
+        let ctor = make_ctor(i, "BigInt", bigint_ctor, i.p.bigint.clone());
+        define_global(i, "BigInt", ctor);
+    }
+
+    // -- Proxy -- `new Proxy(target, handler)`; MOP ops consult the
+    // handler's traps and fall back to the target
+    {
+        fn proxy_ctor(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
+            if i.new_target_native.is_none() {
+                return Err(i.type_err(
+                    "Constructor Proxy requires 'new'",
+                ));
+            }
+            let (t, h) = (arg(a, 0), arg(a, 1));
+            if !matches!(t, Value::Obj(_)) || !matches!(h, Value::Obj(_)) {
+                return Err(i.type_err(
+                    "Cannot create proxy with a non-object as target or handler",
+                ));
+            }
+            Ok(Value::Obj(Rc::new(RefCell::new(Obj::new(
+                None,
+                ObjKind::Proxy {
+                    target: t,
+                    handler: h,
+                },
+            )))))
+        }
+        // the ctor returns its own object so .prototype is only the
+        // IsConstructor marker — it must stay for `new Proxy()` to work
+        let ctor = make_ctor(i, "Proxy", proxy_ctor, i.p.func.clone());
+        define_global(i, "Proxy", ctor);
+    }
+
     // -- RegExp --
     {
         let ctor = make_ctor(i, "RegExp", regexp_ctor, i.p.regexp.clone());
@@ -2879,8 +3057,10 @@ fn install_globals(i: &mut Interp) {
         method(i, &r, "has", reflect_has);
         method(i, &r, "deleteProperty", reflect_delete);
         method(i, &r, "ownKeys", reflect_own_keys);
+        method(i, &r, "getOwnPropertyDescriptor", obj_get_own_prop_desc);
+        method(i, &r, "defineProperty", reflect_define_property);
         method(i, &r, "getPrototypeOf", obj_get_prototype_of);
-        method(i, &r, "setPrototypeOf", obj_set_prototype_of);
+        method(i, &r, "setPrototypeOf", reflect_set_prototype_of);
         method(i, &r, "apply", reflect_apply);
         method(i, &r, "construct", reflect_construct);
         define_global(i, "Reflect", Value::Obj(r));
@@ -3022,12 +3202,28 @@ fn obj_value_of(_i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 fn obj_get_proto(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let _ = i;
     match this {
-        Value::Obj(o) => Ok(match o.borrow().proto.clone() {
-            Some(p) => Value::Obj(p),
-            None => Value::Null,
-        }),
+        Value::Obj(o) => {
+            if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+                let (t, h) = (target.clone(), handler.clone());
+                return match i.proxy_trap(&h, "getPrototypeOf")? {
+                    Some(trap) => {
+                        let r = i.call(&trap, h, vec![t])?;
+                        match r {
+                            Value::Obj(_) | Value::Null => Ok(r),
+                            _ => Err(i.type_err(
+                                "proxy getPrototypeOf must return object or null",
+                            )),
+                        }
+                    }
+                    None => obj_get_proto(i, &t, &[]),
+                };
+            }
+            Ok(match o.borrow().proto.clone() {
+                Some(p) => Value::Obj(p),
+                None => Value::Null,
+            })
+        }
         _ => Ok(Value::Und),
     }
 }
@@ -3051,7 +3247,23 @@ fn proto_cycle(o: &ObjRef, p: &ObjRef) -> bool {
 }
 
 fn obj_set_proto(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let _ = i;
+    if let Value::Obj(o) = this {
+        if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+            let (t, h) = (target.clone(), handler.clone());
+            return match i.proxy_trap(&h, "setPrototypeOf")? {
+                Some(trap) => {
+                    let r = i.call(&trap, h, vec![t, arg(args, 0)])?;
+                    if !i.to_bool(&r) {
+                        return Err(i.type_err(
+                            "proxy setPrototypeOf trap returned falsy",
+                        ));
+                    }
+                    Ok(Value::Und)
+                }
+                None => obj_set_proto(i, &t, args),
+            };
+        }
+    }
     if let (Value::Obj(o), v) = (this, &arg(args, 0)) {
         match v {
             // __proto__ set silently ignores a cycle-forming value
@@ -3065,7 +3277,7 @@ fn obj_set_proto(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 /// `Object.getOwnPropertyNames` — own string keys incl non-enumerable.
 fn obj_get_own_prop_names(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let keys = own_keys_all(&arg(args, 0))
+    let keys = own_keys_all(i, &arg(args, 0))?
         .into_iter()
         .filter_map(|k| match k {
             PropKey::S(s) => Some(Value::Str(s)),
@@ -3077,7 +3289,7 @@ fn obj_get_own_prop_names(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult
 
 /// `Reflect.ownKeys` — all own keys incl symbols.
 fn reflect_own_keys(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let keys = own_keys_all(&arg(args, 0))
+    let keys = own_keys_all(i, &arg(args, 0))?
         .into_iter()
         .map(|k| match k {
             PropKey::S(s) => Value::Str(s),
@@ -3173,7 +3385,7 @@ fn read_desc_prop(i: &mut Interp, desc: &Value, name: &str) -> Result<(bool, Val
 
 fn obj_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let target = arg(args, 0);
-    let Value::Obj(o) = &target else {
+    let Value::Obj(o) = target.clone() else {
         return Err(i.type_err("Object.defineProperty called on non-object"));
     };
     let key = i.to_propkey(&arg(args, 1))?;
@@ -3181,7 +3393,29 @@ fn obj_define_property(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     if !matches!(desc, Value::Obj(_)) {
         return Err(i.type_err("Property description must be an object"));
     }
-    define_prop_from_desc(i, o, key, &desc)?;
+    if let ObjKind::Proxy { target: tg, handler } = o.borrow().kind.clone() {
+        let (tg, h) = (tg, handler);
+        return match i.proxy_trap(&h, "defineProperty")? {
+            Some(trap) => {
+                let r =
+                    i.call(&trap, h, vec![tg, i.key_to_value(&key), desc])?;
+                if !i.to_bool(&r) {
+                    return Err(i.type_err(
+                        "proxy defineProperty trap returned falsy",
+                    ));
+                }
+                Ok(target)
+            }
+            None => match &tg {
+                Value::Obj(to) => {
+                    define_prop_from_desc(i, to, key, &arg(args, 2))?;
+                    Ok(target)
+                }
+                _ => Err(i.type_err("proxy target is not an object")),
+            },
+        };
+    }
+    define_prop_from_desc(i, &o, key, &desc)?;
     Ok(target)
 }
 
@@ -3364,6 +3598,21 @@ fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
     let Value::Obj(o) = &v else {
         return Ok(Value::Und);
     };
+    if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+        let (t, h) = (target.clone(), handler.clone());
+        return match i.proxy_trap(&h, "getOwnPropertyDescriptor")? {
+            Some(trap) => {
+                let r = i.call(&trap, h, vec![t, i.key_to_value(&key)])?;
+                match r {
+                    Value::Und | Value::Obj(_) => Ok(r),
+                    _ => Err(i.type_err(
+                        "proxy gOPD trap must return object or undefined",
+                    )),
+                }
+            }
+            None => obj_get_own_prop_desc(i, &Value::Und, &[t, arg(args, 1)]),
+        };
+    }
     // array index/length
     if let ObjKind::Arr(items) = &o.borrow().kind {
         if let PropKey::S(s) = &key {
@@ -3429,8 +3678,25 @@ fn obj_get_own_prop_descs(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult
 }
 
 fn obj_get_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let _ = i;
-    match arg(args, 0) {
+    let v = arg(args, 0);
+    if let Value::Obj(o) = &v {
+        if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+            let (t, h) = (target.clone(), handler.clone());
+            return match i.proxy_trap(&h, "getPrototypeOf")? {
+                Some(trap) => {
+                    let r = i.call(&trap, h, vec![t])?;
+                    match r {
+                        Value::Obj(_) | Value::Null => Ok(r),
+                        _ => Err(i.type_err(
+                            "proxy getPrototypeOf must return object or null",
+                        )),
+                    }
+                }
+                None => obj_get_prototype_of(i, &Value::Und, &[t]),
+            };
+        }
+    }
+    match v {
         Value::Obj(o) => Ok(match o.borrow().proto.clone() {
             Some(p) => Value::Obj(p),
             None => Value::Null,
@@ -3441,6 +3707,31 @@ fn obj_get_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 fn obj_set_prototype_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let t = arg(args, 0);
+    let proxy_parts = if let Value::Obj(o) = &t {
+        match o.borrow().kind.clone() {
+            ObjKind::Proxy { target, handler } => Some((target, handler)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some((tg, h)) = proxy_parts {
+        {
+            return match i.proxy_trap(&h, "setPrototypeOf")? {
+                Some(trap) => {
+                    let r =
+                        i.call(&trap, h, vec![tg, arg(args, 1)])?;
+                    if !i.to_bool(&r) {
+                        return Err(i.type_err(
+                            "proxy setPrototypeOf trap returned falsy",
+                        ));
+                    }
+                    Ok(t)
+                }
+                None => obj_set_prototype_of(i, &Value::Und, &[tg, arg(args, 1)]),
+            };
+        }
+    }
     if let (Value::Obj(o), v) = (&t, &arg(args, 1)) {
         if !o.borrow().extensible {
             return Err(i.type_err(
@@ -3921,12 +4212,12 @@ fn arr_splice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 i.set_prop(this, PropKey::from_str(&k.to_string()), v.clone())?
             }
             None => {
-                i.delete_prop(this, &PropKey::from_str(&k.to_string()));
+                i.delete_prop(this, &PropKey::from_str(&k.to_string()))?;
             }
         }
     }
     for k in new_len..len {
-        i.delete_prop(this, &PropKey::from_str(&k.to_string()));
+        i.delete_prop(this, &PropKey::from_str(&k.to_string()))?;
     }
     i.set_prop(
         this,
@@ -5408,7 +5699,10 @@ fn symbol_for(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 fn symbol_key_for(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let _ = i;
     match arg(args, 0) {
-        Value::Sym(_, d) => Ok(Value::Str(Rc::from(d.as_ref()))),
+        // only Symbol.for-registry ids (>= 1_000_000) have a key
+        Value::Sym(id, d) if id >= 1_000_000 => {
+            Ok(Value::Str(Rc::from(d.as_ref())))
+        }
         _ => Ok(Value::Und),
     }
 }
@@ -7401,12 +7695,27 @@ fn reflect_set(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 fn reflect_has(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let k = i.to_propkey(&arg(args, 1))?;
-    Ok(Value::Bool(i.has_prop(&arg(args, 0), &k)))
+    Ok(Value::Bool(i.has_prop(&arg(args, 0), &k)?))
 }
 
 fn reflect_delete(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let k = i.to_propkey(&arg(args, 1))?;
-    Ok(Value::Bool(i.delete_prop(&arg(args, 0), &k)))
+    Ok(Value::Bool(i.delete_prop(&arg(args, 0), &k)?))
+}
+
+// Reflect.defineProperty/setPrototypeOf return booleans instead of throwing
+fn reflect_define_property(i: &mut Interp, t: &Value, args: &[Value]) -> NResult {
+    match obj_define_property(i, t, args) {
+        Ok(_) => Ok(Value::Bool(true)),
+        Err(_) => Ok(Value::Bool(false)),
+    }
+}
+
+fn reflect_set_prototype_of(i: &mut Interp, t: &Value, args: &[Value]) -> NResult {
+    match obj_set_prototype_of(i, t, args) {
+        Ok(_) => Ok(Value::Bool(true)),
+        Err(_) => Ok(Value::Bool(false)),
+    }
 }
 
 fn reflect_apply(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {

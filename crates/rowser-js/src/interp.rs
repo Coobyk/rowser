@@ -407,6 +407,46 @@ pub enum ObjKind {
         off: usize,
         len: usize,
     },
+    /// Proxy: target + handler objects; every MOP op consults the
+    /// handler's trap first and falls back to the target when absent
+    Proxy {
+        target: Value,
+        handler: Value,
+    },
+    /// suspended generator — the body runs on a coroutine stack and
+    /// `yield` parks it mid-execution
+    Gen(Rc<RefCell<GenCell>>),
+}
+
+/// what `next(v)`/`return(v)`/`throw(e)` send into a suspended generator
+#[derive(Clone)]
+pub enum GenIn {
+    Next(Value),
+    Return(Value),
+    Throw(Value),
+}
+
+/// generator body completion: Ok = `return` value, Err = thrown/aborted
+pub type GenRet = Result<Value, Value>;
+pub type GenCoro = corosensei::Coroutine<GenIn, Value, GenRet>;
+
+pub struct GenCell {
+    /// taken out during resume so a reentrant `next()` sees `running`
+    /// instead of tripping a RefCell double-borrow
+    pub coro: Option<GenCoro>,
+    pub running: bool,
+    /// completed — next() → {value: undefined, done: true}
+    pub done: bool,
+}
+
+/// sentinel error value — a `return()` injected at a suspended yield
+/// unwinds the body as an abrupt completion user try/catch can't grab
+pub const GEN_ABORT_ID: u64 = u64::MAX;
+pub fn gen_abort_v() -> Value {
+    Value::Sym(GEN_ABORT_ID, Rc::from("generator abort"))
+}
+pub fn is_gen_abort(v: &Value) -> bool {
+    matches!(v, Value::Sym(id, _) if *id == GEN_ABORT_ID)
 }
 
 /// Lazy-iterator state machine. `src` pulls raw values; `op` transforms.
@@ -653,7 +693,14 @@ impl Obj {
         }
     }
     pub fn is_callable(&self) -> bool {
-        matches!(self.kind, ObjKind::Func(_) | ObjKind::Bound { .. })
+        match &self.kind {
+            ObjKind::Func(_) | ObjKind::Bound { .. } => true,
+            // proxies forward callability to their target
+            ObjKind::Proxy { target, .. } => {
+                matches!(target, Value::Obj(t) if t.borrow().is_callable())
+            }
+            _ => false,
+        }
     }
 }
 
@@ -768,6 +815,8 @@ pub struct Protos {
     pub regexp: ObjRef,
     pub arraybuffer: ObjRef,
     pub global: ObjRef,
+    /// %BigInt.prototype% — minimal BigInt: values are Ord objects here
+    pub bigint: ObjRef,
 }
 
 pub struct Interp {
@@ -827,13 +876,16 @@ pub struct Interp {
     pub eval_fn: Option<Value>,
     /// eager-generator yield collectors: `function*` bodies push one Vec
     /// per running generator call; `$yield` appends to the top.
-    pub gen_stack: Vec<Vec<Value>>,
+    /// yielder stack of in-flight generator coroutines — `$yield` suspends
+    /// the innermost one. Raw pointers are only dereferenced while the
+    /// owning coroutine is on-stack inside a resume call.
+    pub gen_yielders: Vec<*const corosensei::Yielder<GenIn, Value>>,
     /// step budget for the innermost running generator body (infinite
     /// `for(;;) yield` bodies are cut off); `u64::MAX` = no active gen.
-    gen_cap: u64,
+    pub(crate) gen_cap: u64,
     /// set when `gen_cap` tripped — the gen call boundary converts the
     /// resulting unwind into "return what was collected"
-    gen_cap_hit: bool,
+    pub(crate) gen_cap_hit: bool,
     /// NewTarget while a native constructor body runs — `Some(f)` when
     /// `f` was `new`-ed without an explicit newTarget; `None` for calls.
     /// Lets natives implement "NewTarget === active function" checks
@@ -848,7 +900,7 @@ const MAX_DEPTH: usize = 400;
 
 /// Statement budget per eager `function*` body — bounds infinite
 /// `for(;;) yield` sources at ~1M statements (~500K collected items).
-const GEN_STEP_BUDGET: u64 = 1_000_000;
+pub(crate) const GEN_STEP_BUDGET: u64 = 1_000_000;
 
 impl Interp {
     pub fn new() -> Interp {
@@ -881,6 +933,7 @@ impl Interp {
                 regexp: mk(Some(obj.clone())),
                 arraybuffer: mk(Some(obj.clone())),
                 global: mk(Some(obj.clone())),
+                bigint: mk(Some(obj.clone())),
                 obj,
                 func,
             },
@@ -909,7 +962,7 @@ impl Interp {
             fn_hoist: FxMap::default(),
             slice_hoist: FxMap::default(),
             eval_fn: None,
-            gen_stack: Vec::new(),
+            gen_yielders: Vec::new(),
             gen_cap: u64::MAX,
             gen_cap_hit: false,
             new_target_native: None,
@@ -1229,6 +1282,17 @@ impl Interp {
             ObjKind::Ord,
         )))
     }
+    /// BigInt values are Ord objects on %BigInt.prototype% — enough for
+    /// `typeof`-blind uses (iterator tests, wrappers) until real BigInt
+    /// lands. `typeof` reports 'object', not 'bigint'.
+    pub fn bigint_obj(&self, n: f64) -> Value {
+        let o = Rc::new(RefCell::new(Obj::new(
+            Some(self.p.bigint.clone()),
+            ObjKind::Ord,
+        )));
+        self.set_attr(&o, "__bigint", Value::Num(n), false, false);
+        Value::Obj(o)
+    }
     pub fn new_arr(&self, items: Vec<Value>) -> ObjRef {
         Rc::new(RefCell::new(Obj::new(
             Some(self.p.array.clone()),
@@ -1311,6 +1375,52 @@ impl Interp {
 
     pub fn is_callable(&self, v: &Value) -> bool {
         matches!(v, Value::Obj(o) if o.borrow().is_callable())
+    }
+
+    /// spec GetMethod on a proxy handler: returns the trap fn, `None`
+    /// when absent (→ fall back to the target), TypeError when a
+    /// non-callable value sits in the trap slot.
+    pub(crate) fn proxy_trap(
+        &mut self,
+        handler: &Value,
+        name: &str,
+    ) -> Result<Option<Value>, Value> {
+        match self.get_prop_str(handler, name)? {
+            Value::Und | Value::Null => Ok(None),
+            m if self.is_callable(&m) => Ok(Some(m)),
+            _ => Err(self.type_err("proxy trap is not callable")),
+        }
+    }
+
+    /// PropKey → the JS value traps receive (`"a"` → Str, symbol → Sym)
+    pub fn key_to_value(&self, k: &PropKey) -> Value {
+        match k {
+            PropKey::S(s) => {
+                if let Some(n) = arr_index(s) {
+                    // spec: integer keys arrive as canonical strings
+                    Value::Str(Rc::from(n.to_string().as_str()))
+                } else {
+                    Value::Str(s.clone())
+                }
+            }
+            PropKey::Sym(id) => {
+                let d: &str = match *id {
+                    SYM_ITERATOR => "Symbol.iterator",
+                    SYM_TOPRIMITIVE => "Symbol.toPrimitive",
+                    SYM_TOSTRINGTAG => "Symbol.toStringTag",
+                    SYM_HASINSTANCE => "Symbol.hasInstance",
+                    SYM_MATCH => "Symbol.match",
+                    SYM_REPLACE => "Symbol.replace",
+                    SYM_SPLIT => "Symbol.split",
+                    SYM_SEARCH => "Symbol.search",
+                    SYM_MATCHALL => "Symbol.matchAll",
+                    SYM_IS_CONCAT_SPREADABLE => "Symbol.isConcatSpreadable",
+                    SYM_SPECIES => "Symbol.species",
+                    _ => "",
+                };
+                Value::Sym(*id, Rc::from(d))
+            }
+        }
     }
 
     // -- property access -------------------------------------------------------
@@ -1472,6 +1582,23 @@ impl Interp {
                     return Ok(v);
                 }
                 let b = c.borrow();
+                if let ObjKind::Proxy { target, handler } = &b.kind {
+                    let (t, h, r) =
+                        (target.clone(), handler.clone(), receiver.clone());
+                    drop(b);
+                    return match self.proxy_trap(&h, "get")? {
+                        Some(trap) => self.call(
+                            &trap,
+                            h,
+                            vec![t, self.key_to_value(key), r],
+                        ),
+                        // spec fallback: target.[[Get]](P, Receiver)
+                        None => match t {
+                            Value::Obj(to) => self.obj_get(&to, key, &r),
+                            _ => Ok(Value::Und),
+                        },
+                    };
+                }
                 if let Some(p) = b.props.get(key) {
                     if p.is_accessor() {
                         match &p.get {
@@ -1501,6 +1628,22 @@ impl Interp {
                     return Ok(v);
                 }
                 let b = c.borrow();
+                if let ObjKind::Proxy { target, handler } = &b.kind {
+                    let (t, h, r) =
+                        (target.clone(), handler.clone(), receiver.clone());
+                    drop(b);
+                    return match self.proxy_trap(&h, "get")? {
+                        Some(trap) => self.call(
+                            &trap,
+                            h,
+                            vec![t, Value::Str(Rc::from(key)), r],
+                        ),
+                        None => match t {
+                            Value::Obj(to) => self.obj_get_str(&to, key, &r),
+                            _ => Ok(Value::Und),
+                        },
+                    };
+                }
                 if let Some(p) = b.props.get_str(key) {
                     if p.is_accessor() {
                         match &p.get {
@@ -1567,6 +1710,26 @@ impl Interp {
         v: Value,
         receiver: &Value,
     ) -> Result<(), Value> {
+        // proxy set trap fires before anything else
+        if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+            let (t, h, r) = (target.clone(), handler.clone(), receiver.clone());
+            return match self.proxy_trap(&h, "set")? {
+                Some(trap) => {
+                    let kv = self.key_to_value(&key);
+                    let r2 = self.call(&trap, h, vec![t, kv, v, r])?;
+                    if self.to_bool(&r2) {
+                        Ok(())
+                    } else {
+                        Err(self.type_err("proxy set trap returned falsy"))
+                    }
+                }
+                // spec fallback: target.[[Set]](P, V, Receiver)
+                None => match t {
+                    Value::Obj(to) => self.obj_set(&to, key, v, &r),
+                    _ => Ok(()),
+                },
+            };
+        }
         // integer-indexed writes + read-only virtuals on binary views
         {
             let b = o.borrow();
@@ -1939,25 +2102,37 @@ impl Interp {
         true
     }
 
-    pub fn has_prop(&mut self, base: &Value, key: &PropKey) -> bool {
+    pub fn has_prop(&mut self, base: &Value, key: &PropKey) -> Result<bool, Value> {
         let Value::Obj(o) = base else {
-            return false;
+            return Ok(false);
         };
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
             {
                 let b = c.borrow();
+                if let ObjKind::Proxy { target, handler } = &b.kind {
+                    let (t, h) = (target.clone(), handler.clone());
+                    drop(b);
+                    return match self.proxy_trap(&h, "has")? {
+                        Some(trap) => {
+                            let kv = self.key_to_value(key);
+                            let r = self.call(&trap, h, vec![t, kv])?;
+                            Ok(self.to_bool(&r))
+                        }
+                        None => self.has_prop(&t, key),
+                    };
+                }
                 match &b.kind {
                     ObjKind::Arr(items) => {
                         if let PropKey::S(s) = key {
                             if s.as_ref() == "length" {
-                                return true;
+                                return Ok(true);
                             }
                             if let Some(i) = arr_index(s) {
                                 if i < items.len()
                                     && !b.holes.as_ref().is_some_and(|h| h.contains(&i))
                                 {
-                                    return true;
+                                    return Ok(true);
                                 }
                             }
                         }
@@ -1968,11 +2143,11 @@ impl Interp {
                                 s.as_ref(),
                                 "length" | "byteLength" | "byteOffset" | "buffer"
                             ) {
-                                return true;
+                                return Ok(true);
                             }
                             if let Some(i) = arr_index(s) {
                                 if i < *len {
-                                    return true;
+                                    return Ok(true);
                                 }
                             }
                         }
@@ -1980,32 +2155,43 @@ impl Interp {
                     ObjKind::Bytes(_) => {
                         if let PropKey::S(s) = key {
                             if s.as_ref() == "byteLength" {
-                                return true;
+                                return Ok(true);
                             }
                         }
                     }
                     ObjKind::View { .. } => {
                         if let PropKey::S(s) = key {
                             if matches!(s.as_ref(), "byteLength" | "byteOffset" | "buffer") {
-                                return true;
+                                return Ok(true);
                             }
                         }
                     }
                     _ => {}
                 }
                 if b.props.contains_key(key) {
-                    return true;
+                    return Ok(true);
                 }
             }
             cur = c.borrow().proto.clone();
         }
-        false
+        Ok(false)
     }
 
-    pub fn delete_prop(&mut self, base: &Value, key: &PropKey) -> bool {
+    pub fn delete_prop(&mut self, base: &Value, key: &PropKey) -> Result<bool, Value> {
         let Value::Obj(o) = base else {
-            return true;
+            return Ok(true);
         };
+        if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+            let (t, h) = (target.clone(), handler.clone());
+            return match self.proxy_trap(&h, "deleteProperty")? {
+                Some(trap) => {
+                    let kv = self.key_to_value(key);
+                    let r = self.call(&trap, h, vec![t, kv])?;
+                    Ok(self.to_bool(&r))
+                }
+                None => self.delete_prop(&t, key),
+            };
+        }
         let mut b = o.borrow_mut();
         if let ObjKind::Arr(items) = &mut b.kind {
             if let PropKey::S(s) = key {
@@ -2041,16 +2227,16 @@ impl Interp {
                         if let Some(h) = &mut b.holes {
                             h.retain(|&h| h < new_len);
                         }
-                        return true;
+                        return Ok(true);
                     }
                 }
             }
         }
         if b.props.get(key).is_some_and(|p| !p.configurable) {
-            return false;
+            return Ok(false);
         }
         b.props.remove(key);
-        true
+        Ok(true)
     }
 
     /// enumerable own + inherited string keys (for..in), deduped
@@ -2351,6 +2537,8 @@ impl Interp {
                         format!("[Function {name}]")
                     }
                     ObjKind::Bound { .. } => "[Function bound]".into(),
+                    ObjKind::Proxy { target, .. } => self.inspect(&target, depth),
+            ObjKind::Gen(_) => "[object Generator]".to_string(),
                     ObjKind::Err => {
                         let b = o.borrow();
                         let name = b
@@ -2472,29 +2660,47 @@ impl Interp {
                 }
                 self.apply_hoisted(&h, &scope);
                 if def.is_gen {
-                    // eager generator: run the body now, collecting every
-                    // `$yield` into a snapshot. A step budget cuts off
-                    // infinite `for(;;) yield` bodies — the partial
-                    // snapshot still satisfies consumers that stop early.
-                    let (ocap, ohit) = (self.gen_cap, self.gen_cap_hit);
-                    self.gen_cap = self.steps.saturating_add(GEN_STEP_BUDGET);
-                    self.gen_cap_hit = false;
-                    self.gen_stack.push(Vec::new());
-                    self.depth += 1;
-                    let r = self.exec_block(&def.body, &scope);
-                    self.depth -= 1;
-                    let items = self.gen_stack.pop().unwrap_or_default();
-                    let hit = std::mem::replace(&mut self.gen_cap_hit, ohit);
-                    self.gen_cap = ocap;
-                    if let Err(e) = r {
-                        if !hit {
-                            return Err(e);
-                        }
-                    }
-                    return Ok(crate::builtins::make_iter_in(
-                        items,
-                        self.p.generator.clone(),
-                    ));
+                    // lazy generator: the body runs on a coroutine stack;
+                    // `yield` suspends back to the resumer. The Interp is
+                    // passed by raw pointer — only dereferenced while a
+                    // resume() is on the stack, on this same thread.
+                    let ip = self as *mut Interp;
+                    let scope = scope.clone();
+                    let coro = corosensei::Coroutine::with_stack(
+                        corosensei::stack::DefaultStack::new(8 * 1024 * 1024)
+                            .expect("gen stack"),
+                        move |y: &corosensei::Yielder<GenIn, Value>,
+                              first: GenIn|
+                              -> GenRet {
+                            // GeneratorResumeAbrupt on a suspendedStart
+                            // generator: return()/throw() completes the
+                            // record WITHOUT running the body
+                            match first {
+                                GenIn::Return(v) => return Ok(v),
+                                GenIn::Throw(e) => return Err(e),
+                                GenIn::Next(_) => {}
+                            }
+                            let i = unsafe { &mut *ip };
+                            i.gen_yielders.push(y as *const _);
+                            i.depth += 1;
+                            let r = i.exec_block(&def.body, &scope);
+                            i.depth -= 1;
+                            i.gen_yielders.pop();
+                            match r {
+                                Ok(Completion::Return(v)) => Ok(v),
+                                Ok(_) => Ok(Value::Und),
+                                Err(e) => Err(e),
+                            }
+                        },
+                    );
+                    return Ok(Value::Obj(Rc::new(RefCell::new(Obj::new(
+                        Some(self.p.generator.clone()),
+                        ObjKind::Gen(Rc::new(RefCell::new(GenCell {
+                            coro: Some(coro),
+                            running: false,
+                            done: false,
+                        }))),
+                    )))));
                 }
                 if let Some(e) = &def.arrow_expr {
                     // `(x) => expr` — implicit return
@@ -2522,6 +2728,15 @@ impl Interp {
                 all.extend(args);
                 self.call(&target, thisv, all)
             }
+            ObjKind::Proxy { target, handler } => {
+                match self.proxy_trap(&handler, "apply")? {
+                    Some(trap) => {
+                        let args_arr = Value::Obj(self.new_arr(args));
+                        self.call(&trap, handler, vec![target, this, args_arr])
+                    }
+                    None => self.call(&target, this, args),
+                }
+            }
             _ => Err(self.type_err("value is not a function")),
         }
     }
@@ -2540,6 +2755,7 @@ impl Interp {
                 .obj_get_raw(o, &PropKey::from_str("prototype"))
                 .is_some_and(|p| !matches!(p, Value::Und)),
             ObjKind::Bound { target, .. } => self.is_constructor(target),
+            ObjKind::Proxy { target, .. } => self.is_constructor(target),
             _ => false,
         }
     }
@@ -2560,6 +2776,26 @@ impl Interp {
         }
         let kind = o.borrow().kind.clone();
         match kind {
+            ObjKind::Proxy { target, handler } => {
+                match self.proxy_trap(&handler, "construct")? {
+                    Some(trap) => {
+                        let args_arr = Value::Obj(self.new_arr(args));
+                        let nt = new_target.unwrap_or_else(|| f.clone());
+                        let r = self.call(
+                            &trap,
+                            handler,
+                            vec![target, args_arr, nt],
+                        )?;
+                        if !matches!(r, Value::Obj(_)) {
+                            return Err(self.type_err(
+                                "proxy construct trap must return an object",
+                            ));
+                        }
+                        Ok(r)
+                    }
+                    None => self.construct(&target, args, new_target),
+                }
+            }
             ObjKind::Func(Func::Native { f: nf, name }) => {
                 // natives act as their own ctor (Error, Array(1,2), etc.)
                 // — but only ctors (make_ctor sets `.prototype`); plain
@@ -3498,7 +3734,9 @@ impl Interp {
             } => {
                 let mut res = self.exec_hoisted_block(block, env);
                 if let Err(exc) = res {
-                    if let Some(h) = handler {
+                    if is_gen_abort(&exc) {
+                        res = Err(exc);
+                    } else if let Some(h) = handler {
                         if let Some(p) = param {
                             // `catch (e)` param binds into the catch scope
                             let catch_scope = Scope::new(Some(env.clone()), false);
@@ -3851,6 +4089,7 @@ impl Interp {
     pub fn eval_expr(&mut self, e: &Expr, env: &EnvRef) -> ERes {
         match e {
             Expr::Num(n) => Ok(Value::Num(*n)),
+            Expr::BigInt(n) => Ok(self.bigint_obj(*n)),
             // interned: string literals become refcount bumps, not allocs
             Expr::Str(s) => Ok(Value::Str(self.intern(s))),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
@@ -4175,21 +4414,48 @@ impl Interp {
                     Some(Arg::Expr(e)) => self.eval_expr(e, env)?,
                     _ => Value::Und,
                 };
-                match self.gen_stack.last_mut() {
-                    Some(top) => top.push(v),
-                    None => return Err(self.syntax_err("yield outside generator")),
-                }
-                return Ok(Value::Und);
+                let Some(&y) = self.gen_yielders.last() else {
+                    return Err(self.syntax_err("yield outside generator"));
+                };
+                // park the coroutine; the resumer's input arrives here
+                let input = unsafe { (*y).suspend(v) };
+                return match input {
+                    GenIn::Next(sent) => Ok(sent),
+                    GenIn::Throw(e) => Err(e),
+                    GenIn::Return(_) => Err(gen_abort_v()),
+                };
             }
             if n == "$yieldstar" {
                 let v = match args.first() {
                     Some(Arg::Expr(e)) => self.eval_expr(e, env)?,
                     _ => Value::Und,
                 };
-                let items = self.iter_values(&v)?;
-                match self.gen_stack.last_mut() {
-                    Some(top) => top.extend(items),
-                    None => return Err(self.syntax_err("yield outside generator")),
+                let Some(&y) = self.gen_yielders.last() else {
+                    return Err(self.syntax_err("yield outside generator"));
+                };
+                let mut inner = crate::builtins::for_of_iter(self, &v)?;
+                loop {
+                    match crate::builtins::iter_lazy_step(self, &mut inner) {
+                        Ok(Some(x)) => {
+                            match unsafe { (*y).suspend(x) } {
+                                GenIn::Next(_) => {}
+                                GenIn::Throw(e) => {
+                                    let _ = crate::builtins::iter_lazy_close(
+                                        self, &mut inner,
+                                    );
+                                    return Err(e);
+                                }
+                                GenIn::Return(_) => {
+                                    let _ = crate::builtins::iter_lazy_close(
+                                        self, &mut inner,
+                                    );
+                                    return Err(gen_abort_v());
+                                }
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(e),
+                    }
                 }
                 return Ok(Value::Und);
             }
@@ -4339,7 +4605,7 @@ impl Interp {
                     }
                     let pv = self.eval_expr(prop, env)?;
                     let key = self.to_propkey(&pv)?;
-                    Ok(Value::Bool(self.delete_prop(&ov, &key)))
+                    Ok(Value::Bool(self.delete_prop(&ov, &key)?))
                 }
                 Expr::Ident(_) | Expr::This => Ok(Value::Bool(false)),
                 _ => {
@@ -4438,7 +4704,7 @@ impl Interp {
                     return Err(self.type_err("Cannot use 'in' operator on non-object"));
                 }
                 let key = self.to_propkey(&l)?;
-                Value::Bool(self.has_prop(&r, &key))
+                Value::Bool(self.has_prop(&r, &key)?)
             }
             Instanceof => {
                 let proto = match &r {
@@ -4889,6 +5155,7 @@ fn expr_uses_arguments(e: &Expr) -> bool {
     match e {
         Expr::Ident(n) => n == "arguments",
         Expr::Num(_)
+        | Expr::BigInt(_)
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::Null
