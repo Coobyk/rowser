@@ -509,7 +509,12 @@ pub fn install(i: &mut Interp) {
 
 fn define_global(i: &mut Interp, name: &str, v: Value) {
     i.declare(&i.global.clone(), name, v.clone(), true);
-    // declare() already mirrors to global object
+    // builtins are {writable, non-enumerable, configurable} on the
+    // global object — declare() mirrors as enumerable data, fix attrs
+    let k = PropKey::from_str(name);
+    if let Some(p) = i.p.global.borrow_mut().props.get_mut(&k) {
+        p.enumerable = false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +720,15 @@ fn install_protos(i: &mut Interp) {
         let hp = i.p.iter_helper.clone();
         method(i, &hp, "next", iter_next);
         method(i, &hp, "return", iter_lazy_ret);
+        hp.borrow_mut().props.insert(
+            PropKey::Sym(SYM_TOSTRINGTAG),
+            Prop::data(Value::Str(Rc::from("Iterator Helper"))),
+        );
+        // %WrapForValidIteratorPrototype% — `Iterator.from` wraps; next via
+        // the shared lazy path, return delegates to the [[Iterated]] record
+        let wp = i.p.wrap_iter.clone();
+        method(i, &wp, "next", iter_next);
+        method(i, &wp, "return", wrap_iter_ret);
         // %GeneratorPrototype% — eager generators step a snapshot, so
         // `next` is the Iter stepper; `return`/`throw` finish the snapshot
         let gp = i.p.generator.clone();
@@ -746,7 +760,16 @@ fn install_protos(i: &mut Interp) {
                 }
             }
         }
-        i.set_builtin(&p, "constructor", itctor.clone());
+        // spec: `constructor` is an accessor — get → Iterator; set →
+        // SetterThatIgnoresPrototypeProperties(%Iterator.prototype%)
+        {
+            let g = native(i, "get constructor", iter_ctor_get);
+            let s = native(i, "set constructor", iter_ctor_set);
+            p.borrow_mut().props.insert(
+                PropKey::from_str("constructor"),
+                Prop::accessor(Some(g), Some(s)),
+            );
+        }
         define_global(i, "Iterator", itctor);
     }
 
@@ -799,14 +822,62 @@ fn tag_get_iterator(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Str(Rc::from("Iterator")))
 }
 
-fn tag_set_iterator(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    if let Value::Obj(o) = this {
-        o.borrow_mut().props.insert(
-            PropKey::Sym(SYM_TOSTRINGTAG),
-            Prop::data(arg(args, 0)),
-        );
+/// spec `SetterThatIgnoresPrototypeProperties(home, P, V)`: non-object →
+/// TypeError; `this === home` → TypeError; no own prop → CreateDataProperty;
+/// otherwise `? Set(this, P, V, true)`.
+fn setter_ignores_proto(
+    i: &mut Interp,
+    home: &ObjRef,
+    this: &Value,
+    key: &PropKey,
+    v: Value,
+) -> NResult {
+    let Value::Obj(o) = this else {
+        return Err(i.type_err("setter called on non-object"));
+    };
+    if Rc::ptr_eq(o, home) {
+        return Err(i.type_err("cannot set on %Iterator.prototype%"));
     }
+    let has_own = o.borrow().props.contains_key(key);
+    if !has_own {
+        let mut b = o.borrow_mut();
+        if !b.extensible {
+            return Err(i.type_err("object is not extensible"));
+        }
+        b.props.insert(key.clone(), Prop::data(v));
+        return Ok(Value::Und);
+    }
+    i.set_prop(this, key.clone(), v)?;
     Ok(Value::Und)
+}
+
+fn tag_set_iterator(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let home = i.p.iterator.clone();
+    setter_ignores_proto(
+        i,
+        &home,
+        this,
+        &PropKey::Sym(SYM_TOSTRINGTAG),
+        arg(args, 0),
+    )
+}
+
+/// `get %Iterator.prototype%.constructor` — resolves the `Iterator` ctor
+/// off the global object so rebinding is honored.
+fn iter_ctor_get(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
+    let g = Value::Obj(i.p.global.clone());
+    i.get_prop(&g, &PropKey::from_str("Iterator"))
+}
+
+fn iter_ctor_set(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let home = i.p.iterator.clone();
+    setter_ignores_proto(
+        i,
+        &home,
+        this,
+        &PropKey::from_str("constructor"),
+        arg(args, 0),
+    )
 }
 
 fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -822,8 +893,12 @@ fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             }
             if r.is_err() {
                 // spec: an abrupt step completes the helper — later
-                // next() → done, return() not forwarded to the source
+                // next() → done, return() not forwarded to the source,
+                // pending concat args are never opened
                 lz.src = IterSrc::Empty;
+                if let IterOp::Cat { rest } = &mut lz.op {
+                    rest.clear();
+                }
             }
             put_lazy(o, lz);
             return match r {
@@ -920,26 +995,38 @@ fn make_lazy(i: &mut Interp, lz: IterLazy) -> Value {
     make_lazy_in(lz, i.p.iter_helper.clone())
 }
 
-/// Wrap a value as a lazy source. `flattenable` selects the spec op:
-///   false = GetIteratorDirect — read `next` directly (helpers/terminals)
-///   true  = GetIteratorFlattenable — call `@@iterator` once when present,
-///           then direct-check the result (from/concat/zip/flatMap-inner).
+/// `iter_to_lazy` flattening mode — spec `GetIteratorFlattenable`'s
+/// `stringHandling` argument plus the plain GetIteratorDirect path.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Flat {
+    /// GetIteratorDirect — read `next` directly (helpers/terminals)
+    Direct,
+    /// GetIteratorFlattenable(iterate-strings): `Iterator.from`
+    Strings,
+    /// GetIteratorFlattenable(reject-strings): zip/zipKeyed/flatMap-inner
+    RejectStrings,
+}
+
+/// Wrap a value as a lazy source per the spec ops above.
 /// `next` is stored so every pull shares the object's own consumption state.
-pub(crate) fn iter_to_lazy(i: &mut Interp, v: &Value, flattenable: bool) -> Result<IterLazy, Value> {
+pub(crate) fn iter_to_lazy(i: &mut Interp, v: &Value, flat: Flat) -> Result<IterLazy, Value> {
     let mut target = v.clone();
-    if flattenable {
-        if let Value::Obj(_) = &target {
-            // GetMethod: nullish → absent; non-callable non-nullish → TypeError
-            match i.get_prop(&target, &PropKey::Sym(SYM_ITERATOR))? {
-                Value::Und | Value::Null => {}
-                m if i.is_callable(&m) => {
-                    target = i.call(&m, target.clone(), Vec::new())?;
-                    if !matches!(target, Value::Obj(_)) {
-                        return Err(i.type_err("@@iterator result is not an object"));
-                    }
+    if flat != Flat::Direct {
+        if !matches!(target, Value::Obj(_))
+            && (flat == Flat::RejectStrings || !matches!(target, Value::Str(_)))
+        {
+            return Err(i.type_err("value is not iterable"));
+        }
+        // GetMethod: nullish → absent; non-callable non-nullish → TypeError
+        match i.get_prop(&target, &PropKey::Sym(SYM_ITERATOR))? {
+            Value::Und | Value::Null => {}
+            m if i.is_callable(&m) => {
+                target = i.call(&m, target.clone(), Vec::new())?;
+                if !matches!(target, Value::Obj(_)) {
+                    return Err(i.type_err("@@iterator result is not an object"));
                 }
-                _ => return Err(i.type_err("@@iterator is not callable")),
             }
+            _ => return Err(i.type_err("@@iterator is not callable")),
         }
     }
     iter_direct(i, &target)
@@ -950,7 +1037,7 @@ pub(crate) fn iter_to_lazy(i: &mut Interp, v: &Value, flattenable: bool) -> Resu
 /// get a live-view source, strings iterate chars.
 pub(crate) fn for_of_iter(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
     match v {
-        Value::Str(_) => iter_to_lazy(i, v, false),
+        Value::Str(_) => iter_to_lazy(i, v, Flat::Direct),
         Value::Obj(o) => {
             if matches!(o.borrow().kind, ObjKind::Arr(_)) {
                 return Ok(IterLazy::id(IterSrc::Arr {
@@ -969,7 +1056,19 @@ pub(crate) fn for_of_iter(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> 
                 _ => Err(i.type_err("value is not iterable")),
             }
         }
-        _ => Err(i.type_err("value is not iterable")),
+        // GetV wraps primitives for the @@iterator lookup
+        _ => {
+            match i.get_prop(v, &PropKey::Sym(SYM_ITERATOR))? {
+                m if i.is_callable(&m) => {
+                    let it = i.call(&m, v.clone(), Vec::new())?;
+                    if !matches!(it, Value::Obj(_)) {
+                        return Err(i.type_err("@@iterator result is not an object"));
+                    }
+                    iter_direct(i, &it)
+                }
+                _ => Err(i.type_err("value is not iterable")),
+            }
+        }
     }
 }
 
@@ -997,11 +1096,12 @@ fn iter_direct(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
 }
 
 /// `Return ? IteratorClose(record, err)` — a close error replaces `err`.
+/// `IteratorClose` with a throw completion in flight — every close error
+/// (GetMethod, non-callable, non-object result, throw) is swallowed and the
+/// original error propagates (spec step 5).
 fn iter_close_err(i: &mut Interp, it: &Value, err: Value) -> Value {
-    match i.iter_close_obj(it) {
-        Err(close_err) => close_err,
-        _ => err,
-    }
+    let _ = i.iter_close_obj(it);
+    err
 }
 
 /// pull one value from a source — spec `? IteratorStep(Value)`: every
@@ -1312,13 +1412,19 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
         }
         // flatMap drains its inner source before pulling the outer one
         if let IterOp::FlatMap { inner: Some(in_lz), .. } = &mut lz.op {
-            match iter_lazy_step(i, in_lz)? {
-                Some(v) => return Ok(Some(v)),
-                None => {
+            match iter_lazy_step(i, in_lz) {
+                Ok(Some(v)) => return Ok(Some(v)),
+                Ok(None) => {
                     if let IterOp::FlatMap { inner, .. } = &mut lz.op {
                         *inner = None;
                     }
                     continue;
+                }
+                // spec: an inner step error closes the OUTER iterator
+                // only — the failed inner iterator is not closed
+                Err(e) => {
+                    let _ = iter_src_close(i, &mut lz.src);
+                    return Err(e);
                 }
             }
         }
@@ -1332,9 +1438,22 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
             Some(v) => v,
             None => {
                 if let IterOp::Cat { rest } = &mut lz.op {
-                    if let Some(nx) = rest.pop_front() {
-                        // concat: wrap each arg's iterator as it's reached
-                        let wrapped = iter_to_lazy(i, &nx, true)?;
+                    if let Some((nx, method)) = rest.pop_front() {
+                        // concat: call the pre-fetched @@iterator (or use the
+                        // object itself when the method was absent), then
+                        // GetIteratorDirect — all lazily, as the chain reaches
+                        let it = if matches!(method, Value::Und | Value::Null) {
+                            nx
+                        } else {
+                            let it = i.call(&method, nx, Vec::new())?;
+                            if !matches!(it, Value::Obj(_)) {
+                                return Err(i.type_err(
+                                    "@@iterator result is not an object",
+                                ));
+                            }
+                            it
+                        };
+                        let wrapped = iter_to_lazy(i, &it, Flat::Direct)?;
                         lz.src = wrapped.src;
                         continue;
                     }
@@ -1377,7 +1496,14 @@ pub(crate) fn iter_lazy_step(i: &mut Interp, lz: &mut IterLazy) -> Result<Option
                         return Err(e);
                     }
                 };
-                match iter_to_lazy(i, &r, true) {
+                // flatMap inner must be an object — strings/primitives are
+                // NOT flattened (GetIteratorFlattenable, reject-primitives)
+                if !matches!(r, Value::Obj(_)) {
+                    let e = i.type_err("flatMap result is not an object");
+                    let _ = iter_lazy_close(i, lz);
+                    return Err(e);
+                }
+                match iter_to_lazy(i, &r, Flat::RejectStrings) {
                     Ok(nl) => *inner = Some(Box::new(nl)),
                     Err(e) => {
                         let _ = iter_lazy_close(i, lz);
@@ -1484,7 +1610,7 @@ where
     F: FnMut(&mut Interp, Value) -> Result<bool, Value>,
 {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     let mut steps = 0usize;
     loop {
         steps += 1;
@@ -1496,11 +1622,14 @@ where
             Ok(Some(v)) => match f(i, v) {
                 Ok(true) => {}
                 Ok(false) => {
+                    // early exit is a normal completion — close errors propagate
                     iter_lazy_close(i, &mut lz)?;
                     return Ok(());
                 }
                 Err(e) => {
-                    iter_lazy_close(i, &mut lz)?;
+                    // callback threw → close with throw in flight: swallow
+                    // close errors, propagate the callback's error
+                    let _ = iter_lazy_close(i, &mut lz);
                     return Err(e);
                 }
             },
@@ -1523,7 +1652,23 @@ fn iter_result(i: &mut Interp, v: Value, done: bool) -> NResult {
 /// `new Iterator()` / `class X extends Iterator` — base iterator object
 /// (proto comes from new_target via `construct`); it has no own `next`
 /// so calling `.next()` is a TypeError, per spec.
-fn iter_ctor(_i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+fn iter_ctor(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    // spec: "If NewTarget is undefined or the active function object,
+    // throw a TypeError" — `Iterator()` and `new Iterator()` throw;
+    // `class X extends Iterator` + Reflect.construct with another
+    // NewTarget are legal
+    let ctor = i.get_prop(
+        &Value::Obj(i.p.global.clone()),
+        &PropKey::from_str("Iterator"),
+    );
+    let legal = match (&i.new_target_native, &ctor) {
+        (Some(Value::Obj(nt)), Ok(Value::Obj(c))) => !Rc::ptr_eq(nt, c),
+        (Some(_), _) => true,
+        _ => false,
+    };
+    if !legal {
+        return Err(i.type_err("Iterator is an abstract class"));
+    }
     Ok(this.clone())
 }
 
@@ -1547,25 +1692,83 @@ fn gen_throw(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Err(arg(args, 0))
 }
 
-/// `Iterator.from(obj)` — iterators pass through; `{next}` objects and
-/// iterables get a lazy protocol wrap (spec %WrapForValidIteratorPrototype%).
+/// walk `v`'s prototype chain looking for `target` (OrdinaryHasInstance)
+fn proto_chain_has(v: &Value, target: &ObjRef) -> bool {
+    let Value::Obj(o) = v else {
+        return false;
+    };
+    let mut cur = o.borrow().proto.clone();
+    let mut hops = 0;
+    while let Some(p) = cur {
+        if Rc::ptr_eq(&p, target) {
+            return true;
+        }
+        cur = p.borrow().proto.clone();
+        hops += 1;
+        if hops > 64 {
+            break;
+        }
+    }
+    false
+}
+
+/// `%WrapForValidIteratorPrototype%.return` — GetMethod on the [[Iterated]]
+/// iterator; absent → `{done:true}`; else the raw call result is returned.
+fn wrap_iter_ret(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    if let Value::Obj(o) = this {
+        if let Some(lz) = take_lazy(o) {
+            let base = match &lz.src {
+                IterSrc::Proto { iter, .. } => iter.clone(),
+                _ => Value::Und,
+            };
+            put_lazy(o, lz);
+            if matches!(base, Value::Obj(_)) {
+                let m = i.get_prop(&base, &PropKey::from_str("return"))?;
+                if matches!(m, Value::Und | Value::Null) {
+                    return iter_result(i, Value::Und, true);
+                }
+                if !i.is_callable(&m) {
+                    return Err(i.type_err("iterator return is not a function"));
+                }
+                return i.call(&m, base, Vec::new());
+            }
+        }
+    }
+    // RequireInternalSlot(O, [[Iterated]]) — non-wrapper receivers throw
+    Err(i.type_err("wrapped iterator return called on invalid receiver"))
+}
+
+/// `Iterator.from(obj)` — spec: GetIteratorFlattenable, then
+/// OrdinaryHasInstance(Iterator) passes real iterators through untouched;
+/// everything else gets a %WrapForValidIteratorPrototype% lazy wrap whose
+/// `return` delegates to the underlying iterator's `return`.
 fn iter_from(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
-    let lz = iter_to_lazy(i, &v, true)?;
-    Ok(make_lazy(i, lz))
+    let lz = iter_to_lazy(i, &v, Flat::Strings)?;
+    if let IterSrc::Proto { iter, .. } = &lz.src {
+        if proto_chain_has(iter, &i.p.iterator) {
+            return Ok(iter.clone());
+        }
+    }
+    Ok(make_lazy_in(lz, i.p.wrap_iter.clone()))
 }
 
 /// `Iterator.concat(...iters)` — lazy chain over each argument's iterator
 fn iter_concat(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    // spec: args must be objects (checked at call time); each arg's
-    // @@iterator is invoked lazily as the chain reaches it — `return()`
-    // before that point must not touch the iterable
+    // spec: at call time each arg must be an Object and its @@iterator is
+    // fetched via GetMethod in order (getter effects are observable now);
+    // the method is only *called* lazily as the chain reaches it
     let mut rest = std::collections::VecDeque::with_capacity(args.len());
     for a in args {
         if !matches!(a, Value::Obj(_)) {
             return Err(i.type_err("Iterator.concat argument is not an object"));
         }
-        rest.push_back(a.clone());
+        // spec: GetMethod — undefined/null/non-callable all TypeError
+        let m = match i.get_prop(a, &PropKey::Sym(SYM_ITERATOR))? {
+            m if i.is_callable(&m) => m,
+            _ => return Err(i.type_err("@@iterator is not a function")),
+        };
+        rest.push_back((a.clone(), m));
     }
     Ok(make_lazy(i, IterLazy {
         src: IterSrc::Empty,
@@ -1671,7 +1874,7 @@ fn iter_zip(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             let e = i.type_err("zip iterable is not an object");
             return Err(zip_close_all(i, &mut outer, &mut srcs, e));
         }
-        let s = match iter_to_lazy(i, &it, true) {
+        let s = match iter_to_lazy(i, &it, Flat::RejectStrings) {
             Ok(s) => s,
             // GetIteratorFlattenable abrupt → close inners reverse, outer last
             Err(e) => return Err(zip_close_all(i, &mut outer, &mut srcs, e)),
@@ -1727,7 +1930,7 @@ fn iter_zip_keyed(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             let _ = iter_zip_keyed_close_srcs(i, &mut cols, &mut d);
             return Err(e);
         }
-        match iter_to_lazy(i, &v, true) {
+        match iter_to_lazy(i, &v, Flat::RejectStrings) {
             Ok(s) => cols.push((k, s)),
             Err(e) => {
                 let mut d = vec![false; cols.len()];
@@ -1776,7 +1979,7 @@ fn iter_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         let e = i.range_err("skippedElements out of range");
         return Err(iter_close_err(i, this, e));
     }
-    let mut lz = iter_to_lazy(i, this, false)?;
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     if to_skip > 0.0 {
         lz.op = IterOp::Drop { left: to_skip.min(usize::MAX as f64) as usize };
     }
@@ -1810,7 +2013,7 @@ fn iter_join(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             Err(e) => return Err(iter_close_err(i, this, e)),
         },
     };
-    let mut lz = iter_to_lazy(i, this, false)?;
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     let mut out = String::new();
     let mut steps = 0usize;
     loop {
@@ -1844,29 +2047,40 @@ fn iter_join(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 /// failure closes the record (IfAbruptCloseIterator) — so wrap first, then
 /// validate, closing `lz` on error.
 fn helper_close_err(i: &mut Interp, lz: &mut IterLazy, err: Value) -> Value {
-    match iter_lazy_close(i, lz) {
-        Err(ce) => ce,
-        _ => err,
-    }
+    // IteratorClose with a throw completion in flight — close errors are
+    // swallowed, the original error propagates
+    let _ = iter_lazy_close(i, lz);
+    err
 }
 
-fn helper_num(i: &mut Interp, lz: &mut IterLazy, v: &Value) -> Result<f64, Value> {
+/// validation failure against the placeholder record (before `next` is
+/// read): `IteratorClose` on the object itself, close errors swallowed
+fn helper_arg_close(i: &mut Interp, this: &Value, err: Value) -> Value {
+    let _ = i.iter_close_obj(this);
+    err
+}
+
+fn helper_num(i: &mut Interp, this: &Value, v: &Value) -> Result<f64, Value> {
     match i.to_num(v) {
         Ok(n) => Ok(n),
-        Err(e) => Err(helper_close_err(i, lz, e)),
+        Err(e) => Err(helper_arg_close(i, this, e)),
     }
 }
 
 /// windows/chunks sizes: must already be a Number — `valueOf`/`toString`
 /// are never invoked; integral 1..2^32-1 or RangeError. Close on failure.
-fn helper_window_size(i: &mut Interp, lz: &mut IterLazy, v: &Value) -> Result<usize, Value> {
+fn helper_window_size(i: &mut Interp, this: &Value, v: &Value) -> Result<usize, Value> {
     let Value::Num(n) = v else {
         let e = i.type_err("size must be a Number");
-        return Err(helper_close_err(i, lz, e));
+        return Err(helper_arg_close(i, this, e));
     };
-    if n.fract() != 0.0 || !(1.0..=4294967295.0).contains(n) {
+    if n.fract() != 0.0 {
+        let e = i.type_err("size must be an integral Number");
+        return Err(helper_arg_close(i, this, e));
+    }
+    if !(1.0..=4294967295.0).contains(n) {
         let e = i.range_err("size out of range");
-        return Err(helper_close_err(i, lz, e));
+        return Err(helper_arg_close(i, this, e));
     }
     Ok(*n as usize)
 }
@@ -1875,17 +2089,18 @@ fn helper_window_size(i: &mut Interp, lz: &mut IterLazy, v: &Value) -> Result<us
 /// `undersized` is "only-full" (default) or "allow-partial".
 fn iter_windows(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
-    let size = helper_window_size(i, &mut lz, &arg(args, 0))?;
+    // spec: placeholder record → validate → then GetIteratorDirect
+    let size = helper_window_size(i, this, &arg(args, 0))?;
     let partial = match arg(args, 1) {
         Value::Und => false,
         Value::Str(s) if s.as_ref() == "allow-partial" => true,
         Value::Str(s) if s.as_ref() == "only-full" => false,
         _ => {
             let e = i.type_err("undersized must be \"only-full\" or \"allow-partial\"");
-            return Err(helper_close_err(i, &mut lz, e));
+            return Err(helper_arg_close(i, this, e));
         }
     };
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     lz.op = IterOp::Windows {
         size,
         partial,
@@ -1897,80 +2112,81 @@ fn iter_windows(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 /// `Iterator.prototype.chunks(size)` — lazy non-overlapping chunks
 fn iter_chunks(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
-    let size = helper_window_size(i, &mut lz, &arg(args, 0))?;
+    let size = helper_window_size(i, this, &arg(args, 0))?;
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     lz.op = IterOp::Chunks { size };
     Ok(make_lazy(i, lz))
 }
 
 fn iter_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
         let e = i.type_err("mapper is not a function");
-        return Err(helper_close_err(i, &mut lz, e));
+        return Err(helper_arg_close(i, this, e));
     }
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     lz.op = IterOp::Map { f, n: 0.0 };
     Ok(make_lazy(i, lz))
 }
 
 fn iter_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
         let e = i.type_err("predicate is not a function");
-        return Err(helper_close_err(i, &mut lz, e));
+        return Err(helper_arg_close(i, this, e));
     }
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     lz.op = IterOp::Filter { f, n: 0.0 };
     Ok(make_lazy(i, lz))
 }
 
 fn iter_flat_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
         let e = i.type_err("mapper is not a function");
-        return Err(helper_close_err(i, &mut lz, e));
+        return Err(helper_arg_close(i, this, e));
     }
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     lz.op = IterOp::FlatMap { f, n: 0.0, inner: None };
     Ok(make_lazy(i, lz))
 }
 
 /// take/drop `limit`: ToNumber → NaN → RangeError; >2^53-1 → RangeError;
-/// ToIntegerOrInfinity → <0 → RangeError. All close the record.
-fn helper_limit(i: &mut Interp, lz: &mut IterLazy, v: &Value) -> Result<usize, Value> {
-    let n = helper_num(i, lz, v)?;
+/// ToIntegerOrInfinity → <0 → RangeError. All close the placeholder record.
+fn helper_limit(i: &mut Interp, this: &Value, v: &Value) -> Result<usize, Value> {
+    let n = helper_num(i, this, v)?;
     if n.is_nan() {
         let e = i.range_err("limit must be a number");
-        return Err(helper_close_err(i, lz, e));
+        return Err(helper_arg_close(i, this, e));
     }
     if n.is_finite() && n > 9007199254740991.0 {
         let e = i.range_err("limit out of range");
-        return Err(helper_close_err(i, lz, e));
+        return Err(helper_arg_close(i, this, e));
     }
     let int = n.trunc();
     if int < 0.0 {
         let e = i.range_err("limit must be non-negative");
-        return Err(helper_close_err(i, lz, e));
+        return Err(helper_arg_close(i, this, e));
     }
     Ok(int.min(usize::MAX as f64) as usize)
 }
 
 fn iter_take(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
-    let left = helper_limit(i, &mut lz, &arg(args, 0))?;
+    // spec: placeholder record → validate → then GetIteratorDirect
+    let left = helper_limit(i, this, &arg(args, 0))?;
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     lz.op = IterOp::Take { left };
     Ok(make_lazy(i, lz))
 }
 
 fn iter_drop(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
-    let left = helper_limit(i, &mut lz, &arg(args, 0))?;
+    let left = helper_limit(i, this, &arg(args, 0))?;
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     lz.op = IterOp::Drop { left };
     Ok(make_lazy(i, lz))
 }
@@ -1979,7 +2195,8 @@ fn iter_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
-        return Err(i.type_err("reducer is not a function"));
+        let e = i.type_err("reducer is not a function");
+        return Err(helper_arg_close(i, this, e));
     }
     let mut acc = Value::Und;
     let mut have_acc = false;
@@ -1992,6 +2209,7 @@ fn iter_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         if !have_acc {
             acc = v;
             have_acc = true;
+            idx += 1.0;
             return Ok(true);
         }
         acc = i.call(&f, Value::Und, vec![acc.clone(), v, Value::Num(idx)])?;
@@ -2008,7 +2226,8 @@ fn iter_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
-        return Err(i.type_err("callback is not a function"));
+        let e = i.type_err("callback is not a function");
+        return Err(helper_arg_close(i, this, e));
     }
     let mut idx = 0.0f64;
     iter_each(i, this, |i, v| {
@@ -2023,7 +2242,8 @@ fn iter_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
-        return Err(i.type_err("predicate is not a function"));
+        let e = i.type_err("predicate is not a function");
+        return Err(helper_arg_close(i, this, e));
     }
     let mut idx = 0.0f64;
     let mut all = true;
@@ -2043,7 +2263,8 @@ fn iter_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
-        return Err(i.type_err("predicate is not a function"));
+        let e = i.type_err("predicate is not a function");
+        return Err(helper_arg_close(i, this, e));
     }
     let mut idx = 0.0f64;
     let mut any = false;
@@ -2063,7 +2284,8 @@ fn iter_find(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     iter_this(i, this)?;
     let f = arg(args, 0);
     if !i.is_callable(&f) {
-        return Err(i.type_err("predicate is not a function"));
+        let e = i.type_err("predicate is not a function");
+        return Err(helper_arg_close(i, this, e));
     }
     let mut idx = 0.0f64;
     let mut found = Value::Und;
@@ -2091,7 +2313,7 @@ fn iter_to_array(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 
 fn iter_indexed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     iter_this(i, this)?;
-    let mut lz = iter_to_lazy(i, this, false)?;
+    let mut lz = iter_to_lazy(i, this, Flat::Direct)?;
     lz.op = IterOp::Indexed { n: 0.0 };
     Ok(make_lazy(i, lz))
 }
@@ -2119,10 +2341,14 @@ fn iter_lazy_ret(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
             if let Err(e) = r {
                 return Err(e);
             }
-            return iter_result(i, v, true);
+            // spec: helper return results carry `undefined`, not the
+            // caller's argument (GeneratorResumeAbrupt C.[[Value]])
+            return iter_result(i, Value::Und, true);
         }
     }
-    iter_result(i, v, true)
+    // RequireInternalSlot(O, [[UnderlyingIterator]]) — non-helpers throw
+    let _ = v;
+    Err(i.type_err("Iterator helper return called on invalid receiver"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2673,7 +2899,9 @@ fn make_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: ObjRef) -> Value {
         }),
     )));
     i.set_attr(&o, "name", Value::Str(Rc::from(name)), false, true);
-    i.set_builtin(&o, "prototype", Value::Obj(proto.clone()));
+    i.set_attr(&o, "length", Value::Num(0.0), false, true);
+    // ctor .prototype: {W:false, E:false, C:false}
+    i.set_attr(&o, "prototype", Value::Obj(proto.clone()), false, false);
     i.set_builtin(&proto, "constructor", Value::Obj(o.clone()));
     Value::Obj(o)
 }
@@ -2762,20 +2990,30 @@ fn obj_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         Value::Str(_) => "String",
         Value::Bool(_) => "Boolean",
         Value::Sym(..) => "Symbol",
-        Value::Obj(o) => match &o.borrow().kind {
-            ObjKind::Arr(_) => "Array",
-            ObjKind::Func(_) | ObjKind::Bound { .. } => "Function",
-            ObjKind::Err => "Error",
-            ObjKind::Promise(_) => "Promise",
-            ObjKind::Map(_) => "Map",
-            ObjKind::Set(_) => "Set",
-            ObjKind::Bytes(_) => "ArrayBuffer",
-            ObjKind::Typed { kind, .. } => kind.type_name(),
-            ObjKind::View { .. } => "DataView",
-            _ => "Object",
-        },
+        Value::Obj(o) => {
+            let builtin = match &o.borrow().kind {
+                ObjKind::Arr(_) => "Array",
+                ObjKind::Func(_) | ObjKind::Bound { .. } => "Function",
+                ObjKind::Err => "Error",
+                ObjKind::Promise(_) => "Promise",
+                ObjKind::Map(_) => "Map",
+                ObjKind::Set(_) => "Set",
+                ObjKind::Bytes(_) => "ArrayBuffer",
+                ObjKind::Typed { kind, .. } => kind.type_name(),
+                ObjKind::View { .. } => "DataView",
+                _ => "Object",
+            };
+            // spec: a string-valued @@toStringTag overrides the builtin tag
+            if let Value::Str(t) =
+                i.get_prop(this, &PropKey::Sym(SYM_TOSTRINGTAG))?
+            {
+                return Ok(Value::Str(
+                    Rc::from(format!("[object {t}]").as_str()),
+                ));
+            }
+            builtin
+        }
     };
-    let _ = i;
     Ok(Value::Str(Rc::from(format!("[object {tag}]").as_str())))
 }
 

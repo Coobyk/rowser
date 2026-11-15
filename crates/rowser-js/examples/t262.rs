@@ -94,6 +94,10 @@ const SKIP_FEATURES: &[&str] = &[
 ];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+    if dir.is_file() {
+        if dir.extension().is_some_and(|x| x == "js") { out.push(dir.to_path_buf()); }
+        return;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();

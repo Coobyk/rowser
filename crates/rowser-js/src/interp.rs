@@ -457,7 +457,11 @@ pub enum IterOp {
     Windows { size: usize, partial: bool, buf: std::collections::VecDeque<Value> },
     /// remaining sources after the current one exhausts
     /// `Iterator.concat` — arg values wrap lazily as reached
-    Cat { rest: std::collections::VecDeque<Value> },
+    /// concat: (iterable, its @@iterator method-or-undefined) — GetMethod
+    /// was already run eagerly at call time; only the call is lazy
+    Cat {
+        rest: std::collections::VecDeque<(Value, Value)>,
+    },
     Zip { srcs: Vec<IterLazy>, done: Vec<bool>, mode: ZipMode, padding: Vec<Value> },
     ZipKeyed { cols: Vec<(PropKey, IterLazy)>, done: Vec<bool>, mode: ZipMode, padding: Vec<Value> },
 }
@@ -759,6 +763,8 @@ pub struct Protos {
     pub generator: ObjRef,
     /// %IteratorHelperPrototype% — proto of lazy map/filter/take/… results
     pub iter_helper: ObjRef,
+    /// %WrapForValidIteratorPrototype% — proto of `Iterator.from` wraps
+    pub wrap_iter: ObjRef,
     pub regexp: ObjRef,
     pub arraybuffer: ObjRef,
     pub global: ObjRef,
@@ -828,6 +834,11 @@ pub struct Interp {
     /// set when `gen_cap` tripped — the gen call boundary converts the
     /// resulting unwind into "return what was collected"
     gen_cap_hit: bool,
+    /// NewTarget while a native constructor body runs — `Some(f)` when
+    /// `f` was `new`-ed without an explicit newTarget; `None` for calls.
+    /// Lets natives implement "NewTarget === active function" checks
+    /// (Iterator, Promise-without-new, etc).
+    pub new_target_native: Option<Value>,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -865,6 +876,7 @@ impl Interp {
                 string_iter: mk(Some(iterator.clone())),
                 generator: mk(Some(iterator.clone())),
                 iter_helper: mk(Some(iterator.clone())),
+                wrap_iter: mk(Some(iterator.clone())),
                 iterator,
                 regexp: mk(Some(obj.clone())),
                 arraybuffer: mk(Some(obj.clone())),
@@ -900,6 +912,7 @@ impl Interp {
             gen_stack: Vec::new(),
             gen_cap: u64::MAX,
             gen_cap_hit: false,
+            new_target_native: None,
         }
     }
 
@@ -2578,7 +2591,11 @@ impl Interp {
                     Value::Und
                 };
                 self.depth += 1;
+                let prev_nt = self.new_target_native.replace(
+                    new_target.clone().unwrap_or_else(|| f.clone()),
+                );
                 let r = nf(self, &this, &args);
+                self.new_target_native = prev_nt;
                 self.depth -= 1;
                 match r {
                     Ok(Value::Und) if !matches!(this, Value::Und) => Ok(this),
@@ -2917,41 +2934,7 @@ impl Interp {
                 let m = self.get_prop(v, &PropKey::Sym(SYM_ITERATOR))?;
                 if self.is_callable(&m) {
                     let iter = self.call(&m, v.clone(), Vec::new())?;
-                    let mut out = Vec::new();
-                    loop {
-                        if out.len() > 100_000 {
-                            return Err(self.range_err("iteration limit exceeded"));
-                        }
-                        let next = self.get_prop(&iter, &PropKey::from_str("next"))?;
-                        if !self.is_callable(&next) {
-                            return Err(self.type_err("iterator.next is not a function"));
-                        }
-                        let r = match self.call(&next, iter.clone(), Vec::new()) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                let _ = self.iter_close_obj(&iter);
-                                return Err(e);
-                            }
-                        };
-                        let done = match self.get_prop(&r, &PropKey::from_str("done")) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                let _ = self.iter_close_obj(&iter);
-                                return Err(e);
-                            }
-                        };
-                        if self.to_bool(&done) {
-                            break;
-                        }
-                        match self.get_prop(&r, &PropKey::from_str("value")) {
-                            Ok(val) => out.push(val),
-                            Err(e) => {
-                                let _ = self.iter_close_obj(&iter);
-                                return Err(e);
-                            }
-                        }
-                    }
-                    return Ok(out);
+                    return self.drain_iter(iter);
                 }
                 if let ObjKind::Arr(items) = &o.borrow().kind {
                     return Ok(items.clone());
@@ -2971,8 +2954,57 @@ impl Interp {
                 }
                 Err(self.type_err("value is not iterable"))
             }
-            _ => Err(self.type_err("value is not iterable")),
+            // GetV wraps primitives for the @@iterator lookup; the raw
+            // primitive stays `this` when the method is invoked
+            _ => {
+                let m = self.get_prop(v, &PropKey::Sym(SYM_ITERATOR))?;
+                if self.is_callable(&m) {
+                    let iter = self.call(&m, v.clone(), Vec::new())?;
+                    return self.drain_iter(iter);
+                }
+                Err(self.type_err("value is not iterable"))
+            }
         }
+    }
+
+    /// step `iter` via its `next` method until done — shared by the
+    /// @@iterator paths above (close on any abrupt protocol error)
+    fn drain_iter(&mut self, iter: Value) -> Result<Vec<Value>, Value> {
+        let mut out = Vec::new();
+        loop {
+            if out.len() > 100_000 {
+                return Err(self.range_err("iteration limit exceeded"));
+            }
+            let next = self.get_prop(&iter, &PropKey::from_str("next"))?;
+            if !self.is_callable(&next) {
+                return Err(self.type_err("iterator.next is not a function"));
+            }
+            let r = match self.call(&next, iter.clone(), Vec::new()) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = self.iter_close_obj(&iter);
+                    return Err(e);
+                }
+            };
+            let done = match self.get_prop(&r, &PropKey::from_str("done")) {
+                Ok(d) => d,
+                Err(e) => {
+                    let _ = self.iter_close_obj(&iter);
+                    return Err(e);
+                }
+            };
+            if self.to_bool(&done) {
+                break;
+            }
+            match self.get_prop(&r, &PropKey::from_str("value")) {
+                Ok(val) => out.push(val),
+                Err(e) => {
+                    let _ = self.iter_close_obj(&iter);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(out)
     }
 
     // -- hoisting ----------------------------------------------------------------

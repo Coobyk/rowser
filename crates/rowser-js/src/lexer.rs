@@ -829,6 +829,33 @@ impl Lexer {
 
     /// Capture raw source inside `${ ... }` with brace/string balancing.
     fn template_expr_source(&mut self) -> Result<String, Error> {
+        /// heuristic for `/` inside a template interpolation: after `(` `,`
+        /// `=` operators or keywords it's a regex, after a value it's division
+        fn tmpl_regex_ctx(raw: &str) -> bool {
+            let trimmed = raw.trim_end();
+            let Some(c) = trimmed.chars().last() else {
+                return true;
+            };
+            if "([{,:;=!&|?+-*/%^~<>".contains(c) {
+                return true;
+            }
+            for kw in [
+                "return", "typeof", "instanceof", "new", "delete", "void",
+                "throw", "yield", "await", "case", "do", "else", "in", "of",
+            ] {
+                if trimmed.ends_with(kw) {
+                    let before =
+                        trimmed[..trimmed.len() - kw.len()].chars().last();
+                    if before.is_none()
+                        || !(before.unwrap().is_alphanumeric()
+                            || "_$".contains(before.unwrap()))
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
         let mut depth = 1usize;
         let mut raw = String::new();
         loop {
@@ -849,6 +876,33 @@ impl Lexer {
                     }
                     raw.push(c);
                     self.bump();
+                }
+                '/' if tmpl_regex_ctx(&raw) => {
+                    // regex literal inside an interpolation — scan verbatim
+                    // so quotes/braces in the pattern don't break tracking
+                    raw.push('/');
+                    self.bump();
+                    let mut in_class = false;
+                    while let Some(d) = self.peek() {
+                        raw.push(d);
+                        self.bump();
+                        match d {
+                            '\\' => {
+                                if let Some(e) = self.peek() {
+                                    raw.push(e);
+                                    self.bump();
+                                }
+                            }
+                            '[' => in_class = true,
+                            ']' => in_class = false,
+                            '/' if !in_class => break,
+                            '\n' | '\r' => break,
+                            _ => {}
+                        }
+                    }
+                    while matches!(self.peek(), Some(c) if c.is_alphanumeric() || c == '_') {
+                        raw.push(self.bump().unwrap());
+                    }
                 }
                 '"' | '\'' => {
                     let q = c;
