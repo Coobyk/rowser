@@ -809,6 +809,10 @@ fn install_protos(i: &mut Interp) {
             (i.p.range_error.clone(), "RangeError"),
             (i.p.syntax_error.clone(), "SyntaxError"),
             (i.p.ref_error.clone(), "ReferenceError"),
+            (i.p.eval_error.clone(), "EvalError"),
+            (i.p.uri_error.clone(), "URIError"),
+            (i.p.agg_error.clone(), "AggregateError"),
+            (i.p.suppressed_error.clone(), "SuppressedError"),
         ] {
             proto.borrow_mut().proto = Some(p.clone());
             i.set_builtin(&proto, "name", Value::Str(Rc::from(name)));
@@ -3205,6 +3209,19 @@ fn install_globals(i: &mut Interp) {
         define_global(i, "SyntaxError", se);
         let fe = make_ctor(i, "ReferenceError", ref_error_ctor, i.p.ref_error.clone());
         define_global(i, "ReferenceError", fe);
+        let ee = make_ctor(i, "EvalError", eval_error_ctor, i.p.eval_error.clone());
+        define_global(i, "EvalError", ee);
+        let ue = make_ctor(i, "URIError", uri_error_ctor, i.p.uri_error.clone());
+        define_global(i, "URIError", ue);
+        let ae = make_ctor(i, "AggregateError", agg_error_ctor, i.p.agg_error.clone());
+        define_global(i, "AggregateError", ae);
+        let su = make_ctor(
+            i,
+            "SuppressedError",
+            suppressed_error_ctor,
+            i.p.suppressed_error.clone(),
+        );
+        define_global(i, "SuppressedError", su);
     }
 
     // -- Promise (stub: callbacks run synchronously) --
@@ -6696,6 +6713,9 @@ macro_rules! sub_err_ctor {
     };
 }
 sub_err_ctor!(type_error_ctor, type_error, "TypeError");
+sub_err_ctor!(eval_error_ctor, eval_error, "EvalError");
+sub_err_ctor!(uri_error_ctor, uri_error, "URIError");
+
 sub_err_ctor!(range_error_ctor, range_error, "RangeError");
 sub_err_ctor!(syntax_error_ctor, syntax_error, "SyntaxError");
 sub_err_ctor!(ref_error_ctor, ref_error, "ReferenceError");
@@ -6716,6 +6736,57 @@ fn err_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         return Ok(Value::Str(Rc::from(format!("{name}: {msg}").as_str())));
     }
     Ok(Value::Str(Rc::from("Error")))
+}
+
+
+/// `AggregateError(iterable, message)` — collects the iterable into an
+/// `errors` own data property
+fn agg_error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let errs = match args.first() {
+        Some(v) => i.iter_values(v)?,
+        None => Vec::new(),
+    };
+    let msg = match args.get(1).cloned().unwrap_or(Value::Und) {
+        Value::Und => String::new(),
+        v => i.to_str(&v)?,
+    };
+    let arr = Value::Obj(i.new_arr(errs));
+    if let Value::Obj(o) = this {
+        o.borrow_mut().kind = ObjKind::Err;
+        i.set_attr(o, "errors", arr, true, true);
+        i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
+        i.set_attr(o, "name", Value::Str(Rc::from("AggregateError")), true, true);
+        return Ok(this.clone());
+    }
+    let e = i.err_obj(&i.p.agg_error.clone(), "AggregateError", &msg);
+    if let Value::Obj(o) = &e {
+        i.set_attr(o, "errors", arr, true, true);
+    }
+    Ok(e)
+}
+
+/// `SuppressedError(error, suppressed, message)`
+fn suppressed_error_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let err = arg(args, 0);
+    let supp = arg(args, 1);
+    let msg = match arg(args, 2) {
+        Value::Und => String::new(),
+        v => i.to_str(&v)?,
+    };
+    if let Value::Obj(o) = this {
+        o.borrow_mut().kind = ObjKind::Err;
+        i.set_attr(o, "error", err, true, true);
+        i.set_attr(o, "suppressed", supp, true, true);
+        i.set_attr(o, "message", Value::Str(Rc::from(msg.as_str())), true, true);
+        i.set_attr(o, "name", Value::Str(Rc::from("SuppressedError")), true, true);
+        return Ok(this.clone());
+    }
+    let e = i.err_obj(&i.p.suppressed_error.clone(), "SuppressedError", &msg);
+    if let Value::Obj(o) = &e {
+        i.set_attr(o, "error", err, true, true);
+        i.set_attr(o, "suppressed", supp, true, true);
+    }
+    Ok(e)
 }
 
 // ===========================================================================

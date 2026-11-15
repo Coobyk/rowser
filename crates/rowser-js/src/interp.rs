@@ -1003,6 +1003,10 @@ pub struct Protos {
     pub range_error: ObjRef,
     pub syntax_error: ObjRef,
     pub ref_error: ObjRef,
+    pub eval_error: ObjRef,
+    pub uri_error: ObjRef,
+    pub agg_error: ObjRef,
+    pub suppressed_error: ObjRef,
     pub promise: ObjRef,
     pub iterator: ObjRef,
     /// %ArrayIteratorPrototype% — proto of array/typed-array iterators
@@ -1140,6 +1144,10 @@ impl Interp {
                 range_error: mk(Some(obj.clone())),
                 syntax_error: mk(Some(obj.clone())),
                 ref_error: mk(Some(obj.clone())),
+                eval_error: mk(Some(obj.clone())),
+                uri_error: mk(Some(obj.clone())),
+                agg_error: mk(Some(obj.clone())),
+                suppressed_error: mk(Some(obj.clone())),
                 promise: mk(Some(obj.clone())),
                 array_iter: mk(Some(iterator.clone())),
                 map_iter: mk(Some(iterator.clone())),
@@ -5305,8 +5313,10 @@ impl Interp {
                         self.declare(env, name, fv, true);
                     }
                     // Annex B.3.3: executing a block-level fn decl syncs the
-                    // block-scoped value into the var-environment binding
-                    if !self.cur_strict {
+                    // block-scoped value into the var-environment binding —
+                    // plain functions only; generators/async fns stay purely
+                    // block-scoped
+                    if !self.cur_strict && !f.is_gen && !f.is_async {
                         if let Some(fv) = self.env_lookup(env, name)? {
                             self.declare_var(env, name, fv);
                         }
@@ -5466,6 +5476,32 @@ impl Interp {
                 };
                 let mut last = Value::Und;
                 let mut env_i = scope.clone();
+                if per_iter {
+                    // CreatePerIterationEnvironment: even the first
+                    // iteration runs in a fresh env copied from the head
+                    // env — head-env bindings stay untouched by writes in
+                    // test/body/update
+                    let s = Scope::new(Some(env.clone()), false);
+                    {
+                        let pv = scope.vars.borrow();
+                        let mut cur = s.vars.borrow_mut();
+                        for n in &head_names {
+                            if let Some(b) = pv.get(n.as_ref()) {
+                                cur.insert(
+                                    n.clone(),
+                                    Binding {
+                                        val: b.val.clone(),
+                                        mutable: b.mutable,
+                                        uninit: b.uninit,
+                                        deletable: false,
+                                        lexical: true,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    env_i = s;
+                }
                 loop {
                     if let Some(t) = test {
                         let tv = self.eval_expr(t, &env_i)?;
@@ -5902,8 +5938,12 @@ impl Interp {
                             // `catch (e)` param binds into the catch scope
                             let catch_scope = Scope::new(Some(env.clone()), false);
                             self.bind_pattern(&catch_scope, p, exc, VarKind::Let, true)?;
-                            self.hoist_stmts(h, &catch_scope)?;
-                            res = self.exec_block(h, &catch_scope);
+                            // catch-block lexicals live in a child env of
+                            // the param env — param-default closures must
+                            // NOT see the body's `let`s
+                            let body_scope = Scope::new(Some(catch_scope.clone()), false);
+                            self.hoist_stmts(h, &body_scope)?;
+                            res = self.exec_block(h, &body_scope);
                         } else {
                             res = self.exec_hoisted_block(h, env);
                         }
@@ -7792,9 +7832,13 @@ fn collect_stmt<'a>(
     lets: &mut Vec<&'a str>,
     top: bool,
 ) {
+    // Annex-B block-fn var bindings only cover plain `function` decls —
+    // generators and async fns stay purely block-scoped
     let nested = |f: &'a Rc<FnDef>, block_fns: &mut Vec<&'a str>| {
-        if let Some(n) = f.name.as_deref() {
-            block_fns.push(n);
+        if !f.is_gen && !f.is_async {
+            if let Some(n) = f.name.as_deref() {
+                block_fns.push(n);
+            }
         }
     };
     match s {
@@ -7851,7 +7895,7 @@ fn collect_stmt<'a>(
         }
         Stmt::Switch { cases, .. } => {
             for c in cases {
-                collect_hoisted(&c.body, fns, block_fns, vars, lets);
+                collect_hoisted_at(&c.body, fns, block_fns, vars, lets, false);
             }
         }
         Stmt::Try {
@@ -7874,7 +7918,7 @@ fn collect_stmt<'a>(
     }
 }
 
-fn collect_pattern_names<'a>(p: &'a Pattern, out: &mut Vec<&'a str>) {
+pub(crate) fn collect_pattern_names<'a>(p: &'a Pattern, out: &mut Vec<&'a str>) {
     match p {
         Pattern::Target(_) => {}
         Pattern::Ident(n) => out.push(n),

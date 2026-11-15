@@ -734,7 +734,9 @@ impl Parser {
                     "class declaration not allowed in statement position",
                 ));
             }
-            Stmt::FnDecl(_) if !(fn_ok && !self.strict) => {
+            Stmt::FnDecl(f)
+                if f.is_gen || f.is_async || !(fn_ok && !self.strict) =>
+            {
                 return Err(self.err(
                     "function declaration not allowed in statement position",
                 ));
@@ -743,7 +745,7 @@ impl Parser {
             // through labels is still in a single-statement position:
             // Annex B labelled fns are only legal at function/script/block
             // top level
-            Stmt::Labeled(_, inner) if !fn_ok => {
+            Stmt::Labeled(_, inner) => {
                 let mut cur: &Stmt = inner;
                 loop {
                     match cur {
@@ -946,6 +948,7 @@ impl Parser {
         self.expect_punct(")")?;
         self.expect_punct("{")?;
         let mut cases = Vec::new();
+        let mut seen_default = false;
         while !self.at_punct("}") {
             if self.eat_kw(Kw::Case) {
                 let test = self.expression()?;
@@ -959,6 +962,10 @@ impl Parser {
                     body,
                 });
             } else if self.eat_kw(Kw::Default) {
+                if seen_default {
+                    return Err(self.err("multiple `default` clauses in switch"));
+                }
+                seen_default = true;
                 self.expect_punct(":")?;
                 let mut body = Vec::new();
                 while !self.at_punct("}") && !self.at_kw(Kw::Case) && !self.at_kw(Kw::Default) {
@@ -970,6 +977,32 @@ impl Parser {
             }
         }
         self.expect_punct("}")?;
+        // CaseBlock early errors: LexicallyDeclaredNames of all case bodies
+        // share one block scope — duplicates, or any name that is also
+        // VarDeclared, are a SyntaxError
+        let mut lex: Vec<String> = Vec::new();
+        let mut vars: Vec<String> = Vec::new();
+        for c in &cases {
+            for st in &c.body {
+                collect_switch_lex(st, &mut lex);
+            }
+            collect_switch_vars(&c.body, &mut vars);
+        }
+        let mut lex_s = std::collections::HashSet::new();
+        for n in &lex {
+            if !lex_s.insert(n.clone()) {
+                return Err(self.err(format!(
+                    "Identifier `{n}` has already been declared"
+                )));
+            }
+        }
+        for v in &vars {
+            if lex_s.contains(v) {
+                return Err(self.err(format!(
+                    "Identifier `{v}` has already been declared"
+                )));
+            }
+        }
         Ok(Stmt::Switch { disc, cases })
     }
 
@@ -3328,5 +3361,105 @@ fn vexpr_pat(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
             vexpr(prop, cx)
         }
         _ => vexpr(e, cx),
+    }
+}
+
+/// Top-level LexicallyDeclaredNames of a switch case body statement:
+/// let/const, class, and function declarations (block-level fns are
+/// lexically scoped even in sloppy mode).
+fn collect_switch_lex(st: &Stmt, out: &mut Vec<String>) {
+    match st {
+        Stmt::VarDecl { kind, decls }
+            if matches!(kind, VarKind::Let | VarKind::Const) =>
+        {
+            for (p, _) in decls {
+                let mut names = Vec::new();
+                crate::interp::collect_pattern_names(p, &mut names);
+                out.extend(names.into_iter().map(str::to_string));
+            }
+        }
+        Stmt::ClassDecl(c) => {
+            if let Some(n) = c.name.clone() {
+                out.push(n);
+            }
+        }
+        Stmt::FnDecl(f) => {
+            if let Some(n) = f.name.clone() {
+                out.push(n);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// VarDeclaredNames across a switch case body — `var`s hoist out of
+/// nested blocks/labels/loops (but not into nested functions), so walk
+/// every statement container.
+fn collect_switch_vars(stmts: &[Stmt], out: &mut Vec<String>) {
+    for st in stmts {
+        match st {
+            Stmt::VarDecl { kind, decls } if *kind == VarKind::Var => {
+                for (p, _) in decls {
+                    let mut names = Vec::new();
+                    crate::interp::collect_pattern_names(p, &mut names);
+                    out.extend(names.into_iter().map(str::to_string));
+                }
+            }
+            Stmt::Block(b) => collect_switch_vars(b, out),
+            Stmt::If { t, e, .. } => {
+                collect_switch_vars(std::slice::from_ref(t), out);
+                if let Some(e) = e {
+                    collect_switch_vars(std::slice::from_ref(e), out);
+                }
+            }
+            Stmt::While { body, .. }
+            | Stmt::DoWhile { body, .. }
+            | Stmt::With { body, .. } => {
+                collect_switch_vars(std::slice::from_ref(body), out)
+            }
+            Stmt::For { init, body, .. } => {
+                if let Some(ForInit::Var(kind, decls)) = init {
+                    if *kind == VarKind::Var {
+                        for (p, _) in decls {
+                            let mut names = Vec::new();
+                            crate::interp::collect_pattern_names(p, &mut names);
+                            out.extend(names.into_iter().map(str::to_string));
+                        }
+                    }
+                }
+                collect_switch_vars(std::slice::from_ref(body), out);
+            }
+            Stmt::ForOf { left, body, .. } | Stmt::ForIn { left, body, .. } => {
+                if let ForTarget::Var(kind, p) = left {
+                    if *kind == VarKind::Var {
+                        let mut names = Vec::new();
+                        crate::interp::collect_pattern_names(p, &mut names);
+                        out.extend(names.into_iter().map(str::to_string));
+                    }
+                }
+                collect_switch_vars(std::slice::from_ref(body), out);
+            }
+            Stmt::Labeled(_, i) => collect_switch_vars(std::slice::from_ref(i), out),
+            Stmt::Switch { cases, .. } => {
+                for c in cases {
+                    collect_switch_vars(&c.body, out);
+                }
+            }
+            Stmt::Try {
+                block,
+                handler,
+                finally,
+                ..
+            } => {
+                collect_switch_vars(block, out);
+                if let Some(h) = handler {
+                    collect_switch_vars(h, out);
+                }
+                if let Some(f) = finally {
+                    collect_switch_vars(f, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
