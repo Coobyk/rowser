@@ -799,7 +799,9 @@ impl ReParser {
                         let (name, raw) = self.parse_group_name()?;
                         Node::BackrefName(name, raw)
                     }
-                } else if self.unicode {
+                } else if self.unicode || self.has_named {
+                    // a pattern WITH named groups makes `\k` a strict
+                    // AtomEscape — a `<`-less `\k` is a SyntaxError
                     return Err("invalid \\k escape".into());
                 } else {
                     Node::Ch('k' as u32)

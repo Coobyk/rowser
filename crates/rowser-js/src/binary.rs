@@ -1010,12 +1010,16 @@ fn ta_species_ctor(i: &mut Interp, this: &Value) -> Result<Option<Value>, Value>
 /// validation: construct `ctor(args)` (default = intrinsic of `kind`),
 /// require a valid TypedArray result. `min_len` enforces the
 /// single-number-argument length check used by slice/map/filter.
+/// `write` is the accessMode — spec ~write~ (slice/map/filter
+/// destinations) additionally rejects results backed by immutable
+/// buffers; ~read~ (subarray) does not.
 fn ta_species_result(
     i: &mut Interp,
     this: &Value,
     kind: TAK,
     args: Vec<Value>,
     min_len: Option<usize>,
+    write: bool,
 ) -> NR {
     let result = match ta_species_ctor(i, this)? {
         Some(c) => i.construct(&c, args, None)?,
@@ -1030,6 +1034,11 @@ fn ta_species_result(
     let Some(t) = ta_parts(&result) else {
         return Err(i.type_err("species constructor did not return a TypedArray"));
     };
+    // spec ValidateTypedArray(O, seq-cst, ~write~): the immutable
+    // check precedes the out-of-bounds check
+    if write && t.buf.borrow().immutable {
+        return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+    }
     let Some(eff) = t.eff() else {
         return Err(
             i.type_err("species constructor returned a detached or out-of-bounds TypedArray")
@@ -1501,7 +1510,9 @@ fn m_ta_subarray(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             Value::Num(nlen as f64),
         ]
     };
-    ta_species_result(i, this, t.kind, argv, None)
+    // subarray's species create is ~read~ — the result is never
+    // written to by the method, so an immutable buffer is fine here.
+    ta_species_result(i, this, t.kind, argv, None, false)
 }
 
 fn m_ta_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1513,46 +1524,70 @@ fn m_ta_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         v => clamp_index(ta_to_int(i, &v)?, len),
     };
     let count = end.saturating_sub(begin);
-    let a = ta_species_result(i, this, t.kind, vec![Value::Num(count as f64)], Some(count))?;
-    // spec re-validates the source after species construction — a
-    // detached or shrunk-out-of-bounds view throws even when count is 0.
-    if t.eff().is_none() {
-        return Err(i.type_err("Cannot perform slice on a detached or out-of-bounds ArrayBuffer"));
-    }
+    // spec: the destination is created with accessMode ~write~ —
+    // an immutable-backed result is a TypeError.
+    let a = ta_species_result(
+        i,
+        this,
+        t.kind,
+        vec![Value::Num(count as f64)],
+        Some(count),
+        true,
+    )?;
+    // spec: the post-species revalidation + live re-clamp only run
+    // when countBytes > 0 — a zero-count slice returns the species
+    // result without ever observing the (possibly detached) source
+    // again.
     if count > 0 {
-        // spec: same element kind → byte-level copy (requires the same
-        // [[ContentType]] too — bigint-kind storage shares TAK::F64
-        // with Float64Array). Source bytes past the live (possibly
-        // shrunk) buffer read as zero — the fresh destination buffer
-        // is already zero-initialised.
-        let src_big = ta_is_big(this);
-        let a_big = ta_is_big(&a);
-        if a_big != src_big {
-            // per-element Set would fail on the first conversion —
-            // ToNumber(bigint) / ToBigInt(number) both throw
-            return Err(i.type_err("Cannot mix BigInt and non-BigInt TypedArrays"));
-        }
-        if ta_parts(&a).is_some_and(|d| d.kind == t.kind) {
+        let Some(live) = t.eff() else {
+            return Err(
+                i.type_err("Cannot perform slice on a detached or out-of-bounds ArrayBuffer")
+            );
+        };
+        // spec: endIndex is re-clamped against the LIVE length after
+        // the species ctor ran (a resizable buffer may have shrunk
+        // in-bounds); countBytes becomes max(endIndex - startIndex, 0)
+        // in ELEMENT units — partial trailing elements are dropped.
+        let end2 = end.min(live);
+        let cnt = end2.saturating_sub(begin);
+        if cnt > 0 {
             let d = ta_parts(&a).unwrap();
             let sz = t.kind.size();
-            let src_at = t.off + begin * sz;
-            if let (Some(sb), Some(db)) = (buffer_bytes(&t.buf), buffer_bytes(&d.buf)) {
-                let avail = sb.borrow().len().saturating_sub(src_at);
-                let n_bytes = (count * sz)
-                    .min(avail)
-                    .min(db.borrow().len().saturating_sub(d.off));
-                let tmp: Vec<u8> = sb.borrow()[src_at..src_at + n_bytes].to_vec();
-                db.borrow_mut()[d.off..d.off + n_bytes].copy_from_slice(&tmp);
-            }
-        } else {
-            // different element kinds — per-element Get → Set; a custom
-            // species result may alias this buffer so snapshot first.
-            let mut vals = Vec::with_capacity(count);
-            for k in 0..count {
-                vals.push(ta_elem(i, this, begin + k)?);
-            }
-            for (k, v) in vals.into_iter().enumerate() {
-                i.set_prop(&a, ta_elem_key(k), v)?;
+            if d.kind == t.kind {
+                // spec same-type path: byte-wise FORWARD copy (the
+                // buffer-level GetValueFromBuffer/SetValueInBuffer
+                // loop). Bit-level encoding is preserved, and when a
+                // custom species result aliases the source buffer the
+                // smear semantics emerge naturally — a snapshot would
+                // produce different elements.
+                let sb = buffer_bytes(&t.buf);
+                let db = buffer_bytes(&d.buf);
+                let mut src_i = t.off + begin * sz;
+                let mut dst_i = d.off;
+                let mut rem = cnt.saturating_mul(sz);
+                while rem > 0 {
+                    let b = sb
+                        .as_ref()
+                        .and_then(|s| s.borrow().get(src_i).copied())
+                        .unwrap_or(0);
+                    if let Some(db) = &db {
+                        if let Some(m) = db.borrow_mut().get_mut(dst_i) {
+                            *m = b;
+                        }
+                    }
+                    src_i += 1;
+                    dst_i += 1;
+                    rem -= 1;
+                }
+            } else {
+                // different element types — spec interleaves integer-
+                // indexed Get → Set element by element (the conversion
+                // inside [[Set]] does the element-type coercion; the
+                // species result's [[ContentType]] already matched).
+                for k in 0..cnt {
+                    let v = ta_elem(i, this, begin + k)?;
+                    i.set_prop(&a, ta_elem_key(k), v)?;
+                }
             }
         }
     }
@@ -1778,9 +1813,11 @@ fn m_ta_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         return Ok(Value::Num(-1.0));
     }
     let needle = arg(args, 0);
-    let n = match arg(args, 1) {
-        Value::Und => len as f64 - 1.0,
-        v => ta_to_int(i, &v)?,
+    // spec: `n = len - 1` only when fromIndex is ABSENT — an explicit
+    // `undefined` is a present argument and ToIntegerOrInfinity's to +0.
+    let n = match args.get(1) {
+        None => len as f64 - 1.0,
+        Some(v) => ta_to_int(i, v)?,
     };
     if n == f64::NEG_INFINITY {
         return Ok(Value::Num(-1.0));
@@ -1915,7 +1952,16 @@ fn m_ta_map(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let t = need_ta(i, this)?;
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
-    let a = ta_species_result(i, this, t.kind, vec![Value::Num(len as f64)], Some(len))?;
+    // spec ~write~ species create — immutable-backed results throw
+    // before the first callback runs.
+    let a = ta_species_result(
+        i,
+        this,
+        t.kind,
+        vec![Value::Num(len as f64)],
+        Some(len),
+        true,
+    )?;
     for k in 0..len {
         let kv = ta_pub_elem(i, this, k)?;
         let rv = i.call(
@@ -1948,12 +1994,15 @@ fn m_ta_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             kept.push(kv);
         }
     }
+    // spec ~write~ species create — runs AFTER the callbacks, so an
+    // immutable-backed result still throws, just later.
     let a = ta_species_result(
         i,
         this,
         t.kind,
         vec![Value::Num(kept.len() as f64)],
         Some(kept.len()),
+        true,
     )?;
     for (k, kv) in kept.into_iter().enumerate() {
         i.set_prop(&a, ta_elem_key(k), kv)?;

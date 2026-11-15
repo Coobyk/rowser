@@ -20,6 +20,11 @@ pub enum Expr {
         flags: String,
     },
     Template(Vec<TemplPart>),
+    /// a tagged-template call-site object — evaluating it yields the
+    /// realm-cached frozen template array for this parse node
+    /// (GetTemplateObject); only ever appears as the first argument of
+    /// a tagged-template `Call`
+    TemplateObj(Rc<TemplateSite>),
     Array(Vec<ArrElem>),
     Object(Vec<ObjProp>),
     /// object literal containing a duplicate `__proto__` data prop —
@@ -83,6 +88,19 @@ pub enum Expr {
 pub enum TemplPart {
     Str(String),
     Expr(Expr),
+}
+
+/// One tagged-template literal site — its allocation identity is the
+/// spec's [[Site]] parse-node key for the realm [[TemplateMap]] (the
+/// interpreter caches the built template object by `Rc` pointer and
+/// pins the site in the map so the address can never be reused).
+/// `cooked[i]` is `None` where the segment held an invalid escape —
+/// the cooked element then reads `undefined`.
+#[derive(Debug)]
+pub struct TemplateSite {
+    pub cooked: Vec<Option<String>>,
+    /// raw segment text (TRV — line terminators folded to `\n`)
+    pub raw: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

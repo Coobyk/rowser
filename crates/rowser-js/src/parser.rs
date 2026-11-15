@@ -160,6 +160,10 @@ struct Parser {
     /// inside a class `static {}` block — `await` is a reserved
     /// BindingIdentifier here (early error; function boundaries reset it)
     in_static_block: bool,
+    /// token index where the current directive prologue began — a
+    /// `"use strict"` directive retro-makes earlier prologue octal
+    /// escapes / legacy-octal literals SyntaxErrors
+    prologue_start: usize,
 }
 
 impl Parser {
@@ -192,6 +196,7 @@ impl Parser {
             priv_next_id: 0,
             priv_pending: Vec::new(),
             in_static_block: false,
+            prologue_start: 0,
         }
     }
 
@@ -353,10 +358,11 @@ impl Parser {
     fn program(&mut self) -> Result<Vec<Stmt>, Error> {
         let mut stmts = Vec::new();
         let mut prologue = true;
+        self.prologue_start = self.pos;
         while !self.at_eof() {
             let dir = self.directive_candidate();
             let s = self.statement()?;
-            self.check_directive(&s, dir, &mut prologue);
+            self.check_directive(&s, dir, &mut prologue)?;
             stmts.push(s);
         }
         Ok(stmts)
@@ -370,18 +376,33 @@ impl Parser {
 
     /// Directive-prologue bookkeeping: `Stmt` continues the prologue iff it
     /// is a bare string expression; an unescaped "use strict" turns strict on.
-    fn check_directive(&mut self, s: &Stmt, tok_was_str: bool, prologue: &mut bool) {
+    fn check_directive(
+        &mut self,
+        s: &Stmt,
+        tok_was_str: bool,
+        prologue: &mut bool,
+    ) -> Result<(), Error> {
         if !*prologue {
-            return;
+            return Ok(());
         }
         match s {
             Stmt::Expr(Expr::Str(t)) => {
                 if tok_was_str && t == "use strict" {
                     self.strict = true;
+                    // the directive's strictness is retroactive — an
+                    // octal escape or legacy-octal literal anywhere in
+                    // the prologue (even before the directive) errors
+                    if self.toks[self.prologue_start..self.pos.min(self.toks.len())]
+                        .iter()
+                        .any(|t| t.octal)
+                    {
+                        return Err(self.err("octal literal not allowed in strict mode"));
+                    }
                 }
             }
             _ => *prologue = false,
         }
+        Ok(())
     }
 
     /// Function body `{ stmts }`: handles the directive prologue and
@@ -395,8 +416,10 @@ impl Parser {
             self.ctor_depth,
             self.method_depth,
             self.in_static_block,
+            self.prologue_start,
         );
         self.in_static_block = false;
+        self.prologue_start = self.pos;
         self.fn_depth += 1;
         if !arrow {
             self.nonarrow_fn_depth += 1;
@@ -429,7 +452,7 @@ impl Parser {
             }
             let dir = self.directive_candidate();
             let s = self.statement()?;
-            self.check_directive(&s, dir, &mut prologue);
+            self.check_directive(&s, dir, &mut prologue)?;
             stmts.push(s);
         }
         self.expect_punct("}")?;
@@ -440,6 +463,7 @@ impl Parser {
             self.ctor_depth,
             self.method_depth,
             self.in_static_block,
+            self.prologue_start,
         ) = saved;
         if !arrow {
             self.nonarrow_fn_depth -= 1;
@@ -625,6 +649,9 @@ impl Parser {
                 if name == "yield" && (self.yield_decl > 0 || self.strict) {
                     return Err(self.err("`yield` is not a valid label here"));
                 }
+                if name == "await" && self.in_static_block {
+                    return Err(self.err("`await` is not a valid label in a class static block"));
+                }
                 self.next();
                 self.next();
                 let inner = self.stmt_body(true)?;
@@ -633,7 +660,8 @@ impl Parser {
             Tok::Kw(k)
                 if is_contextual_ident_kw(&k)
                     && matches!(self.peek2().tok, Tok::Punct(":"))
-                    && !(k == Kw::Yield && (self.yield_decl > 0 || self.strict)) =>
+                    && !(k == Kw::Yield && (self.yield_decl > 0 || self.strict))
+                    && !(k == Kw::Await && self.in_static_block) =>
             {
                 let name = k.name().to_string();
                 self.next();
@@ -1362,29 +1390,37 @@ impl Parser {
         src_start: usize,
     ) -> Result<FnDef, Error> {
         let name = {
-            // the name is parsed under the fn's own [Yield]/[Await]
-            // parameters — `function* yield(){}` and `async function
-            // await(){}` are early errors (BindingIdentifier[+Yield])
-            let saved_gd = (self.gen_depth, self.yield_decl, self.await_decl);
-            self.gen_depth = gen as usize;
-            self.yield_decl = gen as usize;
-            self.await_decl = is_async as usize;
+            // fn-DECLARATION names bind in the enclosing [Yield]/[Await]
+            // context; fn-EXPRESSION names are always
+            // BindingIdentifier[~Yield][~Await] — `function yield(){}` /
+            // `function await(){}` are legal even inside generators /
+            // async functions
+            let check = |p: &mut Self, s: &str| {
+                if name_required {
+                    p.check_binding_name(s)
+                } else {
+                    let saved = (p.yield_decl, p.await_decl);
+                    (p.yield_decl, p.await_decl) = (0, 0);
+                    let r = p.check_binding_name(s);
+                    (p.yield_decl, p.await_decl) = saved;
+                    r
+                }
+            };
             let n = match self.peek().tok.clone() {
                 Tok::Ident(s) => {
-                    self.check_binding_name(&s)?;
+                    check(self, &s)?;
                     self.next();
                     Some(s)
                 }
                 Tok::Kw(k) if is_contextual_ident_kw(&k) => {
                     let s = k.name().to_string();
-                    self.check_binding_name(&s)?;
+                    check(self, &s)?;
                     self.next();
                     Some(s)
                 }
                 _ if !name_required => None,
                 _ => return Err(self.err("expected function name")),
             };
-            (self.gen_depth, self.yield_decl, self.await_decl) = saved_gd;
             n
         };
         let old_ctx = (
@@ -2578,25 +2614,10 @@ impl Parser {
                     };
                 }
                 Tok::Template(parts) => {
-                    // tagged template — treat as call with cooked parts + args
+                    // tagged template — a call whose first argument is the
+                    // site's (cached, frozen) template object
                     self.next();
-                    let mut args = Vec::new();
-                    let mut strings = Vec::new();
-                    let mut exprs = Vec::new();
-                    for p in parts {
-                        match p {
-                            crate::lexer::TemplPart::Str(s) => strings.push(Expr::Str(s)),
-                            crate::lexer::TemplPart::Expr(raw) => {
-                                exprs.push(parse_expr_src(&raw, self)?)
-                            }
-                        }
-                    }
-                    args.push(Arg::Expr(Expr::Array(
-                        strings.into_iter().map(ArrElem::Expr).collect(),
-                    )));
-                    for ex in exprs {
-                        args.push(Arg::Expr(ex));
-                    }
+                    let args = self.tagged_args(parts)?;
                     e = Expr::Call {
                         callee: Box::new(e),
                         args,
@@ -2649,11 +2670,48 @@ impl Parser {
                     computed: true,
                     optional: false,
                 };
+            } else if let Tok::Template(parts) = self.peek().tok.clone() {
+                // `new tag`x`` — a tagged template binds tighter than
+                // `new`: the callee is MemberExpression, which includes
+                // MemberExpression TemplateLiteral, so `new` applies to
+                // the RESULT of the tagged call
+                self.next();
+                let args = self.tagged_args(parts)?;
+                e = Expr::Call {
+                    callee: Box::new(e),
+                    args,
+                };
             } else {
                 break;
             }
         }
         Ok(e)
+    }
+
+    /// tagged-template argument list: `[siteObj, ...substitutions]` —
+    /// the first arg is the per-parse-node template object (the
+    /// interpreter resolves `Expr::TemplateObj` through the realm's
+    /// template cache); cooked/raw segment vectors ride on the site
+    fn tagged_args(&mut self, parts: Vec<crate::lexer::TemplPart>) -> Result<Vec<Arg>, Error> {
+        let mut cooked = Vec::new();
+        let mut raw = Vec::new();
+        let mut subs = Vec::new();
+        for p in parts {
+            match p {
+                crate::lexer::TemplPart::Str { cooked: c, raw: r } => {
+                    cooked.push(c);
+                    raw.push(r);
+                }
+                crate::lexer::TemplPart::Expr(src) => {
+                    subs.push(Arg::Expr(parse_expr_src(&src, self)?))
+                }
+            }
+        }
+        let site = Rc::new(TemplateSite { cooked, raw });
+        let mut args = Vec::with_capacity(subs.len() + 1);
+        args.push(Arg::Expr(Expr::TemplateObj(site)));
+        args.extend(subs);
+        Ok(args)
     }
 
     fn call_args(&mut self) -> Result<Vec<Arg>, Error> {
@@ -2693,12 +2751,20 @@ impl Parser {
                 Ok(Expr::Str(s))
             }
             Tok::Template(parts) => {
-                self.check_octal()?;
                 self.next();
                 let mut out = Vec::new();
                 for p in parts {
                     match p {
-                        crate::lexer::TemplPart::Str(s) => out.push(TemplPart::Str(s)),
+                        crate::lexer::TemplPart::Str { cooked, .. } => {
+                            // an invalid escape (NotEscapeSequence) is a
+                            // grammar error in an untagged template —
+                            // only tagged sites may consume it as
+                            // `undefined`
+                            let Some(s) = cooked else {
+                                return Err(self.err("invalid escape sequence in template literal"));
+                            };
+                            out.push(TemplPart::Str(s));
+                        }
                         crate::lexer::TemplPart::Expr(raw) => {
                             out.push(TemplPart::Expr(parse_expr_src(&raw, self)?))
                         }
@@ -3276,10 +3342,12 @@ impl VCtx {
     }
     /// declare a var name: a var propagates up through every enclosing
     /// statement list, so it joins the VarDeclaredNames of EVERY ancestor
-    /// block — conflicts with any lexically-declared name (let/const/
-    /// class/block-fn) in those lists, e.g. `{function f(){} {var f}}`
+    /// block — conflicts with let/const/class/block-fn names in those
+    /// lists, e.g. `{function f(){} {var f}}` (sloppy params and catch
+    /// params live in `lexes` but not `hard` — `var x` redeclaring a
+    /// param is legal)
     fn decl_var(&mut self, name: &str) -> Result<(), Error> {
-        if self.lexes.iter().any(|s| s.contains(name)) {
+        if self.hard.iter().any(|s| s.contains(name)) {
             return Err(self.err(format!("`{name}` conflicts with a lexical declaration")));
         }
         for v in self.vars.iter_mut() {
@@ -3299,6 +3367,10 @@ impl VCtx {
                 return Err(self.err(format!("duplicate declaration `{name}`")));
             }
             self.lexes.last_mut().unwrap().insert(name.to_string());
+            // a block-fn name is a lexical decl for `var`-conflict
+            // purposes (`{function f(){} {var f}}` and
+            // `{function f(){} var f}` both error)
+            self.hard.last_mut().unwrap().insert(name.to_string());
             // Annex B: block fn in sloppy code also creates a var binding
             // at function scope — it enters the VarDeclaredNames of every
             // enclosing statement list
@@ -3739,10 +3811,12 @@ fn vfn(f: &FnDef, cx: &mut VCtx, method: Option<bool>) -> Result<(), Error> {
     cx.push_scope();
     let simple = f.params.iter().all(|p| matches!(p, Param::Ident(_)));
     let mut r = Ok(());
+    let mut pnames = Vec::new();
     for p in &f.params {
         let mut ns = Vec::new();
         pattern_names(p, &mut ns);
         for n in ns {
+            pnames.push(n.to_string());
             if cx.strict {
                 if let Err(e) = cx.decl_lex(n) {
                     r = Err(e);
@@ -3755,8 +3829,12 @@ fn vfn(f: &FnDef, cx: &mut VCtx, method: Option<bool>) -> Result<(), Error> {
     }
     if r.is_ok() {
         if !simple && !cx.strict {
-            // param scope separate from body scope
+            // param scope separate from body scope — the body's top
+            // scope still sees param names for `let`/`const` conflicts
             cx.push_scope();
+            for n in &pnames {
+                cx.lexes.last_mut().unwrap().insert(n.clone());
+            }
             r = vblock(&f.body, cx, false);
             cx.pop_scope();
         } else {
@@ -4349,7 +4427,8 @@ fn expr_has_arguments(e: &Expr) -> bool {
         | Expr::Null
         | Expr::This
         | Expr::Super
-        | Expr::Regex { .. } => false,
+        | Expr::Regex { .. }
+        | Expr::TemplateObj(_) => false,
         Expr::Fn(f) => f.is_arrow && fndef_has_arguments(f),
         Expr::Class(c) => class_has_arguments(c),
         Expr::Template(parts) => parts

@@ -1273,6 +1273,12 @@ pub struct Interp {
     /// parsed AST (blocks, try/catch/finally bodies) go through here —
     /// they live for the whole run; function bodies use `fn_hoist`.
     slice_hoist: FxMap<(usize, usize), Rc<Hoisted>>,
+    /// the realm's [[TemplateMap]] — GetTemplateObject results keyed by
+    /// `Rc<TemplateSite>` pointer (the parse-node [[Site]] identity).
+    /// The stored `Rc<TemplateSite>` pins the site so its address can
+    /// never be reused while an entry exists — the key is always unique
+    /// and the cache needs no invalidation, mirroring `fn_hoist`.
+    template_cache: FxMap<usize, (Rc<TemplateSite>, ObjRef)>,
     /// the installed `eval` function — direct `eval(...)` calls compare
     /// against this to pick the caller-environment evaluation path
     pub eval_fn: Option<Value>,
@@ -1370,6 +1376,20 @@ impl Interp {
             }
             b.extensible = false;
         }
+        // %Function.prototype% itself carries the inherited poisoned
+        // caller/arguments accessors — functions that lack OWN
+        // restricted props (methods, accessors, class ctors, generators)
+        // still throw via the proto chain
+        {
+            let mut b = func.borrow_mut();
+            let tv = Value::Obj(tte.clone());
+            for k in ["caller", "arguments"] {
+                b.props.insert(
+                    PropKey::from_str(k),
+                    Prop::accessor(Some(tv.clone()), Some(tv.clone())),
+                );
+            }
+        }
         let iterator = mk(Some(obj.clone()));
         Interp {
             global: Scope::new(None, true),
@@ -1443,6 +1463,7 @@ impl Interp {
             interned: FxSet::default(),
             fn_hoist: FxMap::default(),
             slice_hoist: FxMap::default(),
+            template_cache: FxMap::default(),
             eval_fn: None,
             gen_yielders: Vec::new(),
             gen_cap: u64::MAX,
@@ -2085,6 +2106,49 @@ impl Interp {
             Some(self.p.array.clone()),
             ObjKind::Arr(items),
         )))
+    }
+    /// GetTemplateObject — the realm's [[TemplateMap]] hands each tagged
+    /// template parse node ONE frozen call-site array, reused for every
+    /// evaluation of that site: an Array of the cooked strings with a
+    /// frozen `raw` Array of the raw segments. A segment whose escape
+    /// was invalid cooks to `undefined`.
+    fn template_obj(&mut self, site: &Rc<TemplateSite>) -> Result<ObjRef, Value> {
+        let key = Rc::as_ptr(site) as usize;
+        if let Some((_, o)) = self.template_cache.get(&key) {
+            return Ok(o.clone());
+        }
+        let raw_arr = self.new_arr(
+            site.raw
+                .iter()
+                .map(|s| Value::Str(Rc::from(s.as_str())))
+                .collect(),
+        );
+        crate::builtins::set_integrity(self, &raw_arr, true)?;
+        let tpl = self.new_arr(
+            site.cooked
+                .iter()
+                .map(|c| match c {
+                    Some(s) => Value::Str(Rc::from(s.as_str())),
+                    None => Value::Und,
+                })
+                .collect(),
+        );
+        // own `raw` — non-enumerable; the freeze below also clamps it
+        // non-writable/non-configurable (the spec freezes both objects)
+        tpl.borrow_mut().props.insert(
+            PropKey::from_str("raw"),
+            Prop {
+                val: Value::Obj(raw_arr),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+                get: None,
+                set: None,
+            },
+        );
+        crate::builtins::set_integrity(self, &tpl, true)?;
+        self.template_cache.insert(key, (site.clone(), tpl.clone()));
+        Ok(tpl)
     }
     /// `arguments` object. Mapped (sloppy, simple-ident params): indexed
     /// props alias the parameter bindings in `scope`; unmapped (strict
@@ -3108,8 +3172,13 @@ impl Interp {
         let eligible = {
             let b = o.borrow();
             match &b.kind {
-                ObjKind::Func(Func::User { def, dynamic, .. }) => {
+                ObjKind::Func(Func::User {
+                    def, dynamic, home, ..
+                }) => {
                     !def.is_arrow
+                        && !def.is_gen
+                        && !def.is_async
+                        && home.is_none()
                         && !*dynamic
                         && !def.strict
                         && !crate::parser::stmts_strict(&def.body)
@@ -4566,6 +4635,18 @@ impl Interp {
 
     pub fn delete_prop(&mut self, base: &Value, key: &PropKey) -> Result<bool, Value> {
         let Value::Obj(o) = base else {
+            // string-exotic [[Delete]] — ToObject'd primitives expose
+            // non-configurable indexed units + length → false
+            if let (Value::Str(s), PropKey::S(k)) = (base, key) {
+                if k.as_ref() == "length" {
+                    return Ok(false);
+                }
+                if let Some(i) = arr_index(k) {
+                    if i < s.encode_utf16().count() {
+                        return Ok(false);
+                    }
+                }
+            }
             return Ok(true);
         };
         let proxy = {
@@ -6772,7 +6853,7 @@ impl Interp {
                 def: def.clone(),
                 env: env.clone(),
                 home: home.clone(),
-                ctor,
+                ctor: ctor.clone(),
                 inst_fields: None,
                 ban_eval_args: self.eval_args_ban > 0,
                 dynamic: false,
@@ -6789,18 +6870,10 @@ impl Interp {
             true,
         );
         self.set_attr(&o, "name", Value::Str(Rc::from(name.as_str())), false, true);
-        if def.strict || parser::stmts_strict(&def.body) {
-            // AddRestrictedFunctionProperties — strict fns own poisoned
-            // caller/arguments accessors; the realm's single
-            // %ThrowTypeError% is both getter and setter
-            let tte = Value::Obj(self.p.tte.clone());
-            for k in ["caller", "arguments"] {
-                o.borrow_mut().props.insert(
-                    PropKey::from_str(k),
-                    Prop::accessor(Some(tte.clone()), Some(tte.clone())),
-                );
-            }
-        }
+        // no AddRestrictedFunctionProperties — NO syntactically-created
+        // function gets own caller/arguments props (strict or not); the
+        // throws come from %Function.prototype%'s inherited poisoned
+        // accessors (spec: FunctionInitialize post-ES2017 semantics)
         if def.is_gen && home.is_none() {
             // generator fns: proto is %GeneratorFunction.prototype%; the
             // `.prototype` prop is an ordinary object whose proto is
@@ -8373,6 +8446,7 @@ impl Interp {
                 }
                 Ok(Value::Str(Rc::from(s.as_str())))
             }
+            Expr::TemplateObj(site) => Ok(Value::Obj(self.template_obj(site)?)),
             Expr::Array(elems) => {
                 let mut items = Vec::with_capacity(elems.len());
                 let mut hole_idx: Vec<usize> = Vec::new();
@@ -8426,6 +8500,7 @@ impl Interp {
                             }
                         }
                         _ => {
+                            let mut key_val: Option<Value> = None;
                             let key = match &p.key {
                                 ast::PropKey::Ident(s) | ast::PropKey::Str(s) => {
                                     PropKey::from_str(s)
@@ -8433,12 +8508,33 @@ impl Interp {
                                 ast::PropKey::Num(n) => PropKey::from_str(&js_num_str(*n)),
                                 ast::PropKey::Computed(ex) => {
                                     let kv = self.eval_expr(ex, env)?;
-                                    self.to_propkey(&kv)?
+                                    let k = self.to_propkey(&kv)?;
+                                    key_val = Some(kv);
+                                    k
                                 }
+                            };
+                            // SetFunctionName source name — symbol keys
+                            // become `[desc]` (empty desc → "")
+                            let fname: Rc<str> = match &p.key {
+                                ast::PropKey::Ident(s) | ast::PropKey::Str(s) => {
+                                    Rc::from(s.as_str())
+                                }
+                                ast::PropKey::Num(n) => Rc::from(js_num_str(*n).as_str()),
+                                ast::PropKey::Computed(_) => match &key_val {
+                                    Some(Value::Sym(_, d)) if !d.is_empty() => {
+                                        Rc::from(format!("[{d}]").as_str())
+                                    }
+                                    Some(Value::Sym(_, _)) => Rc::from(""),
+                                    _ => Rc::from(self.key_to_name(&key).as_str()),
+                                },
                             };
                             match &p.val {
                                 PropVal::Expr(ex) => {
-                                    let v = self.eval_expr(ex, env)?;
+                                    let v = if Self::is_anon_fn_def(ex) {
+                                        self.eval_expr_named(ex, env, &fname)?
+                                    } else {
+                                        self.eval_expr(ex, env)?
+                                    };
                                     // `{__proto__: v}` sets the prototype
                                     // instead of creating a property
                                     if matches!(&p.key, ast::PropKey::Ident(s) | ast::PropKey::Str(s) if s == "__proto__")
@@ -8459,6 +8555,7 @@ impl Interp {
                                         Some(o.clone()),
                                         CtorKind::NotClass,
                                     );
+                                    self.set_fn_name(&f, &fname, "");
                                     o.borrow_mut().props.insert(key, Prop::data(f));
                                 }
                                 PropVal::Get(def) | PropVal::Set(def) => {
@@ -8467,6 +8564,15 @@ impl Interp {
                                         env,
                                         Some(o.clone()),
                                         CtorKind::NotClass,
+                                    );
+                                    self.set_fn_name(
+                                        &f,
+                                        &fname,
+                                        if matches!(&p.val, PropVal::Get(_)) {
+                                            "get "
+                                        } else {
+                                            "set "
+                                        },
                                     );
                                     let mut b = o.borrow_mut();
                                     let ent =
@@ -10077,7 +10183,8 @@ fn expr_uses_arguments(e: &Expr) -> bool {
         | Expr::Null
         | Expr::This
         | Expr::Super
-        | Expr::Regex { .. } => false,
+        | Expr::Regex { .. }
+        | Expr::TemplateObj(_) => false,
         Expr::Template(parts) => parts
             .iter()
             .any(|p| matches!(p, TemplPart::Expr(e) if expr_uses_arguments(e))),

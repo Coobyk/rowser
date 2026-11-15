@@ -727,23 +727,6 @@ fn arr_declared_len(o: &ObjRef) -> usize {
     }
 }
 
-fn arr_clone(this: &Value) -> Vec<Value> {
-    if let Value::Obj(o) = this {
-        if let ObjKind::Arr(items) = &o.borrow().kind {
-            return items.clone();
-        }
-    }
-    Vec::new()
-}
-
-fn with_arr(this: &Value, f: impl FnOnce(&mut Vec<Value>)) {
-    if let Value::Obj(o) = this {
-        if let ObjKind::Arr(items) = &mut o.borrow_mut().kind {
-            f(items);
-        }
-    }
-}
-
 /// read array-like elements: real arrays + objects with numeric props/length
 pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
     match v {
@@ -814,89 +797,79 @@ fn length_of_array_like(i: &mut Interp, v: &Value) -> Result<usize, Value> {
     Ok(to_length_num(i.to_num(&lv)?))
 }
 
-fn elems_len(i: &mut Interp, v: &Value) -> Result<usize, Value> {
-    if let Value::Obj(o) = v {
-        if matches!(&o.borrow().kind, ObjKind::Arr(_)) {
-            return Ok(arr_declared_len(o));
-        }
-        if let ObjKind::Iter { items, .. } = &o.borrow().kind {
-            return Ok(items.len());
-        }
+/// spec IsArray: proxies forward to their target (chains unwrap); a
+/// revoked proxy throws a TypeError.
+fn is_array_val(i: &mut Interp, v: &Value) -> Result<bool, Value> {
+    let mut cur = v.clone();
+    for _ in 0..10_000 {
+        let Value::Obj(o) = &cur else {
+            return Ok(false);
+        };
+        let nxt = match &o.borrow().kind {
+            ObjKind::Arr(_) => return Ok(true),
+            ObjKind::Proxy { target, .. } => {
+                if matches!(target, Value::Null) {
+                    return Err(
+                        i.type_err("Cannot perform 'IsArray' on a proxy that has been revoked")
+                    );
+                }
+                target.clone()
+            }
+            _ => return Ok(false),
+        };
+        cur = nxt;
     }
-    let len = i.get_prop_str(v, "length")?;
-    Ok((i.to_num(&len)?.max(0.0) as usize).min(8_000_000))
+    Ok(false)
 }
 
-/// `(index, value)` for PRESENT elements only — spec HasProperty semantics.
-/// Vec-backed arrays can't distinguish `[1,,3]` holes from explicit
-/// `undefined`, so they yield every slot; generic receivers are checked
-/// via `has_prop` per index.
-pub(crate) fn to_elems_sparse(i: &mut Interp, v: &Value) -> Result<Vec<(usize, Value)>, Value> {
-    match v {
-        Value::Obj(o) => {
-            // a fully dense array enumerates directly; holes, sparse
-            // props entries and materialized slots need HasProperty
-            // filtering (spec ArrayMethods skip absent indices)
-            let dense = {
-                let b = o.borrow();
-                match &b.kind {
-                    ObjKind::Arr(items) => {
-                        let no_holes = b.holes.as_ref().map_or(true, |h| h.is_empty());
-                        let declared = arr_declared_len(o);
-                        if no_holes && declared == items.len() {
-                            Some(items.iter().cloned().enumerate().collect())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                }
-            };
-            if let Some(v) = dense {
-                return Ok(v);
-            }
-            if let ObjKind::Iter { items, .. } = &o.borrow().kind {
-                return Ok(items.iter().cloned().enumerate().collect());
-            }
-            if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
-                let items = iter_drain_lazy(i, v)?;
-                return Ok(items.into_iter().enumerate().collect());
-            }
-        }
-        Value::Und | Value::Null => {
-            return Err(i.type_err("cannot convert undefined or null to object"));
-        }
-        _ => {}
+/// spec `Set(O, P, V, true)` — a failed [[Set]] is always a TypeError;
+/// the interpreter's sloppy-mode `set_failed` flag converts to that here.
+fn spec_set(i: &mut Interp, o: &Value, key: PropKey, v: Value) -> Result<(), Value> {
+    i.set_failed = false;
+    i.set_prop(o, key, v)?;
+    if i.set_failed {
+        i.set_failed = false;
+        return Err(i.type_err("Cannot assign to read only property"));
     }
-    let len = i.get_prop_str(v, "length")?;
-    let n = (i.to_num(&len)?.max(0.0) as usize).min(8_000_000);
-    let mut out = Vec::new();
-    for k in 0..n {
-        let key = idx_key(k);
-        if i.has_prop(v, &key)? {
-            out.push((k, i.get_prop(v, &key)?));
-        }
+    Ok(())
+}
+
+/// `spec_set` on an integer index key.
+fn spec_set_idx(i: &mut Interp, o: &Value, k: usize, v: Value) -> Result<(), Value> {
+    spec_set(i, o, idx_key(k), v)
+}
+
+/// spec `DeletePropertyOrThrow(O, P)` on an integer index — a `false`
+/// [[Delete]] (non-configurable prop, live TypedArray element) throws.
+fn spec_del_idx(i: &mut Interp, o: &Value, k: usize) -> Result<(), Value> {
+    if i.delete_prop(o, &idx_key(k))? {
+        Ok(())
+    } else {
+        Err(i.type_err("Cannot delete property"))
     }
-    Ok(out)
 }
 
 /// spec ArraySpeciesCreate: if `o` is an Array, result ctor =
 /// `o.constructor[@@species]` (may be null→default); else default Array.
 fn species_create(i: &mut Interp, o: &Value, len: usize) -> Result<Value, Value> {
     let mut c = Value::Und;
-    if let Value::Obj(ob) = o {
-        if matches!(ob.borrow().kind, ObjKind::Arr(_)) {
-            c = i.get_prop_str(o, "constructor")?;
-            if matches!(c, Value::Obj(_)) {
-                c = i.get_prop(&c, &PropKey::Sym(SYM_SPECIES))?;
-                if matches!(c, Value::Null) {
-                    c = Value::Und;
-                }
+    if is_array_val(i, o)? {
+        c = i.get_prop_str(o, "constructor")?;
+        if matches!(c, Value::Obj(_)) {
+            c = i.get_prop(&c, &PropKey::Sym(SYM_SPECIES))?;
+            if matches!(c, Value::Null) {
+                c = Value::Und;
             }
         }
     }
     match c {
-        Value::Und => Ok(Value::Obj(i.new_arr(vec![Value::Und; len]))),
+        Value::Und => {
+            // ArrayCreate(len): empty dense store + declared length — the
+            // indices are ABSENT (holes), not `undefined`
+            let a = i.new_arr(Vec::new());
+            i.set_attr(&a, "length", Value::Num(len as f64), true, false);
+            Ok(Value::Obj(a))
+        }
         c if i.is_constructor(&c) => i.construct(&c, vec![Value::Num(len as f64)], None),
         _ => Err(i.type_err("invalid species constructor")),
     }
@@ -1086,11 +1059,12 @@ fn install_protos(i: &mut Interp) {
     // -- Array.prototype --
     {
         let p = i.p.array.clone();
-        // @@unscopables — `with (arr)` must not resolve array method names
-        let un = i.new_obj();
+        // @@unscopables — `with (arr)` must not resolve these method
+        // names; spec's NullProtoObjCreate with every prop data-true
+        // (writable/enumerable/configurable)
+        let un = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
         for n in [
             "at",
-            "concat",
             "copyWithin",
             "entries",
             "fill",
@@ -1102,15 +1076,9 @@ fn install_protos(i: &mut Interp) {
             "flatMap",
             "includes",
             "keys",
-            "lastIndexOf",
-            "pop",
-            "push",
-            "reduce",
-            "reduceRight",
-            "shift",
-            "slice",
-            "some",
-            "splice",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
             "values",
         ] {
             un.borrow_mut()
@@ -1153,6 +1121,7 @@ fn install_protos(i: &mut Interp) {
         method(i, &p, "flat", arr_flat);
         method(i, &p, "flatMap", arr_flat_map);
         method(i, &p, "fill", arr_fill);
+        method(i, &p, "copyWithin", arr_copy_within);
         method(i, &p, "reverse", arr_reverse);
         method(i, &p, "sort", arr_sort);
         method(i, &p, "toReversed", arr_to_reversed);
@@ -1160,11 +1129,13 @@ fn install_protos(i: &mut Interp) {
         method(i, &p, "toSpliced", arr_to_spliced);
         method(i, &p, "with", arr_with);
         method(i, &p, "at", arr_at);
-        method(i, &p, "keys", arr_keys);
-        method(i, &p, "values", arr_values);
-        method(i, &p, "entries", arr_entries);
+        // method_len: NATIVE_ARITY's Object.* entries would otherwise
+        // give these length 1 — spec wants 0
+        method_len(i, &p, "keys", arr_keys, 0.0);
+        method_len(i, &p, "values", arr_values, 0.0);
+        method_len(i, &p, "entries", arr_entries, 0.0);
         method(i, &p, "toString", arr_to_string);
-        method(i, &p, "toLocaleString", arr_join);
+        method(i, &p, "toLocaleString", arr_to_locale_string);
         let values_fn = i.obj_get_raw_str(&p, "values").unwrap();
         p.borrow_mut()
             .props
@@ -6178,7 +6149,7 @@ fn materialize_elements(o: &ObjRef) {
 /// A proxy runs it through traps; typed arrays with live elements can
 /// never reach any integrity level (element descriptors always report
 /// {w,e,c:true}) so the op fails → the caller throws.
-fn set_integrity(i: &mut Interp, o: &ObjRef, frozen: bool) -> Result<bool, Value> {
+pub(crate) fn set_integrity(i: &mut Interp, o: &ObjRef, frozen: bool) -> Result<bool, Value> {
     let ov = Value::Obj(o.clone());
     if !ord_prevent_ext(i, o)? {
         return Ok(false);
@@ -6973,108 +6944,114 @@ fn array_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_push(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let _ = i;
-    if let Value::Obj(o) = this {
-        let mut b = o.borrow_mut();
-        if let ObjKind::Arr(items) = &b.kind {
-            // spec: push starts at the *declared* length
-            let declared = match b.props.get(&PropKey::from_str("length")) {
-                Some(p) => match &p.val {
-                    Value::Num(n) => *n as usize,
-                    _ => 0,
-                },
-                None => 0,
-            };
-            let start = declared.max(items.len());
-            if let ObjKind::Arr(items) = &mut b.kind {
-                if start > items.len() && start <= 8_000_000 {
-                    items.resize(start, Value::Und);
-                }
-                items.extend(args.iter().cloned());
-                return Ok(Value::Num(items.len() as f64));
-            }
-        }
+    // spec: O = ToObject → len = ToLength(Get "length") → TypeError when
+    // len + argCount exceeds 2^53-1 → Set(O, len+k, E) per item →
+    // Set(O, "length", newLen). Generic: any array-like, and a failing
+    // [[Set]] (read-only length, string/TA receiver) always throws.
+    let obj = i.to_object(this)?;
+    let mut len = length_of_array_like(i, &obj)?;
+    if len + args.len() > 9007199254740991usize {
+        return Err(i.type_err("Array.prototype.push: too many items"));
     }
-    Ok(Value::Und)
-}
-
-fn arr_pop(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let _ = i;
-    if let Value::Obj(o) = this {
-        let mut b = o.borrow_mut();
-        if let ObjKind::Arr(items) = &b.kind {
-            let declared = match b.props.get(&PropKey::from_str("length")) {
-                Some(p) => match &p.val {
-                    Value::Num(n) => *n as usize,
-                    _ => 0,
-                },
-                None => 0,
-            };
-            let len = declared.max(items.len());
-            if len == 0 {
-                return Ok(Value::Und);
-            }
-            let idx = len - 1;
-            let out = if let ObjKind::Arr(items) = &mut b.kind {
-                if idx < items.len() {
-                    let v = items.get(idx).cloned().unwrap_or(Value::Und);
-                    items.truncate(idx);
-                    v
-                } else {
-                    Value::Und // trailing hole
-                }
-            } else {
-                Value::Und
-            };
-            if let Some(p) = b.props.get_mut(&PropKey::from_str("length")) {
-                p.val = Value::Num(idx as f64);
-            }
-            return Ok(out);
-        }
+    for e in args {
+        spec_set_idx(i, &obj, len, e.clone())?;
+        len += 1;
     }
-    Ok(Value::Und)
-}
-
-fn arr_shift(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let _ = i;
-    let mut out = Value::Und;
-    with_arr(this, |items| {
-        if !items.is_empty() {
-            out = items.remove(0);
-        }
-    });
-    Ok(out)
-}
-
-fn arr_unshift(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let _ = i;
-    let mut len = 0;
-    with_arr(this, |items| {
-        for (k, v) in args.iter().enumerate() {
-            items.insert(k, v.clone());
-        }
-        len = items.len();
-    });
+    spec_set(i, &obj, pk("length"), Value::Num(len as f64))?;
     Ok(Value::Num(len as f64))
 }
 
+fn arr_pop(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    // spec: len==0 → Set("length", 0) + undefined; else element = Get →
+    // DeletePropertyOrThrow → Set("length", len-1) → element
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if len == 0 {
+        spec_set(i, &obj, pk("length"), Value::Num(0.0))?;
+        return Ok(Value::Und);
+    }
+    let idx = len - 1;
+    let el = i.get_prop(&obj, &idx_key(idx))?;
+    spec_del_idx(i, &obj, idx)?;
+    spec_set(i, &obj, pk("length"), Value::Num(idx as f64))?;
+    Ok(el)
+}
+
+fn arr_shift(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    // spec: len==0 → Set("length", 0), undefined; else first = Get(0),
+    // elements renumber via Has → Get → Set / absent → Delete, last
+    // index deleted, Set("length", len-1)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if len == 0 {
+        spec_set(i, &obj, pk("length"), Value::Num(0.0))?;
+        return Ok(Value::Und);
+    }
+    let first = i.get_prop(&obj, &idx_key(0))?;
+    for k in 1..len {
+        let key = idx_key(k);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
+            spec_set_idx(i, &obj, k - 1, v)?;
+        } else {
+            spec_del_idx(i, &obj, k - 1)?;
+        }
+    }
+    spec_del_idx(i, &obj, len - 1)?;
+    spec_set(i, &obj, pk("length"), Value::Num((len - 1) as f64))?;
+    Ok(first)
+}
+
+fn arr_unshift(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec: when argCount>0 (and len+argCount ≤ 2^53-1), elements renumber
+    // right-to-left by argCount (Has → Get → Set / absent → Delete), then
+    // the items Set in at the front, then Set "length".
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    let argc = args.len();
+    if argc > 0 {
+        if len + argc > 9007199254740991usize {
+            return Err(i.type_err("Array.prototype.unshift: too many items"));
+        }
+        let mut k = len;
+        while k > 0 {
+            k -= 1;
+            let from = idx_key(k);
+            if i.has_prop(&obj, &from)? {
+                let v = i.get_prop(&obj, &from)?;
+                spec_set_idx(i, &obj, k + argc, v)?;
+            } else {
+                spec_del_idx(i, &obj, k + argc)?;
+            }
+        }
+        for (j, e) in args.iter().enumerate() {
+            spec_set_idx(i, &obj, j, e.clone())?;
+        }
+    }
+    spec_set(i, &obj, pk("length"), Value::Num((len + argc) as f64))?;
+    Ok(Value::Num((len + argc) as f64))
+}
+
 fn arr_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    // spec: ToObject → length → bounds → ArraySpeciesCreate(O, count) →
-    // copy only PRESENT indices (HasProperty)
-    let len = elems_len(i, this)?;
-    let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
+    // spec: O → LengthOfArrayLike → ToIntegerOrInfinity(start/end) →
+    // ArraySpeciesCreate(O, count) → per-index HasProperty → live Get →
+    // CreateDataProperty (getters fire, mid-copy deletions are observed)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    let start = clamp_index(to_integer_or_inf(i.to_num(&arg(args, 0))?), len);
     let end = match arg(args, 1) {
         Value::Und => len,
-        v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
+        v => clamp_index(to_integer_or_inf(i.to_num(&v)?), len),
     };
-    let a = species_create(i, this, end.saturating_sub(start))?;
-    let items = to_elems_sparse(i, this)?;
+    let a = species_create(i, &obj, end.saturating_sub(start))?;
     let mut n = 0usize;
-    for (k, v) in items {
-        if k >= start && k < end {
+    for k in start..end {
+        let key = idx_key(k);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
             create_data_prop(i, &a, n, v)?;
-            n += 1;
         }
+        n += 1;
     }
     Ok(a)
 }
@@ -7198,76 +7175,82 @@ fn arr_with(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_splice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    // spec order: length/bounds coercions (user code) → removed array via
-    // ArraySpeciesCreate → element read → mutation of `this`.
-    let len = elems_len(i, this)?;
-    let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
-    let del = match args.get(1) {
-        None => len - start,
-        Some(v) => {
-            let n = i.to_num(v).unwrap_or(0.0);
-            if n < 0.0 {
-                0
-            } else {
-                (n as usize).min(len - start)
-            }
-        }
+    // spec Array.prototype.splice — O → len → ToIntegerOrInfinity bounds →
+    // TypeError on 2^53-1 overflow → removed elements copied (live
+    // HasProperty → Get) into an ArraySpeciesCreate result → the tail
+    // renumbers via per-index Has → Get → Set / absent → Delete → items
+    // Set in at actualStart → Set "length".
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    let rel_start = to_integer_or_inf(i.to_num(&arg(args, 0))?);
+    let actual_start = if rel_start < 0.0 {
+        (len as f64 + rel_start).max(0.0) as usize
+    } else {
+        rel_start.min(len as f64) as usize
     };
-    let items = to_elems_sparse(i, this)?;
-    let a = species_create(i, this, del)?;
-    for (k, v) in &items {
-        if *k >= start && *k < start + del {
-            create_data_prop(i, &a, k - start, v.clone())?;
+    let (insert_count, delete_count) = if args.is_empty() {
+        (0usize, 0usize)
+    } else if args.len() == 1 {
+        (0usize, len - actual_start)
+    } else {
+        let dc = to_integer_or_inf(i.to_num(&args[1])?);
+        let dc = if dc < 0.0 {
+            0.0
+        } else {
+            dc.min((len - actual_start) as f64)
+        };
+        (args.len() - 2, dc as usize)
+    };
+    if len + insert_count - delete_count > 9007199254740991usize {
+        return Err(i.type_err("Array.prototype.splice: too many elements"));
+    }
+    let a = species_create(i, &obj, delete_count)?;
+    for k in 0..delete_count {
+        let from = idx_key(actual_start + k);
+        if i.has_prop(&obj, &from)? {
+            let v = i.get_prop(&obj, &from)?;
+            create_data_prop(i, &a, k, v)?;
         }
     }
-    let insert: Vec<Value> = args.iter().skip(2).cloned().collect();
-    // dense fast path — no user code below
-    if let Value::Obj(o) = this {
-        if let ObjKind::Arr(elems) = &mut o.borrow_mut().kind {
-            if start <= elems.len() {
-                let tail = elems.split_off(start);
-                let rest = tail[del.min(tail.len())..].to_vec();
-                for (k, v) in insert.iter().enumerate() {
-                    elems.insert(start + k, v.clone());
-                }
-                elems.extend(rest);
-            }
-            return Ok(a);
-        }
-    }
-    // generic receiver: rebuild indexed props + length
-    let new_len = len - del + insert.len();
-    let mut nv: Vec<Option<Value>> = vec![None; new_len];
-    for (k, v) in items {
-        if k < start {
-            nv[k] = Some(v);
-        } else if k >= start + del {
-            let nk = k - del + insert.len();
-            if nk < nv.len() {
-                nv[nk] = Some(v);
-            }
-        }
-    }
-    for (k, v) in insert.iter().enumerate() {
-        if start + k < nv.len() {
-            nv[start + k] = Some(v.clone());
-        }
-    }
-    for (k, v) in nv.iter().enumerate() {
-        match v {
-            Some(v) => i.set_prop(this, PropKey::from_str(&k.to_string()), v.clone())?,
-            None => {
-                i.delete_prop(this, &PropKey::from_str(&k.to_string()))?;
+    spec_set(i, &a, pk("length"), Value::Num(delete_count as f64))?;
+    if insert_count < delete_count {
+        for k in actual_start..(len - delete_count) {
+            let from = idx_key(k + delete_count);
+            let to = k + insert_count;
+            if i.has_prop(&obj, &from)? {
+                let v = i.get_prop(&obj, &from)?;
+                spec_set_idx(i, &obj, to, v)?;
+            } else {
+                spec_del_idx(i, &obj, to)?;
             }
         }
+        for k in ((len - delete_count + insert_count)..len).rev() {
+            spec_del_idx(i, &obj, k)?;
+        }
+    } else if insert_count > delete_count {
+        let mut k = len - delete_count;
+        while k > actual_start {
+            let from = idx_key(k + delete_count - 1);
+            let to = k + insert_count - 1;
+            if i.has_prop(&obj, &from)? {
+                let v = i.get_prop(&obj, &from)?;
+                spec_set_idx(i, &obj, to, v)?;
+            } else {
+                spec_del_idx(i, &obj, to)?;
+            }
+            k -= 1;
+        }
     }
-    for k in new_len..len {
-        i.delete_prop(this, &PropKey::from_str(&k.to_string()))?;
+    let mut k = actual_start;
+    for e in args.iter().skip(2) {
+        spec_set_idx(i, &obj, k, e.clone())?;
+        k += 1;
     }
-    i.set_prop(
-        this,
-        PropKey::from_str("length"),
-        Value::Num(new_len as f64),
+    spec_set(
+        i,
+        &obj,
+        pk("length"),
+        Value::Num((len - delete_count + insert_count) as f64),
     )?;
     Ok(a)
 }
@@ -7275,16 +7258,17 @@ fn arr_splice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     // spec: E = ToObject(this) — primitives box to wrappers; A =
     // ArraySpeciesCreate(O,0); each element of [E, ...args] spreads iff
-    // IsConcatSpreadable.
-    let boxed = i.to_object(this)?;
-    let a = species_create(i, this, 0)?;
+    // IsConcatSpreadable; spread visits only PRESENT indices
+    // (HasProperty → live Get → CreateDataProperty) up to LengthOfArrayLike.
+    let obj = i.to_object(this)?;
+    let a = species_create(i, &obj, 0)?;
     let mut n = 0usize;
-    for e in std::iter::once(&boxed).chain(args.iter()) {
+    for e in std::iter::once(&obj).chain(args.iter()) {
         let spreadable = match e {
-            Value::Obj(o) => {
+            Value::Obj(_) => {
                 let flag = i.get_prop(e, &PropKey::Sym(SYM_IS_CONCAT_SPREADABLE))?;
                 if matches!(flag, Value::Und) {
-                    matches!(o.borrow().kind, ObjKind::Arr(_))
+                    is_array_val(i, e)?
                 } else {
                     i.to_bool(&flag)
                 }
@@ -7292,16 +7276,27 @@ fn arr_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             _ => false,
         };
         if spreadable {
-            // spread visits only PRESENT indices (HasProperty)
-            for (_, v) in to_elems_sparse(i, e)? {
-                create_data_prop(i, &a, n, v)?;
-                n += 1;
+            let elen = length_of_array_like(i, e)?;
+            if n + elen > 9007199254740991usize {
+                return Err(i.type_err("Array.prototype.concat: too many elements"));
+            }
+            for k in 0..elen {
+                let key = idx_key(k);
+                if i.has_prop(e, &key)? {
+                    let v = i.get_prop(e, &key)?;
+                    create_data_prop(i, &a, n, v)?;
+                    n += 1;
+                }
             }
         } else {
+            if n >= 9007199254740991usize {
+                return Err(i.type_err("Array.prototype.concat: too many elements"));
+            }
             create_data_prop(i, &a, n, e.clone())?;
             n += 1;
         }
     }
+    spec_set(i, &a, pk("length"), Value::Num(n as f64))?;
     Ok(a)
 }
 
@@ -7321,25 +7316,47 @@ fn arr_to_string(i: &mut Interp, this: &Value, _args: &[Value]) -> NResult {
 }
 
 fn arr_join(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec: O = ToObject → len = LengthOfArrayLike — the length snapshots
+    // BEFORE the separator coercion (a toString that resizes the backing
+    // keeps the old element count) — then per-index live Get.
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
     let sep = match arg(args, 0) {
         Value::Und => ",".to_string(),
         v => i.to_str(&v)?,
     };
-    // snapshot the items: to_str on an element can run user code that
-    // mutates the array, so we can't hold the borrow across it — but we
-    // can append straight into the output instead of a Vec<String> + join.
-    let items = to_elems(i, this)?;
     let mut out = String::new();
-    for (k, it) in items.iter().enumerate() {
+    for k in 0..len {
         if k > 0 {
             out.push_str(&sep);
         }
-        match it {
+        match i.get_prop(&obj, &idx_key(k))? {
             Value::Und | Value::Null => {}
-            Value::Str(s) => out.push_str(s),
-            Value::Num(n) => out.push_str(&js_num_str(*n)),
-            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-            v => out.push_str(&i.to_str(v)?),
+            Value::Str(s) => out.push_str(&s),
+            Value::Num(n) => out.push_str(&js_num_str(n)),
+            Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+            v => out.push_str(&i.to_str(&v)?),
+        }
+    }
+    Ok(Value::Str(Rc::from(out.as_str())))
+}
+
+/// spec %Array.prototype.toLocaleString% — each element stringifies via
+/// its own "toLocaleString" Invoke (user overrides fire); nullish and
+/// absent slots become the empty string.
+fn arr_to_locale_string(i: &mut Interp, this: &Value, _args: &[Value]) -> NResult {
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    let mut out = String::new();
+    for k in 0..len {
+        if k > 0 {
+            out.push(',');
+        }
+        let el = i.get_prop(&obj, &idx_key(k))?;
+        if !matches!(el, Value::Und | Value::Null) {
+            let m = i.get_prop(&el, &pk("toLocaleString"))?;
+            let r = i.call(&m, el, Vec::new())?;
+            out.push_str(&i.to_str(&r)?);
         }
     }
     Ok(Value::Str(Rc::from(out.as_str())))
@@ -7603,21 +7620,69 @@ fn arr_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NResult 
     }
     Ok(Value::Num(-1.0))
 }
+/// spec FlattenIntoArray: per-index HasProperty → live Get → optional
+/// mapper Call → IsArray elements recurse when depth>0, everything else
+/// CreateDataProperty-appends at the running target index.
+fn flatten_into(
+    i: &mut Interp,
+    target: &Value,
+    source: &Value,
+    source_len: usize,
+    mapper: Option<(&Value, &Value)>,
+    depth: f64,
+    n: &mut usize,
+) -> Result<(), Value> {
+    for k in 0..source_len {
+        let key = idx_key(k);
+        if i.has_prop(source, &key)? {
+            let mut el = i.get_prop(source, &key)?;
+            if let Some((cb, this_arg)) = mapper {
+                el = i.call(
+                    cb,
+                    this_arg.clone(),
+                    vec![el, Value::Num(k as f64), source.clone()],
+                )?;
+            }
+            if depth > 0.0 && is_array_val(i, &el)? {
+                let elen = length_of_array_like(i, &el)?;
+                flatten_into(i, target, &el, elen, None, depth - 1.0, n)?;
+            } else {
+                if *n >= 9007199254740991usize {
+                    return Err(i.type_err("flatten target index exceeded"));
+                }
+                create_data_prop(i, target, *n, el)?;
+                *n += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn arr_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    let a = species_create(i, this, 0)?;
+    // spec: ToObject → LengthOfArrayLike → IsCallable check → species —
+    // then per-index HasProperty → live Get → callback → CreateDataProperty
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not callable"));
+    }
+    let a = species_create(i, &obj, 0)?;
     let mut n = 0usize;
-    for (k, v) in items {
-        let r = i.call(
-            &cb,
-            this_arg.clone(),
-            vec![v.clone(), Value::Num(k as f64), this.clone()],
-        )?;
-        if i.to_bool(&r) {
-            create_data_prop(i, &a, n, v)?;
-            n += 1;
+    for k in 0..len {
+        let key = idx_key(k);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
+            let r = i.call(
+                &cb,
+                this_arg.clone(),
+                vec![v.clone(), Value::Num(k as f64), obj.clone()],
+            )?;
+            if i.to_bool(&r) {
+                create_data_prop(i, &a, n, v)?;
+                n += 1;
+            }
         }
     }
     Ok(a)
@@ -7626,16 +7691,26 @@ fn arr_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    let len = elems_len(i, this)?;
-    let a = species_create(i, this, len)?;
-    for (k, v) in items {
-        let r = i.call(
-            &cb,
-            this_arg.clone(),
-            vec![v, Value::Num(k as f64), this.clone()],
-        )?;
-        create_data_prop(i, &a, k, r)?;
+    // spec: ToObject → LengthOfArrayLike → IsCallable check →
+    // ArraySpeciesCreate(O, len) → per-index HasProperty → live Get →
+    // callback → CreateDataProperty (result keeps the source's holes)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not callable"));
+    }
+    let a = species_create(i, &obj, len)?;
+    for k in 0..len {
+        let key = idx_key(k);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
+            let r = i.call(
+                &cb,
+                this_arg.clone(),
+                vec![v, Value::Num(k as f64), obj.clone()],
+            )?;
+            create_data_prop(i, &a, k, r)?;
+        }
     }
     Ok(a)
 }
@@ -7643,55 +7718,104 @@ fn arr_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items {
-        i.call(
-            &cb,
-            this_arg.clone(),
-            vec![v, Value::Num(k as f64), this.clone()],
-        )?;
+    // spec: ToObject → LengthOfArrayLike → IsCallable check → per-index
+    // HasProperty → live Get → callback (result discarded)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not callable"));
+    }
+    for k in 0..len {
+        let key = idx_key(k);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
+            i.call(
+                &cb,
+                this_arg.clone(),
+                vec![v, Value::Num(k as f64), obj.clone()],
+            )?;
+        }
     }
     Ok(Value::Und)
 }
 
 fn arr_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
-    let items = to_elems_sparse(i, this)?;
-    let mut it = items.into_iter();
+    // spec: ToObject → LengthOfArrayLike → IsCallable check — then the
+    // accumulator seeds from arg1-if-present else the first PRESENT
+    // element; per-index HasProperty → live Get → callback
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not callable"));
+    }
+    let mut k = 0usize;
     let mut acc = match args.get(1) {
         Some(v) => v.clone(),
-        None => match it.next() {
-            Some((_, v)) => v,
-            None => return Err(i.type_err("Reduce of empty array with no initial value")),
+        None => loop {
+            if k >= len {
+                return Err(i.type_err("Reduce of empty array with no initial value"));
+            }
+            let key = idx_key(k);
+            if i.has_prop(&obj, &key)? {
+                let v = i.get_prop(&obj, &key)?;
+                k += 1;
+                break v;
+            }
+            k += 1;
         },
     };
-    for (k, v) in it {
-        acc = i.call(
-            &cb,
-            Value::Und,
-            vec![acc, v, Value::Num(k as f64), this.clone()],
-        )?;
+    while k < len {
+        let key = idx_key(k);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
+            acc = i.call(
+                &cb,
+                Value::Und,
+                vec![acc, v, Value::Num(k as f64), obj.clone()],
+            )?;
+        }
+        k += 1;
     }
     Ok(acc)
 }
 
 fn arr_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
-    let items = to_elems_sparse(i, this)?;
-    let mut it = items.into_iter().rev();
+    // spec mirror of reduce: k walks len-1 → 0, same live
+    // HasProperty → Get reads (mid-iteration mutations are observed)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not callable"));
+    }
+    let mut k: i64 = len as i64 - 1;
     let mut acc = match args.get(1) {
         Some(v) => v.clone(),
-        None => match it.next() {
-            Some((_, v)) => v,
-            None => return Err(i.type_err("Reduce of empty array with no initial value")),
+        None => loop {
+            if k < 0 {
+                return Err(i.type_err("Reduce of empty array with no initial value"));
+            }
+            let key = idx_key(k as usize);
+            if i.has_prop(&obj, &key)? {
+                let v = i.get_prop(&obj, &key)?;
+                k -= 1;
+                break v;
+            }
+            k -= 1;
         },
     };
-    for (k, v) in it {
-        acc = i.call(
-            &cb,
-            Value::Und,
-            vec![acc, v, Value::Num(k as f64), this.clone()],
-        )?;
+    while k >= 0 {
+        let key = idx_key(k as usize);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
+            acc = i.call(
+                &cb,
+                Value::Und,
+                vec![acc, v, Value::Num(k as f64), obj.clone()],
+            )?;
+        }
+        k -= 1;
     }
     Ok(acc)
 }
@@ -7699,15 +7823,25 @@ fn arr_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items {
-        let r = i.call(
-            &cb,
-            this_arg.clone(),
-            vec![v, Value::Num(k as f64), this.clone()],
-        )?;
-        if i.to_bool(&r) {
-            return Ok(Value::Bool(true));
+    // spec: ToObject → LengthOfArrayLike → IsCallable check → per-index
+    // HasProperty → live Get → callback; first truthy result wins
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not callable"));
+    }
+    for k in 0..len {
+        let key = idx_key(k);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
+            let r = i.call(
+                &cb,
+                this_arg.clone(),
+                vec![v, Value::Num(k as f64), obj.clone()],
+            )?;
+            if i.to_bool(&r) {
+                return Ok(Value::Bool(true));
+            }
         }
     }
     Ok(Value::Bool(false))
@@ -7716,95 +7850,83 @@ fn arr_some(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn arr_every(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    for (k, v) in items {
-        let r = i.call(
-            &cb,
-            this_arg.clone(),
-            vec![v, Value::Num(k as f64), this.clone()],
-        )?;
-        if !i.to_bool(&r) {
-            return Ok(Value::Bool(false));
+    // spec: ToObject → LengthOfArrayLike → IsCallable check → per-index
+    // HasProperty → live Get → callback; first falsy result wins
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not callable"));
+    }
+    for k in 0..len {
+        let key = idx_key(k);
+        if i.has_prop(&obj, &key)? {
+            let v = i.get_prop(&obj, &key)?;
+            let r = i.call(
+                &cb,
+                this_arg.clone(),
+                vec![v, Value::Num(k as f64), obj.clone()],
+            )?;
+            if !i.to_bool(&r) {
+                return Ok(Value::Bool(false));
+            }
         }
     }
     Ok(Value::Bool(true))
 }
 
 fn arr_flat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec: O → len → ArraySpeciesCreate(O,0) → FlattenIntoArray at
+    // ToIntegerOrInfinity(depth, default 1)
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
     let depth = match arg(args, 0) {
-        Value::Und => 1,
-        v => (i.to_num(&v)?.max(0.0)) as usize,
+        Value::Und => 1.0,
+        v => to_integer_or_inf(i.to_num(&v)?),
     };
-    let items = to_elems_sparse(i, this)?;
-    let a = species_create(i, this, 0)?;
+    let a = species_create(i, &obj, 0)?;
     let mut n = 0usize;
-    fn rec(
-        i: &mut Interp,
-        items: Vec<(usize, Value)>,
-        d: usize,
-        a: &Value,
-        n: &mut usize,
-    ) -> Result<(), Value> {
-        for (_, v) in items {
-            if d > 0 {
-                if let Value::Obj(o) = &v {
-                    if let ObjKind::Arr(inner) = &o.borrow().kind {
-                        let inner: Vec<(usize, Value)> =
-                            inner.iter().cloned().enumerate().collect();
-                        rec(i, inner, d - 1, a, n)?;
-                        continue;
-                    }
-                }
-            }
-            create_data_prop(i, a, *n, v)?;
-            *n += 1;
-        }
-        Ok(())
-    }
-    rec(i, items, depth, &a, &mut n)?;
+    flatten_into(i, &a, &obj, len, None, depth, &mut n)?;
     Ok(a)
 }
 
 fn arr_flat_map(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
-    let items = to_elems_sparse(i, this)?;
-    let a = species_create(i, this, 0)?;
-    let mut n = 0usize;
-    for (k, v) in items {
-        let r = i.call(
-            &cb,
-            this_arg.clone(),
-            vec![v, Value::Num(k as f64), this.clone()],
-        )?;
-        // FlattenIntoArray depth 1: arrays expand, others append
-        if let Value::Obj(o) = &r {
-            if let ObjKind::Arr(inner) = &o.borrow().kind {
-                for x in inner.clone() {
-                    create_data_prop(i, &a, n, x)?;
-                    n += 1;
-                }
-                continue;
-            }
-        }
-        create_data_prop(i, &a, n, r)?;
-        n += 1;
+    // spec: O → len → IsCallable check → ArraySpeciesCreate →
+    // FlattenIntoArray with the mapper at depth 1
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not callable"));
     }
+    let a = species_create(i, &obj, 0)?;
+    let mut n = 0usize;
+    flatten_into(i, &a, &obj, len, Some((&cb, &this_arg)), 1.0, &mut n)?;
     Ok(a)
 }
 
 fn arr_fill(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    // spec returns the ToObject'd receiver (primitive this → wrapper)
+    // spec returns the ToObject'd receiver (primitive this → wrapper);
+    // each index is Set(O, k, value, true) — accessors/non-writable
+    // slots must fire/throw, so the dense path only applies when no
+    // index-named shadow props exist
     let obj = i.to_object(this)?;
     let v = arg(args, 0);
     let len = length_of_array_like(i, &obj)?;
-    let start = clamp_index(i.to_num(&arg(args, 1))?, len);
+    let start = clamp_index(to_integer_or_inf(i.to_num(&arg(args, 1))?), len);
     let end = match arg(args, 2) {
         Value::Und => len,
-        x => clamp_index(i.to_num(&x)?, len),
+        x => clamp_index(to_integer_or_inf(i.to_num(&x)?), len),
     };
     if let Value::Obj(o) = &obj {
-        let fast = matches!(o.borrow().kind, ObjKind::Arr(_));
+        let fast = {
+            let b = o.borrow();
+            matches!(&b.kind, ObjKind::Arr(_))
+                && !b
+                    .props
+                    .iter()
+                    .any(|(k, _)| matches!(k, PropKey::S(s) if arr_index(s.as_ref()).is_some()))
+        };
         if fast {
             let mut b = o.borrow_mut();
             if let Some(h) = b.holes.as_mut() {
@@ -7825,71 +7947,214 @@ fn arr_fill(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         }
     }
     for k in start..end {
-        i.set_prop(&obj, idx_key(k), v.clone())?;
+        spec_set_idx(i, &obj, k, v.clone())?;
     }
     Ok(obj)
 }
 
 fn arr_reverse(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let _ = i;
-    with_arr(this, |items| items.reverse());
-    Ok(this.clone())
+    // spec: pairwise swap across the middle — each side HasProperty →
+    // conditional Get, then Set / Delete in the spec's exact order.
+    // Returns the ToObject'd receiver (primitive this → wrapper).
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    let middle = len / 2;
+    for lower in 0..middle {
+        let upper = len - lower - 1;
+        let lower_key = idx_key(lower);
+        let upper_key = idx_key(upper);
+        let lower_exists = i.has_prop(&obj, &lower_key)?;
+        let lower_v = if lower_exists {
+            i.get_prop(&obj, &lower_key)?
+        } else {
+            Value::Und
+        };
+        let upper_exists = i.has_prop(&obj, &upper_key)?;
+        let upper_v = if upper_exists {
+            i.get_prop(&obj, &upper_key)?
+        } else {
+            Value::Und
+        };
+        if lower_exists && upper_exists {
+            spec_set(i, &obj, lower_key, upper_v)?;
+            spec_set(i, &obj, upper_key, lower_v)?;
+        } else if upper_exists {
+            spec_set(i, &obj, lower_key, upper_v)?;
+            spec_del_idx(i, &obj, upper)?;
+        } else if lower_exists {
+            spec_del_idx(i, &obj, lower)?;
+            spec_set(i, &obj, upper_key, lower_v)?;
+        } else {
+            spec_del_idx(i, &obj, lower)?;
+            spec_del_idx(i, &obj, upper)?;
+        }
+    }
+    Ok(obj)
+}
+
+fn arr_copy_within(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec: O = ToObject → len = LengthOfArrayLike → target/start/end
+    // coercions (ToIntegerOrInfinity, clamped ±len) → count =
+    // min(final-from, len-to) → direction flips on overlap → per-index
+    // HasProperty → Get → Set / absent → DeletePropertyOrThrow.
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    let len_f = len as f64;
+    let clamp_to = |n: f64| -> f64 {
+        if n < 0.0 {
+            (len_f + n).max(0.0)
+        } else {
+            n.min(len_f)
+        }
+    };
+    let rel_target = to_integer_or_inf(i.to_num(&arg(args, 0))?);
+    let to = clamp_to(rel_target);
+    let rel_start = to_integer_or_inf(i.to_num(&arg(args, 1))?);
+    let from = clamp_to(rel_start);
+    let rel_end = match arg(args, 2) {
+        Value::Und => len_f,
+        v => to_integer_or_inf(i.to_num(&v)?),
+    };
+    let final_ = clamp_to(rel_end);
+    let mut count = (final_ - from).min(len_f - to);
+    if count <= 0.0 {
+        return Ok(obj);
+    }
+    // overlapping regions copy backwards so source slots aren't clobbered
+    let (mut to, mut from, dir) = if from < to && to < from + count {
+        (to + count - 1.0, from + count - 1.0, -1.0)
+    } else {
+        (to, from, 1.0)
+    };
+    while count > 0.0 {
+        let from_key = idx_key(from as usize);
+        let to_key = idx_key(to as usize);
+        if i.has_prop(&obj, &from_key)? {
+            let v = i.get_prop(&obj, &from_key)?;
+            spec_set(i, &obj, to_key, v)?;
+        } else {
+            spec_del_idx(i, &obj, to as usize)?;
+        }
+        from += dir;
+        to += dir;
+        count -= 1.0;
+    }
+    Ok(obj)
 }
 
 fn arr_sort(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cmp = arg(args, 0);
-    let mut items = arr_clone(this);
-    if i.is_callable(&cmp) {
-        // merge sort to guarantee stability & avoid borrow traps
+    // spec: IsCallable(comparefn) is checked BEFORE ToObject/length — a
+    // poisoned length getter must not fire ahead of the TypeError.
+    if !matches!(cmp, Value::Und) && !i.is_callable(&cmp) {
+        return Err(i.type_err("Array.prototype.sort: comparator is not callable"));
+    }
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    // SortIndexedProperties (skip-holes): collect every PRESENT element
+    // in index order via Has → live Get — getters, proto elements and
+    // mid-collection deletions all count. Dense real arrays collect
+    // directly: every slot is own+present so nothing observable runs.
+    let mut items = if let Value::Obj(o) = &obj {
+        let b = o.borrow();
+        match &b.kind {
+            ObjKind::Arr(it)
+                if b.holes.as_ref().map_or(true, |h| h.is_empty())
+                    && arr_declared_len(o) == it.len()
+                    && !b.props.iter().any(|(k, _)| {
+                        matches!(k, PropKey::S(s) if arr_index(s.as_ref()).is_some_and(|ix| ix < len))
+                    }) =>
+            {
+                it.clone()
+            }
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    if items.is_empty() {
+        for k in 0..len {
+            let key = idx_key(k);
+            if i.has_prop(&obj, &key)? {
+                items.push(i.get_prop(&obj, &key)?);
+            }
+        }
+    }
+    {
         let mut err: Option<Value> = None;
         let mut work = items.clone();
-        merge_sort(&mut items, &mut work, &mut |a, b| {
+        let callable = i.is_callable(&cmp);
+        merge_sort(&mut items, &mut work, &mut |x, y| {
             if err.is_some() {
                 return std::cmp::Ordering::Equal;
             }
-            match i.call(&cmp, Value::Und, vec![a.clone(), b.clone()]) {
-                Ok(v) => match i.to_num(&v) {
-                    Ok(n) => {
-                        if n < 0.0 {
-                            std::cmp::Ordering::Less
-                        } else if n > 0.0 {
-                            std::cmp::Ordering::Greater
-                        } else {
+            // spec CompareArrayElements: undefineds order after everything
+            let xu = matches!(x, Value::Und);
+            let yu = matches!(y, Value::Und);
+            if xu && yu {
+                return std::cmp::Ordering::Equal;
+            }
+            if xu {
+                return std::cmp::Ordering::Greater;
+            }
+            if yu {
+                return std::cmp::Ordering::Less;
+            }
+            if callable {
+                match i.call(&cmp, Value::Und, vec![x.clone(), y.clone()]) {
+                    Ok(v) => match i.to_num(&v) {
+                        // NaN compares equal — never reorders
+                        Ok(n) => {
+                            if n.is_nan() {
+                                std::cmp::Ordering::Equal
+                            } else if n < 0.0 {
+                                std::cmp::Ordering::Less
+                            } else if n > 0.0 {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Equal
+                            }
+                        }
+                        Err(e) => {
+                            err = Some(e);
                             std::cmp::Ordering::Equal
                         }
-                    }
+                    },
                     Err(e) => {
                         err = Some(e);
                         std::cmp::Ordering::Equal
                     }
-                },
-                Err(e) => {
-                    err = Some(e);
-                    std::cmp::Ordering::Equal
+                }
+            } else {
+                // default comparator: ToString per comparison, ordered by
+                // UTF-16 code units
+                match (i.to_str(x), i.to_str(y)) {
+                    (Ok(a), Ok(b)) => {
+                        let a16: Vec<u16> = a.encode_utf16().collect();
+                        let b16: Vec<u16> = b.encode_utf16().collect();
+                        a16.cmp(&b16)
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        err = Some(e);
+                        std::cmp::Ordering::Equal
+                    }
                 }
             }
         });
         if let Some(e) = err {
             return Err(e);
         }
-    } else {
-        let mut strs: Vec<(String, Value)> = Vec::new();
-        for v in items.drain(..) {
-            let s = match &v {
-                Value::Und | Value::Null => "undefined".to_string(),
-                other => i.to_str(other)?,
-            };
-            strs.push((s, v));
-        }
-        strs.sort_by(|a, b| a.0.cmp(&b.0));
-        items = strs.into_iter().map(|(_, v)| v).collect();
-        // undefined sorts last
-        items.sort_by_key(|v| matches!(v, Value::Und));
     }
-    if let Value::Obj(o) = this {
-        o.borrow_mut().kind = ObjKind::Arr(items);
+    // write phase: Set each sorted value, then DeletePropertyOrThrow for
+    // the rest of [itemCount, len) — holes/absent slots stay absent
+    let item_count = items.len();
+    for (j, v) in items.drain(..).enumerate() {
+        spec_set_idx(i, &obj, j, v)?;
     }
-    Ok(this.clone())
+    for j in item_count..len {
+        spec_del_idx(i, &obj, j)?;
+    }
+    Ok(obj)
 }
 
 pub(crate) fn merge_sort(
@@ -7921,67 +8186,46 @@ pub(crate) fn merge_sort(
 }
 
 fn arr_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    // fast path: a numeric index can't run user code — read under one borrow
-    if matches!(arg(args, 0), Value::Num(_)) {
-        let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-        if let Value::Obj(o) = this {
-            let b = o.borrow();
-            if let ObjKind::Arr(items) = &b.kind {
-                let idx = if n < 0.0 {
-                    items.len() as i64 + n as i64
-                } else {
-                    n as i64
-                };
-                if idx < 0 || idx >= items.len() as i64 {
-                    return Ok(Value::Und);
-                }
-                return Ok(items[idx as usize].clone());
-            }
-        }
+    // spec: O = ToObject → len = LengthOfArrayLike → relativeIndex =
+    // ToIntegerOrInfinity(arg0); a negative wraps from the end. The
+    // property read is a live Get so getters/prototypes are observed
+    // (and primitives only see wrapper-prototype values — spec matches).
+    let obj = i.to_object(this)?;
+    let len = length_of_array_like(i, &obj)?;
+    let n = to_integer_or_inf(i.to_num(&arg(args, 0))?);
+    let k = if n < 0.0 { len as f64 + n } else { n };
+    if k < 0.0 || k >= len as f64 {
         return Ok(Value::Und);
     }
-    let items = to_elems(i, this)?;
-    let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let idx = if n < 0.0 {
-        items.len() as i64 + n as i64
-    } else {
-        n as i64
-    };
-    if idx < 0 || idx >= items.len() as i64 {
-        return Ok(Value::Und);
-    }
-    Ok(items[idx as usize].clone())
+    i.get_prop(&obj, &idx_key(k as usize))
 }
 
 fn arr_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    if let Value::Obj(o) = this {
+    // spec CreateArrayIterator(ToObject(this), "key") — a live view:
+    // mutation during iteration is observed
+    let obj = i.to_object(this)?;
+    if let Value::Obj(o) = &obj {
         return Ok(make_live_iter(o.clone(), i.p.array_iter.clone(), 1));
     }
-    let items = to_elems(i, this)?;
-    Ok(make_iter_in(
-        (0..items.len()).map(|k| Value::Num(k as f64)).collect(),
-        i.p.array_iter.clone(),
-    ))
+    unreachable!()
 }
 
 fn arr_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    if let Value::Obj(o) = this {
+    // spec CreateArrayIterator(ToObject(this), "value")
+    let obj = i.to_object(this)?;
+    if let Value::Obj(o) = &obj {
         return Ok(make_live_iter(o.clone(), i.p.array_iter.clone(), 0));
     }
-    let items = to_elems(i, this)?;
-    Ok(make_iter_in(items, i.p.array_iter.clone()))
+    unreachable!()
 }
 
 fn arr_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    if let Value::Obj(o) = this {
+    // spec CreateArrayIterator(ToObject(this), "key+value")
+    let obj = i.to_object(this)?;
+    if let Value::Obj(o) = &obj {
         return Ok(make_live_iter(o.clone(), i.p.array_iter.clone(), 2));
     }
-    let items = to_elems(i, this)?;
-    let mut out = Vec::new();
-    for (k, v) in items.into_iter().enumerate() {
-        out.push(Value::Obj(i.new_arr(vec![Value::Num(k as f64), v])));
-    }
-    Ok(make_iter_in(out, i.p.array_iter.clone()))
+    unreachable!()
 }
 
 /// live-view iterator object — reads `obj` per step so mid-iteration
@@ -15923,15 +16167,25 @@ fn escape_re_pattern(src: &str) -> String {
         return "(?:)".into();
     }
     let mut out = String::with_capacity(src.len() + 4);
+    // "escaped as necessary" — a `/` already preceded by `\` is left
+    // alone: `\/` stays `\/` (re-escaping would change the pattern),
+    // a bare `/` becomes `\/`; LineTerminators escape unconditionally
+    let mut escaped = false;
     for ch in src.chars() {
         match ch {
-            '/' => out.push_str("\\/"),
+            '\\' => {
+                out.push('\\');
+                escaped = !escaped;
+                continue;
+            }
+            '/' if !escaped => out.push_str("\\/"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\u{2028}' => out.push_str("\\u2028"),
             '\u{2029}' => out.push_str("\\u2029"),
             c => out.push(c),
         }
+        escaped = false;
     }
     out
 }
