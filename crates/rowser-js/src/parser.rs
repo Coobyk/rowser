@@ -43,6 +43,8 @@ struct Parser {
     ctor_depth: usize,
     /// inside any method/ctor — `super.prop` validity
     method_depth: usize,
+    /// inside FormalParameters — YieldExpression is an early error here
+    param_depth: usize,
     /// recursion guard for deeply nested source
     depth: usize,
 }
@@ -58,6 +60,7 @@ impl Parser {
             gen_depth: 0,
             ctor_depth: 0,
             method_depth: 0,
+            param_depth: 0,
             depth: 0,
         }
     }
@@ -979,20 +982,30 @@ impl Parser {
     /// `name_required`: decls need names, expressions don't.
     /// `gen`: a `*` generator marker was already consumed.
     fn fn_tail(&mut self, name_required: bool, gen: bool) -> Result<FnDef, Error> {
-        let name = match self.peek().tok.clone() {
-            Tok::Ident(s) => {
-                self.check_binding_name(&s)?;
-                self.next();
-                Some(s)
+        let name = {
+            // the name's [Yield] context: declarations inherit the
+            // enclosing generator; expressions always use their own
+            let saved_gd = self.gen_depth;
+            if !name_required {
+                self.gen_depth = gen as usize;
             }
-            Tok::Kw(k) if is_contextual_ident_kw(&k) => {
-                let s = k.name().to_string();
-                self.check_binding_name(&s)?;
-                self.next();
-                Some(s)
-            }
-            _ if !name_required => None,
-            _ => return Err(self.err("expected function name")),
+            let n = match self.peek().tok.clone() {
+                Tok::Ident(s) => {
+                    self.check_binding_name(&s)?;
+                    self.next();
+                    Some(s)
+                }
+                Tok::Kw(k) if is_contextual_ident_kw(&k) => {
+                    let s = k.name().to_string();
+                    self.check_binding_name(&s)?;
+                    self.next();
+                    Some(s)
+                }
+                _ if !name_required => None,
+                _ => return Err(self.err("expected function name")),
+            };
+            self.gen_depth = saved_gd;
+            n
         };
         let old_ctx = (self.gen_depth, self.strict, self.ctor_depth, self.method_depth);
         self.gen_depth = gen as usize;
@@ -1008,6 +1021,16 @@ impl Parser {
                 if let Tok::Str(t) = &self.peek().tok {
                     if t == "use strict" {
                         self.strict = true;
+                        // early error: an explicit directive can't apply to
+                        // a non-simple parameter list
+                        let simple = params
+                            .iter()
+                            .all(|p| matches!(p, Param::Ident(_)));
+                        if !simple {
+                            return Err(self.err(
+                                "\"use strict\" not allowed with non-simple parameters",
+                            ));
+                        }
                     }
                 }
             }
@@ -1077,6 +1100,10 @@ impl Parser {
     /// strict-mode binding-name restrictions (eval/arguments + strict-only
     /// reserved words).
     fn check_binding_name(&self, name: &str) -> Result<(), Error> {
+        // `yield` is reserved inside generator bodies even in sloppy mode
+        if name == "yield" && self.gen_depth > 0 {
+            return Err(self.err("`yield` is not a valid binding in a generator"));
+        }
         if !self.strict {
             return Ok(());
         }
@@ -1100,6 +1127,13 @@ impl Parser {
     }
 
     fn params(&mut self) -> Result<Vec<Param>, Error> {
+        self.param_depth += 1;
+        let r = self.params_inner();
+        self.param_depth -= 1;
+        r
+    }
+
+    fn params_inner(&mut self) -> Result<Vec<Param>, Error> {
         let mut params = Vec::new();
         while !self.at_punct(")") {
             if self.eat_punct("...") {
@@ -1267,12 +1301,21 @@ impl Parser {
             return Ok(e);
         }
         if self.at_kw(Kw::Yield) && self.gen_depth > 0 {
-            // `yield` — encoded as a call to the `$yield` intrinsic; the
-            // interp collects these per running `function*` (see
-            // `Interp::gen_stack`). `yield*` → `$yieldstar`.
+            // `yield` — encoded as a call to the `$yield` intrinsic.
+            // YieldExpression is an early error inside FormalParameters,
+            // and [no LineTerminator] separates `yield`/`yield*` from the
+            // operand: `yield\n x` parses as `yield; x`.
+            if self.param_depth > 0 {
+                return Err(self.err(
+                    "YieldExpression is not allowed in FormalParameters",
+                ));
+            }
             self.next();
-            let star = self.eat_punct("*");
-            if !self.at_punct(")")
+            // [no LT] separates `yield` from `*` and (when absent) the
+            // operand; after `yield *` the operand may cross lines
+            let star = !self.peek().newline_before && self.eat_punct("*");
+            if (star || !self.peek().newline_before)
+                && !self.at_punct(")")
                 && !self.at_punct("]")
                 && !self.at_punct("}")
                 && !self.at_punct(",")
@@ -1882,6 +1925,11 @@ impl Parser {
                         | Kw::As
                 ) =>
             {
+                // [Yield] early error: `yield` is never an
+                // IdentifierReference inside a generator body
+                if k == Kw::Yield && self.gen_depth > 0 {
+                    return Err(self.err("`yield` is not a valid identifier here"));
+                }
                 self.next();
                 Ok(Expr::Ident(k.name().to_string()))
             }

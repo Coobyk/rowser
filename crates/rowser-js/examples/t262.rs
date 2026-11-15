@@ -167,9 +167,15 @@ fn main() {
         if std::env::var("VERBOSE").is_ok() {
             eprintln!("RUN {rel}");
         }
-        let mut ctx = rowser_js::Context::new();
-        ctx.interp.arm_deadline(std::time::Duration::from_secs(15));
-        let res = ctx.eval(&body);
+        // a panic in one test must not kill the run — count it as a fail
+        let res = std::panic::catch_unwind(|| {
+            let mut ctx = rowser_js::Context::new();
+            ctx.interp.arm_deadline(std::time::Duration::from_secs(15));
+            ctx.eval(&body)
+        })
+        .unwrap_or_else(|_| {
+            Err(rowser_js::Error::new("panic during test", 0, 0))
+        });
         if std::env::var("T262_DEBUG").is_ok() {
             if let Err(e) = &res {
                 eprintln!("ERR {rel}: {e}");

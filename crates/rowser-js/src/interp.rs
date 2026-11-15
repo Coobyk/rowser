@@ -434,6 +434,10 @@ pub struct GenCell {
     /// taken out during resume so a reentrant `next()` sees `running`
     /// instead of tripping a RefCell double-borrow
     pub coro: Option<GenCoro>,
+    /// not-yet-started body — the coroutine stack is only allocated on
+    /// first resume so `function* g(){}` calls that are never stepped
+    /// cost no stack memory
+    pub pending: Option<(Rc<FnDef>, EnvRef)>,
     pub running: bool,
     /// completed — next() → {value: undefined, done: true}
     pub done: bool,
@@ -808,6 +812,9 @@ pub struct Protos {
     pub string_iter: ObjRef,
     /// %GeneratorPrototype% — proto of objects `function*` calls return
     pub generator: ObjRef,
+    /// %GeneratorFunction.prototype% — proto of generator *functions*;
+    /// its `.prototype` slot is %GeneratorPrototype%
+    pub gen_func: ObjRef,
     /// %IteratorHelperPrototype% — proto of lazy map/filter/take/… results
     pub iter_helper: ObjRef,
     /// %WrapForValidIteratorPrototype% — proto of `Iterator.from` wraps
@@ -927,6 +934,7 @@ impl Interp {
                 set_iter: mk(Some(iterator.clone())),
                 string_iter: mk(Some(iterator.clone())),
                 generator: mk(Some(iterator.clone())),
+                gen_func: mk(Some(func.clone())),
                 iter_helper: mk(Some(iterator.clone())),
                 wrap_iter: mk(Some(iterator.clone())),
                 iterator,
@@ -2645,10 +2653,11 @@ impl Interp {
                 }
                 // arrows inherit this/home/new.target lexically — is_fn=false
                 // makes lookups walk through automatically.
-                self.bind_params(&scope, &def.params, &args)?;
                 let h = self.hoisted_fn(&def);
+                // `arguments` is visible inside parameter initializers —
+                // bind it before defaults evaluate
                 if !def.is_arrow && h.uses_arguments {
-                    let arr = self.new_arr(args);
+                    let arr = self.new_arr(args.clone());
                     let k = self.intern("arguments");
                     scope.vars.borrow_mut().insert(
                         k,
@@ -2658,45 +2667,27 @@ impl Interp {
                         },
                     );
                 }
+                self.bind_params(&scope, &def.params, &args)?;
                 self.apply_hoisted(&h, &scope);
                 if def.is_gen {
-                    // lazy generator: the body runs on a coroutine stack;
-                    // `yield` suspends back to the resumer. The Interp is
-                    // passed by raw pointer — only dereferenced while a
-                    // resume() is on the stack, on this same thread.
-                    let ip = self as *mut Interp;
-                    let scope = scope.clone();
-                    let coro = corosensei::Coroutine::with_stack(
-                        corosensei::stack::DefaultStack::new(8 * 1024 * 1024)
-                            .expect("gen stack"),
-                        move |y: &corosensei::Yielder<GenIn, Value>,
-                              first: GenIn|
-                              -> GenRet {
-                            // GeneratorResumeAbrupt on a suspendedStart
-                            // generator: return()/throw() completes the
-                            // record WITHOUT running the body
-                            match first {
-                                GenIn::Return(v) => return Ok(v),
-                                GenIn::Throw(e) => return Err(e),
-                                GenIn::Next(_) => {}
-                            }
-                            let i = unsafe { &mut *ip };
-                            i.gen_yielders.push(y as *const _);
-                            i.depth += 1;
-                            let r = i.exec_block(&def.body, &scope);
-                            i.depth -= 1;
-                            i.gen_yielders.pop();
-                            match r {
-                                Ok(Completion::Return(v)) => Ok(v),
-                                Ok(_) => Ok(Value::Und),
-                                Err(e) => Err(e),
-                            }
-                        },
-                    );
+                    // lazy generator: the body runs on a coroutine stack
+                    // allocated at first resume; `yield` suspends back to
+                    // the resumer. The Interp is passed by raw pointer —
+                    // only dereferenced while a resume() is on the stack,
+                    // on this same thread.
+                    // instances inherit the function's own `prototype`
+                    // (proto %GeneratorPrototype%), not the shared proto
+                    let gproto = match self
+                        .obj_get_raw(&o, &PropKey::from_str("prototype"))
+                    {
+                        Some(Value::Obj(p)) => p,
+                        _ => self.p.generator.clone(),
+                    };
                     return Ok(Value::Obj(Rc::new(RefCell::new(Obj::new(
-                        Some(self.p.generator.clone()),
+                        Some(gproto),
                         ObjKind::Gen(Rc::new(RefCell::new(GenCell {
-                            coro: Some(coro),
+                            coro: None,
+                            pending: Some((def, scope)),
                             running: false,
                             done: false,
                         }))),
@@ -2848,6 +2839,7 @@ impl Interp {
                 ctor,
             }) => {
                 if def.is_arrow
+                    || def.is_gen
                     || (home.is_some() && matches!(ctor, CtorKind::NotClass))
                 {
                     return Err(self.type_err("value is not a constructor"));
@@ -2882,7 +2874,7 @@ impl Interp {
                 self.bind_params(&scope, &def.params, &args)?;
                 let h = self.hoisted_fn(&def);
                 if h.uses_arguments {
-                    let arr = self.new_arr(args);
+                    let arr = self.new_arr(args.clone());
                     let k = self.intern("arguments");
                     scope.vars.borrow_mut().insert(
                         k,
@@ -3340,11 +3332,15 @@ impl Interp {
         self.set_attr(&o, "name", Value::Str(Rc::from(name.as_str())), false, true);
         self.set_attr(&o, "length", Value::Num(param_count(&def.params) as f64), false, true);
         if def.is_gen {
-            // generator fns: `.prototype` is an ordinary object whose
-            // proto is %GeneratorPrototype% — no `constructor` back-ref
+            // generator fns: proto is %GeneratorFunction.prototype%; the
+            // `.prototype` prop is an ordinary object whose proto is
+            // %GeneratorPrototype% — no `constructor` back-ref.
+            // Descriptor: {writable: true, enumerable: false,
+            // configurable: false}
+            o.borrow_mut().proto = Some(self.p.gen_func.clone());
             let proto = self.new_obj();
             proto.borrow_mut().proto = Some(self.p.generator.clone());
-            self.set_builtin(&o, "prototype", Value::Obj(proto));
+            self.set_attr(&o, "prototype", Value::Obj(proto), true, false);
         } else if !def.is_arrow {
             let proto = self.new_obj();
             self.set_builtin(&proto, "constructor", Value::Obj(o.clone()));
@@ -5057,7 +5053,7 @@ pub fn js_num_str(n: f64) -> String {
 fn param_count(params: &[Param]) -> usize {
     params
         .iter()
-        .take_while(|p| !matches!(p, Param::Rest(_)))
+        .take_while(|p| !matches!(p, Param::Rest(_) | Param::Default(..)))
         .count()
 }
 

@@ -593,6 +593,19 @@ fn install_protos(i: &mut Interp) {
         method(i, &p, "apply", fn_apply);
         method(i, &p, "bind", fn_bind);
         method(i, &p, "toString", fn_to_string);
+        // restricted function properties — the shared %ThrowTypeError%
+        // accessor makes `fn.caller`/`fn.arguments` throw on get+set
+        fn throw_type_err(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
+            Err(i.type_err("'caller' and 'arguments' are restricted"))
+        }
+        for k in ["caller", "arguments"] {
+            let g = native(i, "ThrowTypeError", throw_type_err);
+            let s = native(i, "ThrowTypeError", throw_type_err);
+            p.borrow_mut().props.insert(
+                PropKey::from_str(k),
+                Prop::accessor(Some(g), Some(s)),
+            );
+        }
     }
 
     // -- Array.prototype --
@@ -775,6 +788,12 @@ fn install_protos(i: &mut Interp) {
         let wp = i.p.wrap_iter.clone();
         method(i, &wp, "next", iter_next);
         method(i, &wp, "return", wrap_iter_ret);
+        // %GeneratorFunction.prototype% — proto of `function*` fns; its
+        // `.prototype` slot is %GeneratorPrototype%
+        {
+            let gf = i.p.gen_func.clone();
+            i.set_builtin(&gf, "prototype", Value::Obj(i.p.generator.clone()));
+        }
         // %GeneratorPrototype% — eager generators step a snapshot, so
         // `next` is the Iter stepper; `return`/`throw` finish the snapshot
         let gp = i.p.generator.clone();
@@ -945,8 +964,41 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
         c.running = true;
         c.coro.take()
     };
-    let Some(mut coro) = coro else {
-        return iter_result(i, Value::Und, true);
+    let mut coro = match coro {
+        Some(c) => c,
+        None => {
+            // first resume: allocate the coroutine stack now — the
+            // Interp pointer is captured fresh here so it is always the
+            // resumer's own instance
+            let Some((def, scope)) = cell.borrow_mut().pending.take() else {
+                return iter_result(i, Value::Und, true);
+            };
+            let ip = i as *mut Interp;
+            corosensei::Coroutine::new(
+                move |y: &corosensei::Yielder<GenIn, Value>, first: GenIn|
+                      -> GenRet {
+                    // GeneratorResumeAbrupt on a suspendedStart
+                    // generator: return()/throw() completes the record
+                    // WITHOUT running the body
+                    match first {
+                        GenIn::Return(v) => return Ok(v),
+                        GenIn::Throw(e) => return Err(e),
+                        GenIn::Next(_) => {}
+                    }
+                    let i = unsafe { &mut *ip };
+                    i.gen_yielders.push(y as *const _);
+                    i.depth += 1;
+                    let r = i.exec_block(&def.body, &scope);
+                    i.depth -= 1;
+                    i.gen_yielders.pop();
+                    match r {
+                        Ok(Completion::Return(v)) => Ok(v),
+                        Ok(_) => Ok(Value::Und),
+                        Err(e) => Err(e),
+                    }
+                },
+            )
+        }
     };
     let ret_v = match &input {
         GenIn::Return(v) => Some(v.clone()),
@@ -7228,11 +7280,12 @@ fn map_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
     let this_arg = arg(args, 1);
     if let Value::Obj(o) = this {
-        if let ObjKind::Map(items) = &o.borrow().kind {
-            let items = items.clone();
-            for (k, v) in items {
-                i.call(&cb, this_arg.clone(), vec![v, k, this.clone()])?;
-            }
+        let items = match &o.borrow().kind {
+            ObjKind::Map(items) => items.clone(),
+            _ => Vec::new(),
+        };
+        for (k, v) in items {
+            i.call(&cb, this_arg.clone(), vec![v, k, this.clone()])?;
         }
     }
     Ok(Value::Und)
