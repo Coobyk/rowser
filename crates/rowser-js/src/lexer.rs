@@ -5,8 +5,9 @@ use crate::Error;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     Num(f64),
-    /// bigint literal `123n` (magnitude kept as f64 — no true BigInt yet)
-    BigInt(f64),
+    /// bigint literal `123n` — payload is the literal text
+    /// ("123" / "0x7f" / "0o17" / "0b101") without the `n` suffix
+    BigInt(std::rc::Rc<str>),
     Str(String),
     /// template literal: alternating string parts and raw expression sources
     Template(Vec<TemplPart>),
@@ -553,7 +554,13 @@ impl Lexer {
                 });
                 if self.peek() == Some('n') {
                     self.bump();
-                    return self.number_tail_ok(Tok::BigInt(n));
+                    let p = match r {
+                        16 => "0x",
+                        8 => "0o",
+                        _ => "0b",
+                    };
+                    let raw = std::rc::Rc::from(format!("{p}{v}").as_str());
+                    return self.number_tail_ok(Tok::BigInt(raw));
                 }
                 return self.number_tail_ok(Tok::Num(n));
             }
@@ -666,11 +673,9 @@ impl Lexer {
             if seen_dot || seen_exp {
                 return Err(self.err("bigint literal must be an integer"));
             }
-            return s
-                .parse::<f64>()
-                .map(Tok::BigInt)
-                .map_err(|_| self.err("bad bigint literal"))
-                .and_then(|t| self.number_tail_ok(t));
+            return self.number_tail_ok(Tok::BigInt(std::rc::Rc::from(
+                s.as_str(),
+            )));
         }
         let _ = seen_exp;
         self.number_tail(s)

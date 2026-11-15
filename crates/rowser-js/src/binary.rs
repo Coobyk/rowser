@@ -230,22 +230,65 @@ fn ta_intrinsic_name(v: &Value, kind: TAK) -> String {
 /// `%BigInt.prototype%.valueOf` — stand-ins carry their magnitude in a
 /// non-enumerable `__bigint` slot; returning it lets Number() /
 /// ToNumber treat them like real bigints.
-fn bigint_value_of(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+/// the primitive stand-in for `this` — a stand-in returns itself, an
+/// `Object()`-wrapped bigint (`__bigint_wrap`) rebuilds the primitive
+/// from its slots
+fn bigint_prim_of(i: &mut Interp, this: &Value) -> Result<Value, Value> {
     if let Value::Obj(o) = this {
-        if let Some(v) = o.borrow().props.get_str("__bigint").map(|p| p.val.clone()) {
-            return Ok(v);
+        let b = o.borrow();
+        if b.props.contains_key(&PropKey::from_str("__bigint")) {
+            let wrapped = b.props.contains_key(&PropKey::from_str("__bigint_wrap"));
+            if wrapped {
+                let bits = b
+                    .props
+                    .get_str("__bigint_x")
+                    .and_then(|p| match &p.val {
+                        Value::Str(s) => Some(s.to_string()),
+                        _ => None,
+                    });
+                drop(b);
+                if let Some(x) = bits {
+                    let (neg, mag) = match x.strip_prefix('-') {
+                        Some(m) => (true, m.to_string()),
+                        None => (false, x),
+                    };
+                    return Ok(i.bigint_obj_b(neg, &mag));
+                }
+                // legacy wrap without the exact slot — coarse path
+                if let Some(Value::Num(n)) =
+                    o.borrow().props.get_str("__bigint").map(|p| p.val.clone())
+                {
+                    return Ok(i.bigint_obj(n));
+                }
+            } else {
+                drop(b);
+                return Ok(this.clone());
+            }
         }
     }
     Err(i.type_err("not a BigInt"))
 }
 
-fn bigint_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    if let Value::Obj(o) = this {
-        if let Some(v) = o.borrow().props.get_str("__bigint").map(|p| p.val.clone()) {
-            return i.to_str(&v).map(|s| Value::Str(Rc::from(s.as_str())));
+fn bigint_value_of(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    bigint_prim_of(i, this)
+}
+
+fn bigint_to_string(i: &mut Interp, this: &Value, a: &[Value]) -> NR {
+    let prim = bigint_prim_of(i, this)?;
+    let radix = match a.first() {
+        Some(Value::Und) | None => 10,
+        Some(v) => {
+            let n = i.to_num(v)?;
+            if !(2.0..=36.0).contains(&n) || n.fract() != 0.0 {
+                return Err(i.range_err("toString() radix must be between 2 and 36"));
+            }
+            n as u32
         }
+    };
+    match bigint_radix_string(&prim, radix) {
+        Some(s) => Ok(Value::Str(Rc::from(s.as_str()))),
+        None => Err(i.type_err("not a BigInt")),
     }
-    Err(i.type_err("not a BigInt"))
 }
 
 const TA_CTORS: [NativeFn; 9] = [
@@ -666,8 +709,16 @@ fn to_index(i: &mut Interp, v: &Value) -> Result<usize, Value> {
 }
 
 /// magnitude of a bigint stand-in object (the non-enumerable
-/// `__bigint` slot installed by `Interp::bigint_obj`).
+/// `__bigint` slot installed by `Interp::bigint_obj`). Prefers the
+/// exact `__bigint_x` bit-string when present; `Object()`-wrapped
+/// bigints (`__bigint_wrap`) are real objects, not stand-ins.
 pub(crate) fn bigint_magnitude(v: &Value) -> Option<f64> {
+    if !bigint_is_prim(v) {
+        return None;
+    }
+    if let Some((neg, mag)) = bigint_bits(v) {
+        return Some(bits_to_f64(neg, &mag));
+    }
     if let Value::Obj(o) = v {
         if let Some(Value::Num(n)) =
             o.borrow().props.get_str("__bigint").map(|p| p.val.clone())
@@ -680,45 +731,32 @@ pub(crate) fn bigint_magnitude(v: &Value) -> Option<f64> {
 
 /// spec StringToBigInt — a StringIntegerLiteral (decimal / 0x / 0o /
 /// 0b, optional sign for decimal only); empty → 0n; malformed →
-/// SyntaxError. Values are approximated as f64.
-fn str_to_bigint_num(i: &mut Interp, s: &str) -> Result<f64, Value> {
+/// SyntaxError.
+pub(crate) fn str_to_bigint_bits(i: &mut Interp, s: &str) -> Result<(bool, String), Value> {
     let t = s.trim();
     if t.is_empty() {
-        return Ok(0.0);
+        return Ok((false, "0".into()));
     }
-    let (sign, body) = match t.strip_prefix('-') {
-        Some(r) => (-1.0, r),
-        None => match t.strip_prefix('+') {
-            Some(r) => (1.0, r),
-            None => (1.0, t),
-        },
-    };
-    let signed = sign < 0.0 || t.starts_with('+');
-    let (digits, radix) = if let Some(h) =
-        body.strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
-    {
-        (h, 16)
-    } else if let Some(h) =
-        body.strip_prefix("0o").or_else(|| body.strip_prefix("0O"))
-    {
-        (h, 8)
-    } else if let Some(h) =
-        body.strip_prefix("0b").or_else(|| body.strip_prefix("0B"))
-    {
-        (h, 2)
-    } else {
-        (body, 10)
-    };
-    if digits.is_empty()
-        || !digits.chars().all(|c| c.is_digit(radix))
-        || (signed && radix != 10)
+    // spec: the optional sign applies to decimal only — "-0x10" is a
+    // SyntaxError, which lit_to_bits would wrongly accept
+    let signed = t.starts_with('-') || t.starts_with('+');
+    let body = t.trim_start_matches(['-', '+']);
+    if signed
+        && (body.starts_with("0x")
+            || body.starts_with("0X")
+            || body.starts_with("0o")
+            || body.starts_with("0O")
+            || body.starts_with("0b")
+            || body.starts_with("0B"))
     {
         return Err(i.syntax_err("Cannot convert string to a BigInt"));
     }
-    let n = u128::from_str_radix(digits, radix)
-        .map(|v| v as f64)
-        .unwrap_or(f64::INFINITY);
-    Ok(sign * n)
+    lit_to_bits(t).ok_or_else(|| i.syntax_err("Cannot convert string to a BigInt"))
+}
+
+fn str_to_bigint_num(i: &mut Interp, s: &str) -> Result<f64, Value> {
+    let (neg, mag) = str_to_bigint_bits(i, s)?;
+    Ok(bits_to_f64(neg, &mag))
 }
 
 /// spec element conversion — ToNumber for number-kind TypedArrays and
@@ -4925,4 +4963,674 @@ fn crypto_random_uuid(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
         b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
     );
     Ok(Value::Str(Rc::from(s.as_str())))
+}
+
+// ============================ exact BigInt ==============================
+// A bigint stand-in carries two slots: `__bigint` (f64 — coarse cache for
+// legacy readers) and `__bigint_x` (exact magnitude as a Str of an
+// optional '-' followed by binary digits, MSB first, "0" for zero). A
+// wrapper object produced by `Object(1n)` carries `__bigint_wrap` so
+// `bigint_bits`/`bigint_magnitude` exclude it — wrappers are real objects
+// that ToPrimitive to the primitive stand-in.
+
+pub(crate) fn bigint_is_prim(v: &Value) -> bool {
+    if let Value::Obj(o) = v {
+        let b = o.borrow();
+        b.props.contains_key(&PropKey::from_str("__bigint"))
+            && !b.props.contains_key(&PropKey::from_str("__bigint_wrap"))
+    } else {
+        false
+    }
+}
+
+/// exact magnitude — (negative, binary-digit magnitude)
+pub(crate) fn bigint_bits(v: &Value) -> Option<(bool, Rc<str>)> {
+    if !bigint_is_prim(v) {
+        return None;
+    }
+    let Value::Obj(o) = v else { return None };
+    let b = o.borrow();
+    if let Some(Value::Str(s)) = b.props.get_str("__bigint_x").map(|p| p.val.clone()) {
+        let (neg, mag) = match s.strip_prefix('-') {
+            Some(m) => (true, m),
+            None => (false, &*s),
+        };
+        let mag = bnorm(mag);
+        return Some((neg && mag != "0", Rc::from(mag)));
+    }
+    // legacy stand-in without the exact slot — reconstruct from f64
+    if let Some(Value::Num(n)) = b.props.get_str("__bigint").map(|p| p.val.clone()) {
+        let (neg, mag, _) = f64_bits(n.trunc());
+        return Some((neg, Rc::from(mag.as_str())));
+    }
+    None
+}
+
+fn bnorm(s: &str) -> &str {
+    let t = s.trim_start_matches('0');
+    if t.is_empty() { "0" } else { t }
+}
+
+fn snorm(neg: bool, mag: String) -> (bool, String) {
+    let m = bnorm(&mag).to_string();
+    (neg && m != "0", m)
+}
+
+fn bcmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+fn badd(a: &str, b: &str) -> String {
+    let (a, b) = if a.len() < b.len() { (b, a) } else { (a, b) };
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut out = Vec::with_capacity(ab.len() + 1);
+    let mut carry = 0u8;
+    for i in 0..ab.len() {
+        let x = ab[ab.len() - 1 - i] - b'0';
+        let y = if i < bb.len() { bb[bb.len() - 1 - i] - b'0' } else { 0 };
+        let s = x + y + carry;
+        out.push((s & 1) + b'0');
+        carry = s >> 1;
+    }
+    if carry > 0 {
+        out.push(b'1');
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap()
+}
+
+/// `a - b` on magnitudes — requires a >= b
+fn bsub(a: &str, b: &str) -> String {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut out = vec![b'0'; ab.len()];
+    let mut borrow = 0i16;
+    for i in 0..ab.len() {
+        let x = (ab[ab.len() - 1 - i] - b'0') as i16;
+        let y = if i < bb.len() { (bb[bb.len() - 1 - i] - b'0') as i16 } else { 0 };
+        let mut d = x - y - borrow;
+        if d < 0 {
+            d += 2;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        out[ab.len() - 1 - i] = d as u8 + b'0';
+    }
+    bnorm(std::str::from_utf8(&out).unwrap()).to_string()
+}
+
+fn bmul(a: &str, b: &str) -> String {
+    if a == "0" || b == "0" {
+        return "0".into();
+    }
+    // multiply by the sparser operand
+    let ones_a = a.bytes().filter(|&c| c == b'1').count();
+    let ones_b = b.bytes().filter(|&c| c == b'1').count();
+    let (a, b) = if ones_a < ones_b { (b, a) } else { (a, b) };
+    let mut acc = "0".to_string();
+    for (i, c) in b.bytes().rev().enumerate() {
+        if c == b'1' {
+            let mut s = String::with_capacity(a.len() + i);
+            s.push_str(a);
+            s.extend(std::iter::repeat('0').take(i));
+            acc = badd(&acc, &s);
+        }
+    }
+    acc
+}
+
+fn bdivmod(a: &str, b: &str) -> (String, String) {
+    if bcmp(a, b) == std::cmp::Ordering::Less {
+        return ("0".into(), a.to_string());
+    }
+    let mut q = String::with_capacity(a.len());
+    let mut rem = String::new();
+    for c in a.bytes() {
+        rem.push(c as char);
+        let r = bnorm(&rem);
+        if bcmp(r, b) != std::cmp::Ordering::Less {
+            q.push('1');
+            rem = bsub(r, b);
+        } else {
+            q.push('0');
+            rem = r.to_string();
+        }
+    }
+    (bnorm(&q).to_string(), bnorm(&rem).to_string())
+}
+
+// -- signed ops on (neg, magnitude-bits) ----------------------------------
+
+fn sadd(a: (bool, &str), b: (bool, &str)) -> (bool, String) {
+    use std::cmp::Ordering::*;
+    let r = match (a.0, b.0) {
+        (false, false) => (false, badd(a.1, b.1)),
+        (true, true) => (true, badd(a.1, b.1)),
+        (an, _) => match bcmp(a.1, b.1) {
+            Equal => (false, "0".into()),
+            Greater => (an, bsub(a.1, b.1)),
+            Less => (!an, bsub(b.1, a.1)),
+        },
+    };
+    snorm(r.0, r.1)
+}
+
+fn ssub(a: (bool, &str), b: (bool, &str)) -> (bool, String) {
+    sadd(a, (!b.0, b.1))
+}
+
+fn smul(a: (bool, &str), b: (bool, &str)) -> (bool, String) {
+    snorm(a.0 != b.0, bmul(a.1, b.1))
+}
+
+/// truncating division — remainder takes the dividend's sign
+fn sdivmod(a: (bool, &str), b: (bool, &str)) -> Option<((bool, String), (bool, String))> {
+    if b.1 == "0" {
+        return None;
+    }
+    let (q, r) = bdivmod(a.1, b.1);
+    Some((snorm(a.0 != b.0, q), snorm(a.0, r)))
+}
+
+pub(crate) fn scmp_bits(a: (bool, &str), b: (bool, &str)) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    if a.0 != b.0 {
+        return if a.0 { Less } else { Greater };
+    }
+    let c = bcmp(a.1, b.1);
+    if a.0 { c.reverse() } else { c }
+}
+
+// two's-complement bitwise --------------------------------------------------
+
+fn to_tc(neg: bool, mag: &str, w: usize) -> Vec<u8> {
+    let mut v = vec![0u8; w];
+    let mb = mag.as_bytes();
+    for i in 0..mb.len().min(w) {
+        v[w - 1 - i] = mb[mb.len() - 1 - i] - b'0';
+    }
+    if neg {
+        for x in v.iter_mut() {
+            *x ^= 1;
+        }
+        let mut c = 1u8;
+        for x in v.iter_mut().rev() {
+            let s = *x + c;
+            *x = s & 1;
+            c = s >> 1;
+        }
+    }
+    v
+}
+
+fn from_tc(v: &[u8]) -> (bool, String) {
+    let s: String = v.iter().map(|b| (b'0' + b) as char).collect();
+    if v[0] == 0 {
+        return (false, bnorm(&s).to_string());
+    }
+    let mut t = v.to_vec();
+    for x in t.iter_mut() {
+        *x ^= 1;
+    }
+    let mut c = 1u8;
+    for x in t.iter_mut().rev() {
+        let s = *x + c;
+        *x = s & 1;
+        c = s >> 1;
+    }
+    let m: String = t.iter().map(|b| (b'0' + b) as char).collect();
+    snorm(true, bnorm(&m).to_string())
+}
+
+fn sbit(a: (bool, &str), b: (bool, &str), f: impl Fn(u8, u8) -> u8) -> (bool, String) {
+    let w = a.1.len().max(b.1.len()) + 1;
+    let ta = to_tc(a.0, a.1, w);
+    let tb = to_tc(b.0, b.1, w);
+    let r: Vec<u8> = ta.iter().zip(tb.iter()).map(|(&x, &y)| f(x, y)).collect();
+    from_tc(&r)
+}
+
+fn snot(a: (bool, &str)) -> (bool, String) {
+    // ~x = -x - 1
+    if a.0 {
+        snorm(false, bsub(a.1, "1"))
+    } else {
+        snorm(true, badd(a.1, "1"))
+    }
+}
+
+fn sshl(a: (bool, &str), k: usize) -> (bool, String) {
+    if a.1 == "0" || k == 0 {
+        return snorm(a.0, a.1.to_string());
+    }
+    let mut m = String::with_capacity(a.1.len() + k);
+    m.push_str(a.1);
+    m.extend(std::iter::repeat('0').take(k));
+    (a.0, m)
+}
+
+fn sshr(a: (bool, &str), k: usize) -> (bool, String) {
+    let sh = |m: &str| -> String {
+        if k >= m.len() {
+            "0".into()
+        } else {
+            bnorm(&m[..m.len() - k]).to_string()
+        }
+    };
+    if !a.0 {
+        return snorm(false, sh(a.1));
+    }
+    // negative: -ceil(m / 2^k) = -(floor((m - 1) / 2^k) + 1)
+    let m1 = bsub(a.1, "1");
+    let q = sh(&m1);
+    snorm(true, badd(&q, "1"))
+}
+
+// -- conversions -----------------------------------------------------------
+
+/// exact binary expansion of a finite f64: (negative, integer-part bits,
+/// has-fraction). Integers give has-fraction=false.
+pub(crate) fn f64_bits(n: f64) -> (bool, String, bool) {
+    if n == 0.0 {
+        return (false, "0".into(), false);
+    }
+    let neg = n.is_sign_negative();
+    let bits = n.abs().to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as i64;
+    let (mant, e) = if exp == 0 {
+        (bits & ((1u64 << 52) - 1), -1074i64)
+    } else {
+        ((bits & ((1u64 << 52) - 1)) | (1u64 << 52), exp - 1075)
+    };
+    if e >= 0 {
+        let mut m = format!("{mant:b}");
+        m.extend(std::iter::repeat('0').take(e as usize));
+        (neg, m, false)
+    } else {
+        let shift = (-e) as u64;
+        let bitlen = 64 - mant.leading_zeros() as u64;
+        if shift >= bitlen {
+            (neg, "0".into(), true)
+        } else {
+            let int = format!("{:b}", mant >> shift);
+            let frac = mant & ((1u64 << shift) - 1) != 0;
+            (neg, int, frac)
+        }
+    }
+}
+
+fn bits_to_f64(neg: bool, mag: &str) -> f64 {
+    let mut n = 0f64;
+    for c in mag.bytes() {
+        n = n * 2.0 + (c - b'0') as f64;
+    }
+    if neg {
+        -n
+    } else {
+        n
+    }
+}
+
+/// binary-digit magnitude → decimal string
+pub(crate) fn bits_to_dec(mag: &str) -> String {
+    // little-endian decimal digit accumulator: d = d*2 + bit
+    let mut d: Vec<u8> = vec![0];
+    for c in mag.bytes() {
+        let mut carry = c - b'0';
+        for x in d.iter_mut() {
+            let s = *x * 2 + carry;
+            *x = s % 10;
+            carry = s / 10;
+        }
+        while carry > 0 {
+            d.push(carry % 10);
+            carry /= 10;
+        }
+    }
+    d.iter().rev().map(|x| (b'0' + x) as char).collect()
+}
+
+/// decimal string → binary-digit magnitude
+fn dec_to_bits(s: &str) -> String {
+    let mut d: Vec<u8> = s.bytes().map(|c| c - b'0').collect();
+    let mut bits = Vec::new();
+    while !(d.len() == 1 && d[0] == 0) {
+        let mut rem = 0u16;
+        let mut q = Vec::with_capacity(d.len());
+        for &x in &d {
+            let v = rem * 10 + x as u16;
+            q.push((v / 2) as u8);
+            rem = v % 2;
+        }
+        let nz = q.iter().position(|&x| x != 0).unwrap_or(q.len() - 1);
+        d = q.split_off(nz);
+        bits.push(b'0' + rem as u8);
+    }
+    bits.reverse();
+    String::from_utf8(bits).unwrap()
+}
+
+/// spec StringToBigInt / BigInt-literal text → (neg, bits). Accepts
+/// decimal (optional sign), 0x/0o/0b (no sign); returns None on
+/// malformed input. `allow_sep` permits '_' digit separators
+/// (numeric-literal syntax only — StringToBigInt rejects them).
+pub(crate) fn lit_to_bits_sep(s: &str, allow_sep: bool) -> Option<(bool, String)> {
+    let t = s.trim();
+    if t.is_empty() {
+        // StringToBigInt("") = 0n — also reached by `==`/`!=` on strings
+        return Some((false, "0".into()));
+    }
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if !allow_sep && body.contains('_') {
+        return None;
+    }
+    let body: String = body.chars().filter(|&c| c != '_').collect();
+    if body.is_empty() {
+        // a bare sign is malformed — but unsigned input trimmed to
+        // nothing was handled above
+        return None;
+    }
+    // sign applies to decimal only (StringToBigInt grammar; literals
+    // never carry a sign at all)
+    if (neg || t.starts_with('+'))
+        && (body.starts_with("0x")
+            || body.starts_with("0X")
+            || body.starts_with("0o")
+            || body.starts_with("0O")
+            || body.starts_with("0b")
+            || body.starts_with("0B"))
+    {
+        return None;
+    }
+    let mag = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        if h.is_empty() || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut m = String::with_capacity(h.len() * 4);
+        for c in h.bytes() {
+            let v = (c as char).to_digit(16).unwrap();
+            m.push_str(&format!("{v:04b}"));
+        }
+        m
+    } else if let Some(h) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        if h.is_empty() || !h.bytes().all(|c| (b'0'..=b'7').contains(&c)) {
+            return None;
+        }
+        let mut m = String::with_capacity(h.len() * 3);
+        for c in h.bytes() {
+            m.push_str(&format!("{:03b}", c - b'0'));
+        }
+        m
+    } else if let Some(h) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        if h.is_empty() || !h.bytes().all(|c| c == b'0' || c == b'1') {
+            return None;
+        }
+        h.to_string()
+    } else {
+        if body == "-" || !body.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        dec_to_bits(&body)
+    };
+    Some(snorm(neg, mag))
+}
+
+pub(crate) fn lit_to_bits(s: &str) -> Option<(bool, String)> {
+    lit_to_bits_sep(s, false)
+}
+
+/// exact compare of bigint stand-in against a JS number — None when the
+/// number is NaN (relational ops then yield false/undefined)
+pub(crate) fn bigint_cmp_num(a: (bool, &str), n: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::*;
+    if n.is_nan() {
+        return None;
+    }
+    if n.is_infinite() {
+        return Some(if n > 0.0 { Less } else { Greater });
+    }
+    let (ns, nmag, frac) = f64_bits(n);
+    let c = scmp_bits(a, (ns, &nmag));
+    if c == Equal && frac {
+        // integer parts equal — the fraction breaks the tie
+        return Some(if ns { Greater } else { Less });
+    }
+    Some(c)
+}
+
+pub(crate) fn bigint_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (bigint_bits(a), bigint_bits(b)) {
+        (Some(x), Some(y)) => Some(scmp_bits((x.0, &x.1), (y.0, &y.1))),
+        _ => None,
+    }
+}
+
+/// exact bigint ↔ arbitrary-value ordering used by relational ops.
+/// ToPrimitive results arrive here; strings must parse as integer
+/// literals or the result is None (→ false).
+pub(crate) fn bigint_order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    if let Some(x) = bigint_bits(a) {
+        return match b {
+            Value::Num(n) => bigint_cmp_num((x.0, &x.1), *n),
+            Value::Str(s) => lit_to_bits(s).map(|y| scmp_bits((x.0, &x.1), (y.0, &y.1))),
+            Value::Bool(v) => bigint_cmp_num((x.0, &x.1), if *v { 1.0 } else { 0.0 }),
+            Value::Null | Value::Und => bigint_cmp_num((x.0, &x.1), 0.0_f64.mul_add(0.0, 0.0)),
+            _ => bigint_bits(b).map(|y| scmp_bits((x.0, &x.1), (y.0, &y.1))),
+        };
+    }
+    if let Some(y) = bigint_bits(b) {
+        let c = match a {
+            Value::Num(n) => bigint_cmp_num((y.0, &y.1), *n).map(|o| o.reverse()),
+            Value::Str(s) => lit_to_bits(s)
+                .map(|x| scmp_bits((x.0, &x.1), (y.0, &y.1))),
+            Value::Bool(v) => {
+                bigint_cmp_num((y.0, &y.1), if *v { 1.0 } else { 0.0 })
+                    .map(|o| o.reverse())
+            }
+            Value::Null | Value::Und => {
+                bigint_cmp_num((y.0, &y.1), 0.0).map(|o| o.reverse())
+            }
+            _ => None,
+        };
+        return c;
+    }
+    None
+}
+
+/// decimal text of a stand-in (toString/concat/inspect)
+pub(crate) fn bigint_dec_string(v: &Value) -> Option<String> {
+    let (neg, mag) = bigint_bits(v)?;
+    Some(format!("{}{}", if neg { "-" } else { "" }, bits_to_dec(&mag)))
+}
+
+/// magnitude → arbitrary radix text (BigInt.prototype.toString)
+pub(crate) fn bigint_radix_string(v: &Value, radix: u32) -> Option<String> {
+    let (neg, mag) = bigint_bits(v)?;
+    if mag.as_ref() == "0" {
+        return Some("0".into());
+    }
+    let mut out = String::new();
+    match radix {
+        2 => out.push_str(&mag),
+        8 | 16 => {
+            let g = if radix == 8 { 3 } else { 4 };
+            let pad = (g - mag.len() % g) % g;
+            let padded = format!("{}{}", "0".repeat(pad), mag);
+            for chunk in padded.as_bytes().chunks(g) {
+                let mut v = 0u32;
+                for &c in chunk {
+                    v = v * 2 + (c - b'0') as u32;
+                }
+                out.push(char::from_digit(v, radix).unwrap());
+            }
+        }
+        10 => out.push_str(&bits_to_dec(&mag)),
+        r => {
+            // repeated divmod by r
+            let rb = dec_to_bits(&r.to_string());
+            let mut cur = mag.to_string();
+            let mut digs = Vec::new();
+            while cur != "0" {
+                let (q, rem) = bdivmod(&cur, &rb);
+                let mut rv = 0u32;
+                for c in rem.bytes() {
+                    rv = rv * 2 + (c - b'0') as u32;
+                }
+                digs.push(char::from_digit(rv, r).unwrap());
+                cur = q;
+            }
+            digs.reverse();
+            out.extend(digs);
+        }
+    }
+    Some(format!("{}{}", if neg { "-" } else { "" }, out))
+}
+
+/// one of the BigInt-typed ops on two exact operands; `Err(&str)` is the
+/// spec-mandated RangeError case
+pub(crate) fn bigint_apply(
+    op: crate::ast::BinOp,
+    a: (bool, &str),
+    b: (bool, &str),
+) -> Result<(bool, String), &'static str> {
+    use crate::ast::BinOp::*;
+    Ok(match op {
+        Add => sadd(a, b),
+        Sub => ssub(a, b),
+        Mul => smul(a, b),
+        Div => {
+            return sdivmod(a, b)
+                .map(|(q, _)| q)
+                .ok_or("Division by zero")
+        }
+        Mod => {
+            return sdivmod(a, b)
+                .map(|(_, r)| r)
+                .ok_or("Division by zero")
+        }
+        Pow => {
+            if b.0 {
+                return Err("Exponent must be non-negative");
+            }
+            // exponent as usize — results beyond ~16M bits are refused
+            let mut e = 0usize;
+            for c in b.1.bytes() {
+                e = match e.checked_mul(2).and_then(|v| v.checked_add((c - b'0') as usize)) {
+                    Some(v) => v,
+                    None => return Err("Maximum BigInt size exceeded"),
+                };
+            }
+            let maxbits = 1usize << 24;
+            if a.1.len().saturating_sub(1).saturating_mul(e) > maxbits {
+                return Err("Maximum BigInt size exceeded");
+            }
+            // square-and-multiply
+            let mut base = a.1.to_string();
+            let mut acc = "1".to_string();
+            let mut ex = e;
+            while ex > 0 {
+                if ex & 1 == 1 {
+                    acc = bmul(&acc, &base);
+                }
+                ex >>= 1;
+                if ex > 0 {
+                    base = bmul(&base, &base);
+                }
+            }
+            snorm(a.0 && e % 2 == 1, acc)
+        }
+        BitAnd => sbit(a, b, |x, y| x & y),
+        BitOr => sbit(a, b, |x, y| x | y),
+        BitXor => sbit(a, b, |x, y| x ^ y),
+        Shl => {
+            if b.0 {
+                // negative shift flips direction
+                let k = bits_to_usize(b.1).ok_or("Maximum BigInt size exceeded")?;
+                sshr(a, k)
+            } else {
+                let k = bits_to_usize(b.1).ok_or("Maximum BigInt size exceeded")?;
+                sshl(a, k)
+            }
+        }
+        Shr => {
+            if b.0 {
+                let k = bits_to_usize(b.1).ok_or("Maximum BigInt size exceeded")?;
+                sshl(a, k)
+            } else {
+                let k = bits_to_usize(b.1).ok_or("Maximum BigInt size exceeded")?;
+                sshr(a, k)
+            }
+        }
+        _ => return Err("unsupported BigInt operation"),
+    })
+}
+
+/// `~x` on a bigint = -(x + 1)
+pub(crate) fn bigint_not(a: (bool, &str)) -> (bool, String) {
+    snot(a)
+}
+
+/// `x ± 1` — used by ++/--
+pub(crate) fn bigint_inc(a: (bool, &str), inc: bool) -> (bool, String) {
+    if inc {
+        sadd(a, (false, "1"))
+    } else {
+        ssub(a, (false, "1"))
+    }
+}
+
+fn bits_to_usize(mag: &str) -> Option<usize> {
+    if mag.len() > 24 {
+        return None;
+    }
+    let mut v = 0usize;
+    for c in mag.bytes() {
+        v = v * 2 + (c - b'0') as usize;
+    }
+    Some(v)
+}
+
+/// spec BigInt::equal / ::lessThan usable when at least one side is a
+/// stand-in — also powers the ToBigInt path for `==`/`!=` via
+/// `lit_to_bits` on the string operand.
+pub(crate) fn bigint_loose_cmp(a: &Value, b: &Value) -> Option<bool> {
+    // returns Some(eq-result) when the comparison is decided
+    if let Some(x) = bigint_bits(a) {
+        return Some(match b {
+            Value::Num(n) => bigint_cmp_num((x.0, &x.1), *n) == Some(std::cmp::Ordering::Equal),
+            Value::Str(s) => lit_to_bits(s)
+                .map(|y| scmp_bits((x.0, &x.1), (y.0, &y.1)) == std::cmp::Ordering::Equal)
+                .unwrap_or(false),
+            _ => bigint_bits(b)
+                .map(|y| scmp_bits((x.0, &x.1), (y.0, &y.1)) == std::cmp::Ordering::Equal)
+                .unwrap_or(false),
+        });
+    }
+    if let Some(y) = bigint_bits(b) {
+        return Some(match a {
+            Value::Num(n) => bigint_cmp_num((y.0, &y.1), *n) == Some(std::cmp::Ordering::Equal),
+            Value::Str(s) => lit_to_bits(s)
+                .map(|x| scmp_bits((x.0, &x.1), (y.0, &y.1)) == std::cmp::Ordering::Equal)
+                .unwrap_or(false),
+            _ => false,
+        });
+    }
+    None
+}
+
+/// BigInt.asIntN / asUintN — wrap to n-bit two's complement
+pub(crate) fn bigint_as_int(bits: (bool, &str), n: usize, signed: bool) -> (bool, String) {
+    if n == 0 {
+        return (false, "0".into());
+    }
+    let tc = to_tc(bits.0, bits.1, n);
+    if signed {
+        from_tc(&tc)
+    } else {
+        let s: String = tc.iter().map(|b| (b'0' + b) as char).collect();
+        (false, bnorm(&s).to_string())
+    }
 }

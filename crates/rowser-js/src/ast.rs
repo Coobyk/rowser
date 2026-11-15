@@ -5,8 +5,8 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 pub enum Expr {
     Num(f64),
-    /// bigint literal `123n` — evaluates to a BigInt value
-    BigInt(f64),
+    /// bigint literal `123n` — the literal text, parsed at eval
+    BigInt(Rc<str>),
     Str(String),
     Bool(bool),
     Null,

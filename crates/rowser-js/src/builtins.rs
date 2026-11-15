@@ -156,7 +156,10 @@ fn own_prop_enumerable(
     Ok(b.props.get(k).map(|p| p.enumerable).unwrap_or(false))
 }
 
-fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
+fn own_enum_entries(
+    i: &Interp,
+    v: &Value,
+) -> Vec<(PropKey, Option<Value>)> {
     let Value::Obj(o) = v else {
         return Vec::new();
     };
@@ -167,7 +170,7 @@ fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
     let mut strs: Vec<(PropKey, Option<Value>)> = Vec::new();
     let mut syms: Vec<(PropKey, Option<Value>)> = Vec::new();
     match &b.kind {
-        ObjKind::Arr(items) | ObjKind::Args { items, .. } => {
+        ObjKind::Arr(items) => {
             ints.reserve(items.len());
             for (k, it) in items.iter().enumerate() {
                 if b.holes.as_ref().is_some_and(|h| h.contains(&k)) {
@@ -178,6 +181,20 @@ fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
                     continue;
                 }
                 ints.push((k, Some(it.clone())));
+            }
+        }
+        ObjKind::Args { items, .. } => {
+            ints.reserve(items.len());
+            for k in 0..items.len() {
+                if b.holes.as_ref().is_some_and(|h| h.contains(&k)) {
+                    continue;
+                }
+                if b.props.contains_key(&idx_key(k)) {
+                    continue;
+                }
+                // mapped slots read the parameter binding — resolve via
+                // get_prop instead of the (possibly stale) dense value
+                ints.push((k, None));
             }
         }
         ObjKind::Typed { buf, off, len, kind, track } => {
@@ -192,15 +209,34 @@ fn own_enum_entries(v: &Value) -> Vec<(PropKey, Option<Value>)> {
         if !p.enumerable {
             continue;
         }
+        if let PropKey::S(s) = k {
+            if is_internal_key(i, &b, s) {
+                continue;
+            }
+        }
         let val = if p.is_accessor() {
             None
+        } else if let (PropKey::S(s), ObjKind::Args { map, .. }) =
+            (k, &b.kind)
+        {
+            // a still-mapped arguments index reads the env binding, not
+            // the stored prop value
+            if arr_index(s)
+                .is_some_and(|n| matches!(map.get(n), Some(Some(_))))
+            {
+                None
+            } else {
+                Some(p.val.clone())
+            }
         } else {
             Some(p.val.clone())
         };
         match k {
             PropKey::Sym(_) => syms.push((k.clone(), val)),
             PropKey::S(s) => {
-                if let Some(n) = arr_index(s) {
+                // spec integer-index ordering covers < 2^32-1, wider
+                // than the dense-store `arr_index` bound
+                if let Some(n) = js_int_index(s) {
                     ints.push((n, val));
                 } else {
                     strs.push((k.clone(), val));
@@ -243,7 +279,7 @@ fn own_enum_entries_full(
         }
     }
     let mut out = Vec::new();
-    for (k, slot) in own_enum_entries(v) {
+    for (k, slot) in own_enum_entries(i, v) {
         let val = match slot {
             Some(val) => val,
             None => i.get_prop(v, &k)?,
@@ -285,6 +321,7 @@ fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Value> {
     let mut ints: Vec<usize> = Vec::new();
     let mut strs: Vec<PropKey> = Vec::new();
     let mut syms: Vec<PropKey> = Vec::new();
+    let mut seen_strs = std::collections::HashSet::new();
     match &b.kind {
         ObjKind::Arr(items) => {
             for k in 0..items.len() {
@@ -293,7 +330,10 @@ fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Value> {
                 }
                 ints.push(k);
             }
-            strs.push(PropKey::from_str("length"));
+            let lkey = PropKey::from_str("length");
+            // a materialized length prop must not list twice
+            seen_strs.insert(lkey.clone());
+            strs.push(lkey);
         }
         ObjKind::Args { items, .. } => {
             for k in 0..items.len() {
@@ -308,15 +348,17 @@ fn own_keys_all(i: &mut Interp, v: &Value) -> Result<Vec<PropKey>, Value> {
         }
         _ => {}
     }
-    let mut seen_strs = std::collections::HashSet::new();
     for (k, _) in b.props.iter() {
         match k {
-            PropKey::Sym(_) => syms.push(k.clone()),
+            // private-name slots live at PRIV_BASE+ — [[OwnPropertyKeys]]
+            // must never surface them
+            PropKey::Sym(id) if *id < PRIV_BASE => syms.push(k.clone()),
+            PropKey::Sym(_) => {}
             PropKey::S(s) => {
                 if is_internal_key(i, &b, s) {
                     continue;
                 }
-                if let Some(n) = arr_index(s) {
+                if let Some(n) = js_int_index(s) {
                     ints.push(n);
                 } else if seen_strs.insert(k.clone()) {
                     strs.push(k.clone());
@@ -474,15 +516,27 @@ pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
                 if len > 8_000_000 {
                     return Err(i.range_err("array too large"));
                 }
-                let b = o.borrow();
-                if let ObjKind::Arr(items) = &b.kind {
-                    if len == items.len() {
-                        return Ok(items.clone());
+                let dense_full = {
+                    let b = o.borrow();
+                    match &b.kind {
+                        ObjKind::Arr(items) if len == items.len()
+                            && b.holes.as_ref().map_or(true, |h| h.is_empty()) =>
+                        {
+                            Some(items.clone())
+                        }
+                        _ => None,
                     }
-                    return Ok((0..len)
-                        .map(|k| items.get(k).cloned().unwrap_or(Value::Und))
-                        .collect());
+                };
+                if let Some(items) = dense_full {
+                    return Ok(items);
                 }
+                // sparse/mixed: spec reads every index via Get — props
+                // entries, holes→proto, and materialized slots all apply
+                let mut out = Vec::with_capacity(len.min(1_000_000));
+                for k in 0..len {
+                    out.push(i.get_prop(v, &idx_key(k))?);
+                }
+                return Ok(out);
             }
             if let ObjKind::Iter { items, .. } = &o.borrow().kind {
                 return Ok(items.clone());
@@ -512,8 +566,8 @@ pub(crate) fn to_elems(i: &mut Interp, v: &Value) -> Result<Vec<Value>, Value> {
 /// that must preserve the source length
 fn elems_len(i: &mut Interp, v: &Value) -> Result<usize, Value> {
     if let Value::Obj(o) = v {
-        if let ObjKind::Arr(items) = &o.borrow().kind {
-            return Ok(items.len());
+        if matches!(&o.borrow().kind, ObjKind::Arr(_)) {
+            return Ok(arr_declared_len(o));
         }
         if let ObjKind::Iter { items, .. } = &o.borrow().kind {
             return Ok(items.len());
@@ -533,8 +587,29 @@ pub(crate) fn to_elems_sparse(
 ) -> Result<Vec<(usize, Value)>, Value> {
     match v {
         Value::Obj(o) => {
-            if let ObjKind::Arr(items) = &o.borrow().kind {
-                return Ok(items.iter().cloned().enumerate().collect());
+            // a fully dense array enumerates directly; holes, sparse
+            // props entries and materialized slots need HasProperty
+            // filtering (spec ArrayMethods skip absent indices)
+            let dense = {
+                let b = o.borrow();
+                match &b.kind {
+                    ObjKind::Arr(items) => {
+                        let no_holes = b
+                            .holes
+                            .as_ref()
+                            .map_or(true, |h| h.is_empty());
+                        let declared = arr_declared_len(o);
+                        if no_holes && declared == items.len() {
+                            Some(items.iter().cloned().enumerate().collect())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(v) = dense {
+                return Ok(v);
             }
             if let ObjKind::Iter { items, .. } = &o.borrow().kind {
                 return Ok(items.iter().cloned().enumerate().collect());
@@ -596,9 +671,62 @@ fn create_data_prop(
 ) -> Result<(), Value> {
     if let Value::Obj(o) = a {
         let mut b = o.borrow_mut();
+        let b = &mut *b;
         if let ObjKind::Arr(items) = &mut b.kind {
+            // CreateDataProperty = [[DefineOwnProperty]] {w,e,c:true} —
+            // a materialized index validates + resets its attrs, a new
+            // index needs extensible, growth needs a writable length
+            let key = PropKey::from_str(&k.to_string());
+            if let Some(p) = b.props.get_mut(&key) {
+                if !p.configurable {
+                    return Err(i.type_err("Cannot redefine property"));
+                }
+                *p = Prop::data(v.clone());
+            } else {
+                let slot_exists = k < items.len()
+                    && !b.holes.as_ref().is_some_and(|h| h.contains(&k));
+                if !slot_exists && !b.extensible {
+                    return Err(i.type_err("object is not extensible"));
+                }
+            }
             if k >= items.len() {
+                let lkey = PropKey::from_str("length");
+                let len_w =
+                    b.props.get(&lkey).map(|p| p.writable).unwrap_or(true);
+                if !len_w {
+                    return Err(i.type_err("Cannot define property"));
+                }
+                if k > 8_000_000 {
+                    // beyond the dense cap: sparse props entry + grow
+                    // the declared length to k+1
+                    b.props.insert(key, Prop::data(v));
+                    let need = k + 1;
+                    match b.props.get_mut(&lkey) {
+                        Some(p) => p.val = Value::Num(need as f64),
+                        None => {
+                            b.props.insert(
+                                lkey,
+                                Prop {
+                                    val: Value::Num(need as f64),
+                                    writable: true,
+                                    enumerable: false,
+                                    configurable: false,
+                                    get: None,
+                                    set: None,
+                                },
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                let old = items.len();
                 items.resize(k + 1, Value::Und);
+                if k > old {
+                    let h = b.holes.get_or_insert_with(Default::default);
+                    for g in old..k {
+                        h.insert(g);
+                    }
+                }
             }
             items[k] = v;
             if let Some(h) = &mut b.holes {
@@ -666,7 +794,7 @@ fn install_protos(i: &mut Interp) {
         method(i, &p, "isPrototypeOf", obj_is_prototype_of);
         method(i, &p, "propertyIsEnumerable", obj_prop_is_enum);
         method(i, &p, "toString", obj_to_string);
-        method(i, &p, "toLocaleString", obj_to_string);
+        method(i, &p, "toLocaleString", obj_to_locale_string);
         method(i, &p, "valueOf", obj_value_of);
         method(i, &p, "__defineGetter__", obj_define_getter);
         method(i, &p, "__defineSetter__", obj_define_setter);
@@ -867,6 +995,11 @@ fn install_protos(i: &mut Interp) {
         let p = i.p.symbol.clone();
         method(i, &p, "toString", sym_to_string);
         method(i, &p, "valueOf", sym_value_of);
+        // Symbol.prototype[@@toPrimitive] — returns the wrapped symbol
+        let stp = native(i, "[Symbol.toPrimitive]", sym_to_primitive);
+        p.borrow_mut()
+            .props
+            .insert(PropKey::Sym(SYM_TOPRIMITIVE), Prop::builtin(stp));
         let get = native(i, "get description", sym_get_description);
         p.borrow_mut().props.insert(
             pk("description"),
@@ -1368,7 +1501,11 @@ pub(crate) fn make_iter_in(items: Vec<Value>, proto: ObjRef) -> Value {
 /// primitive values and must not pass object checks
 fn is_spec_obj(v: &Value) -> bool {
     match v {
-        Value::Obj(o) => !o.borrow().props.contains_key(&PropKey::from_str("__bigint")),
+        Value::Obj(o) => {
+            let b = o.borrow();
+            !(b.props.contains_key(&PropKey::from_str("__bigint"))
+                && !b.props.contains_key(&PropKey::from_str("__bigint_wrap")))
+        }
         _ => false,
     }
 }
@@ -1539,7 +1676,8 @@ fn iter_direct(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
                 .collect();
             return Ok(IterLazy::id(IterSrc::List { items, idx: 0 }));
         }
-        Value::Obj(o) if !o.borrow().props.contains_key(&PropKey::from_str("__bigint")) => {}
+        Value::Obj(o)
+            if !crate::binary::bigint_is_prim(&Value::Obj(o.clone())) => {}
         _ => return Err(i.type_err("value is not iterable")),
     }
     let next = i.get_prop(v, &PropKey::from_str("next"))?;
@@ -2934,7 +3072,7 @@ fn install_globals(i: &mut Interp) {
             ("isSealed", obj_is_sealed),
             ("preventExtensions", obj_prevent_ext),
             ("isExtensible", obj_is_extensible),
-            ("hasOwn", obj_has_own),
+            ("hasOwn", obj_static_has_own),
             ("fromEntries", obj_from_entries),
             ("groupBy", obj_group_by),
             ("is", obj_is),
@@ -3083,23 +3221,65 @@ fn install_globals(i: &mut Interp) {
         define_global(i, "Symbol", ctor);
     }
 
-    // -- BigInt -- minimal: `BigInt(x)`/`123n` yield a %BigInt.prototype%
-    // object carrying the magnitude; no bigint arithmetic yet
+    // -- BigInt -- `BigInt(x)`/`123n` yield %BigInt.prototype% stand-ins
+    // carrying an exact binary magnitude in `__bigint_x`
     {
-        fn bigint_ctor(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
-            let n = match a.first() {
-                Some(Value::Num(n)) => *n,
-                Some(Value::Str(s)) => {
-                    s.trim().parse::<f64>().unwrap_or(f64::NAN)
+        fn to_bigint(i: &mut Interp, v: &Value) -> Result<(bool, String), Value> {
+            match v {
+                Value::Num(n) => {
+                    if !n.is_finite() || n.fract() != 0.0 {
+                        return Err(i.range_err(format!(
+                            "Cannot convert {n} to a BigInt"
+                        )));
+                    }
+                    let (neg, mag, _) = crate::binary::f64_bits(*n);
+                    Ok((neg, mag))
                 }
-                _ => f64::NAN,
-            };
-            if n.is_nan() {
-                return Err(i.type_err("cannot convert to BigInt"));
+                Value::Str(s) => crate::binary::str_to_bigint_bits(i, s),
+                Value::Bool(b) => Ok((false, if *b { "1".into() } else { "0".into() })),
+                Value::Null | Value::Und | Value::Sym(..) => {
+                    Err(i.type_err("Cannot convert value to a BigInt"))
+                }
+                Value::Obj(_) => {
+                    if let Some(x) = crate::binary::bigint_bits(v) {
+                        return Ok((x.0, x.1.to_string()));
+                    }
+                    let p = i.to_primitive(v)?;
+                    to_bigint(i, &p)
+                }
             }
-            Ok(i.bigint_obj(n))
+        }
+        fn bigint_ctor(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
+            let (neg, mag) = to_bigint(i, &arg(a, 0))?;
+            Ok(i.bigint_obj_b(neg, &mag))
+        }
+        fn bigint_as_int_n(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
+            let bits_n = i.to_num(&arg(a, 0))?;
+            if !bits_n.is_finite() || bits_n < 0.0 || bits_n.fract() != 0.0 {
+                return Err(i.range_err("Invalid BigInt64Array size"));
+            }
+            let (neg, mag) = to_bigint(i, &arg(a, 1))?;
+            let (sn, sm) = crate::binary::bigint_as_int(
+                (neg, &mag), bits_n as usize, true);
+            Ok(i.bigint_obj_b(sn, &sm))
+        }
+        fn bigint_as_uint_n(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
+            let bits_n = i.to_num(&arg(a, 0))?;
+            if !bits_n.is_finite() || bits_n < 0.0 || bits_n.fract() != 0.0 {
+                return Err(i.range_err("Invalid BigInt64Array size"));
+            }
+            let (neg, mag) = to_bigint(i, &arg(a, 1))?;
+            let (sn, sm) = crate::binary::bigint_as_int(
+                (neg, &mag), bits_n as usize, false);
+            Ok(i.bigint_obj_b(sn, &sm))
         }
         let ctor = make_ctor(i, "BigInt", bigint_ctor, i.p.bigint.clone());
+        if let Value::Obj(co) = &ctor {
+            i.set_builtin(&co.clone(), "asIntN",
+                i.native("asIntN", bigint_as_int_n));
+            i.set_builtin(&co.clone(), "asUintN",
+                i.native("asUintN", bigint_as_uint_n));
+        }
         define_global(i, "BigInt", ctor);
     }
 
@@ -3636,6 +3816,28 @@ fn install_globals(i: &mut Interp) {
         method(i, &r, "preventExtensions", reflect_prevent_extensions);
         method(i, &r, "apply", reflect_apply);
         method(i, &r, "construct", reflect_construct);
+        // spec arities — the names collide with other builtins (Map.get
+        // &co) so they can't ride NATIVE_ARITY
+        for (n, len) in [
+            ("apply", 3.0),
+            ("construct", 2.0),
+            ("defineProperty", 3.0),
+            ("deleteProperty", 2.0),
+            ("get", 2.0),
+            ("getOwnPropertyDescriptor", 2.0),
+            ("getPrototypeOf", 1.0),
+            ("has", 2.0),
+            ("isExtensible", 1.0),
+            ("ownKeys", 1.0),
+            ("preventExtensions", 1.0),
+            ("set", 3.0),
+            ("setPrototypeOf", 2.0),
+        ] {
+            let f = r.borrow().props.get_str(n).map(|p| p.val.clone());
+            if let Some(Value::Obj(fo)) = f {
+                i.set_attr(&fo, "length", Value::Num(len), false, true);
+            }
+        }
         define_global(i, "Reflect", Value::Obj(r));
     }
 
@@ -3663,8 +3865,21 @@ fn make_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: ObjRef) -> Value {
 // natives: object
 // ===========================================================================
 
+/// `Object.hasOwn(target, key)` — the static takes (obj, prop) as args;
+/// `hasOwnProperty` reaches here with this=receiver and args=[key].
+fn obj_static_has_own(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let target = arg(args, 0);
+    let kv = arg(args, 1);
+    has_own_impl(i, &target, &kv)
+}
+
 fn obj_has_own(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let k = i.to_propkey(&arg(args, 0))?;
+    let kv = arg(args, 0);
+    has_own_impl(i, this, &kv)
+}
+
+fn has_own_impl(i: &mut Interp, this: &Value, kv: &Value) -> NResult {
+    let k = i.to_propkey(kv)?;
     // spec ToObject — null/undefined throw; string wrappers own their
     // indexed chars + length
     let this = i.to_object(this)?;
@@ -3777,6 +3992,18 @@ fn obj_prop_is_enum(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 }
             }
         }
+        // integer-indexed exotic slots are enumerable (10.4.5.3) — only
+        // live, in-bounds canonical numeric keys produce a descriptor
+        if let ObjKind::Typed { buf, off, len, kind, track } = &b.kind {
+            if let PropKey::S(s) = &k {
+                if let Some(ni) = canonical_numeric_index(s) {
+                    return Ok(Value::Bool(
+                        typed_state(buf, *off, *len, *kind, *track)
+                            .is_some_and(|eff| valid_int_index(ni, eff)),
+                    ));
+                }
+            }
+        }
     }
     Ok(Value::Bool(false))
 }
@@ -3816,8 +4043,18 @@ fn obj_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Str(Rc::from(format!("[object {tag}]").as_str())))
 }
 
-fn obj_value_of(_i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(this.clone())
+fn obj_to_locale_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    // spec 19.1.3.5: Invoke(O, "toString") — an overridden toString wins
+    let f = i.get_prop_str(this, "toString")?;
+    if !i.is_callable(&f) {
+        return Err(i.type_err("toString is not a function"));
+    }
+    i.call(&f, this.clone(), Vec::new())
+}
+
+fn obj_value_of(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    // spec ToObject(this) — a primitive receiver returns its wrapper
+    i.to_object(this)
 }
 
 fn obj_get_proto(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -3843,12 +4080,22 @@ fn obj_get_proto(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
                 None => Value::Null,
             })
         }
-        // spec __proto__ getter: RequireObjectCoercible — primitives
-        // (other than null/undefined) answer `undefined`
+        // spec __proto__ getter: RequireObjectCoercible — null/undefined
+        // throw; a primitive reads its wrapper's proto (`(5).__proto__`
+        // is Number.prototype in every engine)
         Value::Und | Value::Null => {
             Err(i.type_err("Cannot convert undefined or null to object"))
         }
-        _ => Ok(Value::Und),
+        _ => {
+            let w = i.to_object(this)?;
+            Ok(match w {
+                Value::Obj(o) => match o.borrow().proto.clone() {
+                    Some(p) => Value::Obj(p),
+                    None => Value::Null,
+                },
+                _ => Value::Null,
+            })
+        }
     }
 }
 
@@ -3880,9 +4127,11 @@ fn obj_set_proto(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let Value::Obj(o) = this else {
         return Ok(Value::Und);
     };
-    // spec: the __proto__ setter ignores a [[SetPrototypeOf]] failure —
-    // cycles are silently dropped, never thrown
-    let _ = ord_set_proto(i, o, &v)?;
+    // spec B.2.2.1.2 step 5: a false [[SetPrototypeOf]] (cycle or
+    // non-extensible) throws TypeError
+    if !ord_set_proto(i, o, &v)? {
+        return Err(i.type_err("Cyclic __proto__ value"));
+    }
     Ok(Value::Und)
 }
 
@@ -4362,6 +4611,30 @@ fn define_prop_from_desc(
                     let in_range =
                         matches!(&b.kind, ObjKind::Arr(it) if idx < it.len());
                     let pure_val = has_val && !has_w && !has_e && !has_c;
+                    if !in_range {
+                        // index at/past the declared length needs a
+                        // writable length (spec 10.4.2.1 step 3.e)
+                        let lkey = PropKey::from_str("length");
+                        let items_len = match &b.kind {
+                            ObjKind::Arr(it) => it.len(),
+                            _ => 0,
+                        };
+                        let (cur_len, len_w) = match b.props.get(&lkey) {
+                            Some(p) => {
+                                let n = match &p.val {
+                                    Value::Num(n) => {
+                                        (*n as usize).max(items_len)
+                                    }
+                                    _ => items_len,
+                                };
+                                (n, p.writable)
+                            }
+                            None => (items_len, true),
+                        };
+                        if idx >= cur_len && !len_w {
+                            return Ok(false);
+                        }
+                    }
                     if !mat {
                         if in_range && !hole {
                             if pure_val {
@@ -4391,10 +4664,22 @@ fn define_prop_from_desc(
                             && idx <= 8_000_000
                         {
                             // fresh index within dense range — grow the
-                            // store; length follows items.len()
+                            // store; the gap is holes, not undefined
+                            // elements; length follows items.len()
+                            let mut grow_from = None;
                             if let ObjKind::Arr(items) = &mut b.kind {
+                                let old = items.len();
                                 items.resize(idx + 1, Value::Und);
+                                if idx > old {
+                                    grow_from = Some(old);
+                                }
                                 items[idx] = vv.clone();
+                            }
+                            if let Some(old) = grow_from {
+                                let h = b.holes.get_or_insert_with(Default::default);
+                                for k in old..idx {
+                                    h.insert(k);
+                                }
                             }
                             return Ok(true);
                         }
@@ -4405,6 +4690,11 @@ fn define_prop_from_desc(
                     }
                 }
                 if s.as_ref() == "length" {
+                    // `length` is a non-configurable data prop — an
+                    // accessor desc always fails the kind-change check
+                    if is_acc {
+                        return Ok(false);
+                    }
                     // 10.4.2.1 ArraySetLength — ToNumber may run user
                     // code, so release the borrow around the coercion
                     let new_len = if has_val {
@@ -4465,11 +4755,13 @@ fn define_prop_from_desc(
                                 .iter()
                                 .map(|(k, _)| k)
                                 .filter_map(|k| match k {
-                                    PropKey::S(s) => arr_index(s.as_ref())
-                                        .filter(|ix| {
-                                            *ix >= nl && *ix < eff_len
-                                        })
-                                        .map(|ix| (ix, k.clone())),
+                                    PropKey::S(s) => {
+                                        js_int_index(s.as_ref())
+                                            .filter(|ix| {
+                                                *ix >= nl && *ix < eff_len
+                                            })
+                                            .map(|ix| (ix, k.clone()))
+                                    }
                                     _ => None,
                                 })
                                 .collect();
@@ -4665,13 +4957,15 @@ fn define_prop_from_desc(
         b.props.insert(key.clone(), prop);
         if matches!(&b.kind, ObjKind::Arr(_)) {
             if let PropKey::S(s) = &key {
-                if let Some(idx) = arr_index(s) {
+                // spec index range (< 2^32-1) drives length growth even
+                // for props-only sparse entries beyond the dense cap
+                if let Some(idx) = js_int_index(s) {
                     let in_range =
                         matches!(&b.kind, ObjKind::Arr(it) if idx < it.len());
                     if in_range {
                         if is_acc {
                             // the accessor entry shadows the dense slot
-                            b.holes.get_or_insert_default().insert(idx);
+                            b.holes.get_or_insert_with(Default::default).insert(idx);
                         } else {
                             if let ObjKind::Arr(items) = &mut b.kind {
                                 items[idx] = mirror_val.clone();
@@ -4768,18 +5062,20 @@ fn define_prop_from_desc(
 
 fn obj_define_properties(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let target = arg(args, 0);
-    let Value::Obj(o) = &target else {
+    let Value::Obj(_) = &target else {
         return Err(i.type_err("Object.defineProperties called on non-object"));
     };
-    let descs = arg(args, 1);
+    // spec 19.1.2.3.1: `ToObject(Properties)` — null/undefined throw
+    let descs = i.to_object(&arg(args, 1))?;
     for (k, d) in own_enum_entries_full(i, &descs)? {
         // ToPropertyDescriptor requires an object — primitives throw
         if !matches!(d, Value::Obj(_)) {
             return Err(i.type_err("Property description must be an object"));
         }
-        if !define_prop_from_desc(i, o, k, &d)? {
-            return Err(i.type_err("Cannot define property"));
-        }
+        // route through Object.defineProperty so a proxy target fires
+        // its defineProperty trap per key
+        let kv = i.key_to_value(&k);
+        obj_define_property(i, &Value::Und, &[target.clone(), kv, d])?;
     }
     Ok(target)
 }
@@ -4796,7 +5092,52 @@ fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
             Some(trap) => {
                 let r = i.call(&trap, h, vec![t, i.key_to_value(&key)])?;
                 match r {
-                    Value::Und | Value::Obj(_) => Ok(r),
+                    Value::Und => Ok(Value::Und),
+                    Value::Obj(_) => {
+                        // spec ToPropertyDescriptor + FromPropertyDescriptor:
+                        // the six fields are read through Get (getters run,
+                        // accessor/data conflicts throw) and a normalized
+                        // fresh descriptor object is returned
+                        let (hg, gv) = read_desc_prop(i, &r, "get")?;
+                        let (hs, sv) = read_desc_prop(i, &r, "set")?;
+                        let (hv, vv) = read_desc_prop(i, &r, "value")?;
+                        let (hw, wv) = read_desc_prop(i, &r, "writable")?;
+                        let (he, ev) = read_desc_prop(i, &r, "enumerable")?;
+                        let (hc, cv) = read_desc_prop(i, &r, "configurable")?;
+                        if (hg || hs) && (hv || hw) {
+                            return Err(i.type_err(
+                                "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+                            ));
+                        }
+                        if hg && !matches!(gv, Value::Und) && !i.is_callable(&gv)
+                        {
+                            return Err(i.type_err("Getter must be a function"));
+                        }
+                        if hs && !matches!(sv, Value::Und) && !i.is_callable(&sv)
+                        {
+                            return Err(i.type_err("Setter must be a function"));
+                        }
+                        let d = i.new_obj();
+                        if hv {
+                            i.set_data(&d, "value", vv);
+                        }
+                        if hw {
+                            i.set_data(&d, "writable", wv);
+                        }
+                        if hg {
+                            i.set_data(&d, "get", gv);
+                        }
+                        if hs {
+                            i.set_data(&d, "set", sv);
+                        }
+                        if he {
+                            i.set_data(&d, "enumerable", ev);
+                        }
+                        if hc {
+                            i.set_data(&d, "configurable", cv);
+                        }
+                        Ok(Value::Obj(d))
+                    }
                     _ => Err(i.type_err(
                         "proxy gOPD trap must return object or undefined",
                     )),
@@ -4889,7 +5230,8 @@ fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult 
                 i.set_data(&d, "value", elem);
                 i.set_data(&d, "writable", Value::Bool(true));
                 i.set_data(&d, "enumerable", Value::Bool(true));
-                i.set_data(&d, "configurable", Value::Bool(true));
+                // integer-indexed props are non-configurable (10.4.5.3)
+                i.set_data(&d, "configurable", Value::Bool(false));
                 return Ok(Value::Obj(d));
             }
         }
@@ -5116,6 +5458,21 @@ fn ord_prevent_ext(i: &mut Interp, o: &ObjRef) -> Result<bool, Value> {
             },
         };
     }
+    // 10.4.5.4: a length-tracking TA or one with live elements can never
+    // become non-extensible — [[PreventExtensions]] fails outright
+    {
+        let b = o.borrow();
+        if let ObjKind::Typed { buf, off, len, kind, track } = &b.kind {
+            if *track {
+                return Ok(false);
+            }
+            if typed_state(buf, *off, *len, *kind, *track)
+                .is_some_and(|eff| eff > 0)
+            {
+                return Ok(false);
+            }
+        }
+    }
     o.borrow_mut().extensible = false;
     Ok(true)
 }
@@ -5142,6 +5499,28 @@ fn materialize_elements(o: &ObjRef) {
                 _ => Value::Und,
             };
             b.props.insert(k, Prop::data(val));
+        }
+    }
+    // the virtual `length` materializes too so the integrity clamp
+    // reaches it — a frozen array's length is non-writable
+    if matches!(&b.kind, ObjKind::Arr(_)) {
+        let items_len = match &b.kind {
+            ObjKind::Arr(items) => items.len(),
+            _ => 0,
+        };
+        let k = PropKey::from_str("length");
+        if b.props.get(&k).is_none() {
+            b.props.insert(
+                k,
+                Prop {
+                    val: Value::Num(items_len as f64),
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                    get: None,
+                    set: None,
+                },
+            );
         }
     }
 }
@@ -5402,6 +5781,25 @@ fn object_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             } else {
                 Ok(Value::Obj(i.new_obj()))
             }
+        }
+        Value::Obj(_) if crate::binary::bigint_is_prim(&v) => {
+            // Object(1n) boxes the primitive — the wrapper carries the
+            // slots but is a real object (typeof 'object', strict-eq
+            // identity semantics)
+            let o = Rc::new(RefCell::new(Obj::new(
+                Some(i.p.bigint.clone()),
+                ObjKind::Ord,
+            )));
+            if let Value::Obj(src) = &v {
+                for k in ["__bigint", "__bigint_x"] {
+                    if let Some(p) = src.borrow().props.get_str(k).map(|p| p.val.clone()) {
+                        i.set_attr(&o, k, p, false, false);
+                    }
+                }
+            }
+            i.set_attr(&o, "__bigint_wrap", Value::Bool(true), false, false);
+            i.set_builtin(&o, "$value", v.clone());
+            Ok(Value::Obj(o))
         }
         Value::Obj(_) => Ok(v),
         // box primitives
@@ -7085,10 +7483,27 @@ fn string_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         }
     };
     if matches!(this, Value::Obj(_)) {
-        // `new String(x)` → boxed
+        // `new String(x)` → boxed — string-exotic own props: chars are
+        // {W:false,E:true,C:false}, length {W:false,E:false,C:false}
         if let Value::Obj(o) = this {
             i.set_builtin(o, "$value", Value::Str(Rc::from(s.as_str())));
-            i.set_data(o, "length", Value::Num(s.chars().count() as f64));
+            let len = s.chars().count();
+            let mut ob = o.borrow_mut();
+            for (k, c) in s.chars().enumerate() {
+                ob.props.insert(
+                    PropKey::from_str(&k.to_string()),
+                    Prop {
+                        val: Value::Str(Rc::from(c.to_string().as_str())),
+                        writable: false,
+                        enumerable: true,
+                        configurable: false,
+                        get: None,
+                        set: None,
+                    },
+                );
+            }
+            drop(ob);
+            i.set_attr(o, "length", Value::Num(len as f64), false, false);
         }
         Ok(this.clone())
     } else {
@@ -7370,9 +7785,20 @@ fn sym_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     }
 }
 
+fn sym_to_primitive(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    sym_value_of(i, this, _a)
+}
+
 fn sym_value_of(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let _ = i;
-    Ok(this.clone())
+    match this {
+        Value::Sym(..) => Ok(this.clone()),
+        // Symbol wrapper objects carry the primitive in `$value`
+        Value::Obj(o) => match o.borrow().props.get_str("$value") {
+            Some(p) => Ok(p.val.clone()),
+            None => Err(i.type_err("Cannot convert a Symbol value to a value")),
+        },
+        _ => Err(i.type_err("Cannot convert a Symbol value to a value")),
+    }
 }
 
 fn sym_get_description(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -7918,7 +8344,7 @@ fn json_ser_into(
                         true
                     }
                     K::Obj => {
-                        let entries = own_enum_entries(&v2);
+                        let entries = own_enum_entries(i, &v2);
                         let sep_colon: &str = if indent.is_empty() { ":" } else { ": " };
                         let open_len = out.len();
                         if indent.is_empty() {

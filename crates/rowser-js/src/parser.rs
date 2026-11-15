@@ -18,12 +18,15 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
 
 /// Parse eval source: `strict` = strictCaller (a "use strict" directive in
 /// the source ORs on top), `in_fn`/`in_method` seed new.target/super
-/// availability from the calling context.
+/// availability from the calling context. `privs` = private names visible
+/// to the caller (direct eval inherits the PrivateEnvironment — a `#x`
+/// use is legal iff some enclosing class declares it).
 pub fn parse_eval(
     src: &str,
     strict: bool,
     in_fn: bool,
     in_method: bool,
+    privs: Vec<String>,
 ) -> Result<Vec<Stmt>, Error> {
     let toks = lex(src)?;
     let mut p = Parser::new(toks);
@@ -36,7 +39,18 @@ pub fn parse_eval(
     if in_method {
         p.method_depth = 1;
     }
+    // a pseudo class-scope claiming every caller-visible name — inner
+    // classes' own #x decls push/pop frames as usual. The frame never
+    // pops, so its claims run by hand after program().
+    let pseudo: std::collections::HashMap<String, u8> =
+        privs.into_iter().map(|n| (n, 0b001)).collect();
+    if !pseudo.is_empty() {
+        p.priv_stack.push((usize::MAX, pseudo.clone()));
+    }
     let stmts = p.program()?;
+    if !pseudo.is_empty() {
+        p.resolve_privates(usize::MAX, &pseudo);
+    }
     p.check_privates()?;
     validate_strict_ctx(&stmts, strict, in_fn, in_method)?;
     Ok(stmts)
@@ -55,13 +69,34 @@ pub fn stmts_strict(stmts: &[Stmt]) -> bool {
 }
 
 /// Parse a single expression from source (used for template interpolations).
-fn parse_expr_src(src: &str) -> Result<Expr, Error> {
+fn parse_expr_src(src: &str, ctx: &mut Parser) -> Result<Expr, Error> {
     let toks = lex(src)?;
     let mut p = Parser::new(toks);
+    // template interpolations live in the enclosing parse context:
+    // `yield` inside a generator's template is a YieldExpression,
+    // strict mode applies, and private names resolve against the
+    // enclosing class scopes
+    p.no_in = ctx.no_in;
+    p.lex_decl = ctx.lex_decl;
+    p.strict = ctx.strict;
+    p.paren_depth = ctx.paren_depth;
+    p.fn_depth = ctx.fn_depth;
+    p.nonarrow_fn_depth = ctx.nonarrow_fn_depth;
+    p.gen_depth = ctx.gen_depth;
+    p.yield_decl = ctx.yield_decl;
+    p.ctor_depth = ctx.ctor_depth;
+    p.method_depth = ctx.method_depth;
+    p.param_depth = ctx.param_depth;
+    p.await_decl = ctx.await_decl;
+    p.priv_stack = ctx.priv_stack.clone();
+    p.priv_next_id = ctx.priv_next_id;
     let e = p.expression()?;
     if !matches!(p.peek().tok, Tok::Eof) {
         return Err(p.err("trailing tokens in expression"));
     }
+    // private-name uses defer until the enclosing class body completes —
+    // merge them back into the outer parse's pending set
+    ctx.priv_pending.append(&mut p.priv_pending);
     Ok(e)
 }
 
@@ -1276,13 +1311,13 @@ impl Parser {
     /// `gen`: a `*` generator marker was already consumed.
     fn fn_tail(&mut self, name_required: bool, gen: bool, is_async: bool) -> Result<FnDef, Error> {
         let name = {
-            // the name's [Yield] context: declarations inherit the
-            // enclosing generator; the nested fn always uses its own
-            // a function's *name* is not yield-restricted by the [Yield]
-            // context — `function* yield(){}` is legal in sloppy code
-            let saved_gd = (self.gen_depth, self.yield_decl);
+            // the name is parsed under the fn's own [Yield]/[Await]
+            // parameters — `function* yield(){}` and `async function
+            // await(){}` are early errors (BindingIdentifier[+Yield])
+            let saved_gd = (self.gen_depth, self.yield_decl, self.await_decl);
             self.gen_depth = gen as usize;
-            self.yield_decl = 0;
+            self.yield_decl = gen as usize;
+            self.await_decl = is_async as usize;
             let n = match self.peek().tok.clone() {
                 Tok::Ident(s) => {
                     self.check_binding_name(&s)?;
@@ -1298,7 +1333,7 @@ impl Parser {
                 _ if !name_required => None,
                 _ => return Err(self.err("expected function name")),
             };
-            (self.gen_depth, self.yield_decl) = saved_gd;
+            (self.gen_depth, self.yield_decl, self.await_decl) = saved_gd;
             n
         };
         let old_ctx = (
@@ -1438,6 +1473,10 @@ impl Parser {
     /// strict-mode binding-name restrictions (eval/arguments + strict-only
     /// reserved words).
     fn check_binding_name(&self, name: &str) -> Result<(), Error> {
+        // `#x` is a private-name token, never a binding identifier
+        if name.starts_with('#') {
+            return Err(self.err("private name is not a valid binding"));
+        }
         // `yield` is reserved in any [Yield] context even in sloppy mode
         if name == "yield" && self.yield_decl > 0 {
             return Err(self.err("`yield` is not a valid binding in a generator"));
@@ -1546,6 +1585,11 @@ impl Parser {
     fn class_tail(&mut self, name_required: bool) -> Result<ClassDef, Error> {
         let name = match self.peek().tok.clone() {
             Tok::Ident(s) => {
+                // the class name is always a LEXICAL binding — `eval` /
+                // `arguments` / `let` are banned even in sloppy code
+                if matches!(s.as_str(), "eval" | "arguments" | "let") {
+                    return Err(self.err(format!("`{s}` is not a valid class name")));
+                }
                 self.check_binding_name(&s)?;
                 self.next();
                 Some(s)
@@ -1691,7 +1735,13 @@ impl Parser {
                 // `async *m` — async generator (parsed, runtime may not
                 // support it, but the grammar is valid)
             }
+            // computed keys evaluate in the enclosing scope — `super`
+            // of any kind is an early error inside ClassElementName
+            let ksaved = (self.ctor_depth, self.method_depth);
+            self.ctor_depth = 0;
+            self.method_depth = 0;
             let key = self.prop_key(true)?;
+            (self.ctor_depth, self.method_depth) = ksaved;
             // PropName as a static string — `constructor`/`prototype`
             // early errors apply to literal names only, never computed
             let keyname: Option<&str> = match &key {
@@ -1810,7 +1860,15 @@ impl Parser {
                 return Err(self.err("duplicate constructor"));
             }
             self.expect_punct("(")?;
-            let params = self.params()?;
+            // no super of either kind inside FormalParameters — `super()`
+            // is only legal in the ctor BODY, `super.prop` only in the
+            // method body
+            let psaved = (self.ctor_depth, self.method_depth);
+            self.ctor_depth = 0;
+            self.method_depth = 0;
+            let params = self.params();
+            (self.ctor_depth, self.method_depth) = psaved;
+            let params = params?;
             self.expect_punct(")")?;
             match kind {
                 MemberKind::Getter if !params.is_empty() => {
@@ -2267,7 +2325,7 @@ impl Parser {
                     e = Expr::Member {
                         obj: Box::new(e),
                         prop: Box::new(prop),
-                        computed: true,
+                        computed: false,
                         optional: opt_chain,
                     };
                 }
@@ -2287,21 +2345,25 @@ impl Parser {
                             args,
                         };
                     } else {
-                        let prop = if self.eat_punct("[") {
+                        let (prop, braced) = if self.eat_punct("[") {
                             let p = self.expression()?;
                             self.expect_punct("]")?;
-                            p
+                            (p, true)
                         } else {
-                            match self.prop_key(false)? {
-                                PropKey::Ident(s) | PropKey::Str(s) => Expr::Str(s),
-                                PropKey::Num(n) => Expr::Str(n.to_string()),
-                                PropKey::Computed(c) => c,
-                            }
+                            (
+                                match self.prop_key(false)? {
+                                    PropKey::Ident(s) | PropKey::Str(s) => Expr::Str(s),
+                                    PropKey::Num(n) => Expr::Str(n.to_string()),
+                                    PropKey::Computed(c) => c,
+                                },
+                                false,
+                            )
                         };
                         e = Expr::Member {
                             obj: Box::new(e),
                             prop: Box::new(prop),
-                            computed: true,
+                            // `o?.[k]` is computed; `o?.name` / `o?.#x` are not
+                            computed: braced,
                             optional: true,
                         };
                     }
@@ -2336,7 +2398,7 @@ impl Parser {
                     for p in parts {
                         match p {
                             crate::lexer::TemplPart::Str(s) => strings.push(Expr::Str(s)),
-                            crate::lexer::TemplPart::Expr(raw) => exprs.push(parse_expr_src(&raw)?),
+                            crate::lexer::TemplPart::Expr(raw) => exprs.push(parse_expr_src(&raw, self)?),
                         }
                     }
                     args.push(Arg::Expr(Expr::Array(
@@ -2384,7 +2446,7 @@ impl Parser {
                 e = Expr::Member {
                     obj: Box::new(e),
                     prop: Box::new(prop),
-                    computed: true,
+                    computed: false,
                     optional: false,
                 };
             } else if self.at_punct("[") {
@@ -2448,7 +2510,7 @@ impl Parser {
                     match p {
                         crate::lexer::TemplPart::Str(s) => out.push(TemplPart::Str(s)),
                         crate::lexer::TemplPart::Expr(raw) => {
-                            out.push(TemplPart::Expr(parse_expr_src(&raw)?))
+                            out.push(TemplPart::Expr(parse_expr_src(&raw, self)?))
                         }
                     }
                 }
@@ -3644,7 +3706,31 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
             vexpr(target, cx)
         }
         Expr::Paren(inner) => vexpr(inner, cx),
-        Expr::Unary { expr, .. } => vexpr(expr, cx),
+        Expr::Unary { op, expr } => {
+            // `delete obj.#x` / `delete obj?.#x` — early error on any
+            // delete of a private reference (parens don't change it)
+            if matches!(op, UnaryOp::Delete) {
+                let mut t: &Expr = expr;
+                while let Expr::Paren(i) = t {
+                    t = &**i;
+                }
+                if let Expr::Member {
+                    prop, computed, ..
+                } = t
+                {
+                    // `delete o.#x` is an early error; `delete o["#x"]`
+                    // is an ordinary string-property delete
+                    if !*computed {
+                        if let Expr::Str(s) = &**prop {
+                            if s.starts_with('#') {
+                                return Err(cx.err("cannot delete a private member"));
+                            }
+                        }
+                    }
+                }
+            }
+            vexpr(expr, cx)
+        }
         // a bare `#x` is only grammatical as the lhs of `in` (private
         // brand check); member access `.#x` goes through Expr::Str
         Expr::Ident(n) if n.starts_with('#') => {
@@ -3666,6 +3752,15 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
             vexpr(f, cx)
         }
         Expr::Member { obj, prop, .. } => {
+            // `super.#x` — private names can't follow `super` (the
+            // grammar only allows IdentifierName / [expr] there)
+            if matches!(&**obj, Expr::Super) {
+                if let Expr::Str(s) = &**prop {
+                    if s.starts_with('#') {
+                        return Err(cx.err("private member not allowed after `super`"));
+                    }
+                }
+            }
             vexpr(obj, cx)?;
             vexpr(prop, cx)
         }
@@ -3694,6 +3789,14 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
         }
         Expr::Object(props) => {
             for p in props {
+                // bare `#x` can't name an object-literal member (only
+                // class bodies declare private names); a QUOTED "#x"
+                // is just a string property and stays legal
+                if let PropKey::Ident(s) = &p.key {
+                    if s.starts_with('#') {
+                        return Err(cx.err("private member not allowed in object literal"));
+                    }
+                }
                 if let PropKey::Computed(c) = &p.key {
                     vexpr(c, cx)?;
                 }
@@ -4094,14 +4197,20 @@ fn expr_has_arguments(e: &Expr) -> bool {
 fn expr_has_await(e: &Expr) -> bool {
     match e {
         Expr::Paren(inner) => expr_has_await(inner),
+        // `await` is a reserved word in static-block / field-init
+        // contexts — bare-identifier uses are early errors too
+        Expr::Ident(n) => n == "await",
         Expr::Unary { op: UnaryOp::Await, .. } => true,
-        Expr::Fn(f) => !f.is_async && fndef_has_await(f),
+        // arrows are transparent to `await` (they inherit the context);
+        // non-arrow functions get their own — an `await` inside them is
+        // either legal (async) or a plain identifier (non-async)
+        Expr::Fn(f) => f.is_arrow && !f.is_async && fndef_has_await(f),
+        // a nested class's own member contexts re-check themselves;
+        // only the heritage expr + computed keys live in OUR context
         Expr::Class(c) => {
             c.superclass.as_ref().is_some_and(|e| expr_has_await(e))
                 || c.members.iter().any(|m| {
                     matches!(&m.key, PropKey::Computed(e) if expr_has_await(e))
-                        || m.init.as_ref().is_some_and(|e| expr_has_await(e))
-                        || (!m.func.is_async && stmts_have_await(&m.func.body))
                 })
         }
         Expr::Template(parts) => parts
@@ -4119,9 +4228,8 @@ fn expr_has_await(e: &Expr) -> bool {
                     PropVal::Expr(e) | PropVal::Spread(e) | PropVal::SpreadTrail(e) => {
                         expr_has_await(e)
                     }
-                    PropVal::Method(d) | PropVal::Get(d) | PropVal::Set(d) => {
-                        !d.is_async && fndef_has_await(d)
-                    }
+                    // object methods are non-arrow fns — their own context
+                    PropVal::Method(_) | PropVal::Get(_) | PropVal::Set(_) => false,
                 }
         }),
         Expr::Unary { expr, .. } | Expr::Update { target: expr, .. } => expr_has_await(expr),
@@ -4193,10 +4301,7 @@ fn pat_has_await(p: &Pattern) -> bool {
 }
 
 fn stmts_have_await(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| match s {
-        Stmt::FnDecl(f) => !f.is_async && fndef_has_await(f),
-        _ => stmt_has_await(s),
-    })
+    stmts.iter().any(stmt_has_await)
 }
 
 fn stmt_has_await(s: &Stmt) -> bool {
@@ -4205,13 +4310,15 @@ fn stmt_has_await(s: &Stmt) -> bool {
         Stmt::VarDecl { decls, .. } => decls
             .iter()
             .any(|(p, i)| pat_has_await(p) || i.as_ref().is_some_and(|e| expr_has_await(e))),
-        Stmt::FnDecl(f) => !f.is_async && fndef_has_await(f),
+        // nested function declarations are non-arrow fns — their own
+        // await context (arrows inside expressions stay transparent)
+        Stmt::FnDecl(_) => false,
+        // a nested class re-checks its own member contexts; only the
+        // heritage expr + computed keys live in ours
         Stmt::ClassDecl(c) => {
             c.superclass.as_ref().is_some_and(|e| expr_has_await(e))
                 || c.members.iter().any(|m| {
                     matches!(&m.key, PropKey::Computed(e) if expr_has_await(e))
-                        || m.init.as_ref().is_some_and(|e| expr_has_await(e))
-                        || (!m.func.is_async && stmts_have_await(&m.func.body))
                 })
         }
         Stmt::If { c, t, e } => {

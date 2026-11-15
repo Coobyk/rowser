@@ -1821,11 +1821,11 @@ mod tests {
     #[test]
     fn proto_cycle_rejected() {
         // a.__proto__ = b; b.__proto__ = a must not create a lookup cycle —
-        // __proto__ set silently ignores it, setPrototypeOf throws
-        let v = eval("var a={},b={}; a.__proto__=b; b.__proto__=a; b.x = 1; a.x");
-        match v {
-            Ok(Value::Num(1.0)) => {}
-            other => panic!("__proto__ cycle set"),
+        // [[SetPrototypeOf]] fails on cycles; the __proto__ setter throws
+        // TypeError (B.2.2.1.2 step 5), setPrototypeOf throws too
+        match eval("var a={},b={}; a.__proto__=b; b.__proto__=a") {
+            Err(_) => {}
+            Ok(_) => panic!("__proto__ cycle set"),
         }
         match eval("var a={},b={}; a.__proto__=b; Object.setPrototypeOf(b,a)") {
             Err(_) => {}
