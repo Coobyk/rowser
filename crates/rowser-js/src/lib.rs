@@ -724,22 +724,26 @@ mod tests {
     // --- promises (synchronous stub) ---
     #[test]
     fn promise_stub() {
+        // microtask semantics: .then callbacks run in drained jobs at end
+        // of eval — the result is observable on a persistent Context
+        let mut ctx = Context::new();
+        ctx.eval("var r = 0; new Promise((res) => res(5)).then(v => r = v);")
+            .unwrap();
+        assert_eq!(num_ctx(&mut ctx, "r"), 5.0);
+        ctx.eval("var r2 = 0; new Promise((res, rej) => rej('e')).catch(v => r2 = 9);")
+            .unwrap();
+        assert_eq!(num_ctx(&mut ctx, "r2"), 9.0);
+        // within the same eval the job has NOT run yet (spec order)
         assert_eq!(
-            num("let r = 0; new Promise((res) => res(5)).then(v => r = v); r"),
-            5.0
+            num("let r = 0; new Promise((res) => res(5)).then(v => r = 7); r"),
+            0.0
         );
-        assert_eq!(
-            num("let r = 0; new Promise((res, rej) => rej('e')).catch(v => r = 9); r"),
-            9.0
-        );
-        assert_eq!(
-            num("let r = 0; Promise.resolve(3).then(v => v * 2).then(v => r = v); r"),
-            6.0
-        );
-        assert_eq!(
-            num("let r = 0; Promise.all([Promise.resolve(1), Promise.resolve(2)]).then(a => r = a[0] + a[1]); r"),
-            3.0
-        );
+        ctx.eval("var r3 = 0; Promise.resolve(3).then(v => v * 2).then(v => r3 = v);")
+            .unwrap();
+        assert_eq!(num_ctx(&mut ctx, "r3"), 6.0);
+        ctx.eval("var r4 = 0; Promise.all([Promise.resolve(1), Promise.resolve(2)]).then(a => r4 = a[0] + a[1]);")
+            .unwrap();
+        assert_eq!(num_ctx(&mut ctx, "r4"), 3.0);
     }
 
     // --- misc ---
@@ -1733,14 +1737,19 @@ mod tests {
         assert_eq!(num("new Blob(['hi', ' there']).size"), 8.0);
         assert_eq!(s("new Blob([], {type: 'Text/HTML'}).type"), "text/html");
         assert_eq!(num("new Blob([new Uint8Array([1,2,3])]).size"), 3.0);
-        assert_eq!(
-            s("let out; new Blob(['hi']).text().then(t => out = t); out"),
-            "hi"
-        );
-        assert_eq!(
-            num("let out; new Blob(['abc']).arrayBuffer().then(b => out = b.byteLength); out"),
-            3.0
-        );
+        let mut ctx = Context::new();
+        ctx.eval("var out; new Blob(['hi']).text().then(t => out = t);")
+            .unwrap();
+        match ctx.eval("out").unwrap() {
+            Value::Str(sv) => assert_eq!(&*sv, "hi"),
+            _ => panic!("expected string"),
+        }
+        ctx.eval("var out2; new Blob(['abc']).arrayBuffer().then(b => out2 = b.byteLength);")
+            .unwrap();
+        match ctx.eval("out2").unwrap() {
+            Value::Num(n) => assert_eq!(n, 3.0),
+            _ => panic!("expected number"),
+        }
         assert_eq!(num("new Blob(['abcdef']).slice(1, 3).size"), 2.0);
     }
 

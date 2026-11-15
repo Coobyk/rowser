@@ -112,7 +112,7 @@ fn own_prop_enumerable(
     // `{ }` scopes the borrow — the gOPD trap may touch the proxy
     if let ObjKind::Proxy { target, handler } = &{ o.borrow().kind.clone() } {
         let (t, h) = (target.clone(), handler.clone());
-        return match i.proxy_gopd(&t, &h, k)? {
+        return match i.proxy_gopd(&t, &h, k, o)? {
             Some(d) => Ok(d.enumerable.unwrap_or(false)),
             None => Ok(false),
         };
@@ -526,13 +526,14 @@ const NATIVE_ARITY: &[(&str, f64)] = &[
     // Reflect
     ("construct", 2.0), ("deleteProperty", 2.0), ("ownKeys", 1.0),
     // Promise
-    ("all", 1.0), ("allSettled", 1.0), ("any", 1.0), ("race", 1.0),
-    ("reject", 1.0), ("resolve", 1.0), ("then", 2.0), ("catch", 1.0),
-    ("finally", 1.0),
+    ("all", 1.0), ("allKeyed", 1.0), ("allSettled", 1.0), ("any", 1.0),
+    ("race", 1.0), ("reject", 1.0), ("resolve", 1.0), ("then", 2.0),
+    ("catch", 1.0), ("finally", 1.0), ("try", 1.0), ("withResolvers", 0.0),
     // Map/Set (name collisions with Reflect resolved to the Map/Set
     // arities — same tests, better coverage)
     ("add", 1.0), ("delete", 1.0), ("get", 1.0), ("has", 1.0),
     ("set", 2.0), ("getOrInsert", 2.0), ("getOrInsertComputed", 2.0),
+    ("toString", 1.0),
     // RegExp / Symbol / Proxy / globals / misc
     ("revocable", 2.0),
     ("exec", 1.0), ("test", 1.0), ("compile", 2.0), ("for", 1.0),
@@ -915,7 +916,9 @@ fn install_protos(i: &mut Interp) {
         method(i, &p, "hasOwnProperty", obj_has_own);
         method(i, &p, "isPrototypeOf", obj_is_prototype_of);
         method(i, &p, "propertyIsEnumerable", obj_prop_is_enum);
-        method(i, &p, "toString", obj_to_string);
+        // spec: Object.prototype.toString has length 0 (shared
+        // NATIVE_ARITY entry gives 1) — like Function.prototype.toString
+        method_len(i, &p, "toString", obj_to_string, 0.0);
         method(i, &p, "toLocaleString", obj_to_locale_string);
         method(i, &p, "valueOf", obj_value_of);
         method(i, &p, "__defineGetter__", obj_define_getter);
@@ -934,25 +937,31 @@ fn install_protos(i: &mut Interp) {
     // -- Function.prototype --
     {
         let p = i.p.func.clone();
+        // own `length`/`name` come FIRST — spec installation order and
+        // getOwnPropertyNames expects them adjacent before the methods
+        i.set_attr(&p, "length", Value::Num(0.0), false, true);
+        i.set_attr(&p, "name", Value::Str(Rc::from("")), false, true);
         method(i, &p, "call", fn_call);
         method(i, &p, "apply", fn_apply);
         method(i, &p, "bind", fn_bind);
-        method(i, &p, "toString", fn_to_string);
-        // restricted function properties — the shared %ThrowTypeError%
-        // accessor makes `fn.caller`/`fn.arguments` throw on get+set
-        fn throw_type_err(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
-            Err(i.type_err("'caller' and 'arguments' are restricted"))
-        }
+        // the shared "toString" arity entry (1) is for
+        // Number.prototype.toString(radix) — Function's is 0
+        method_len(i, &p, "toString", fn_to_string, 0.0);
+        // restricted function properties — the realm's single frozen
+        // %ThrowTypeError% intrinsic is BOTH getter and setter here
+        let tte = Value::Obj(i.p.tte.clone());
         for k in ["caller", "arguments"] {
-            let g = native(i, "ThrowTypeError", throw_type_err);
-            let s = native(i, "ThrowTypeError", throw_type_err);
             p.borrow_mut().props.insert(
                 PropKey::from_str(k),
-                Prop::accessor(Some(g), Some(s)),
+                Prop::accessor(Some(tte.clone()), Some(tte.clone())),
             );
         }
-        // Function.prototype[@@hasInstance] — {w:false, e:false, c:false}
+        // Function.prototype[@@hasInstance] — {w:false, e:false, c:false},
+        // and the function's own length is 1
         let hi = native(i, "[Symbol.hasInstance]", fn_has_instance);
+        if let Value::Obj(hio) = &hi {
+            i.set_attr(hio, "length", Value::Num(1.0), false, true);
+        }
         p.borrow_mut().props.insert(
             PropKey::Sym(SYM_HASINSTANCE),
             Prop {
@@ -1261,7 +1270,7 @@ fn install_protos(i: &mut Interp) {
         let p = i.p.regexp.clone();
         method(i, &p, "test", re_test);
         method(i, &p, "exec", re_exec);
-        method(i, &p, "toString", re_to_string);
+        method_len(i, &p, "toString", re_to_string, 0.0);
         method(i, &p, "compile", re_compile);
         for (name, f) in [
             ("source", re_get_source as NativeFn),
@@ -3229,6 +3238,12 @@ fn install_globals(i: &mut Interp) {
 
     // -- String --
     {
+        // %String.prototype% is itself a String object ([[StringData]] =
+        // the empty string) — proto methods accept it as `this`
+        i.p.string.borrow_mut().props.insert_str(
+            "$value",
+            Prop::builtin(Value::Str(Rc::from(""))),
+        );
         let ctor = make_ctor(i, "String", string_ctor, i.p.string.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         i.set_builtin(
@@ -3247,18 +3262,22 @@ fn install_globals(i: &mut Interp) {
 
     // -- Number --
     {
+        // %Number.prototype% is a Number wrapper ([[NumberData]] = +0)
+        i.p.number.borrow_mut().props.insert_str(
+            "$value",
+            Prop::builtin(Value::Num(0.0)),
+        );
         let ctor = make_ctor(i, "Number", number_ctor, i.p.number.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         for (n, f) in [
-            ("parseInt", g_parse_int as NativeFn),
-            ("parseFloat", g_parse_float),
-            ("isNaN", number_is_nan),
+            ("isNaN", number_is_nan as NativeFn),
             ("isFinite", number_is_finite),
             ("isInteger", number_is_integer),
-            ("isSafeInteger", number_is_integer),
+            ("isSafeInteger", number_is_safe_integer),
         ] {
             i.set_builtin(o, n, native(i, n, f));
         }
+
         for (n, v) in [
             ("MAX_SAFE_INTEGER", 9007199254740991.0),
             ("MIN_SAFE_INTEGER", -9007199254740991.0),
@@ -3276,6 +3295,11 @@ fn install_globals(i: &mut Interp) {
 
     // -- Boolean --
     {
+        // %Boolean.prototype% is a Boolean wrapper ([[BooleanData]] = false)
+        i.p.boolean.borrow_mut().props.insert_str(
+            "$value",
+            Prop::builtin(Value::Bool(false)),
+        );
         let ctor = make_ctor(i, "Boolean", boolean_ctor, i.p.boolean.clone());
         define_global(i, "Boolean", ctor);
     }
@@ -3470,13 +3494,19 @@ fn install_globals(i: &mut Interp) {
                     "Cannot create proxy with a non-object as target or handler",
                 ));
             }
-            Ok(Value::Obj(Rc::new(RefCell::new(Obj::new(
+            // spec: the proxy has [[Call]]/[[Construct]] iff the target
+            // has them AT CREATION — revocation later can't remove them
+            let pflags = (i.is_callable(&t) as u8)
+                | ((i.is_constructor(&t) as u8) << 1);
+            let mut obj = Obj::new(
                 None,
                 ObjKind::Proxy {
                     target: t,
                     handler: h,
                 },
-            )))))
+            );
+            obj.pflags = pflags;
+            Ok(Value::Obj(Rc::new(RefCell::new(obj))))
         }
         fn proxy_revocable(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
             let (t, h) = (arg(a, 0), arg(a, 1));
@@ -3485,13 +3515,17 @@ fn install_globals(i: &mut Interp) {
                     "Cannot create proxy with a non-object as target or handler",
                 ));
             }
-            let p = Value::Obj(Rc::new(RefCell::new(Obj::new(
+            let pflags = (i.is_callable(&t) as u8)
+                | ((i.is_constructor(&t) as u8) << 1);
+            let mut obj = Obj::new(
                 None,
                 ObjKind::Proxy {
                     target: t,
                     handler: h,
                 },
-            ))));
+            );
+            obj.pflags = pflags;
+            let p = Value::Obj(Rc::new(RefCell::new(obj)));
             // the revoker: a Bound object carrying the proxy as bound-this
             // so the plain fn-pointer native reaches it via `this`
             let do_revoke = i.native("revoke", proxy_do_revoke);
@@ -3503,10 +3537,10 @@ fn install_globals(i: &mut Interp) {
                     extra: Vec::new(),
                 },
             )));
-            // spec CreateBuiltinFunction(0, "") — the revoker's name
-            // is the EMPTY string
-            i.set_attr(&rev, "name", Value::Str(Rc::from("")), false, true);
+            // spec CreateBuiltinFunction(0, "") — Set order is `length`
+            // THEN `name`; the revoker's name is the EMPTY string
             i.set_attr(&rev, "length", Value::Num(0.0), false, true);
+            i.set_attr(&rev, "name", Value::Str(Rc::from("")), false, true);
             let r = i.new_obj();
             i.set_data(&r, "proxy", p);
             i.set_data(&r, "revoke", Value::Obj(rev));
@@ -3543,8 +3577,9 @@ fn install_globals(i: &mut Interp) {
                 ctor: true,
             }),
         )));
-        i.set_attr(&o, "name", Value::Str(Rc::from("Proxy")), false, true);
+        // spec CreateBuiltinFunction Set order: `length` then `name`
         i.set_attr(&o, "length", Value::Num(2.0), false, true);
+        i.set_attr(&o, "name", Value::Str(Rc::from("Proxy")), false, true);
         i.set_builtin(&o, "revocable", native(i, "revocable", proxy_revocable));
         // spec: Proxy has NO `prototype` property (ctor flag set on
         // Func::Native carries [[Construct]])
@@ -3763,7 +3798,7 @@ fn install_globals(i: &mut Interp) {
         define_global(i, "SuppressedError", su);
     }
 
-    // -- Promise (stub: callbacks run synchronously) --
+    // -- Promise --
     {
         let p = i.p.promise.clone();
         method(i, &p, "then", promise_then);
@@ -3775,9 +3810,22 @@ fn install_globals(i: &mut Interp) {
         i.set_builtin(o, "resolve", native(i, "resolve", promise_resolve_static));
         i.set_builtin(o, "reject", native(i, "reject", promise_reject_static));
         i.set_builtin(o, "all", native(i, "all", promise_all));
+        i.set_builtin(o, "allSettled", native(i, "allSettled", promise_all_settled));
+        i.set_builtin(o, "any", native(i, "any", promise_any));
         i.set_builtin(o, "race", native(i, "race", promise_race));
-        i.set_builtin(o, "allSettled", native(i, "allSettled", promise_all));
+        i.set_builtin(o, "try", native(i, "try", promise_try));
+        i.set_builtin(o, "allKeyed", native(i, "allKeyed", promise_all_keyed));
         i.set_builtin(o, "withResolvers", native(i, "withResolvers", promise_with_resolvers));
+        // Promise[@@species] — spec getter returning the constructor
+        // itself; SpeciesConstructor reads it on then/catch/finally
+        let species_get = native(i, "get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
+        o.borrow_mut().props.insert(
+            PropKey::Sym(SYM_SPECIES),
+            Prop::accessor(Some(species_get), None),
+        );
+        // intrinsic %Promise% — SpeciesConstructor's default survives a
+        // rewritten global Promise binding
+        i.p.promise_ctor = o.clone();
         define_global(i, "Promise", ctor);
     }
 
@@ -4052,6 +4100,22 @@ fn install_globals(i: &mut Interp) {
         ("eval", g_eval),
     ] {
         define_global(i, n, native(i, n, f));
+    }
+    // spec: Number.parseInt === parseInt / Number.parseFloat ===
+    // parseFloat — the same function objects (globals install above)
+    {
+        let g = i.global.clone();
+        for n in ["parseInt", "parseFloat"] {
+            if let Ok(Some(v)) = i.env_lookup(&g, n) {
+                if let Ok(Some(num)) = i.env_lookup(&g, "Number") {
+                    if let Value::Obj(no) = num {
+                        no.borrow_mut()
+                            .props
+                            .insert_str(n, Prop::builtin(v));
+                    }
+                }
+            }
+        }
     }
     // remember the installed eval so direct `eval(...)` calls take the
     // caller-environment path
@@ -4806,6 +4870,40 @@ fn define_prop_from_desc(
     key: PropKey,
     desc: &Value,
 ) -> Result<bool, Value> {
+    // proxy [[DefineOwnProperty]] — reached when an outer proxy's
+    // missing `defineProperty` trap forwards to a target that is itself
+    // a proxy (10.5.6 step 7.a). The trap's third arg is the descriptor
+    // object; a truish result still faces the target-side invariants.
+    let proxy = {
+        let b = o.borrow();
+        match &b.kind {
+            ObjKind::Proxy { target, handler } => {
+                Some((target.clone(), handler.clone()))
+            }
+            _ => None,
+        }
+    };
+    if let Some((t, h)) = proxy {
+        return match i.proxy_trap(&h, "defineProperty")? {
+            Some(trap) => {
+                let kv = i.key_to_value(&key);
+                let r = i.call(&trap, h, vec![t.clone(), kv, desc.clone()])?;
+                if !i.to_bool(&r) {
+                    return Ok(false);
+                }
+                let pd = i.pdesc_from_obj(desc)?;
+                i.proxy_define_invariant(&t, &key, &pd)?;
+                Ok(true)
+            }
+            None => match &t {
+                Value::Obj(to) => {
+                    let to = to.clone();
+                    define_prop_from_desc(i, &to, key, desc)
+                }
+                _ => Err(i.type_err("proxy target is not an object")),
+            },
+        };
+    }
     let (has_get, gv) = read_desc_prop(i, desc, "get")?;
     let (has_set, sv) = read_desc_prop(i, desc, "set")?;
     let (has_val, vv) = read_desc_prop(i, desc, "value")?;
@@ -5513,7 +5611,7 @@ pub(crate) fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) 
         let (t, h) = (target.clone(), handler.clone());
         // the trap result is validated/normalized and checked against
         // the target's own descriptor — a completed desc comes back
-        return match i.proxy_gopd(&t, &h, &key)? {
+        return match i.proxy_gopd(&t, &h, &key, o)? {
             Some(d) => Ok(Value::Obj(i.pdesc_to_obj(&d))),
             None => Ok(Value::Und),
         };
@@ -6272,40 +6370,38 @@ fn map_group_by(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(Value::Obj(out))
 }
 
-/// capture executor for Promise.withResolvers — `this` is a holder
-/// object the resolve/reject fns get stored on
+/// spec GetCapabilitiesExecutor — captures the resolve/reject pair a
+/// promise ctor hands its executor onto the bound `this` holder. A
+/// second call (or pre-filled slots) is a TypeError.
 fn promise_cap_executor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let taken = {
+        let Value::Obj(h) = this else {
+            return Err(i.type_err("capability executor has no holder"));
+        };
+        let b = h.borrow();
+        let has = |k: &str| {
+            b.props
+                .get_str(k)
+                .is_some_and(|p| !matches!(p.val, Value::Und))
+        };
+        has("resolve") || has("reject")
+    };
+    if taken {
+        return Err(i.type_err("GetCapabilitiesExecutor called more than once"));
+    }
     i.set_prop(this, PropKey::from_str("resolve"), arg(args, 0))?;
     i.set_prop(this, PropKey::from_str("reject"), arg(args, 1))?;
     Ok(Value::Und)
 }
 
-/// `Promise.withResolvers` — NewPromiseCapability(C): run `new C(exec)`
-/// with a capture executor, return { promise, resolve, reject }
+/// `Promise.withResolvers` — spec: NewPromiseCapability(this), then an
+/// ordinary { promise, resolve, reject } record
 fn promise_with_resolvers(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    if !matches!(this, Value::Obj(_)) {
-        return Err(i.type_err("Promise.withResolvers called on non-object"));
-    }
-    let holder = Value::Obj(i.new_obj());
-    let cap = i.native("", promise_cap_executor);
-    let exec = Rc::new(RefCell::new(Obj::new(
-        Some(i.p.func.clone()),
-        ObjKind::Bound {
-            target: cap,
-            thisv: holder.clone(),
-            extra: Vec::new(),
-        },
-    )));
-    let promise = i.construct(this, vec![Value::Obj(exec)], None)?;
-    let resolve = i.get_prop_str(&holder, "resolve")?;
-    let reject = i.get_prop_str(&holder, "reject")?;
-    if !i.is_callable(&resolve) || !i.is_callable(&reject) {
-        return Err(i.type_err("promise capability functions missing"));
-    }
+    let (promise, resolve, reject) = new_promise_capability(i, this)?;
     let out = i.new_obj();
-    i.set_prop_str(&Value::Obj(out.clone()), "promise", promise)?;
-    i.set_prop_str(&Value::Obj(out.clone()), "resolve", resolve)?;
-    i.set_prop_str(&Value::Obj(out.clone()), "reject", reject)?;
+    i.set_data(&out, "promise", promise);
+    i.set_data(&out, "resolve", resolve);
+    i.set_data(&out, "reject", reject);
     Ok(Value::Obj(out))
 }
 
@@ -6418,6 +6514,12 @@ fn fn_apply(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let list = if matches!(arr, Value::Und | Value::Null) {
         Vec::new()
     } else {
+        // CreateListFromArrayLike requires an Object — primitives
+        // (booleans, numbers, strings, symbols) are a TypeError even
+        // though their wrappers would have readable `length` props
+        if !matches!(arr, Value::Obj(_)) {
+            return Err(i.type_err("argArray must be an object"));
+        }
         to_elems(i, &arr)?
     };
     i.call(this, this_arg, list)
@@ -6435,19 +6537,32 @@ fn fn_bind(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             extra: args.iter().skip(1).cloned().collect(),
         },
     )));
-    // spec: name = "bound " + target.name; length = max(0, L - N) where L
-    // is the target's .length and N the bound-arg count
-    let tname = match i.get_prop_str(this, "name") {
-        Ok(Value::Str(s)) => s.to_string(),
+    let bound_args = (args.len() as f64 - 1.0).max(0.0);
+    // spec order: `length` is defined before `name`. Only an OWN
+    // `length` on the target counts (inherited values are ignored —
+    // `bind` on a fn with `{length:42}` on its proto yields 0), and
+    // only numeric values apply ToIntegerOrInfinity → clamp at 0
+    let has_len = has_own_impl(i, this, &Value::Str(Rc::from("length")))?;
+    let blen = if matches!(has_len, Value::Bool(true)) {
+        match i.get_prop_str(this, "length")? {
+            Value::Num(n) => {
+                let n = if n.is_nan() { 0.0 } else { n.trunc() };
+                (n - bound_args).max(0.0)
+            }
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+    i.set_attr(&bound, "length", Value::Num(blen), false, true);
+    // name = "bound " + ToString(target.name); a throwing `name`
+    // getter propagates (don't swallow the error); non-string names
+    // contribute ""
+    let tname = match i.get_prop_str(this, "name")? {
+        Value::Str(s) => s.to_string(),
         _ => String::new(),
     };
     i.set_attr(&bound, "name", Value::Str(Rc::from(format!("bound {tname}"))), false, true);
-    let tlen = match i.get_prop_str(this, "length") {
-        Ok(v) => i.to_num(&v).unwrap_or(0.0),
-        Err(_) => 0.0,
-    };
-    let blen = (tlen - (args.len() as f64 - 1.0).max(0.0)).max(0.0);
-    i.set_attr(&bound, "length", Value::Num(blen), false, true);
     Ok(Value::Obj(bound))
 }
 
@@ -6519,19 +6634,57 @@ fn fn_has_instance(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
     Ok(Value::Bool(ordinary_has_instance(i, this, &v)?))
 }
 
+/// a single valid IdentifierName (native-source function names may be
+/// keyword-shaped but never contain spaces, `#`, or punctuation)
+fn is_ident_name(s: &str) -> bool {
+    fn start(c: char) -> bool {
+        c == '_' || c == '$' || unicode_ident::is_xid_start(c)
+    }
+    fn part(c: char) -> bool {
+        start(c)
+            || unicode_ident::is_xid_continue(c)
+            || c == '\u{200c}'
+            || c == '\u{200d}'
+    }
+    !s.is_empty() && s.chars().next().is_some_and(start) && s.chars().all(part)
+}
+
 fn fn_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let _ = i;
-    let name = if let Value::Obj(o) = this {
-        match &o.borrow().kind {
-            ObjKind::Func(Func::User { def, .. }) => def.name.clone().unwrap_or_default(),
-            ObjKind::Func(Func::Native { name, .. }) => name.to_string(),
-            _ => String::new(),
-        }
-    } else {
-        String::new()
+    let Value::Obj(o) = this else {
+        return Err(i.type_err(
+            "Function.prototype.toString called on non-callable receiver",
+        ));
     };
+    let kind = o.borrow().kind.clone();
+    let name = match &kind {
+        ObjKind::Func(Func::User { def, .. }) => def.name.clone().unwrap_or_default(),
+        ObjKind::Func(Func::Native { name, .. }) => name.to_string(),
+        // bound functions have no source text — anonymous native form
+        ObjKind::Bound { .. } => String::new(),
+        // a proxy answers the NativeFunction form only when its target
+        // is callable; a non-callable target is a TypeError
+        ObjKind::Proxy { target, .. } => {
+            if matches!(target, Value::Obj(t) if t.borrow().is_callable()) {
+                String::new()
+            } else {
+                return Err(i.type_err(
+                    "Function.prototype.toString called on non-callable receiver",
+                ));
+            }
+        }
+        ObjKind::Und => String::new(),
+        _ => {
+            return Err(i.type_err(
+                "Function.prototype.toString called on non-callable receiver",
+            ))
+        }
+    };
+    // emit the name only when it is a single valid IdentifierName —
+    // computed/`#private`/otherwise-unusual names fall back to the
+    // anonymous form so the result is always valid NativeFunction syntax
+    let emit = if is_ident_name(&name) { name } else { String::new() };
     Ok(Value::Str(Rc::from(
-        format!("function {name}() {{ [native code] }}").as_str(),
+        format!("function {emit}() {{ [native code] }}").as_str(),
     )))
 }
 
@@ -6540,8 +6693,8 @@ fn fn_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 // ===========================================================================
 
 fn array_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    // Array(n) → length-n array of holes; Array(a,b,..) → [a,b,..]
-    let items = if args.len() == 1 {
+    // Array(n) → length-n array of HOLES; Array(a,b,..) → [a,b,..]
+    let (items, declared) = if args.len() == 1 {
         if let Value::Num(n) = args[0] {
             if n >= 0.0 && n == n.trunc() && n < 4294967295.0 {
                 // dense Vec backing — can't honor holey arrays past a
@@ -6549,24 +6702,34 @@ fn array_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 if n > 8_000_000.0 {
                     return Err(i.range_err("Invalid array length"));
                 }
-                vec![Value::Und; n as usize]
+                // spec: the slots are ABSENT, not undefined — an empty
+                // dense store + a declared `length` keeps `i in arr`
+                // false and lets proto chains (incl. proxies) answer
+                (Vec::new(), Some(n as usize))
             } else {
                 return Err(i.range_err("Invalid array length"));
             }
         } else {
-            args.to_vec()
+            (args.to_vec(), None)
         }
     } else {
-        args.to_vec()
+        (args.to_vec(), None)
     };
     // [[Construct]] via super(): `this` was allocated with
     // newTarget.prototype — convert it in place so the subclass proto
     // survives (`class Sub extends Array {}`)
     if let Value::Obj(o) = this {
         o.borrow_mut().kind = ObjKind::Arr(items);
+        if let Some(n) = declared {
+            i.set_attr(o, "length", Value::Num(n as f64), true, false);
+        }
         return Ok(this.clone());
     }
-    Ok(Value::Obj(i.new_arr(items)))
+    let o = i.new_arr(items);
+    if let Some(n) = declared {
+        i.set_attr(&o, "length", Value::Num(n as f64), true, false);
+    }
+    Ok(Value::Obj(o))
 }
 
 fn array_is_array(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -8303,23 +8466,55 @@ fn string_raw(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 // natives: number / boolean / symbol
 // ===========================================================================
 
+/// thisNumberValue — only a Number primitive or a [[NumberData]] wrapper
+/// is a valid receiver (other primitives and other wrappers TypeError)
 fn unbox_num(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     match this {
         Value::Num(n) => Ok(*n),
         Value::Obj(o) => {
-            if let Some(v) = i.obj_get_raw_str(o, "$value") {
-                return i.to_num(&v);
+            if let Some(Value::Num(n)) = i.obj_get_raw_str(o, "$value") {
+                return Ok(n);
             }
             Err(i.type_err("Number.prototype method called on incompatible receiver"))
         }
-        other => i.to_num(other),
+        _ => Err(i.type_err("Number.prototype method called on incompatible receiver")),
+    }
+}
+
+/// fractionDigits coercion — ToIntegerOrInfinity then the 0..=100 range
+/// check (RangeError, not clamp); `undefined`/`NaN` → 0
+/// ToIntegerOrInfinity — BigInt/Symbol → TypeError; ±Inf passes through;
+/// NaN → +0. Range checks live at the call site (spec order varies)
+fn num_digits_raw(i: &mut Interp, v: &Value) -> Result<f64, Value> {
+    if crate::binary::bigint_is_prim(v) {
+        return Err(i.type_err("Cannot convert a BigInt value to a number"));
+    }
+    let n = i.to_num(v)?;
+    if n.is_nan() {
+        Ok(0.0)
+    } else {
+        Ok(n.trunc())
     }
 }
 
 fn num_to_fixed(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let n = unbox_num(i, this)?;
-    let d = i.to_num(&arg(args, 0)).unwrap_or(0.0).clamp(0.0, 100.0) as usize;
+    let df = num_digits_raw(i, &arg(args, 0))?;
+    // spec order: ToIntegerOrInfinity → "f is not finite" → RangeError
+    // BEFORE the x-finite check (NaN.toFixed(Infinity) → RangeError);
+    // the 0..=100 range check runs AFTER (Infinity.toFixed(1000) → "Infinity")
+    if !df.is_finite() {
+        return Err(i.range_err("toFixed() digits argument must be between 0 and 100"));
+    }
     if !n.is_finite() {
+        return Ok(Value::Str(Rc::from(js_num_str(n).as_str())));
+    }
+    if !(0.0..=100.0).contains(&df) {
+        return Err(i.range_err("toFixed() digits argument must be between 0 and 100"));
+    }
+    let d = df as usize;
+    // spec: |x| >= 1e21 falls back to ordinary ToString
+    if n.abs() >= 1e21 {
         return Ok(Value::Str(Rc::from(js_num_str(n).as_str())));
     }
     Ok(Value::Str(Rc::from(format!("{n:.d$}").as_str())))
@@ -8330,30 +8525,180 @@ fn num_to_precision(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     match arg(args, 0) {
         Value::Und => Ok(Value::Str(Rc::from(js_num_str(n).as_str()))),
         v => {
-            let d = i.to_num(&v)?.clamp(1.0, 100.0) as usize;
-            if n == 0.0 {
-                return Ok(Value::Str(Rc::from("0".repeat(d).as_str())));
+            let dd = num_digits_raw(i, &v)?;
+            // spec: x NaN/±Inf returns BEFORE the precision range check
+            if !n.is_finite() {
+                return Ok(Value::Str(Rc::from(js_num_str(n).as_str())));
             }
-            let mag = n.abs().log10().floor() as i32;
-            let decimals = (d as i32 - 1 - mag).max(0) as usize;
-            Ok(Value::Str(Rc::from(format!("{n:.decimals$}").as_str())))
+            if !(1.0..=100.0).contains(&dd) {
+                return Err(i.range_err("toPrecision() argument must be between 1 and 100"));
+            }
+            let d = dd as usize;
+            if n == 0.0 {
+                // spec: p significant digits of ±0 → "0" or "0.0…0"
+                let s = if d == 1 {
+                    "0".to_string()
+                } else {
+                    format!("0.{}", "0".repeat(d - 1))
+                };
+                return Ok(Value::Str(Rc::from(s.as_str())));
+            }
+            // spec: e = floor(log10|x|); exponential iff e >= p or e < -6
+            // — rounding itself must run BEFORE the boundary decision
+            // (9.999.toPrecision(3) → "10.0" via decimal, not "9.999")
+            let (digits, e0) = js_exact_digits(n);
+            let (digs, e) = js_round_sig(&digits, e0, d);
+            if e >= d as i32 || e < -6 {
+                let neg = n < 0.0;
+                let mant: String = digs.iter().map(|b| (*b as char)).collect();
+                let mant = if mant.len() > 1 {
+                    format!("{}.{}", &mant[..1], &mant[1..])
+                } else {
+                    mant
+                };
+                let esign = if e < 0 { "-" } else { "+" };
+                return Ok(Value::Str(Rc::from(
+                    format!("{}{mant}e{}{}", if neg { "-" } else { "" }, esign, e.abs())
+                        .as_str(),
+                )));
+            }
+            // decimal: digit `k` sits at position 10^(e-k)
+            let neg = n < 0.0;
+            let mut out = String::new();
+            if neg {
+                out.push('-');
+            }
+            for k in 0..d {
+                let pos = e - k as i32;
+                let ch = if k < digs.len() {
+                    digs[k] as char
+                } else {
+                    '0'
+                };
+                if pos < 0 && k as i32 == e + 1 {
+                    out.push('.');
+                }
+                out.push(ch);
+            }
+            if e < 0 {
+                // leading "0.000" before the digits
+                let mut pre = String::from("0.");
+                for _ in 0..(-e - 1) {
+                    pre.push('0');
+                }
+                let body: String = digs.iter().map(|b| (*b as char)).collect();
+                out = format!("{}{}{}", if neg { "-" } else { "" }, pre, body);
+            }
+            Ok(Value::Str(Rc::from(out.as_str())))
         }
     }
 }
 
 fn num_to_exponential(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let n = unbox_num(i, this)?;
-    let d = i.to_num(&arg(args, 0)).unwrap_or(6.0).clamp(0.0, 100.0) as usize;
+    // spec: no digits arg → the minimal exponent form that round-trips
+    // (Rust's {:e} Display is already shortest-repr)
+    if matches!(arg(args, 0), Value::Und) {
+        let s = format!("{n:e}");
+        let s = js_exp_str(&s);
+        return Ok(Value::Str(Rc::from(s.as_str())));
+    }
+    let df = num_digits_raw(i, &arg(args, 0))?;
     if !n.is_finite() {
         return Ok(Value::Str(Rc::from(js_num_str(n).as_str())));
     }
-    let s = format!("{n:.d$e}");
-    // rust gives "1.5e2" — JS wants "1.5e+2"
-    let s = s
-        .replace("e-", "e-")
-        .replacen('e', "e+", 1)
-        .replace("e+-", "e-");
+    if !df.is_finite() || !(0.0..=100.0).contains(&df) {
+        return Err(i.range_err("toExponential() argument must be between 0 and 100"));
+    }
+    let d = df as usize;
+    if n == 0.0 {
+        // spec: ±0 → "0" + (d>0 ? "." + d zeros : "") + "e+0"
+        let mant = if d == 0 {
+            "0".to_string()
+        } else {
+            format!("0.{}", "0".repeat(d))
+        };
+        return Ok(Value::Str(Rc::from(format!("{mant}e+0").as_str())));
+    }
+    let s = js_exp_fixed(n, d);
     Ok(Value::Str(Rc::from(s.as_str())))
+}
+
+/// exact significant decimal digits of |n| + base-10 exponent —
+/// Rust's high-precision `{:.*e}` prints the full expansion
+fn js_exact_digits(n: f64) -> (Vec<u8>, i32) {
+    let s = format!("{:.800e}", n.abs());
+    let epos = s.find('e').unwrap();
+    let exp: i32 = s[epos + 1..].parse().unwrap();
+    let digits: Vec<u8> = s[..epos].bytes().filter(|b| b.is_ascii_digit()).collect();
+    (digits, exp)
+}
+
+/// round `digits` to `keep` significant digits, HALF-UP (spec picks the
+/// larger s on ties); returns (digits, carry-adjusted exponent delta)
+fn js_round_sig(digits: &[u8], exp: i32, keep: usize) -> (Vec<u8>, i32) {
+    let mut digs: Vec<u8> = digits[..keep.min(digits.len())].to_vec();
+    let tail = &digits[keep.min(digits.len())..];
+    let up = tail.first().is_some_and(|t| *t >= b'5');
+    let mut exp = exp;
+    if up {
+        let mut k = digs.len();
+        loop {
+            if k == 0 {
+                digs.insert(0, b'1');
+                exp += 1;
+                break;
+            }
+            k -= 1;
+            if digs[k] == b'9' {
+                digs[k] = b'0';
+            } else {
+                digs[k] += 1;
+                break;
+            }
+        }
+        // the carry insert ("9"→"10") leaves an extra digit
+        digs.truncate(keep);
+    }
+    (digs, exp)
+}
+
+/// spec-faithful `x.toExponential(d)`: f64's exact decimal expansion is
+/// produced by Rust's high-precision `{:.*e}`, then rounded HALF-UP at
+/// d+1 significant digits (spec picks the larger s on ties; Rust's
+/// built-in rounding is half-even)
+fn js_exp_fixed(n: f64, d: usize) -> String {
+    let (digits, exp) = js_exact_digits(n);
+    let (digs, exp) = js_round_sig(&digits, exp, d + 1);
+    let neg = n < 0.0;
+    let mant: String = digs.iter().map(|b| (*b as char)).collect();
+    let mant = if mant.len() > 1 {
+        format!("{}.{}", &mant[..1], &mant[1..])
+    } else {
+        mant
+    };
+    let esign = if exp < 0 { "-" } else { "+" };
+    format!(
+        "{}{mant}e{}{}",
+        if neg { "-" } else { "" },
+        esign,
+        exp.abs()
+    )
+}
+
+/// normalize a Rust `{:e}` string to the JS `e±d` form
+fn js_exp_str(s: &str) -> String {
+    match s.find('e') {
+        Some(p) => {
+            let (m, e) = (&s[..p], &s[p + 1..]);
+            if let Some(d) = e.strip_prefix('-') {
+                format!("{m}e-{d}")
+            } else {
+                format!("{m}e+{e}")
+            }
+        }
+        None => s.to_string(),
+    }
 }
 
 fn num_to_string(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -8409,9 +8754,10 @@ fn num_value_of(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 fn number_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let n = match arg(args, 0) {
-        Value::Und => 0.0,
-        v => i.to_num(&v)?,
+    // Number() → +0 but Number(undefined) → NaN — arg presence matters
+    let n = match args.first() {
+        None => 0.0,
+        Some(v) => i.to_num(v)?,
     };
     if matches!(this, Value::Obj(_)) {
         if let Value::Obj(o) = this {
@@ -8435,6 +8781,14 @@ fn number_is_finite(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     Ok(Value::Bool(
         matches!(arg(args, 0), Value::Num(n) if n.is_finite()),
     ))
+}
+
+fn number_is_safe_integer(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let _ = i;
+    Ok(Value::Bool(match arg(args, 0) {
+        Value::Num(n) => n.fract() == 0.0 && n.abs() <= 9007199254740991.0,
+        _ => false,
+    }))
 }
 
 fn number_is_integer(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -8499,6 +8853,18 @@ fn function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         Ok(v) => v,
         Err(e) => return Err(i.syntax_err(format!("{e}"))),
     };
+    if let Value::Obj(o) = &v {
+        let mut b = o.borrow_mut();
+        // dynamically-created fns own NO caller/arguments props even
+        // when the body is strict (the inherited %ThrowTypeError%
+        // accessors still fire) — but they count as restricted callers
+        // for the legacy sloppy `.caller` lookup
+        b.props.remove_str("caller");
+        b.props.remove_str("arguments");
+        if let ObjKind::Func(Func::User { dynamic, .. }) = &mut b.kind {
+            *dynamic = true;
+        }
+    }
     // OrdinaryCreateFromConstructor: newTarget.prototype wins
     // (`class F extends Function {}` → fn proto is F.prototype)
     let nt = i.new_target_native.clone().unwrap_or(Value::Und);
@@ -8534,6 +8900,15 @@ fn gen_function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         Ok(v) => v,
         Err(e) => return Err(i.syntax_err(format!("{e}"))),
     };
+    if let Value::Obj(o) = &v {
+        let mut b = o.borrow_mut();
+        // same dynamic-function semantics as function_ctor
+        b.props.remove_str("caller");
+        b.props.remove_str("arguments");
+        if let ObjKind::Func(Func::User { dynamic, .. }) = &mut b.kind {
+            *dynamic = true;
+        }
+    }
     // newTarget.prototype wins over %GeneratorFunction.prototype%
     // (subclassing: `class G extends GeneratorFunction {}`)
     let nt = i.new_target_native.clone().unwrap_or(Value::Und);
@@ -8927,16 +9302,115 @@ fn json_parse(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         pos: 0,
     };
     p.skip_ws();
-    match p.value(i) {
+    let v = match p.value(i) {
         Ok(v) => {
             p.skip_ws();
             if p.pos != p.chars.len() {
                 return Err(i.syntax_err("Unexpected token in JSON"));
             }
-            Ok(v)
+            v
         }
-        Err(msg) => Err(i.syntax_err(format!("Unexpected token in JSON: {msg}"))),
+        Err(msg) => return Err(i.syntax_err(format!("Unexpected token in JSON: {msg}"))),
+    };
+    // spec InternalizeJSONProperty: reviver walks the tree post-order
+    // inside a {"": value} holder; deleted props remove array/object slots
+    let reviver = arg(args, 1);
+    if i.is_callable(&reviver) {
+        let holder = i.new_obj();
+        i.set_data(&holder, "", v);
+        return json_internalize(
+            i,
+            &Value::Obj(holder),
+            "",
+            &reviver,
+        );
     }
+    Ok(v)
+}
+
+/// CreateDataProperty — [[DefineOwnProperty]]({value,W:T,E:T,C:T})
+/// returning success; a `false` result (non-configurable target) is
+/// skipped silently, matching how InternalizeJSONProperty ignores it
+fn json_create_data_prop(
+    i: &mut Interp,
+    obj: &Value,
+    key: PropKey,
+    v: Value,
+) -> Result<(), Value> {
+    let Value::Obj(o) = obj else { return Ok(()) };
+    // proxies route through the defineProperty trap — a throwing trap
+    // propagates; ordinary objects use the validate-and-apply path where
+    // a `false` (non-configurable) result is skipped silently
+    if { matches!(&o.borrow().kind, ObjKind::Proxy { .. }) } {
+        return i.recv_define(o, &key, v, true);
+    }
+    let d = i.new_obj();
+    i.set_data(&d, "value", v);
+    i.set_data(&d, "writable", Value::Bool(true));
+    i.set_data(&d, "enumerable", Value::Bool(true));
+    i.set_data(&d, "configurable", Value::Bool(true));
+    let _ = define_prop_from_desc(i, o, key, &Value::Obj(d))?;
+    Ok(())
+}
+
+/// InternalizeJSONProperty — `holder`/`name` name the slot holding `val`
+/// (read inside, not passed in, so the reviver sees fresh values)
+fn json_internalize(
+    i: &mut Interp,
+    holder: &Value,
+    name: &str,
+    reviver: &Value,
+) -> NResult {
+    let val = i.get_prop_str(holder, name)?;
+    if let Value::Obj(o) = &val {
+        let is_arr = matches!(
+            array_is_array(i, &Value::Und, &[val.clone()])?,
+            Value::Bool(true)
+        );
+        if is_arr {
+            // ToLength(Get("length")) — proxies / array-likes read live
+            let len_v = i.get_prop_str(&val, "length")?;
+            let len = to_length_num(i.to_num(&len_v)?).min(1_000_000);
+            for k in 0..len {
+                let kk = k.to_string();
+                let new_elem =
+                    json_internalize(i, &val, &kk, reviver)?;
+                if matches!(new_elem, Value::Und) {
+                    i.delete_prop(&val, &PropKey::S(Rc::from(kk.as_str())))?;
+                } else {
+                    let kv = PropKey::S(Rc::from(kk.as_str()));
+                    json_create_data_prop(i, &val, kv, new_elem)?;
+                }
+            }
+        } else {
+            // enumerable own string keys (live snapshot via traps)
+            let mut keys: Vec<String> = Vec::new();
+            for (k, _) in own_enum_entries_full(i, &val, false)? {
+                if let PropKey::S(s) = k {
+                    keys.push(s.to_string());
+                }
+            }
+            for kk in keys {
+                let new_elem = json_internalize(i, &val, &kk, reviver)?;
+                if matches!(new_elem, Value::Und) {
+                    i.delete_prop(&val, &PropKey::S(Rc::from(kk.as_str())))?;
+                } else {
+                    json_create_data_prop(
+                        i,
+                        &val,
+                        PropKey::S(Rc::from(kk.as_str())),
+                        new_elem,
+                    )?;
+                }
+            }
+        }
+        let _ = o;
+    }
+    i.call(
+        reviver,
+        holder.clone(),
+        vec![Value::Str(Rc::from(name)), val],
+    )
 }
 
 struct JsonParser {
@@ -8945,8 +9419,13 @@ struct JsonParser {
 }
 
 impl JsonParser {
+    /// JSON ws is exactly space/tab/LF/CR — no Unicode extras
     fn skip_ws(&mut self) {
-        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
+        while self
+            .chars
+            .get(self.pos)
+            .is_some_and(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
+        {
             self.pos += 1;
         }
     }
@@ -9019,21 +9498,52 @@ impl JsonParser {
             Some('t') => self.lit("true", Value::Bool(true)),
             Some('f') => self.lit("false", Value::Bool(false)),
             Some('n') => self.lit("null", Value::Null),
-            Some(c) if c == '-' || c.is_ascii_digit() => {
-                let start = self.pos;
-                while self
-                    .peek()
-                    .is_some_and(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
-                {
-                    self.pos += 1;
-                }
-                let s: String = self.chars[start..self.pos].iter().collect();
-                s.parse::<f64>()
-                    .map(Value::Num)
-                    .map_err(|_| format!("bad number {s}"))
-            }
+            Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
             _ => Err("unexpected char".into()),
         }
+    }
+    /// strict JSONNumber: `-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?`
+    fn number(&mut self) -> Result<Value, String> {
+        let start = self.pos;
+        if self.peek() == Some('-') {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Some('0') => {
+                self.pos += 1;
+            }
+            Some(c) if c.is_ascii_digit() => {
+                while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err("bad number".into()),
+        }
+        if self.peek() == Some('.') {
+            self.pos += 1;
+            if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return Err("bad fraction".into());
+            }
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.pos += 1;
+            }
+            if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return Err("bad exponent".into());
+            }
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        let s: String = self.chars[start..self.pos].iter().collect();
+        s.parse::<f64>()
+            .map(Value::Num)
+            .map_err(|_| format!("bad number {s}"))
     }
     fn lit(&mut self, word: &str, v: Value) -> Result<Value, String> {
         for c in word.chars() {
@@ -9084,6 +9594,10 @@ impl JsonParser {
                     }
                     self.pos += 1;
                 }
+                // unescaped control chars are invalid in JSON strings
+                Some(c) if (c as u32) < 0x20 => {
+                    return Err("unescaped control char".into());
+                }
                 Some(c) => {
                     s.push(c);
                     self.pos += 1;
@@ -9095,178 +9609,337 @@ impl JsonParser {
 
 fn json_stringify(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
-    let indent = match arg(args, 2) {
-        Value::Num(n) => " ".repeat((n as usize).min(10)),
+    let replacer = arg(args, 1);
+    let mut replacer_fn = Value::Und;
+    let mut property_list: Option<Vec<String>> = None;
+    if let Value::Obj(ro) = &replacer {
+        if i.is_callable(&replacer) {
+            replacer_fn = replacer.clone();
+        } else if matches!(
+            array_is_array(i, &Value::Und, &[replacer.clone()])?,
+            Value::Bool(true)
+        ) {
+            // spec: PropertyList only when IsArray(replacer) — other
+            // non-callable objects are ignored entirely
+            let len_v = i.get_prop_str(&replacer, "length")?;
+            let len = to_length_num(i.to_num(&len_v)?).min(1_000_000);
+            let mut list: Vec<String> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for idx in 0..len {
+                let e = i.get_prop(&replacer, &idx_key(idx))?;
+                let item = match e {
+                    Value::Str(s) => Some(s.to_string()),
+                    Value::Num(n) => Some(js_num_str(n)),
+                    Value::Obj(ref o) => {
+                        // [[StringData]]/[[NumberData]] objects → ToString(v)
+                        // (the wrapper's own toString runs — overrides are
+                        // observable)
+                        let has_data = o
+                            .borrow()
+                            .props
+                            .get_str("$value")
+                            .is_some_and(|p| {
+                                matches!(p.val, Value::Str(_) | Value::Num(_))
+                            });
+                        if has_data {
+                            Some(i.to_str(&e)?)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(k) = item {
+                    if seen.insert(k.clone()) {
+                        list.push(k);
+                    }
+                }
+            }
+            property_list = Some(list);
+        }
+        let _ = ro;
+    }
+    // spec: space arg unboxes via ToNumber/ToString — wrapper
+    // conversions are observable (overridden toString fires)
+    let space = match arg(args, 2) {
+        Value::Obj(o) => {
+            let slot = o.borrow().props.get_str("$value").map(|p| p.val.clone());
+            let ov = Value::Obj(o.clone());
+            match slot {
+                Some(Value::Str(_)) => Value::Str(Rc::from(i.to_str(&ov)?.as_str())),
+                Some(Value::Num(_)) => Value::Num(i.to_num(&ov)?),
+                _ => Value::Und,
+            }
+        }
+        s => s,
+    };
+    let indent = match space {
+        Value::Num(n) => {
+            let k = to_integer_or_inf(n);
+            " ".repeat(if k.is_finite() { (k.max(0.0) as usize).min(10) } else { 10 })
+        }
         Value::Str(s) => s.chars().take(10).collect(),
         _ => String::new(),
     };
-    let mut out = String::new();
+    // the root holder: {"": value}
+    let holder = i.new_obj();
+    i.set_data(&holder, "", v);
     let mut stack = Vec::new();
-    if json_ser_into(i, &v, &indent, 0, &mut out, &mut stack)? {
-        Ok(Value::Str(Rc::from(out.as_str())))
-    } else {
-        Ok(Value::Und)
+    match json_ser_prop(
+        i,
+        &Value::Obj(holder),
+        "",
+        &replacer_fn,
+        &property_list,
+        &indent,
+        &mut stack,
+    )? {
+        Some(s) => Ok(Value::Str(Rc::from(s.as_str()))),
+        None => Ok(Value::Und),
     }
 }
 
-fn json_pad(out: &mut String, indent: &str, level: usize) {
-    for _ in 0..level {
-        out.push_str(indent);
+fn to_integer_or_inf(n: f64) -> f64 {
+    if n.is_nan() {
+        0.0
+    } else if n.is_infinite() {
+        n
+    } else {
+        n.trunc()
     }
 }
 
-/// Serialize into `out` — returns false when the value is omitted
-/// (undefined/symbol/function). Writes directly instead of building a
-/// `String` per node plus a `Vec<String>` join per container.
-fn json_ser_into(
-    i: &mut Interp,
-    v: &Value,
-    indent: &str,
-    level: usize,
-    out: &mut String,
-    stack: &mut Vec<usize>,
-) -> Result<bool, Value> {
-    // replacer via toJSON
-    let tj = i.get_prop_str(v, "toJSON").unwrap_or(Value::Und);
-    let v2 = if i.is_callable(&tj) {
-        i.call(&tj, v.clone(), vec![Value::Str(empty_rc())])?
-    } else {
-        v.clone()
+/// unbox a Number/String/Boolean wrapper's `$value` slot (spec
+/// SerializeJSONProperty step 4)
+fn json_unbox(i: &mut Interp, v: &Value) -> Result<Value, Value> {
+    let Value::Obj(o) = v else {
+        return Ok(v.clone());
     };
-    Ok(match &v2 {
-        Value::Und | Value::Sym(..) => false,
-        Value::Null => {
-            out.push_str("null");
-            true
+    let slot = {
+        let b = o.borrow();
+        if !matches!(&b.kind, ObjKind::Ord) {
+            return Ok(v.clone());
         }
-        Value::Bool(b) => {
-            out.push_str(if *b { "true" } else { "false" });
-            true
+        if b.props.contains_key(&PropKey::from_str("__bigint_wrap")) {
+            // BigIntData unwraps directly to the primitive stand-in
+            if let Some(p) = b.props.get_str("$value") {
+                return Ok(p.val.clone());
+            }
+            return Ok(v.clone());
         }
+        b.props.get_str("$value").map(|p| p.val.clone())
+    };
+    // spec: Number → ToNumber(obj), String → ToString(obj) — the
+    // wrapper's valueOf/toString run and may throw or be overridden;
+    // Boolean unwraps the slot directly (no coercion)
+    match slot {
+        Some(Value::Num(_)) => Ok(Value::Num(i.to_num(v)?)),
+        Some(Value::Str(_)) => Ok(Value::Str(Rc::from(i.to_str(v)?.as_str()))),
+        Some(p @ Value::Bool(_)) => Ok(p),
+        _ => Ok(v.clone()),
+    }
+}
+
+/// spec SerializeJSONProperty — returns the serialized text or None when
+/// the value is omitted (undefined/function/symbol)
+fn json_ser_prop(
+    i: &mut Interp,
+    holder: &Value,
+    key: &str,
+    replacer_fn: &Value,
+    property_list: &Option<Vec<String>>,
+    indent: &str,
+    stack: &mut Vec<usize>,
+) -> Result<Option<String>, Value> {
+    let mut value = i.get_prop(holder, &PropKey::from_str(key))?;
+    // step 2: toJSON on objects only (and bigint stand-ins — ours are
+    // objects anyway)
+    if matches!(value, Value::Obj(_)) {
+        let tj = i.get_prop_str(&value, "toJSON")?;
+        if i.is_callable(&tj) {
+            value = i.call(
+                &tj,
+                value.clone(),
+                vec![Value::Str(Rc::from(key))],
+            )?;
+        }
+    }
+    // step 3: replacer function sees the post-toJSON value
+    if i.is_callable(replacer_fn) {
+        value = i.call(
+            replacer_fn,
+            holder.clone(),
+            vec![Value::Str(Rc::from(key)), value],
+        )?;
+    }
+    let value = json_unbox(i, &value)?;
+    Ok(match &value {
+        Value::Und | Value::Sym(..) => None,
+        Value::Null => Some("null".to_string()),
+        Value::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
         Value::Num(n) => {
             if n.is_finite() {
-                out.push_str(&js_num_str(*n));
+                Some(js_num_str(*n))
             } else {
-                out.push_str("null");
+                Some("null".to_string())
             }
-            true
         }
         Value::Str(s) => {
-            json_escape_into(s, out);
-            true
+            let mut o = String::new();
+            json_escape_into(s, &mut o);
+            Some(o)
         }
         Value::Obj(o) => {
-            // cyclic structure → TypeError (JSON.stringify spec); the
-            // ancestor stack distinguishes cycles from merely shared refs
+            // bigint stand-ins throw on bare stringify
+            if crate::binary::bigint_is_prim(&value) {
+                return Err(i.type_err("Do not know how to serialize a BigInt"));
+            }
+            if i.is_callable(&value) {
+                return Ok(None);
+            }
             let ptr = Rc::as_ptr(o) as usize;
             if stack.contains(&ptr) {
                 return Err(i.type_err("circular structure"));
             }
             stack.push(ptr);
-            enum K {
-                Arr(Vec<Value>),
-                Obj,
-                Skip,
-            }
-            // short borrow only — recursion can run getters that mutate this
-            let k = {
-                let b = o.borrow();
-                match &b.kind {
-                    ObjKind::Arr(items) => K::Arr(items.clone()),
-                    ObjKind::Func(_) | ObjKind::Bound { .. } => K::Skip,
-                    _ => K::Obj,
+            let r = (|| {
+                let is_arr = matches!(
+                    array_is_array(i, &Value::Und, &[value.clone()])?,
+                    Value::Bool(true)
+                );
+                if is_arr {
+                    json_ser_arr(i, &value, replacer_fn, property_list, indent, stack)
+                } else {
+                    json_ser_obj(i, &value, replacer_fn, property_list, indent, stack)
                 }
-            };
-            let r: Result<bool, Value> = (|| {
-                Ok(match k {
-                    K::Skip => false,
-                    K::Arr(items) => {
-                        if indent.is_empty() {
-                            out.push('[');
-                            for (n, it) in items.iter().enumerate() {
-                                if n > 0 {
-                                    out.push(',');
-                                }
-                                if !json_ser_into(i, it, indent, level + 1, out, stack)? {
-                                    out.push_str("null");
-                                }
-                            }
-                            out.push(']');
-                        } else if items.is_empty() {
-                            out.push_str("[]");
-                        } else {
-                            out.push_str("[\n");
-                            json_pad(out, indent, level + 1);
-                            for (n, it) in items.iter().enumerate() {
-                                if n > 0 {
-                                    out.push_str(",\n");
-                                    json_pad(out, indent, level + 1);
-                                }
-                                if !json_ser_into(i, it, indent, level + 1, out, stack)? {
-                                    out.push_str("null");
-                                }
-                            }
-                            out.push('\n');
-                            json_pad(out, indent, level);
-                            out.push(']');
-                        }
-                        true
-                    }
-                    K::Obj => {
-                        let entries = own_enum_entries(i, &v2);
-                        let sep_colon: &str = if indent.is_empty() { ":" } else { ": " };
-                        let open_len = out.len();
-                        if indent.is_empty() {
-                            out.push('{');
-                        } else {
-                            out.push_str("{\n");
-                            json_pad(out, indent, level + 1);
-                        }
-                        let mut first = true;
-                        for (key, slot) in entries {
-                            let val = match slot {
-                                Some(val) => val,
-                                None => i.get_prop(&v2, &key)?,
-                            };
-                            // serialize first — skip the key entirely when the
-                            // value is omitted
-                            let mut tmp = String::new();
-                            if json_ser_into(i, &val, indent, level + 1, &mut tmp, stack)? {
-                                if !first {
-                                    if indent.is_empty() {
-                                        out.push(',');
-                                    } else {
-                                        out.push_str(",\n");
-                                        json_pad(out, indent, level + 1);
-                                    }
-                                }
-                                first = false;
-                                if let PropKey::S(s) = &key {
-                                    json_escape_into(s, out);
-                                }
-                                out.push_str(sep_colon);
-                                out.push_str(&tmp);
-                            }
-                        }
-                        if indent.is_empty() {
-                            out.push('}');
-                        } else if first {
-                            // nothing written (empty obj or all values omitted) → {}
-                            out.truncate(open_len);
-                            out.push_str("{}");
-                        } else {
-                            out.push('\n');
-                            json_pad(out, indent, level);
-                            out.push('}');
-                        }
-                        true
-                    }
-                })
             })();
             stack.pop();
-            r?
+            Some(r?)
         }
     })
+}
+
+/// SerializeJSONArray — ToLength(Get("length")) + per-index props so
+/// proxies / subclasses read through [[Get]]
+fn json_ser_arr(
+    i: &mut Interp,
+    arr: &Value,
+    replacer_fn: &Value,
+    property_list: &Option<Vec<String>>,
+    indent: &str,
+    stack: &mut Vec<usize>,
+) -> Result<String, Value> {
+    let len_v = i.get_prop_str(arr, "length")?;
+    let len = to_length_num(i.to_num(&len_v)?).min(1_000_000);
+    let mut parts: Vec<String> = Vec::with_capacity(len.min(1024));
+    for k in 0..len {
+        match json_ser_prop(
+            i,
+            arr,
+            &k.to_string(),
+            replacer_fn,
+            property_list,
+            indent,
+            stack,
+        )? {
+            Some(s) => parts.push(s),
+            None => parts.push("null".to_string()),
+        }
+    }
+    if indent.is_empty() {
+        return Ok(format!("[{}]", parts.join(",")));
+    }
+    if parts.is_empty() {
+        return Ok("[]".to_string());
+    }
+    let level = stack.len();
+    let pad = indent.repeat(level - 1);
+    let inner = indent.repeat(level);
+    Ok(format!(
+        "[\n{}{}\n{}]",
+        inner,
+        parts.join(&format!(",\n{inner}")),
+        pad
+    ))
+}
+
+/// Enumerable string own keys WITHOUT [[Get]] — the JSON key list is a
+/// snapshot (K computed once); getters fire later inside
+/// SerializeJSONProperty where deletions remain observable
+fn json_enum_string_keys(i: &mut Interp, v: &Value) -> Result<Vec<String>, Value> {
+    let mut out = Vec::new();
+    if let Value::Obj(o) = v {
+        if { matches!(&o.borrow().kind, ObjKind::Proxy { .. }) } {
+            for k in own_keys_all(i, v)? {
+                let PropKey::S(_) = &k else { continue };
+                let kv = i.key_to_value(&k);
+                let d = obj_get_own_prop_desc(i, &Value::Und, &[v.clone(), kv])?;
+                if let Value::Obj(dv) = d {
+                    let en = i.get_prop_str(&Value::Obj(dv), "enumerable")?;
+                    if i.to_bool(&en) {
+                        if let PropKey::S(s) = k {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
+    }
+    for (k, _) in own_enum_entries(i, v) {
+        if let PropKey::S(s) = k {
+            out.push(s.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// SerializeJSONObject — enumerable string keys (or the PropertyList),
+/// each serialized via SerializeJSONProperty with THIS object as holder
+fn json_ser_obj(
+    i: &mut Interp,
+    obj: &Value,
+    replacer_fn: &Value,
+    property_list: &Option<Vec<String>>,
+    indent: &str,
+    stack: &mut Vec<usize>,
+) -> Result<String, Value> {
+    let keys: Vec<String> = match property_list {
+        Some(list) => list.clone(),
+        None => json_enum_string_keys(i, obj)?,
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for k in &keys {
+        if let Some(ser) = json_ser_prop(
+            i,
+            obj,
+            k,
+            replacer_fn,
+            property_list,
+            indent,
+            stack,
+        )? {
+            let mut ek = String::new();
+            json_escape_into(k, &mut ek);
+            let colon = if indent.is_empty() { ":" } else { ": " };
+            parts.push(format!("{ek}{colon}{ser}"));
+        }
+    }
+    if indent.is_empty() {
+        return Ok(format!("{{{}}}", parts.join(",")));
+    }
+    if parts.is_empty() {
+        return Ok("{}".to_string());
+    }
+    let level = stack.len();
+    let pad = indent.repeat(level - 1);
+    let inner = indent.repeat(level);
+    Ok(format!(
+        "{{\n{}{}\n{}}}",
+        inner,
+        parts.join(&format!(",\n{inner}")),
+        pad
+    ))
 }
 
 fn json_escape_into(s: &str, out: &mut String) {
@@ -9310,116 +9983,187 @@ fn console_log(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 }
 
 // ===========================================================================
-// natives: promise (stub — synchronous)
+// natives: promise — spec jobs-based: reactions + thenable resolution run
+// as queued jobs drained at the microtask checkpoint (end of `run`)
 // ===========================================================================
 
 fn new_promise(i: &mut Interp) -> ObjRef {
-    Rc::new(RefCell::new(Obj::new(
+    let p = Rc::new(RefCell::new(Obj::new(
         Some(i.p.promise.clone()),
         ObjKind::Promise(PromiseState::Pending),
-    )))
+    )));
+    // pending reactions live in a hidden `$handlers` array — each
+    // element is a {onF,onR,resolve,reject} reaction record
+    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
+    p
+}
+
+fn promise_state(o: &ObjRef) -> PromiseState {
+    match &o.borrow().kind {
+        ObjKind::Promise(s) => s.clone(),
+        _ => PromiseState::Pending,
+    }
+}
+
+fn is_promise(v: &Value) -> bool {
+    matches!(v, Value::Obj(o) if matches!(o.borrow().kind, ObjKind::Promise(_)))
+}
+
+/// the `$handlers` reaction list — lazily installed so engine-made
+/// promises that skip `new_promise` still take reactions
+fn handlers_arr(i: &mut Interp, p: &ObjRef) -> ObjRef {
+    let cur = p
+        .borrow()
+        .props
+        .get_str("$handlers")
+        .map(|pr| pr.val.clone());
+    if let Some(Value::Obj(o)) = cur {
+        if matches!(o.borrow().kind, ObjKind::Arr(_)) {
+            return o;
+        }
+    }
+    let a = i.new_arr(Vec::new());
+    i.set_builtin(p, "$handlers", Value::Obj(a.clone()));
+    a
+}
+
+/// a native fn wrapped as a Bound fn carrying `holder` as `this` — the
+/// engine's stand-in for spec internal-slot closures (resolve/reject,
+/// element fns, finally thunks). Bound fns have no `prototype`, are
+/// extensible, and are non-constructors — matching the spec shapes.
+fn bound_native(i: &mut Interp, name: &str, f: NativeFn, holder: Value, len: f64) -> Value {
+    let target = i.native(name, f);
+    let b = Rc::new(RefCell::new(Obj::new(
+        Some(i.p.func.clone()),
+        ObjKind::Bound {
+            target,
+            thisv: holder,
+            extra: Vec::new(),
+        },
+    )));
+    i.set_attr(&b, "name", Value::Str(Rc::from(name)), false, true);
+    i.set_attr(&b, "length", Value::Num(len), false, true);
+    Value::Obj(b)
+}
+
+/// spec CreateResolvingFunctions — a resolve/reject pair sharing ONE
+/// `alreadyResolved` latch. Pair state lives on a holder bound as the
+/// fns' `this`: `$p` = the promise, `$r` = the latch flag.
+fn resolving_fns(i: &mut Interp, p: &ObjRef) -> (Value, Value) {
+    let holder = i.new_obj();
+    i.set_builtin(&holder, "$p", Value::Obj(p.clone()));
+    i.set_builtin(&holder, "$r", Value::Bool(false));
+    let hv = Value::Obj(holder);
+    (
+        bound_native(i, "", promise_resolve_inner, hv.clone(), 1.0),
+        bound_native(i, "", promise_reject_inner, hv, 1.0),
+    )
+}
+
+/// consume a resolving-fn holder's `alreadyResolved` latch — returns
+/// the promise when this call is the pair's first resolve/reject
+/// attempt; `None` on a foreign receiver or an already-tripped latch
+fn resolve_latch(h: &ObjRef) -> Option<Value> {
+    let mut b = h.borrow_mut();
+    let already =
+        matches!(b.props.get_str("$r"), Some(pr) if matches!(pr.val, Value::Bool(true)));
+    if already {
+        return None;
+    }
+    let p = b.props.get_str("$p").map(|pr| pr.val.clone())?;
+    if let Some(pr) = b.props.get_str_mut("$r") {
+        pr.val = Value::Bool(true);
+    }
+    Some(p)
 }
 
 fn promise_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let p = if let Value::Obj(o) = this {
-        o.borrow_mut().kind = ObjKind::Promise(PromiseState::Pending);
-        o.clone()
-    } else {
-        new_promise(i)
-    };
-    // handlers queue on a prop
-    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
+    // `Promise(executor)` as a plain call is a TypeError — [[Construct]]
+    // only. `this` must be the fresh object [[Construct]] made: the
+    // new_target_native check alone misfires when a native ctor frame is
+    // still on the stack (new_target stays Some during nested calls).
+    let fresh_this = matches!(this, Value::Obj(o)
+        if matches!(o.borrow().kind, ObjKind::Ord) && o.borrow().props.is_empty());
+    if !(i.new_target_native.is_some() && fresh_this) {
+        return Err(i.type_err("Promise constructor cannot be invoked without 'new'"));
+    }
     let executor = arg(args, 0);
-    // spec: non-callable executor → TypeError (incl. no-arg call)
     if !i.is_callable(&executor) {
-        return Err(i.type_err("Promise resolver is not a function"));
+        let tn = i.type_name(&executor);
+        return Err(i.type_err(format!("Promise resolver {tn} is not a function")));
     }
-    {
-        let pv = Value::Obj(p.clone());
-        let res_fn = i.native("resolve", promise_resolve_inner);
-        let rej_fn = i.native("reject", promise_reject_inner);
-        let res = Rc::new(RefCell::new(Obj::new(
-            Some(i.p.func.clone()),
-            ObjKind::Bound {
-                target: res_fn,
-                thisv: pv.clone(),
-                extra: Vec::new(),
-            },
-        )));
-        let rej = Rc::new(RefCell::new(Obj::new(
-            Some(i.p.func.clone()),
-            ObjKind::Bound {
-                target: rej_fn,
-                thisv: pv,
-                extra: Vec::new(),
-            },
-        )));
-        let r = i.call(
-            &executor,
-            Value::Und,
-            vec![Value::Obj(res), Value::Obj(rej)],
-        );
-        if let Err(e) = r {
-            settle(i, &p, false, e)?;
-        }
+    let Value::Obj(o) = this else { unreachable!() };
+    o.borrow_mut().kind = ObjKind::Promise(PromiseState::Pending);
+    let _ = handlers_arr(i, o);
+    let (res, rej) = resolving_fns(i, o);
+    // executor throw → Call(reject, «error») — the latch decides
+    if let Err(e) = i.call(&executor, Value::Und, vec![res, rej.clone()]) {
+        i.call(&rej, Value::Und, vec![e])?;
     }
-    Ok(Value::Obj(p))
+    Ok(this.clone())
 }
 
-/// resolve/reject implementation; `this` = the promise object.
+/// spec Promise Resolve Function — `this` = the resolving-fn holder
+/// carrying the shared `alreadyResolved` latch. Thenables settle
+/// asynchronously through a PromiseResolveThenableJob; everything else
+/// settles synchronously.
 fn promise_resolve_inner(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    if let Value::Obj(p) = this {
-        // resolving with a promise adopts its state
-        if let Value::Obj(po) = &arg(args, 0) {
-            if let ObjKind::Promise(_) = po.borrow().kind {
-                let st = po.borrow().kind.clone();
-                match st {
-                    ObjKind::Promise(PromiseState::Fulfilled(v)) => {
-                        return settle(i, p, true, *v);
-                    }
-                    ObjKind::Promise(PromiseState::Rejected(v)) => {
-                        return settle(i, p, false, *v);
-                    }
-                    ObjKind::Promise(PromiseState::Pending) => {
-                        // forward via then
-                        let then = i.get_prop_str(&arg(args, 0), "then")?;
-                        let pv = Value::Obj(p.clone());
-                        let res_fn = i.native("resolve", promise_resolve_inner);
-                        let rej_fn = i.native("reject", promise_reject_inner);
-                        let res = Rc::new(RefCell::new(Obj::new(
-                            Some(i.p.func.clone()),
-                            ObjKind::Bound {
-                                target: res_fn,
-                                thisv: pv.clone(),
-                                extra: vec![],
-                            },
-                        )));
-                        let rej = Rc::new(RefCell::new(Obj::new(
-                            Some(i.p.func.clone()),
-                            ObjKind::Bound {
-                                target: rej_fn,
-                                thisv: pv,
-                                extra: vec![],
-                            },
-                        )));
-                        return i.call(&then, arg(args, 0), vec![Value::Obj(res), Value::Obj(rej)]);
-                    }
-                    _ => {}
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    let Some(p) = resolve_latch(h) else {
+        return Ok(Value::Und);
+    };
+    let Value::Obj(po) = &p else {
+        return Ok(Value::Und);
+    };
+    let resolution = arg(args, 0);
+    // SameValue(resolution, promise) → RejectPromise(TypeError)
+    if i.same_value(&resolution, &p)? {
+        let e = i.type_err("Chaining cycle detected for promise");
+        return settle(i, po, false, e);
+    }
+    if !matches!(resolution, Value::Obj(_)) {
+        return settle(i, po, true, resolution);
+    }
+    // `then` lookup — an abrupt getter rejects the promise
+    let then = match i.get_prop_str(&resolution, "then") {
+        Ok(t) => t,
+        Err(e) => return settle(i, po, false, e),
+    };
+    if !i.is_callable(&then) {
+        // non-callable `then` → fulfill with the thenable itself
+        return settle(i, po, true, resolution);
+    }
+    // PromiseResolveThenableJob — `then` runs as a job with a FRESH
+    // resolving-fn pair (each job gets its own alreadyResolved record)
+    let pj = p.clone();
+    i.jobs.push_back(Box::new(
+        move |i: &mut Interp| -> Result<(), Value> {
+            if let Value::Obj(po2) = &pj {
+                let (res, rej) = resolving_fns(i, po2);
+                if let Err(e) = i.call(&then, resolution, vec![res, rej.clone()]) {
+                    i.call(&rej, Value::Und, vec![e])?;
                 }
             }
-        }
-        settle(i, p, true, arg(args, 0))
-    } else {
-        Ok(Value::Und)
-    }
+            Ok(())
+        },
+    ));
+    Ok(Value::Und)
 }
 
+/// spec Promise Reject Function — `this` = the resolving-fn holder.
 fn promise_reject_inner(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    if let Value::Obj(p) = this {
-        settle(i, p, false, arg(args, 0))
-    } else {
-        Ok(Value::Und)
-    }
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    let Some(p) = resolve_latch(h) else {
+        return Ok(Value::Und);
+    };
+    let Value::Obj(po) = &p else {
+        return Ok(Value::Und);
+    };
+    settle(i, po, false, arg(args, 0))
 }
 
 fn settle(i: &mut Interp, p: &ObjRef, ok: bool, v: Value) -> NResult {
@@ -9438,7 +10182,30 @@ fn settle(i: &mut Interp, p: &ObjRef, ok: bool, v: Value) -> NResult {
             return Ok(Value::Und);
         }
     }
-    run_handlers(i, p)
+    // spec TriggerPromiseReactions — one job per queued reaction, FIFO;
+    // settlement consumes the pending reaction lists
+    let handlers = handlers_of(i, p);
+    for h in handlers {
+        let Value::Obj(ho) = &h else { continue };
+        let getf = |name: &str| {
+            ho.borrow()
+                .props
+                .get_str(name)
+                .map(|p| p.val.clone())
+                .unwrap_or(Value::Und)
+        };
+        let on_f = getf("onF");
+        let on_r = getf("onR");
+        let resolve = getf("resolve");
+        let reject = getf("reject");
+        let vv = v.clone();
+        i.jobs.push_back(Box::new(move |i: &mut Interp| {
+            run_reaction(i, ok, on_f, on_r, resolve, reject, vv)
+        }));
+    }
+    let h = handlers_arr(i, p);
+    h.borrow_mut().kind = ObjKind::Arr(Vec::new());
+    Ok(Value::Und)
 }
 
 fn handlers_of(i: &mut Interp, p: &ObjRef) -> Vec<Value> {
@@ -9456,258 +10223,688 @@ fn handlers_of(i: &mut Interp, p: &ObjRef) -> Vec<Value> {
     Vec::new()
 }
 
-fn run_handlers(i: &mut Interp, p: &ObjRef) -> NResult {
-    let st = match &p.borrow().kind {
-        ObjKind::Promise(s) => s.clone(),
-        _ => return Ok(Value::Und),
+/// one PromiseReactionJob — runs the matching handler and forwards its
+/// outcome to the reaction's capability resolve/reject. A missing or
+/// non-callable handler is the spec identity (fulfill) / thrower
+/// (reject) passthrough.
+fn run_reaction(
+    i: &mut Interp,
+    ok: bool,
+    on_f: Value,
+    on_r: Value,
+    resolve: Value,
+    reject: Value,
+    v: Value,
+) -> Result<(), Value> {
+    let handler = if ok { on_f } else { on_r };
+    let r = if i.is_callable(&handler) {
+        i.call(&handler, Value::Und, vec![v.clone()])
+    } else if ok {
+        Ok(v.clone())
+    } else {
+        Err(v.clone())
     };
-    let handlers = handlers_of(i, p);
-    for h in handlers {
-        let Value::Obj(ho) = &h else { continue };
-        let getf = |name: &str| {
-            ho.borrow()
-                .props
-                .get_str(name)
-                .map(|p| p.val.clone())
-                .unwrap_or(Value::Und)
-        };
-        let on_f = getf("onF");
-        let on_r = getf("onR");
-        let resolve = getf("resolve");
-        let reject = getf("reject");
-        match &st {
-            PromiseState::Fulfilled(v) => {
-                let v = (**v).clone();
-                if i.is_callable(&on_f) {
-                    match i.call(&on_f, Value::Und, vec![v]) {
-                        Ok(r) => {
-                            i.call(&resolve, Value::Und, vec![r])?;
-                        }
-                        Err(e) => {
-                            i.call(&reject, Value::Und, vec![e])?;
-                        }
-                    }
-                } else {
-                    i.call(&resolve, Value::Und, vec![v])?;
-                }
-            }
-            PromiseState::Rejected(v) => {
-                let v = (**v).clone();
-                if i.is_callable(&on_r) {
-                    match i.call(&on_r, Value::Und, vec![v.clone()]) {
-                        Ok(r) => {
-                            i.call(&resolve, Value::Und, vec![r])?;
-                        }
-                        Err(e) => {
-                            i.call(&reject, Value::Und, vec![e])?;
-                        }
-                    }
-                } else {
-                    i.call(&reject, Value::Und, vec![v])?;
-                }
-            }
-            PromiseState::Pending => {}
+    match r {
+        Ok(x) => {
+            i.call(&resolve, Value::Und, vec![x])?;
+        }
+        Err(e) => {
+            i.call(&reject, Value::Und, vec![e])?;
         }
     }
-    // clear handlers
-    if let Some(Value::Obj(h)) = p
-        .borrow()
-        .props
-        .get_str("$handlers")
-        .map(|pr| pr.val.clone())
-    {
-        h.borrow_mut().kind = ObjKind::Arr(Vec::new());
+    Ok(())
+}
+
+/// spec SpeciesConstructor(O, defaultConstructor) — reads
+/// `O.constructor`, then `C[@@species]`; undefined/null species falls
+/// back to the intrinsic default, a non-constructor species throws.
+fn species_ctor(i: &mut Interp, o: &Value, default: Value) -> ERes {
+    let c = i.get_prop_str(o, "constructor")?;
+    if matches!(c, Value::Und) {
+        return Ok(default);
     }
-    Ok(Value::Und)
+    if !matches!(c, Value::Obj(_)) {
+        return Err(i.type_err("promise constructor is not an object"));
+    }
+    let s = i.get_prop(&c, &PropKey::Sym(SYM_SPECIES))?;
+    match s {
+        Value::Und | Value::Null => Ok(default),
+        s if i.is_constructor(&s) => Ok(s),
+        _ => Err(i.type_err("promise species is not a constructor")),
+    }
+}
+
+/// spec GetPromiseResolve(C) — `C.resolve` must be callable.
+fn get_promise_resolve(i: &mut Interp, c: &Value) -> Result<Value, Value> {
+    let r = i.get_prop_str(c, "resolve")?;
+    if !i.is_callable(&r) {
+        return Err(i.type_err("promise resolve is not a function"));
+    }
+    Ok(r)
+}
+
+/// spec NewPromiseCapability(C) → (promise, resolve, reject). The
+/// capture executor fires inside `new C(exec)` and drops the pair onto
+/// a holder; slots left non-callable → TypeError.
+fn new_promise_capability(
+    i: &mut Interp,
+    c: &Value,
+) -> Result<(Value, Value, Value), Value> {
+    if !i.is_constructor(c) {
+        return Err(i.type_err("promise capability requires a constructor"));
+    }
+    let holder = Value::Obj(i.new_obj());
+    let exec = bound_native(i, "", promise_cap_executor, holder.clone(), 2.0);
+    let promise = i.construct(c, vec![exec], None)?;
+    let resolve = i.get_prop_str(&holder, "resolve")?;
+    let reject = i.get_prop_str(&holder, "reject")?;
+    if !i.is_callable(&resolve) || !i.is_callable(&reject) {
+        return Err(i.type_err("promise capability functions are not callable"));
+    }
+    Ok((promise, resolve, reject))
+}
+
+/// IfAbruptRejectPromise — reject the capability with `e` and return
+/// its promise (a reject-fn error collapses into the returned value)
+fn reject_cap(i: &mut Interp, rej: &Value, p: &Value, e: Value) -> NResult {
+    let _ = i.call(rej, Value::Und, vec![e]);
+    Ok(p.clone())
 }
 
 fn promise_then(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    let Value::Obj(p) = this else {
-        return Err(i.type_err("Promise.prototype.then called on non-promise"));
+    // spec PerformPromiseThen — IsPromise brand check first
+    let Value::Obj(po) = this else {
+        return Err(i.type_err("Promise.prototype.then called on incompatible receiver"));
     };
-    let p2 = new_promise(i);
-    i.set_builtin(&p2, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-    // build handler record
-    let rec = i.new_obj();
-    i.set_builtin(&rec, "onF", arg(args, 0));
-    i.set_builtin(&rec, "onR", arg(args, 1));
-    // resolver fns bound to p2
-    let pv = Value::Obj(p2.clone());
-    let res_fn = i.native("resolve", promise_resolve_inner);
-    let rej_fn = i.native("reject", promise_reject_inner);
-    let res = Rc::new(RefCell::new(Obj::new(
-        Some(i.p.func.clone()),
-        ObjKind::Bound {
-            target: res_fn,
-            thisv: pv.clone(),
-            extra: vec![],
-        },
-    )));
-    let rej = Rc::new(RefCell::new(Obj::new(
-        Some(i.p.func.clone()),
-        ObjKind::Bound {
-            target: rej_fn,
-            thisv: pv,
-            extra: vec![],
-        },
-    )));
-    i.set_builtin(&rec, "resolve", Value::Obj(res));
-    i.set_builtin(&rec, "reject", Value::Obj(rej));
-    // enqueue
-    if let Some(Value::Obj(h)) = p
-        .borrow()
-        .props
-        .get_str("$handlers")
-        .map(|pr| pr.val.clone())
-    {
-        if let ObjKind::Arr(items) = &mut h.borrow_mut().kind {
-            items.push(Value::Obj(rec));
+    if !matches!(po.borrow().kind, ObjKind::Promise(_)) {
+        return Err(i.type_err("Promise.prototype.then called on incompatible receiver"));
+    }
+    let c = species_ctor(i, this, Value::Obj(i.p.promise_ctor.clone()))?;
+    let (p2, res, rej) = new_promise_capability(i, &c)?;
+    let on_f = arg(args, 0);
+    let on_r = arg(args, 1);
+    match promise_state(po) {
+        PromiseState::Pending => {
+            let rec = i.new_obj();
+            i.set_builtin(&rec, "onF", on_f);
+            i.set_builtin(&rec, "onR", on_r);
+            i.set_builtin(&rec, "resolve", res);
+            i.set_builtin(&rec, "reject", rej);
+            let h = handlers_arr(i, po);
+            let mut hb = h.borrow_mut();
+            if let ObjKind::Arr(items) = &mut hb.kind {
+                items.push(Value::Obj(rec));
+            }
+            drop(hb);
+        }
+        PromiseState::Fulfilled(v) => {
+            let vv = (*v).clone();
+            i.jobs.push_back(Box::new(move |i: &mut Interp| {
+                run_reaction(i, true, on_f, on_r, res, rej, vv)
+            }));
+        }
+        PromiseState::Rejected(v) => {
+            let vv = (*v).clone();
+            i.jobs.push_back(Box::new(move |i: &mut Interp| {
+                run_reaction(i, false, on_f, on_r, res, rej, vv)
+            }));
         }
     }
-    run_handlers(i, p)?;
-    Ok(Value::Obj(p2))
+    Ok(p2)
 }
 
 fn promise_catch(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    promise_then(i, this, &[Value::Und, arg(args, 0)])
+    // spec: Invoke(this, "then", « undefined, onRejected ») — `then` is
+    // read fresh off the receiver so overridden hooks fire
+    let then = i.get_prop_str(this, "then")?;
+    i.call(&then, this.clone(), vec![Value::Und, arg(args, 0)])
 }
 
 fn promise_finally(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let cb = arg(args, 0);
-    let Value::Obj(p) = this else {
-        return Err(i.type_err("finally called on non-promise"));
-    };
-    let p2 = new_promise(i);
-    i.set_builtin(&p2, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-    let st = match &p.borrow().kind {
-        ObjKind::Promise(s) => s.clone(),
-        _ => PromiseState::Pending,
-    };
-    match st {
-        PromiseState::Fulfilled(v) => {
-            if i.is_callable(&cb) {
-                i.call(&cb, Value::Und, vec![])?;
-            }
-            p2.borrow_mut().kind = ObjKind::Promise(PromiseState::Fulfilled(v));
-        }
-        PromiseState::Rejected(v) => {
-            if i.is_callable(&cb) {
-                i.call(&cb, Value::Und, vec![])?;
-            }
-            p2.borrow_mut().kind = ObjKind::Promise(PromiseState::Rejected(v));
-        }
-        PromiseState::Pending => {
-            // attach record that will run cb then forward
-            let rec = i.new_obj();
-            // wrapping: onF runs cb then resolves with value — approximate via handler passthrough
-            i.set_builtin(&rec, "onF", cb.clone());
-            i.set_builtin(&rec, "onR", cb);
-            let pv = Value::Obj(p2.clone());
-            let res_fn = i.native("resolve", promise_resolve_inner);
-            let rej_fn = i.native("reject", promise_reject_inner);
-            let res = Rc::new(RefCell::new(Obj::new(
-                Some(i.p.func.clone()),
-                ObjKind::Bound {
-                    target: res_fn,
-                    thisv: pv.clone(),
-                    extra: vec![],
-                },
-            )));
-            let rej = Rc::new(RefCell::new(Obj::new(
-                Some(i.p.func.clone()),
-                ObjKind::Bound {
-                    target: rej_fn,
-                    thisv: pv,
-                    extra: vec![],
-                },
-            )));
-            i.set_builtin(&rec, "resolve", Value::Obj(res));
-            i.set_builtin(&rec, "reject", Value::Obj(rej));
-            if let Some(Value::Obj(h)) = p
-                .borrow()
-                .props
-                .get_str("$handlers")
-                .map(|pr| pr.val.clone())
-            {
-                if let ObjKind::Arr(items) = &mut h.borrow_mut().kind {
-                    items.push(Value::Obj(rec));
-                }
-            }
-        }
+    // spec: the receiver check is Type-not-Object (not IsPromise)
+    if !matches!(this, Value::Obj(_)) {
+        return Err(i.type_err("Promise.prototype.finally called on non-object receiver"));
     }
-    Ok(Value::Obj(p2))
+    let c = species_ctor(i, this, Value::Obj(i.p.promise_ctor.clone()))?;
+    // spec: with a non-callable callback, thenFinally/catchFinally are
+    // the callback itself — `then` sees it verbatim
+    let (then_f, catch_f) = if i.is_callable(&cb) {
+        // GetPromiseResolve is fetched eagerly, before `then` runs
+        let pr = get_promise_resolve(i, &c)?;
+        (
+            mk_finally_fn(i, true, &cb, &c, &pr),
+            mk_finally_fn(i, false, &cb, &c, &pr),
+        )
+    } else {
+        (cb.clone(), cb)
+    };
+    let then = i.get_prop_str(this, "then")?;
+    i.call(&then, this.clone(), vec![then_f, catch_f])
 }
 
-pub(crate) fn promise_resolve_static(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let v = arg(args, 0);
-    if let Value::Obj(o) = &v {
-        if matches!(o.borrow().kind, ObjKind::Promise(_)) {
-            return Ok(v);
-        }
-    }
-    let p = new_promise(i);
-    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-    p.borrow_mut().kind = ObjKind::Promise(PromiseState::Fulfilled(Box::new(v)));
-    Ok(Value::Obj(p))
-}
-
-pub(crate) fn promise_reject_static(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let p = new_promise(i);
-    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-    p.borrow_mut().kind = ObjKind::Promise(PromiseState::Rejected(Box::new(arg(args, 0))));
-    Ok(Value::Obj(p))
-}
-
-fn promise_all(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let items = i.iter_values(&arg(args, 0))?;
-    let mut out = Vec::new();
-    for it in items {
-        if let Value::Obj(o) = &it {
-            match &o.borrow().kind {
-                ObjKind::Promise(PromiseState::Fulfilled(v)) => out.push((**v).clone()),
-                ObjKind::Promise(PromiseState::Rejected(v)) => {
-                    let p = new_promise(i);
-                    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-                    p.borrow_mut().kind = ObjKind::Promise(PromiseState::Rejected(v.clone()));
-                    return Ok(Value::Obj(p));
-                }
-                ObjKind::Promise(PromiseState::Pending) => {
-                    // leave result pending forever (stub)
-                    let p = new_promise(i);
-                    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-                    return Ok(Value::Obj(p));
-                }
-                _ => out.push(it.clone()),
-            }
+fn mk_finally_fn(i: &mut Interp, ok: bool, cb: &Value, c: &Value, pr: &Value) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(&h, "$cb", cb.clone());
+    i.set_builtin(&h, "$C", c.clone());
+    i.set_builtin(&h, "$pr", pr.clone());
+    bound_native(
+        i,
+        if ok { "thenFinally" } else { "catchFinally" },
+        if ok {
+            promise_then_finally
         } else {
-            out.push(it);
-        }
-    }
-    let p = new_promise(i);
-    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-    let arr = Value::Obj(i.new_arr(out));
-    p.borrow_mut().kind = ObjKind::Promise(PromiseState::Fulfilled(Box::new(arr)));
-    Ok(Value::Obj(p))
+            promise_catch_finally
+        },
+        Value::Obj(h),
+        1.0,
+    )
 }
 
-fn promise_race(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
-    let items = i.iter_values(&arg(args, 0))?;
-    for it in items {
-        if let Value::Obj(o) = &it {
-            match &o.borrow().kind {
-                ObjKind::Promise(st) => {
-                    let p = new_promise(i);
-                    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-                    p.borrow_mut().kind = ObjKind::Promise(st.clone());
-                    return Ok(Value::Obj(p));
+/// spec thenFinally(value): run onFinally, lift the result through
+/// `C.resolve`, then `.then(() => value)` — settlement waits on the
+/// callback's returned thenable.
+fn promise_then_finally(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    let cb = i.obj_get_raw_str(h, "$cb").unwrap_or(Value::Und);
+    let c = i.obj_get_raw_str(h, "$C").unwrap_or(Value::Und);
+    let pr = i.obj_get_raw_str(h, "$pr").unwrap_or(Value::Und);
+    let value = arg(args, 0);
+    let r = i.call(&cb, Value::Und, vec![])?;
+    let ip = i.call(&pr, c.clone(), vec![r])?;
+    let then = i.get_prop_str(&ip, "then")?;
+    let th = i.new_obj();
+    i.set_builtin(&th, "$v", value);
+    let tfn = bound_native(i, "", promise_value_thunk, Value::Obj(th), 0.0);
+    i.call(&then, ip, vec![tfn])
+}
+
+/// spec catchFinally(reason): same shape, but the inner `.then` thunk
+/// rethrows the original rejection reason.
+fn promise_catch_finally(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    let cb = i.obj_get_raw_str(h, "$cb").unwrap_or(Value::Und);
+    let c = i.obj_get_raw_str(h, "$C").unwrap_or(Value::Und);
+    let pr = i.obj_get_raw_str(h, "$pr").unwrap_or(Value::Und);
+    let reason = arg(args, 0);
+    let r = i.call(&cb, Value::Und, vec![])?;
+    let ip = i.call(&pr, c.clone(), vec![r])?;
+    let then = i.get_prop_str(&ip, "then")?;
+    let th = i.new_obj();
+    i.set_builtin(&th, "$v", reason);
+    let tfn = bound_native(i, "", promise_thrower, Value::Obj(th), 0.0);
+    i.call(&then, ip, vec![tfn])
+}
+
+/// `() => value` thunk for finally's inner `.then`
+fn promise_value_thunk(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    Ok(i.obj_get_raw_str(h, "$v").unwrap_or(Value::Und))
+}
+
+/// `() => { throw reason }` for finally's inner `.then`
+fn promise_thrower(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    Err(i.obj_get_raw_str(h, "$v").unwrap_or(Value::Und))
+}
+
+/// spec PromiseResolve(C, x) — IsPromise(x) && x.constructor === C
+/// returns x itself; else a fresh capability promise resolved with x.
+/// `this` = the constructor the static was called on.
+pub(crate) fn promise_resolve_static(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    if !matches!(this, Value::Obj(_)) {
+        return Err(i.type_err("Promise.resolve called on non-object receiver"));
+    }
+    let x = arg(args, 0);
+    if is_promise(&x) {
+        let xc = i.get_prop_str(&x, "constructor")?;
+        if i.same_value(&xc, this)? {
+            return Ok(x);
+        }
+    }
+    let (p, res, _rej) = new_promise_capability(i, this)?;
+    i.call(&res, Value::Und, vec![x])?;
+    Ok(p)
+}
+
+/// spec: NewPromiseCapability(this), then Call(reject, «r»).
+pub(crate) fn promise_reject_static(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    if !matches!(this, Value::Obj(_)) {
+        return Err(i.type_err("Promise.reject called on non-object receiver"));
+    }
+    let (p, _res, rej) = new_promise_capability(i, this)?;
+    i.call(&rej, Value::Und, vec![arg(args, 0)])?;
+    Ok(p)
+}
+
+// -- PerformPromise* combinator machinery ----------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PComb {
+    All,
+    AllSettled,
+    Any,
+    Race,
+}
+
+/// element-fn state holder — `$flag` is the alreadyCalled latch, `$i`
+/// the list index; mode-specific slots ($vals/$errs/$rem/$res/$rej/$ok)
+/// are set by the mk_* helpers
+fn mk_el_holder(i: &mut Interp, idx: usize) -> ObjRef {
+    let h = i.new_obj();
+    i.set_builtin(&h, "$flag", Value::Bool(false));
+    i.set_builtin(&h, "$i", Value::Num(idx as f64));
+    h
+}
+
+/// consume the element fn's alreadyCalled latch — true on first call
+fn el_claim(h: &ObjRef) -> bool {
+    let mut b = h.borrow_mut();
+    let done =
+        matches!(b.props.get_str("$flag"), Some(p) if matches!(p.val, Value::Bool(true)));
+    if !done {
+        if let Some(pr) = b.props.get_str_mut("$flag") {
+            pr.val = Value::Bool(true);
+        }
+    }
+    !done
+}
+
+fn el_index(i: &Interp, h: &ObjRef) -> usize {
+    match i.obj_get_raw_str(h, "$i") {
+        Some(Value::Num(n)) => n.max(0.0) as usize,
+        _ => 0,
+    }
+}
+
+fn remaining_n(i: &Interp, rem: &ObjRef) -> usize {
+    match i.obj_get_raw_str(rem, "n") {
+        Some(Value::Num(n)) => n.max(0.0) as usize,
+        _ => 0,
+    }
+}
+
+fn set_remaining_n(rem: &ObjRef, n: usize) {
+    let mut b = rem.borrow_mut();
+    if let Some(pr) = b.props.get_str_mut("n") {
+        pr.val = Value::Num(n as f64);
+    }
+}
+
+fn inc_remaining(i: &Interp, rem: &ObjRef) {
+    let n = remaining_n(i, rem);
+    set_remaining_n(rem, n + 1);
+}
+
+fn dec_remaining(i: &Interp, rem: &ObjRef) -> usize {
+    let n = remaining_n(i, rem).saturating_sub(1);
+    set_remaining_n(rem, n);
+    n
+}
+
+/// `new AggregateError(errors)` without a message arg — Promise.any's
+/// all-rejected terminal value
+fn aggregate_error(i: &mut Interp, errors: Value) -> Value {
+    let p = i.p.agg_error.clone();
+    let e = i.err_obj_opt(&p, "AggregateError", None);
+    if let Value::Obj(o) = &e {
+        i.set_attr(o, "errors", errors, true, true);
+    }
+    e
+}
+
+fn mk_all_element(
+    i: &mut Interp,
+    idx: usize,
+    values: &Value,
+    rem: &ObjRef,
+    res: &Value,
+) -> Value {
+    let h = mk_el_holder(i, idx);
+    i.set_builtin(&h, "$vals", values.clone());
+    i.set_builtin(&h, "$rem", Value::Obj(rem.clone()));
+    i.set_builtin(&h, "$res", res.clone());
+    bound_native(i, "", promise_all_element, Value::Obj(h), 1.0)
+}
+
+/// spec Promise.all resolve element fn — writes values[$i], decrements
+/// remainingElements, resolves the capability with the values array
+/// when the count drains
+fn promise_all_element(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    if !el_claim(h) {
+        return Ok(Value::Und);
+    }
+    let idx = el_index(i, h);
+    let values = i.obj_get_raw_str(h, "$vals").unwrap_or(Value::Und);
+    let rem = i.obj_get_raw_str(h, "$rem");
+    let res = i.obj_get_raw_str(h, "$res").unwrap_or(Value::Und);
+    create_data_prop(i, &values, idx, arg(args, 0))?;
+    if let Some(Value::Obj(ro)) = rem {
+        if dec_remaining(i, &ro) == 0 {
+            i.call(&res, Value::Und, vec![values])?;
+        }
+    }
+    Ok(Value::Und)
+}
+
+fn mk_allsettled_element(
+    i: &mut Interp,
+    idx: usize,
+    values: &Value,
+    rem: &ObjRef,
+    res: &Value,
+    ok: bool,
+) -> Value {
+    let h = mk_el_holder(i, idx);
+    i.set_builtin(&h, "$vals", values.clone());
+    i.set_builtin(&h, "$rem", Value::Obj(rem.clone()));
+    i.set_builtin(&h, "$res", res.clone());
+    i.set_builtin(&h, "$ok", Value::Bool(ok));
+    bound_native(i, "", promise_allsettled_element, Value::Obj(h), 1.0)
+}
+
+/// spec Promise.allSettled resolve/reject element fn — records the
+/// {status, value|reason} snapshot at $i, resolves on zero remaining
+fn promise_allsettled_element(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    if !el_claim(h) {
+        return Ok(Value::Und);
+    }
+    let idx = el_index(i, h);
+    let ok = matches!(i.obj_get_raw_str(h, "$ok"), Some(Value::Bool(true)));
+    let values = i.obj_get_raw_str(h, "$vals").unwrap_or(Value::Und);
+    let rem = i.obj_get_raw_str(h, "$rem");
+    let res = i.obj_get_raw_str(h, "$res").unwrap_or(Value::Und);
+    let o = i.new_obj();
+    if ok {
+        i.set_data(&o, "status", Value::Str(Rc::from("fulfilled")));
+        i.set_data(&o, "value", arg(args, 0));
+    } else {
+        i.set_data(&o, "status", Value::Str(Rc::from("rejected")));
+        i.set_data(&o, "reason", arg(args, 0));
+    }
+    create_data_prop(i, &values, idx, Value::Obj(o))?;
+    if let Some(Value::Obj(ro)) = rem {
+        if dec_remaining(i, &ro) == 0 {
+            i.call(&res, Value::Und, vec![values])?;
+        }
+    }
+    Ok(Value::Und)
+}
+
+fn mk_any_reject(
+    i: &mut Interp,
+    idx: usize,
+    errors: &Value,
+    rem: &ObjRef,
+    rej: &Value,
+) -> Value {
+    let h = mk_el_holder(i, idx);
+    i.set_builtin(&h, "$errs", errors.clone());
+    i.set_builtin(&h, "$rem", Value::Obj(rem.clone()));
+    i.set_builtin(&h, "$rej", rej.clone());
+    bound_native(i, "", promise_any_reject_el, Value::Obj(h), 1.0)
+}
+
+/// spec Promise.any reject element fn — records errors[$i], rejects
+/// with an AggregateError when the remaining count drains
+fn promise_any_reject_el(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    if !el_claim(h) {
+        return Ok(Value::Und);
+    }
+    let idx = el_index(i, h);
+    let errors = i.obj_get_raw_str(h, "$errs").unwrap_or(Value::Und);
+    let rem = i.obj_get_raw_str(h, "$rem");
+    let rej = i.obj_get_raw_str(h, "$rej").unwrap_or(Value::Und);
+    create_data_prop(i, &errors, idx, arg(args, 0))?;
+    if let Some(Value::Obj(ro)) = rem {
+        if dec_remaining(i, &ro) == 0 {
+            let e = aggregate_error(i, errors);
+            i.call(&rej, Value::Und, vec![e])?;
+        }
+    }
+    Ok(Value::Und)
+}
+
+/// driver for Promise.all/allSettled/any/race — the spec's
+/// PerformPromise* loop. NewPromiseCapability failures throw
+/// synchronously; everything after routes through
+/// IfAbruptRejectPromise (IteratorClose on the iterated-record errors,
+/// then reject the capability and return its promise).
+fn promise_combine(i: &mut Interp, this: &Value, args: &[Value], mode: PComb) -> NResult {
+    let (p, res, rej) = new_promise_capability(i, this)?;
+    let promise_resolve = match get_promise_resolve(i, this) {
+        Ok(v) => v,
+        Err(e) => return reject_cap(i, &rej, &p, e),
+    };
+    let mut lz = match for_of_iter(i, &arg(args, 0)) {
+        Ok(l) => l,
+        Err(e) => return reject_cap(i, &rej, &p, e),
+    };
+    let values = Value::Obj(i.new_arr(Vec::new()));
+    let errors = Value::Obj(i.new_arr(Vec::new()));
+    let remaining = i.new_obj();
+    i.set_builtin(&remaining, "n", Value::Num(1.0));
+    let mut index = 0usize;
+    let mut iter_err: Option<Value> = None;
+    loop {
+        match iter_lazy_step(i, &mut lz) {
+            Err(e) => {
+                iter_err = Some(e);
+                break;
+            }
+            Ok(None) => break,
+            Ok(Some(next_value)) => {
+                // spec appends an `undefined` slot first so the values /
+                // errors list has a hole to fill at `index`
+                let slot_err = match mode {
+                    PComb::Any => {
+                        create_data_prop(i, &errors, index, Value::Und).err()
+                    }
+                    PComb::Race => None,
+                    _ => create_data_prop(i, &values, index, Value::Und).err(),
+                };
+                if let Some(e) = slot_err {
+                    iter_err = Some(e);
+                    break;
                 }
-                _ => {}
+                let next_promise =
+                    match i.call(&promise_resolve, this.clone(), vec![next_value]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            iter_err = Some(e);
+                            break;
+                        }
+                    };
+                // per-mode reaction pair — spec "same-reject" semantics
+                // ride the capability's own fns verbatim where it says so
+                let (on_f, on_r) = match mode {
+                    PComb::All => (
+                        mk_all_element(i, index, &values, &remaining, &res),
+                        rej.clone(),
+                    ),
+                    PComb::AllSettled => (
+                        mk_allsettled_element(i, index, &values, &remaining, &res, true),
+                        mk_allsettled_element(i, index, &values, &remaining, &res, false),
+                    ),
+                    PComb::Any => (
+                        res.clone(),
+                        mk_any_reject(i, index, &errors, &remaining, &rej),
+                    ),
+                    PComb::Race => (res.clone(), rej.clone()),
+                };
+                inc_remaining(i, &remaining);
+                let then_call = match i.get_prop_str(&next_promise, "then") {
+                    Err(e) => Err(e),
+                    Ok(then) => i
+                        .call(&then, next_promise, vec![on_f, on_r])
+                        .map(|_| ()),
+                };
+                if let Err(e) = then_call {
+                    iter_err = Some(e);
+                    break;
+                }
+                index += 1;
             }
         }
     }
-    let p = new_promise(i);
-    i.set_builtin(&p, "$handlers", Value::Obj(i.new_arr(Vec::new())));
-    Ok(Value::Obj(p))
+    if let Some(e) = iter_err {
+        // abrupt during iteration — IteratorClose, then reject
+        let _ = iter_lazy_close(i, &mut lz);
+        return reject_cap(i, &rej, &p, e);
+    }
+    // normal loop exit: remaining--; on zero the result settles now
+    if dec_remaining(i, &remaining) == 0 {
+        match mode {
+            PComb::All | PComb::AllSettled => {
+                i.call(&res, Value::Und, vec![values])?;
+            }
+            PComb::Any => {
+                let e = aggregate_error(i, errors);
+                i.call(&rej, Value::Und, vec![e])?;
+            }
+            PComb::Race => {}
+        }
+    }
+    Ok(p)
+}
+
+fn promise_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    promise_combine(i, this, args, PComb::All)
+}
+
+fn promise_all_settled(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    promise_combine(i, this, args, PComb::AllSettled)
+}
+
+fn promise_any(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    promise_combine(i, this, args, PComb::Any)
+}
+
+fn promise_race(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    promise_combine(i, this, args, PComb::Race)
+}
+
+/// spec Promise.try — the callback runs inside the call; its outcome
+/// routes through the capability's resolve/reject so errors settle the
+/// promise rather than throwing synchronously.
+fn promise_try(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    if !matches!(this, Value::Obj(_)) {
+        return Err(i.type_err("Promise.try called on non-object receiver"));
+    }
+    let (p, res, rej) = new_promise_capability(i, this)?;
+    let f = arg(args, 0);
+    let rest: Vec<Value> = args.iter().skip(1).cloned().collect();
+    match i.call(&f, Value::Und, rest) {
+        Ok(v) => {
+            i.call(&res, Value::Und, vec![v])?;
+        }
+        Err(e) => {
+            i.call(&rej, Value::Und, vec![e])?;
+        }
+    }
+    Ok(p)
+}
+
+/// Promise.allKeyed — {fulfilled:{…}, rejected:{…}} snapshot keyed by
+/// the input's enumerable own properties. Elements resolve through
+/// `C.resolve`; every outcome lands in exactly one bucket.
+fn promise_all_keyed(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let (p, res, rej) = new_promise_capability(i, this)?;
+    let promise_resolve = match get_promise_resolve(i, this) {
+        Ok(v) => v,
+        Err(e) => return reject_cap(i, &rej, &p, e),
+    };
+    let fulfilled = Value::Obj(i.new_obj());
+    let rejected = Value::Obj(i.new_obj());
+    let out_o = i.new_obj();
+    i.set_data(&out_o, "fulfilled", fulfilled.clone());
+    i.set_data(&out_o, "rejected", rejected.clone());
+    let outv = Value::Obj(out_o);
+    let remaining = i.new_obj();
+    i.set_builtin(&remaining, "n", Value::Num(1.0));
+    let entries = match own_enum_entries_full(i, &arg(args, 0), true) {
+        Ok(e) => e,
+        Err(e) => return reject_cap(i, &rej, &p, e),
+    };
+    for (k, v) in entries {
+        let next_promise = match i.call(&promise_resolve, this.clone(), vec![v]) {
+            Ok(x) => x,
+            Err(e) => return reject_cap(i, &rej, &p, e),
+        };
+        let kv = i.key_to_value(&k);
+        let res_el = mk_allkeyed_element(i, &kv, &fulfilled, &outv, &remaining, &res);
+        let rej_el = mk_allkeyed_element(i, &kv, &rejected, &outv, &remaining, &res);
+        inc_remaining(i, &remaining);
+        let r = match i.get_prop_str(&next_promise, "then") {
+            Err(e) => Err(e),
+            Ok(then) => i.call(&then, next_promise, vec![res_el, rej_el]).map(|_| ()),
+        };
+        if let Err(e) = r {
+            return reject_cap(i, &rej, &p, e);
+        }
+    }
+    if dec_remaining(i, &remaining) == 0 {
+        i.call(&res, Value::Und, vec![outv])?;
+    }
+    Ok(p)
+}
+
+fn mk_allkeyed_element(
+    i: &mut Interp,
+    k: &Value,
+    tgt: &Value,
+    out: &Value,
+    rem: &ObjRef,
+    res: &Value,
+) -> Value {
+    let h = mk_el_holder(i, 0);
+    i.set_builtin(&h, "$k", k.clone());
+    i.set_builtin(&h, "$tgt", tgt.clone());
+    i.set_builtin(&h, "$out", out.clone());
+    i.set_builtin(&h, "$rem", Value::Obj(rem.clone()));
+    i.set_builtin(&h, "$res", res.clone());
+    bound_native(i, "", promise_allkeyed_element, Value::Obj(h), 1.0)
+}
+
+/// allKeyed element fn — writes tgt[key] with the settled value, then
+/// resolves the capability with the {fulfilled,rejected} record on zero
+fn promise_allkeyed_element(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Ok(Value::Und);
+    };
+    if !el_claim(h) {
+        return Ok(Value::Und);
+    }
+    let kv = i.obj_get_raw_str(h, "$k").unwrap_or(Value::Und);
+    let k = i.to_propkey(&kv)?;
+    let tgt = i.obj_get_raw_str(h, "$tgt").unwrap_or(Value::Und);
+    let out = i.obj_get_raw_str(h, "$out").unwrap_or(Value::Und);
+    let rem = i.obj_get_raw_str(h, "$rem");
+    let res = i.obj_get_raw_str(h, "$res").unwrap_or(Value::Und);
+    i.set_prop(&tgt, k, arg(args, 0))?;
+    if let Some(Value::Obj(ro)) = rem {
+        if dec_remaining(i, &ro) == 0 {
+            i.call(&res, Value::Und, vec![out])?;
+        }
+    }
+    Ok(Value::Und)
 }
 
 // ===========================================================================
@@ -11410,17 +12607,25 @@ fn g_eval(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 }
 
 fn g_queue_microtask(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    // spec queueMicrotask — non-callable is a sync TypeError; callable
+    // callbacks queue onto the job list, run at the checkpoint
     let f = arg(args, 0);
-    if i.is_callable(&f) {
-        i.call(&f, Value::Und, vec![])?;
+    if !i.is_callable(&f) {
+        return Err(i.type_err("queueMicrotask callback is not a function"));
     }
+    i.jobs.push_back(Box::new(move |i: &mut Interp| -> Result<(), Value> {
+        i.call(&f, Value::Und, vec![])?;
+        Ok(())
+    }));
     Ok(Value::Und)
 }
 
 fn g_dyn_import(i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
     // dynamic import() — unresolved modules yield an empty namespace object
     let ns = Value::Obj(i.new_obj());
-    promise_resolve_static(i, &Value::Und, &[ns])
+    let p = new_promise(i);
+    p.borrow_mut().kind = ObjKind::Promise(PromiseState::Fulfilled(Box::new(ns)));
+    Ok(Value::Obj(p))
 }
 
 fn g_btoa(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
@@ -11491,7 +12696,7 @@ fn reflect_get(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     // spec: `receiver` defaults to target only when the arg is absent
     let receiver = args.get(2).cloned().unwrap_or_else(|| target.clone());
     if let ObjKind::Proxy { target: tg, handler } = { o.borrow().kind.clone() } {
-        return i.proxy_get(&tg, &handler, &k, &receiver);
+        return i.proxy_get(&tg, &handler, &k, &receiver, o);
     }
     i.obj_get(o, &k, &receiver)
 }
@@ -11794,7 +12999,7 @@ fn is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
 }
 
 /// spec SpeciesConstructor(O, %RegExp%).
-fn species_ctor(i: &mut Interp, rx: &Value) -> Result<Value, Value> {
+fn re_species_ctor(i: &mut Interp, rx: &Value) -> Result<Value, Value> {
     let default_ctor = Value::Obj(re_ctor(i));
     let c = i.get_prop_str(rx, "constructor")?;
     if matches!(c, Value::Und) {
@@ -12071,12 +13276,15 @@ fn regexp_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             },
         )
     } else if pattern_is_re {
+        // spec order: Get(source) BEFORE Get(flags) — observable on
+        // regexp-like objects whose getters throw
+        let src = i.get_prop_str(&pattern, "source")?;
         let f = if matches!(flags, Value::Und) {
             i.get_prop_str(&pattern, "flags")?
         } else {
             flags
         };
-        (i.get_prop_str(&pattern, "source")?, f)
+        (src, f)
     } else {
         (pattern, flags)
     };
@@ -12228,23 +13436,38 @@ fn re_get_source(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     }
     match re_of(this) {
         Some(re) => Ok(Value::Str(Rc::from(
-            if re.source.is_empty() {
-                "(?:)".to_string()
-            } else {
-                re.source.clone()
-            }
-            .as_str(),
+            escape_re_pattern(&re.source).as_str(),
         ))),
         None => Err(i
             .type_err("RegExp.prototype.source getter called on incompatible receiver")),
     }
 }
 
+/// spec EscapeRegExpPattern — "/" and LineTerminators get backslash-
+/// escaped so `"/" + S + "/" + F` reparses identically; "" → "(?:)"
+fn escape_re_pattern(src: &str) -> String {
+    if src.is_empty() {
+        return "(?:)".into();
+    }
+    let mut out = String::with_capacity(src.len() + 4);
+    for ch in src.chars() {
+        match ch {
+            '/' => out.push_str("\\/"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// spec `get flags` — generic: reads `hasIndices`/`global`/`ignoreCase`/
 /// `multiline`/`dotAll`/`unicode`/`unicodeSets`/`sticky` in order and
 /// appends the flag char for each truthy result.
 fn re_get_flags(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    if !matches!(this, Value::Obj(_)) {
+    if !matches!(this, Value::Obj(_)) || crate::binary::bigint_is_prim(this) {
         return Err(i.type_err("RegExp.prototype.flags getter called on non-object"));
     }
     let mut out = String::new();
@@ -12395,7 +13618,7 @@ fn re_sym_match_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(i.type_err("Symbol.matchAll called on non-object"));
     }
     let s = re_coerce_str(i, &arg(args, 0))?;
-    let c = species_ctor(i, rx)?;
+    let c = re_species_ctor(i, rx)?;
     let fv = i.get_prop_str(rx, "flags")?;
     let flags = re_coerce_str(i, &fv)?;
     let matcher = i.construct(
@@ -12683,7 +13906,7 @@ fn re_sym_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 Value::Str(Rc::from(re_coerce_str(i, &cap_n)?.as_str()))
             });
         }
-        let named = i.get_prop_str(result, "groups")?;
+        let mut named = i.get_prop_str(result, "groups")?;
         let replacement = if functional {
             let mut cargs = vec![Value::Str(Rc::from(matched.as_str()))];
             cargs.extend(captures.iter().cloned());
@@ -12695,6 +13918,11 @@ fn re_sym_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
             let rv = i.call(&repl_arg, Value::Und, cargs)?;
             re_coerce_str(i, &rv)?
         } else {
+            // spec: non-functional replace does ToObject(groups) when
+            // groups isn't undefined — null/undefined→TypeError path
+            if !matches!(named, Value::Und) {
+                named = i.to_object(&named)?;
+            }
             get_substitution(
                 i,
                 &matched,
@@ -12722,7 +13950,7 @@ fn re_sym_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(i.type_err("Symbol.split called on non-object"));
     }
     let s = re_coerce_str(i, &arg(args, 0))?;
-    let c = species_ctor(i, rx)?;
+    let c = re_species_ctor(i, rx)?;
     let fv = i.get_prop_str(rx, "flags")?;
     let flags = re_coerce_str(i, &fv)?;
     let unicode_matching = flags.contains('u') || flags.contains('v');

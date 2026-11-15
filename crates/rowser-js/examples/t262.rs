@@ -78,7 +78,7 @@ const SKIP_FEATURES: &[&str] = &[
     "async-iteration", "regexp-v-flag",
     "set-methods",
     "regexp-modifiers", "json-parse-with-source", "source-phase-imports",
-    "ShadowRealm", "Array.fromAsync",
+    "ShadowRealm", "Array.fromAsync", "await-dictionary",
     "regexp-unicode-property-escapes",
     "weakrefs",
     "uint8array-base64",
@@ -156,7 +156,8 @@ fn main() {
 
         let strict = !m.raw && m.flags.iter().any(|f| f == "onlyStrict");
         let body = if m.raw { src.clone() } else {
-            format!("{sta}\n{assert}\n{inc_src}\n{src}")
+            // `print` — SpiderMonkey-era harness global some old tests use
+            format!("var print = console.log;\n{sta}\n{assert}\n{inc_src}\n{src}")
         };
         let body = if strict { format!("\"use strict\";\n{body}") } else { body };
         let src = if strict { format!("\"use strict\";\n{src}") } else { src };

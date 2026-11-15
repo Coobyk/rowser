@@ -4818,7 +4818,7 @@ fn blob_text(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     } else {
         String::new()
     };
-    promise_resolve_static(i, &Value::Und, &[Value::Str(Rc::from(s.as_str()))])
+    promise_resolve_static(i, &Value::Obj(i.p.promise_ctor.clone()), &[Value::Str(Rc::from(s.as_str()))])
 }
 
 fn blob_array_buffer(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
@@ -4828,7 +4828,7 @@ fn blob_array_buffer(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
         Vec::new()
     };
     let buf = Value::Obj(mk_buffer(i, data));
-    promise_resolve_static(i, &Value::Und, &[buf])
+    promise_resolve_static(i, &Value::Obj(i.p.promise_ctor.clone()), &[buf])
 }
 
 fn blob_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {

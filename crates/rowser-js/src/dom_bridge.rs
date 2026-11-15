@@ -3253,7 +3253,7 @@ fn cs_get_property(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn g_fetch(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
     let e = i.plain_err("fetch is not supported in rowser");
-    builtins::promise_reject_static(i, &Value::Und, &[e])
+    builtins::promise_reject_static(i, &Value::Obj(i.p.promise_ctor.clone()), &[e])
 }
 
 fn g_get_selection(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {

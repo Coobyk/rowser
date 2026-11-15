@@ -427,6 +427,11 @@ pub struct Obj {
     pub immutable: bool,
     /// Resizable-ArrayBuffer max byte length (`{maxByteLength}` option)
     pub rab_max: Option<usize>,
+    /// proxy-only flags captured at creation (spec: a Proxy exotic
+    /// object has [[Call]]/[[Construct]] iff its [[ProxyTarget]] did at
+    /// creation time — revocation does NOT remove them):
+    /// bit0 = callable, bit1 = constructor
+    pub pflags: u8,
 }
 
 #[derive(Clone)]
@@ -454,6 +459,11 @@ pub enum Func {
         /// direct `eval` in this fn may not contain `arguments`
         /// (propagates to arrows created inside the initializer)
         ban_eval_args: bool,
+        /// created by %Function%/%GeneratorFunction% — carries no own
+        /// caller/arguments props (the inherited poisoned accessors
+        /// apply), but counts as a RESTRICTED caller for the legacy
+        /// sloppy-function `.caller` read
+        dynamic: bool,
     },
     Native {
         name: Rc<str>,
@@ -492,6 +502,12 @@ pub enum InstElem {
 }
 
 pub type NativeFn = fn(&mut Interp, &Value, &[Value]) -> Result<Value, Value>;
+
+/// a queued job (HostEnqueuePromiseJob / queueMicrotask) — runs at the
+/// microtask checkpoint when the script's execution stack empties. Job
+/// errors are host-reported (unhandled rejections), never thrown into
+/// the script that queued them.
+pub type Job = Box<dyn FnOnce(&mut Interp) -> Result<(), Value>>;
 
 #[derive(Clone)]
 pub enum ObjKind {
@@ -959,6 +975,7 @@ impl Obj {
             detached: false,
             immutable: false,
             rab_max: None,
+            pflags: 0,
         }
     }
     pub fn is_callable(&self) -> bool {
@@ -967,10 +984,9 @@ impl Obj {
         }
         match &self.kind {
             ObjKind::Func(_) | ObjKind::Bound { .. } => true,
-            // proxies forward callability to their target
-            ObjKind::Proxy { target, .. } => {
-                matches!(target, Value::Obj(t) if t.borrow().is_callable())
-            }
+            // a proxy's [[Call]] presence is fixed at creation (pflags) —
+            // a revoked function-proxy stays callable for `typeof`
+            ObjKind::Proxy { .. } => self.pflags & 1 != 0,
             _ => false,
         }
     }
@@ -1115,6 +1131,9 @@ pub struct Protos {
     pub agg_error: ObjRef,
     pub suppressed_error: ObjRef,
     pub promise: ObjRef,
+    /// %Promise% — the intrinsic ctor for SpeciesConstructor defaults
+    /// (installed during install(); the global binding may be rewritten)
+    pub promise_ctor: ObjRef,
     pub iterator: ObjRef,
     /// %ArrayIteratorPrototype% — proto of array/typed-array iterators
     pub array_iter: ObjRef,
@@ -1138,6 +1157,9 @@ pub struct Protos {
     pub global: ObjRef,
     /// %BigInt.prototype% — minimal BigInt: values are Ord objects here
     pub bigint: ObjRef,
+    /// %ThrowTypeError% — the single frozen anonymous intrinsic shared
+    /// by every poisoned caller/arguments/callee accessor
+    pub tte: ObjRef,
 }
 
 pub struct Interp {
@@ -1152,6 +1174,11 @@ pub struct Interp {
     /// consumed by the loop that actually carries the label.
     pub pending_label: Option<String>,
     pub depth: usize,
+    /// live Func::User call frames, innermost last — the legacy
+    /// sloppy-function `.caller` lookup resolves the caller frame here
+    /// (engines that keep `.caller` return the frame below the
+    /// topmost entry for the receiving function)
+    pub call_stack: Vec<Value>,
     pub sym_counter: u64,
     /// private-name id source — ids live in `PRIV_BASE..`, disjoint from
     /// every user-space symbol id, so enumeration can filter them
@@ -1234,6 +1261,12 @@ pub struct Interp {
     /// Lets natives implement "NewTarget === active function" checks
     /// (Iterator, Promise-without-new, etc).
     pub new_target_native: Option<Value>,
+    /// queued promise/microtask jobs — FIFO, drained at the microtask
+    /// checkpoint (end of the outermost `run`)
+    pub jobs: std::collections::VecDeque<Job>,
+    /// inside `drain_jobs` — nested drains no-op; the outer loop picks
+    /// up jobs enqueued during the drain
+    pub jobs_draining: bool,
 }
 
 /// JS call-depth limit. Each JS call consumes substantial Rust stack in
@@ -1266,11 +1299,54 @@ impl Interp {
                 ctor: false,
             }),
         )));
+        // %ThrowTypeError% — the single frozen anonymous function every
+        // poisoned accessor shares (Function.prototype caller/arguments,
+        // strict-function restricted props, unmapped-arguments
+        // caller/callee). Frozen: [[Extensible]]=false and its own
+        // length/name props are non-writable + non-configurable.
+        fn tte_fn(i: &mut Interp, _t: &Value, _a: &[Value]) -> Result<Value, Value> {
+            Err(i.type_err(
+                "'caller', 'callee', and 'arguments' properties may not be accessed",
+            ))
+        }
+        let tte = Rc::new(RefCell::new(Obj::new(
+            Some(func.clone()),
+            ObjKind::Func(Func::Native {
+                name: Rc::from(""),
+                f: tte_fn,
+                ctor: false,
+            }),
+        )));
+        {
+            let mut b = tte.borrow_mut();
+            for (k, v) in [
+                ("length", Value::Num(0.0)),
+                ("name", Value::Str(Rc::from(""))),
+            ] {
+                b.props.insert(
+                    PropKey::from_str(k),
+                    Prop {
+                        val: v,
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                        get: None,
+                        set: None,
+                    },
+                );
+            }
+            b.extensible = false;
+        }
         let iterator = mk(Some(obj.clone()));
         Interp {
             global: Scope::new(None, true),
             p: Protos {
-                array: mk(Some(obj.clone())),
+                // %Array.prototype% is itself an Array exotic object
+                // (length=0, IsArray → true)
+                array: Rc::new(RefCell::new(Obj::new(
+                    Some(obj.clone()),
+                    ObjKind::Arr(Vec::new()),
+                ))),
                 string: mk(Some(obj.clone())),
                 number: mk(Some(obj.clone())),
                 boolean: mk(Some(obj.clone())),
@@ -1285,6 +1361,7 @@ impl Interp {
                 agg_error: mk(Some(obj.clone())),
                 suppressed_error: mk(Some(obj.clone())),
                 promise: mk(Some(obj.clone())),
+                promise_ctor: mk(Some(obj.clone())),
                 array_iter: mk(Some(iterator.clone())),
                 map_iter: mk(Some(iterator.clone())),
                 set_iter: mk(Some(iterator.clone())),
@@ -1300,6 +1377,7 @@ impl Interp {
                 bigint: mk(Some(obj.clone())),
                 obj,
                 func,
+                tte,
             },
             output: Vec::new(),
             modules: Vec::new(),
@@ -1308,6 +1386,7 @@ impl Interp {
             eval_decl: false,
             eval_args_ban: 0,
             depth: 0,
+            call_stack: Vec::new(),
             sym_counter: 16,
             priv_ctr: 0,
             rng: {
@@ -1337,7 +1416,34 @@ impl Interp {
             gen_ret_override: None,
             gen_cap_hit: false,
             new_target_native: None,
+            jobs: std::collections::VecDeque::new(),
+            jobs_draining: false,
         }
+    }
+
+    /// Run queued jobs FIFO to quiescence — the microtask checkpoint.
+    /// A job may enqueue more jobs (thenable resolution, chained
+    /// reactions); the loop picks them all up. Job errors are
+    /// host-reported unhandled rejections — swallowed, never thrown.
+    /// Reentrant drains (a job that synchronously evaluates more
+    /// script) no-op; the outer drain sees the new jobs.
+    pub fn drain_jobs(&mut self) {
+        if self.jobs_draining {
+            return;
+        }
+        self.jobs_draining = true;
+        let mut budget = 1_000_000u32;
+        while let Some(job) = self.jobs.pop_front() {
+            let _ = job(self);
+            budget -= 1;
+            if budget == 0 {
+                // self-perpetuating chains (a thenable that resolves
+                // with itself) get cut off rather than hang the turn
+                self.jobs.clear();
+                break;
+            }
+        }
+        self.jobs_draining = false;
     }
 
     /// Intern a string so repeated `Rc<str>` key/name uses become cheap
@@ -1521,7 +1627,7 @@ impl Interp {
             }
         };
         if let Some((t, h)) = proxy {
-            return self.proxy_has(&t, &h, &PropKey::from_str(name));
+            return self.proxy_has(&t, &h, &PropKey::from_str(name), &o);
         }
         self.has_prop(&Value::Obj(o.clone()), &PropKey::from_str(name))
     }
@@ -1952,9 +2058,6 @@ impl Interp {
         def: &FnDef,
         callee: &Value,
     ) -> ObjRef {
-        fn throw_type_err(i: &mut Interp, _t: &Value, _a: &[Value]) -> ERes {
-            Err(i.type_err("'caller' and 'arguments' are restricted"))
-        }
         let strict = def.strict || crate::parser::stmts_strict(&def.body);
         // spec: a non-simple parameter list (defaults, destructuring,
         // rest) yields an UNMAPPED arguments object even when sloppy
@@ -1997,8 +2100,9 @@ impl Interp {
             .insert(PropKey::from_str("length"), Prop::builtin(Value::Num(args.len() as f64)));
         if !mapped {
             // unmapped: throwing caller/callee accessors (own props,
-            // non-configurable)
-            let thrower = self.native("ThrowTypeError", throw_type_err);
+            // non-configurable) — the realm's single %ThrowTypeError%
+            // is both getter and setter
+            let thrower = Value::Obj(self.p.tte.clone());
             for k in ["caller", "callee"] {
                 o.borrow_mut().props.insert(
                     PropKey::from_str(k),
@@ -2043,9 +2147,17 @@ impl Interp {
                     Some(self.p.regexp.clone()),
                     ObjKind::Regex(re),
                 )));
+                // spec: lastIndex is {W:true, E:false, C:false}
                 o.borrow_mut().props.insert(
                     PropKey::from_str("lastIndex"),
-                    Prop::builtin(Value::Num(0.0)),
+                    Prop {
+                        val: Value::Num(0.0),
+                        writable: true,
+                        enumerable: false,
+                        configurable: false,
+                        get: None,
+                        set: None,
+                    },
                 );
                 Ok(Value::Obj(o))
             }
@@ -2299,12 +2411,27 @@ impl Interp {
     /// proxy [[Get]](P, Receiver) — the `get` trap plus the 10.5.8
     /// invariants (non-config non-writable data ⇒ SameValue result;
     /// non-config getter-less accessor ⇒ undefined result).
+    /// post-trap revalidation (ES2024 10.5.x): after a trap call the
+    /// proxy may have been revoked mid-call — every subsequent step
+    /// throws TypeError. `p` is the proxy object itself.
+    fn proxy_live(&mut self, p: &ObjRef, op: &str) -> Result<(), Value> {
+        if matches!(&p.borrow().kind, ObjKind::Proxy { handler, .. }
+            if matches!(handler, Value::Null))
+        {
+            return Err(self.type_err(format!(
+                "Cannot perform '{op}' on a proxy that has been revoked"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn proxy_get(
         &mut self,
         t: &Value,
         h: &Value,
         key: &PropKey,
         receiver: &Value,
+        p: &ObjRef,
     ) -> ERes {
         match self.proxy_trap(h, "get")? {
             Some(trap) => {
@@ -2314,6 +2441,7 @@ impl Interp {
                     h.clone(),
                     vec![t.clone(), kv, receiver.clone()],
                 )?;
+                self.proxy_live(p, "get")?;
                 if let Some(td) = self.proxy_target_desc(t, key)? {
                     if td.configurable == Some(false) {
                         if !td.is_accessor() && td.writable == Some(false) {
@@ -2356,6 +2484,7 @@ impl Interp {
         key: &PropKey,
         v: Value,
         receiver: &Value,
+        p: &ObjRef,
     ) -> Result<(), Value> {
         match self.proxy_trap(h, "set")? {
             Some(trap) => {
@@ -2365,6 +2494,7 @@ impl Interp {
                     h.clone(),
                     vec![t.clone(), kv, v.clone(), receiver.clone()],
                 )?;
+                self.proxy_live(p, "set")?;
                 if !self.to_bool(&r) {
                     let kn = self.key_to_name(key);
                     return self.set_fail(&kn);
@@ -2408,11 +2538,13 @@ impl Interp {
         t: &Value,
         h: &Value,
         key: &PropKey,
+        p: &ObjRef,
     ) -> Result<bool, Value> {
         match self.proxy_trap(h, "has")? {
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
+                self.proxy_live(p, "has")?;
                 let br = self.to_bool(&r);
                 if !br {
                     if let Some(td) = self.proxy_target_desc(t, key)? {
@@ -2442,11 +2574,13 @@ impl Interp {
         t: &Value,
         h: &Value,
         key: &PropKey,
+        p: &ObjRef,
     ) -> Result<bool, Value> {
         match self.proxy_trap(h, "deleteProperty")? {
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
+                self.proxy_live(p, "deleteProperty")?;
                 if !self.to_bool(&r) {
                     return Ok(false);
                 }
@@ -2479,11 +2613,13 @@ impl Interp {
         t: &Value,
         h: &Value,
         key: &PropKey,
+        p: &ObjRef,
     ) -> Result<Option<PDesc>, Value> {
         match self.proxy_trap(h, "getOwnPropertyDescriptor")? {
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
+                self.proxy_live(p, "getOwnPropertyDescriptor")?;
                 if !matches!(r, Value::Und | Value::Obj(_)) {
                     return Err(self.type_err(
                         "proxy getOwnPropertyDescriptor trap must return object or undefined",
@@ -2573,6 +2709,17 @@ impl Interp {
                 if cfg_false && td.configurable != Some(false) {
                     return Err(self.type_err(
                         "'defineProperty' on proxy: trap returned truish for defining a configurable target property as non-configurable",
+                    ));
+                }
+                // 10.5.6 step 18.c: a non-configurable but WRITABLE data
+                // property may not be reported made non-writable
+                if td.is_data()
+                    && td.configurable == Some(false)
+                    && td.writable == Some(true)
+                    && desc.writable == Some(false)
+                {
+                    return Err(self.type_err(
+                        "'defineProperty' on proxy: trap returned truish for making a non-configurable, writable property non-writable",
                     ));
                 }
                 if td.configurable == Some(false)
@@ -2848,6 +2995,14 @@ impl Interp {
 
     /// proto-chain walk; `receiver` is the `this` for getters.
     pub(crate) fn obj_get(&mut self, o: &ObjRef, key: &PropKey, receiver: &Value) -> ERes {
+        // legacy `.caller` on non-strict functions answers from the
+        // call stack — intercept before the ordinary proto walk (the
+        // inherited %ThrowTypeError% accessor would fire otherwise)
+        if matches!(key, PropKey::S(s) if s.as_ref() == "caller") {
+            if let Some(v) = self.sloppy_caller(o)? {
+                return Ok(v);
+            }
+        }
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
             {
@@ -2859,7 +3014,7 @@ impl Interp {
                     let (t, h, r) =
                         (target.clone(), handler.clone(), receiver.clone());
                     drop(b);
-                    return self.proxy_get(&t, &h, key, &r);
+                    return self.proxy_get(&t, &h, key, &r, &c);
                 }
                 if let Some(p) = b.props.get(key) {
                     if p.is_accessor() {
@@ -2885,6 +3040,11 @@ impl Interp {
 
     /// `obj_get` by borrowed string key.
     fn obj_get_str(&mut self, o: &ObjRef, key: &str, receiver: &Value) -> ERes {
+        if key == "caller" {
+            if let Some(v) = self.sloppy_caller(o)? {
+                return Ok(v);
+            }
+        }
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
             {
@@ -2901,6 +3061,7 @@ impl Interp {
                         &h,
                         &PropKey::from_str(key),
                         &r,
+                        &c,
                     );
                 }
                 if let Some(p) = b.props.get_str(key) {
@@ -2921,6 +3082,59 @@ impl Interp {
             cur = next;
         }
         Ok(Value::Und)
+    }
+
+    /// legacy `fn.caller` semantics: only NON-strict, non-arrow,
+    /// non-Function-constructor user functions without an own `caller`
+    /// prop get the magic — everything else falls through to the
+    /// inherited (poisoned) accessor. Resolves the frame BELOW the
+    /// receiver's topmost live invocation; a strict / dynamic / bound
+    /// caller is a TypeError, no live invocation → null.
+    fn sloppy_caller(&mut self, o: &ObjRef) -> Result<Option<Value>, Value> {
+        let eligible = {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Func(Func::User { def, dynamic, .. }) => {
+                    !def.is_arrow
+                        && !*dynamic
+                        && !def.strict
+                        && !crate::parser::stmts_strict(&def.body)
+                        && !b.props.contains_str("caller")
+                }
+                _ => false,
+            }
+        };
+        if !eligible {
+            return Ok(None);
+        }
+        for idx in (0..self.call_stack.len()).rev() {
+            if matches!(&self.call_stack[idx], Value::Obj(f) if Rc::ptr_eq(f, o)) {
+                if idx == 0 {
+                    return Ok(Some(Value::Null));
+                }
+                let caller = self.call_stack[idx - 1].clone();
+                let restricted = match &caller {
+                    Value::Obj(co) => match &co.borrow().kind {
+                        ObjKind::Func(Func::User { def, dynamic, .. }) => {
+                            *dynamic
+                                || def.strict
+                                || crate::parser::stmts_strict(&def.body)
+                        }
+                        // natives/bound fns are never pushed — but both
+                        // are restricted callers if one ever lands here
+                        _ => true,
+                    },
+                    _ => false,
+                };
+                if restricted {
+                    return Err(
+                        self.type_err("access to strict function caller is not allowed")
+                    );
+                }
+                return Ok(Some(caller));
+            }
+        }
+        Ok(Some(Value::Null))
     }
 
     pub fn set_prop(&mut self, base: &Value, key: PropKey, v: Value) -> Result<(), Value> {
@@ -3000,7 +3214,7 @@ impl Interp {
         };
         if let Some((t, h)) = proxy {
             let r = receiver.clone();
-            return self.proxy_set(&t, &h, &key, v, &r);
+            return self.proxy_set(&t, &h, &key, v, &r, o);
         }
         // integer-indexed writes + read-only virtuals on binary views
         {
@@ -3147,6 +3361,23 @@ impl Interp {
         // walk chain looking for existing prop (setter or data)
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
+            // a proxy in the chain takes over the walk: parent.[[Set]]
+            // is the proxy's full [[Set]] — its `set` trap (or forward)
+            // sees the ORIGINAL receiver (OrdinarySetWithOwnDescriptor
+            // 2.b.i), not the proxy itself
+            let chain_proxy = {
+                let b = c.borrow();
+                match &b.kind {
+                    ObjKind::Proxy { target, handler } => {
+                        Some((target.clone(), handler.clone()))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((t, h)) = chain_proxy {
+                let r = receiver.clone();
+                return self.proxy_set(&t, &h, &key, v, &r, o);
+            }
             // a TypedArray in the chain intercepts canonical numeric
             // strings via its own [[Set]] (10.4.5.6) — the recursion
             // parent.[[Set]](P, V, receiver) never reaches the tail
@@ -3783,7 +4014,7 @@ impl Interp {
             }
         };
         if let Some((t, h)) = proxy {
-            return match self.proxy_gopd(&t, &h, key)? {
+            return match self.proxy_gopd(&t, &h, key, ro)? {
                 Some(d) => {
                     Ok(Some((d.is_accessor(), d.writable.unwrap_or(false))))
                 }
@@ -3823,7 +4054,7 @@ impl Interp {
 
     /// [[DefineOwnProperty]](P, Desc) on the receiver — a proxy fires its
     /// `defineProperty` trap with a descriptor object.
-    fn recv_define(
+    pub(crate) fn recv_define(
         &mut self,
         ro: &ObjRef,
         key: &PropKey,
@@ -3960,7 +4191,7 @@ impl Interp {
         };
         if let Some((t, h)) = proxy {
             let r = receiver.clone();
-            return self.proxy_set(&t, &h, &PropKey::from_str(key), v, &r);
+            return self.proxy_set(&t, &h, &PropKey::from_str(key), v, &r, o);
         }
         // integer-indexed writes + read-only virtuals on binary views
         {
@@ -4058,6 +4289,28 @@ impl Interp {
         // walk chain looking for existing prop (setter or data)
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
+            // a proxy in the chain runs its own [[Set]] — the trap sees
+            // the ORIGINAL receiver (OrdinarySetWithOwnDescriptor 2.b.i)
+            let chain_proxy = {
+                let b = c.borrow();
+                match &b.kind {
+                    ObjKind::Proxy { target, handler } => {
+                        Some((target.clone(), handler.clone()))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((t, h)) = chain_proxy {
+                let r = receiver.clone();
+                return self.proxy_set(
+                    &t,
+                    &h,
+                    &PropKey::from_str(key),
+                    v,
+                    &r,
+                    &c,
+                );
+            }
             // TypedArray chain interception (10.4.5.6) — see obj_set
             {
                 let (ta_hit, write_elem) = {
@@ -4350,7 +4603,7 @@ impl Interp {
                 if let ObjKind::Proxy { target, handler } = &b.kind {
                     let (t, h) = (target.clone(), handler.clone());
                     drop(b);
-                    return self.proxy_has(&t, &h, key);
+                    return self.proxy_has(&t, &h, key, &c);
                 }
                 match &b.kind {
                     ObjKind::Arr(items) => {
@@ -4420,7 +4673,7 @@ impl Interp {
             }
         };
         if let Some((t, h)) = proxy {
-            return self.proxy_delete(&t, &h, key);
+            return self.proxy_delete(&t, &h, key, &o);
         }
         let mut b = o.borrow_mut();
         if let PropKey::S(s) = key {
@@ -5186,6 +5439,7 @@ impl Interp {
                 ctor,
                 inst_fields: _,
                 ban_eval_args: _,
+                dynamic: _,
             }) => {
                 // class constructors are [[Call]]-rejected per spec —
                 // only [[Construct]] is defined for them
@@ -5214,7 +5468,11 @@ impl Interp {
                 let eff_strict =
                     def.strict || parser::stmts_strict(&def.body);
                 let saved_strict = std::mem::replace(&mut self.cur_strict, eff_strict);
+                // record the live frame — sloppy `.caller` resolves
+                // against call_stack
+                self.call_stack.push(f.clone());
                 let r = self.call_user_body(f, o, &def, &env, home, this, args);
+                self.call_stack.pop();
                 self.cur_strict = saved_strict;
                 r
             }
@@ -5438,7 +5696,9 @@ impl Interp {
             }
             ObjKind::Func(Func::Native { ctor, .. }) => *ctor,
             ObjKind::Bound { target, .. } => self.is_constructor(target),
-            ObjKind::Proxy { target, .. } => self.is_constructor(target),
+            // a proxy's [[Construct]] presence is fixed at creation —
+            // a revoked ctor-proxy stays a constructor for `new`
+            ObjKind::Proxy { .. } => o.borrow().pflags & 2 != 0,
             _ => false,
         }
     }
@@ -5547,6 +5807,7 @@ impl Interp {
                 ctor,
                 inst_fields: _,
                 ban_eval_args: _,
+                dynamic: _,
             }) => {
                 if def.is_arrow
                     || def.is_gen
@@ -5558,14 +5819,28 @@ impl Interp {
                 let eff_strict =
                     def.strict || parser::stmts_strict(&def.body);
                 let saved_strict = std::mem::replace(&mut self.cur_strict, eff_strict);
+                self.call_stack.push(f.clone());
                 let r = self.construct_user_body(f, o, def, env, home, ctor, new_target, args);
+                self.call_stack.pop();
                 self.cur_strict = saved_strict;
                 r
             }
             ObjKind::Bound { target, extra, .. } => {
                 let mut all = extra;
                 all.extend(args);
-                self.construct(&target, all, new_target)
+                // spec: when newTarget IS the bound function itself
+                // (`new bound()` or `Reflect.construct(bound, [], bound)`),
+                // forward the bound TARGET as newTarget instead — nested
+                // binds therefore collapse to the innermost target's
+                // prototype, while a distinct explicit newTarget passes
+                // through unchanged
+                let nt = match &new_target {
+                    Some(Value::Obj(nt)) if !Rc::ptr_eq(nt, o) => {
+                        new_target.clone()
+                    }
+                    _ => Some(target.clone()),
+                };
+                self.construct(&target, all, nt)
             }
             _ => Err(self.type_err("value is not a constructor")),
         }
@@ -6676,13 +6951,26 @@ impl Interp {
                 ctor,
                 inst_fields: None,
                 ban_eval_args: self.eval_args_ban > 0,
+                dynamic: false,
             }),
         )));
         let name = def.name.clone().unwrap_or_default();
         // insertion order matters for getOwnPropertyNames — spec order
-        // is `length` then `name` then `prototype`
+        // is `length` then `name` then (restricted props) `prototype`
         self.set_attr(&o, "length", Value::Num(param_count(&def.params) as f64), false, true);
         self.set_attr(&o, "name", Value::Str(Rc::from(name.as_str())), false, true);
+        if def.strict || parser::stmts_strict(&def.body) {
+            // AddRestrictedFunctionProperties — strict fns own poisoned
+            // caller/arguments accessors; the realm's single
+            // %ThrowTypeError% is both getter and setter
+            let tte = Value::Obj(self.p.tte.clone());
+            for k in ["caller", "arguments"] {
+                o.borrow_mut().props.insert(
+                    PropKey::from_str(k),
+                    Prop::accessor(Some(tte.clone()), Some(tte.clone())),
+                );
+            }
+        }
         if def.is_gen && home.is_none() {
             // generator fns: proto is %GeneratorFunction.prototype%; the
             // `.prototype` prop is an ordinary object whose proto is
@@ -9739,6 +10027,7 @@ impl Interp {
             return Err(self.throw_to_error(v));
         }
         let mut last = Value::Und;
+        let mut err: Option<Value> = None;
         for s in &stmts {
             match self.exec_stmt(s, &g) {
                 Ok(Completion::Normal(v)) => last = v,
@@ -9748,8 +10037,21 @@ impl Interp {
                     break;
                 }
                 Ok(_) => {}
-                Err(v) => return Err(self.throw_to_error(v)),
+                Err(v) => {
+                    err = Some(v);
+                    break;
+                }
             }
+        }
+        // microtask checkpoint: queued promise jobs run once the JS
+        // execution context stack is empty — only on the outermost
+        // run (nested run() inside Function()/ctor natives sees a
+        // nonzero call depth), even when the script ended abruptly
+        if self.depth == 0 {
+            self.drain_jobs();
+        }
+        if let Some(v) = err {
+            return Err(self.throw_to_error(v));
         }
         Ok(last)
     }
@@ -9888,14 +10190,11 @@ pub fn js_num_str(n: f64) -> String {
     }
     let abs = n.abs();
     if (1e-6..1e21).contains(&abs) {
-        // decimal notation — integral values print full digits ({:.0}
-        // handles magnitudes past i64::MAX where `as i64` saturates);
-        // non-integral values use Display's shortest round-trip form
-        return if n == n.trunc() {
-            format!("{n:.0}")
-        } else {
-            format!("{n}")
-        };
+        // Display already gives the shortest round-trip digits expanded
+        // positionally — exactly the JS decimal form (integral values get
+        // no fraction, large ints get the rounded shortest digits, not
+        // the exact binary value like {:.0} would print)
+        return format!("{n}");
     }
     // exponential: Rust's {:e} gives "1e21"/"1.5e-7"; JS wants an
     // explicit '+' on positive exponents and no leading-zero padding
