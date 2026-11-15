@@ -83,10 +83,6 @@ const SKIP_FEATURES: &[&str] = &[
     "AggregateError", "weakrefs",
     "symbols-as-weakmap-keys", "change-array-by-copy",
     "uint8array-base64",
-    "class-fields-private", "class-fields-public",
-    "class-static-block", "class-methods-private",
-    "class-static-methods-private", "class-accessor-methods-private",
-    "class-static-accessor-methods-private",
     "caller",
     // $262.createRealm / Error.isError — APIs we don't expose
     "cross-realm", "Error.isError", "host-gc-required",

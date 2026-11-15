@@ -398,6 +398,10 @@ pub enum Func {
         /// class instance fields: evaluated-key + initializer, run at
         /// construction (base ctor: before body; derived: after super())
         inst_fields: Option<Rc<ClassFields>>,
+        /// defined while a class-field-initializer context was running —
+        /// direct `eval` in this fn may not contain `arguments`
+        /// (propagates to arrows created inside the initializer)
+        ban_eval_args: bool,
     },
     Native {
         name: Rc<str>,
@@ -421,10 +425,15 @@ pub struct ClassFields {
 /// order: fields define an own data prop; private methods get a fresh
 /// fn object per instance; private accessors merge get/set on one slot
 pub enum InstElem {
-    /// key, initializer, is_private (private field → non-enum/non-cfg slot)
-    Field(PropKey, Option<crate::ast::Expr>, bool),
-    Method(PropKey, Rc<crate::ast::FnDef>),
-    Access(PropKey, Option<Rc<crate::ast::FnDef>>, Option<Rc<crate::ast::FnDef>>),
+    /// key, initializer, is_private (private field → non-enum/non-cfg
+    /// slot), source name for NamedEvaluation on the initializer
+    Field(PropKey, Option<crate::ast::Expr>, bool, Rc<str>),
+    /// private instance method — ONE fn object shared across instances
+    /// (private methods are defined once during class evaluation; each
+    /// instance's [[PrivateElements]] entry points at the same object)
+    Method(PropKey, Value),
+    /// private accessor — get/set fns evaluated once at class eval
+    Access(PropKey, Option<Value>, Option<Value>),
 }
 
 pub type NativeFn = fn(&mut Interp, &Value, &[Value]) -> Result<Value, Value>;
@@ -1116,6 +1125,9 @@ pub struct Interp {
     /// inside eval declaration instantiation — var/fn bindings created now
     /// are `deletable` (and global props `configurable`)
     pub eval_decl: bool,
+    /// >0 while a class-field-initializer (or a fn created inside one)
+    /// runs — direct `eval` source must not contain `arguments`
+    pub eval_args_ban: u32,
     /// stmt being executed when the interrupt tripped (triage aid)
     pub interrupt_site: Option<String>,
     /// opt-in call tracing (set `ROWSER_CALL_TRACE=1`): when on, each call
@@ -1235,6 +1247,7 @@ impl Interp {
             pending_label: None,
             cur_strict: false,
             eval_decl: false,
+            eval_args_ban: 0,
             depth: 0,
             sym_counter: 16,
             priv_ctr: 0,
@@ -2532,6 +2545,24 @@ impl Interp {
                 _ => {}
             }
         }
+        // private-name writes (PRIV_BASE syms): the slot must exist and
+        // be writable (or have a setter) — checked at PutValue time, not
+        // at reference resolution, so a field installed mid-destructure
+        // (e.g. a getter that constructs on `this`) still lands
+        if let PropKey::Sym(id) = &key {
+            if *id >= PRIV_BASE {
+                let ok = o
+                    .borrow()
+                    .props
+                    .get(&key)
+                    .is_some_and(|p| p.writable || p.set.is_some());
+                if !ok {
+                    return Err(self.type_err(
+                        "Cannot write private member to an object whose class did not declare it"
+                    ));
+                }
+            }
+        }
         // arguments-object virtual index props are own props — they
         // shadow proto accessors entirely (10.6-11-b-1)
         {
@@ -3104,6 +3135,28 @@ impl Interp {
     /// configurable}` for ordinary names, but private `#x` slots are
     /// non-enumerable + non-configurable so they never leak through
     /// for-in / Object.keys / delete
+    /// AddPrivateField presence check — the object's private-name slot
+    /// must be empty before a private element installs
+    fn priv_double_init_guard(&mut self, o: &ObjRef, key: &PropKey) -> Result<(), Value> {
+        let b = o.borrow();
+        let ks = || self.key_str(key);
+        if b.props.get(key).is_some() {
+            return Err(self.type_err(format!(
+                "Cannot add private name {} twice to the same object",
+                ks()
+            )));
+        }
+        // private elements install on non-extensible receivers too? no —
+        // AddPrivateField honors [[IsExtensible]] of the target
+        if !b.extensible {
+            return Err(self.type_err(format!(
+                "Cannot add private name {} to a non-extensible object",
+                ks()
+            )));
+        }
+        Ok(())
+    }
+
     fn define_field_prop(
         &mut self,
         o: &ObjRef,
@@ -3112,7 +3165,24 @@ impl Interp {
         is_priv: bool,
     ) -> Result<(), Value> {
         if is_priv {
-            o.borrow_mut().props.insert(
+            // AddPrivateField — installing onto an object that already
+            // has the private name is a TypeError (fields/methods install
+            // once per instance; re-install = double initialisation)
+            let mut b = o.borrow_mut();
+            if b.props.get(&key).is_some() {
+                let ks = self.key_str(&key);
+                return Err(self.type_err(format!(
+                    "Cannot add private name {ks} twice to the same object"
+                )));
+            }
+            // AddPrivateField still honors non-extensible receivers
+            if !b.extensible {
+                let ks = self.key_str(&key);
+                return Err(self.type_err(format!(
+                    "Cannot add private name {ks} to a non-extensible object"
+                )));
+            }
+            b.props.insert(
                 key,
                 Prop {
                     val: v,
@@ -3125,7 +3195,14 @@ impl Interp {
             );
             Ok(())
         } else {
-            self.obj_define_data(o, key, v)
+            // CreateDataPropertyOrThrow → [[DefineOwnProperty]] — a
+            // proxy `this` (derived ctor returning a proxy) fires the
+            // defineProperty trap with the full descriptor
+            if matches!(&o.borrow().kind, ObjKind::Proxy { .. }) {
+                self.recv_define(o, &key, v, true)
+            } else {
+                self.obj_define_data(o, key, v)
+            }
         }
     }
 
@@ -4196,6 +4273,18 @@ impl Interp {
             Value::Sym(id, _) => PropKey::Sym(*id),
             Value::Num(n) => PropKey::from_str(&js_num_str(*n)),
             Value::Str(s) => PropKey::S(s.clone()),
+            // ToPropertyKey: ToPrimitive with a *string* hint (toString
+            // before valueOf) — a Symbol result keys the property by
+            // that symbol, anything else stringifies
+            Value::Obj(o) => {
+                if crate::binary::bigint_magnitude(v).is_some() {
+                    // `x[2n]` — ToPropertyKey stringifies the bigint
+                    let s = self.to_str(v)?;
+                    return Ok(PropKey::from_str(&s));
+                }
+                let prim = self.to_primitive_hint(v, o.clone(), "string")?;
+                return self.to_propkey(&prim);
+            }
             _ => {
                 let s = self.to_str(v)?;
                 PropKey::from_str(&s)
@@ -4504,6 +4593,7 @@ impl Interp {
                 home,
                 ctor,
                 inst_fields: _,
+                ban_eval_args: _,
             }) => {
                 // class constructors are [[Call]]-rejected per spec —
                 // only [[Construct]] is defined for them
@@ -4543,6 +4633,35 @@ impl Interp {
     /// The `Func::User` arm of `call`, extracted so `call` can restore
     /// `cur_strict` on every exit path (including `?` early returns).
     fn call_user_body(
+        &mut self,
+        f: &Value,
+        o: &ObjRef,
+        def: &Rc<crate::ast::FnDef>,
+        env: &EnvRef,
+        home: Option<ObjRef>,
+        this: Value,
+        args: Vec<Value>,
+    ) -> ERes {
+        // a fn defined inside a class field initializer inherits the
+        // `arguments`-in-eval ban — bump the context counter for the call
+        let ban = matches!(
+            o.borrow().kind,
+            ObjKind::Func(Func::User {
+                ban_eval_args: true,
+                ..
+            })
+        );
+        if ban {
+            self.eval_args_ban += 1;
+        }
+        let r = self.call_user_body_inner(f, o, def, env, home, this, args);
+        if ban {
+            self.eval_args_ban -= 1;
+        }
+        r
+    }
+
+    fn call_user_body_inner(
         &mut self,
         f: &Value,
         o: &ObjRef,
@@ -4806,6 +4925,7 @@ impl Interp {
                 home,
                 ctor,
                 inst_fields: _,
+                ban_eval_args: _,
             }) => {
                 if def.is_arrow
                     || def.is_gen
@@ -5055,6 +5175,18 @@ impl Interp {
         }
     }
 
+    /// evaluate `e` applying NamedEvaluation — anonymous classes get the
+    /// name DURING class evaluation (inner binding + ctor `name` are set
+    /// before static elements run); other anon fns take it post-eval
+    fn eval_expr_named(&mut self, e: &Expr, env: &EnvRef, name: &str) -> ERes {
+        if let Expr::Class(c) = e {
+            return self.make_class_named(c, env, Some(name));
+        }
+        let v = self.eval_expr(e, env)?;
+        self.maybe_name(&v, name);
+        Ok(v)
+    }
+
     /// NamedEvaluation — an anonymous fn/class bound to a name takes it,
     /// unless it already has an own `name` (e.g. `static name` members).
     fn maybe_name(&mut self, v: &Value, name: &str) {
@@ -5115,26 +5247,17 @@ impl Interp {
         }
         let ov = self.eval_expr(obj, env)?;
         if let Expr::Str(s) = &**prop {
-            // `o.#x` — resolve the PrivateName through the class env,
-            // then the Sym-keyed slot must already exist and be writable
-            // (accessor without a setter → TypeError). `o["#x"]` stays an
-            // ordinary string-key write.
+            // `o.#x` — resolve the PrivateName through the class env to
+            // its Sym slot; `o["#x"]` stays an ordinary string-key write.
             if !*computed && s.starts_with('#') {
                 let Some((Value::Sym(id, _), _)) = self.env_lookup_st(env, s.as_str())?
                 else {
                     return Err(self.syntax_err(format!("Private member {s} must be declared")));
                 };
-                let Value::Obj(o) = &ov else {
-                    return Err(self.type_err(format!(
-                        "Cannot write private member {s}"
-                    )));
-                };
-                let ok = o
-                    .borrow()
-                    .props
-                    .get(&PropKey::Sym(id))
-                    .is_some_and(|p| p.writable || p.set.is_some());
-                if !ok {
+                // the slot check runs at PutValue time — destructuring
+                // evaluates the RHS (getters, calls) before the write,
+                // and the field may be installed mid-destructure
+                if !matches!(&ov, Value::Obj(_)) {
                     return Err(self.type_err(format!(
                         "Cannot write private member {s}"
                     )));
@@ -5911,6 +6034,7 @@ impl Interp {
                 home: home.clone(),
                 ctor,
                 inst_fields: None,
+                ban_eval_args: self.eval_args_ban > 0,
             }),
         )));
         let name = def.name.clone().unwrap_or_default();
@@ -6003,14 +6127,14 @@ impl Interp {
                         None
                     };
                     let v = match init {
-                        Some(e) => self.eval_expr(e, env)?,
+                        Some(e) => match pat {
+                            Pattern::Ident(n) if Self::is_anon_fn_def(e) => {
+                                self.eval_expr_named(e, env, n)?
+                            }
+                            _ => self.eval_expr(e, env)?,
+                        },
                         None => Value::Und,
                     };
-                    if let (Pattern::Ident(n), Some(ie)) = (pat, init) {
-                        if Self::is_anon_fn_def(ie) {
-                            self.maybe_name(&v, n);
-                        }
-                    }
                     match pat {
                         Pattern::Ident(name) => match kind {
                             // `var x;` (no init) leaves the hoisted binding
@@ -6916,13 +7040,28 @@ impl Interp {
 
     // -- class construction ------------------------------------------------------
     fn make_class(&mut self, c: &ClassDef, env: &EnvRef) -> ERes {
+        self.make_class_named(c, env, None)
+    }
+
+    /// class eval — `hint` is the NamedEvaluation name (`var C = class
+    /// {}` names the ctor `C` AND the inner class-name binding `C`,
+    /// set before static elements run)
+    fn make_class_named(
+        &mut self,
+        c: &ClassDef,
+        env: &EnvRef,
+        hint: Option<&str>,
+    ) -> ERes {
         // the class scope exists BEFORE the heritage expression runs —
         // the class-name binding is created uninitialized so heritage /
         // computed member keys referencing the name hit the TDZ
         let class_env = Scope::new(Some(env.clone()), false);
-        if let Some(n) = &c.name {
+        let eff_name: Option<String> =
+            c.name.clone().or_else(|| hint.map(|h| h.to_string()));
+        let eff_name = eff_name.as_deref();
+        if let Some(n) = eff_name {
             class_env.vars.borrow_mut().insert(
-                Rc::from(n.as_str()),
+                Rc::from(n),
                 Binding {
                     val: Value::Und,
                     mutable: false, uninit: true, deletable: false, lexical: true,
@@ -7044,14 +7183,15 @@ impl Interp {
         self.set_builtin(&proto, "constructor", ctor_fn.clone());
         // class `prototype` property: {!writable,!enumerable,!configurable}
         self.set_attr(&ctor_obj, "prototype", Value::Obj(proto.clone()), false, false);
-        // the ctor function's name is the class name ("": anonymous)
-        let cname = c.name.clone().unwrap_or_default();
+        // the ctor function's name is the class name — including the
+        // NamedEvaluation-inferred name for anonymous classes
+        let cname = eff_name.unwrap_or_default().to_string();
         self.set_attr(&ctor_obj, "name", Value::Str(Rc::from(cname.as_str())), false, true);
 
         // static elements execute in member order at class-definition
         // time; instance fields record (key, init, env) for construct/super
         enum StaticItem {
-            Field(PropKey, Option<ast::Expr>, bool),
+            Field(PropKey, Option<ast::Expr>, bool, Rc<str>),
             Block(Rc<FnDef>),
         }
         let mut statics: Vec<StaticItem> = Vec::new();
@@ -7081,11 +7221,32 @@ impl Interp {
                     self.to_propkey(&kv)?
                 }
             };
+            // a computed static key resolving to `prototype` is a
+            // runtime TypeError (the early error only covers literals)
+            if m.is_static && matches!(&key, PropKey::S(s) if &**s == "prototype") {
+                return Err(self.type_err(
+                    "Classes may not have a static property named 'prototype'"
+                ));
+            }
+            // NamedEvaluation source name — `#x` for private names, the
+            // literal/computed key text otherwise
+            let fname: Rc<str> = match &m.key {
+                ast::PropKey::Ident(s) | ast::PropKey::Str(s) => Rc::from(s.as_str()),
+                ast::PropKey::Num(n) => Rc::from(js_num_str(*n).as_str()),
+                ast::PropKey::Computed(_) => Rc::from(self.key_to_name(&key).as_str()),
+            };
             match m.kind {
                 MemberKind::Method => {
                     if is_priv && !m.is_static {
-                        // private instance methods install per-instance
-                        inst_fields.push(InstElem::Method(key, m.func.clone()));
+                        // private instance method — evaluate once now;
+                        // every instance's private slot holds the same fn
+                        let f = self.make_fn_home(
+                            m.func.clone(),
+                            &class_env,
+                            Some(proto.clone()),
+                            CtorKind::NotClass,
+                        );
+                        inst_fields.push(InstElem::Method(key, f));
                         continue;
                     }
                     let f = self.make_fn_home(
@@ -7117,22 +7278,28 @@ impl Interp {
                 }
                 MemberKind::Getter | MemberKind::Setter => {
                     if is_priv && !m.is_static {
-                        // private instance accessor — a single slot per
-                        // instance; get+set share the private name
+                        // private instance accessor — get/set share the
+                        // private name; fns evaluated once at class eval
+                        let f = self.make_fn_home(
+                            m.func.clone(),
+                            &class_env,
+                            Some(proto.clone()),
+                            CtorKind::NotClass,
+                        );
                         let ent = inst_fields.iter_mut().find(|e| {
                             matches!(e, InstElem::Access(k2, _, _) if *k2 == key)
                         });
                         if let Some(InstElem::Access(_, g, s)) = ent {
                             if m.kind == MemberKind::Getter {
-                                *g = Some(m.func.clone());
+                                *g = Some(f);
                             } else {
-                                *s = Some(m.func.clone());
+                                *s = Some(f);
                             }
                         } else {
                             let (g, s) = if m.kind == MemberKind::Getter {
-                                (Some(m.func.clone()), None)
+                                (Some(f), None)
                             } else {
-                                (None, Some(m.func.clone()))
+                                (None, Some(f))
                             };
                             inst_fields.push(InstElem::Access(key, g, s));
                         }
@@ -7162,9 +7329,9 @@ impl Interp {
                 }
                 MemberKind::Field => {
                     if m.is_static {
-                        statics.push(StaticItem::Field(key, m.init.clone(), is_priv));
+                        statics.push(StaticItem::Field(key, m.init.clone(), is_priv, fname));
                     } else {
-                        inst_fields.push(InstElem::Field(key, m.init.clone(), is_priv));
+                        inst_fields.push(InstElem::Field(key, m.init.clone(), is_priv, fname));
                     }
                 }
                 MemberKind::StaticBlock => {
@@ -7176,8 +7343,8 @@ impl Interp {
 
         // the class-name binding initializes between member definition
         // and static-element evaluation (spec step order)
-        if let Some(n) = &c.name {
-            if let Some(b) = class_env.vars.borrow_mut().get_mut(n.as_str()) {
+        if let Some(n) = eff_name {
+            if let Some(b) = class_env.vars.borrow_mut().get_mut(n) {
                 b.val = ctor_fn.clone();
                 b.uninit = false;
             }
@@ -7186,13 +7353,23 @@ impl Interp {
         // static elements: this = ctor, home = ctor — run in member order
         for item in statics {
             match item {
-                StaticItem::Field(key, init, is_priv) => {
+                StaticItem::Field(key, init, is_priv, fname) => {
                     let v = match init {
                         Some(e) => {
                             let fs = Scope::new(Some(class_env.clone()), true);
                             *fs.thisv.borrow_mut() = ctor_fn.clone();
                             *fs.home.borrow_mut() = Some(ctor_obj.clone());
-                            self.eval_expr(&e, &fs)?
+                            // static-field-initializer context — direct
+                            // eval can't use `arguments`; anonymous fn
+                            // initializers take the field name
+                            self.eval_args_ban += 1;
+                            let r = if Self::is_anon_fn_def(&e) {
+                                self.eval_expr_named(&e, &fs, &fname)
+                            } else {
+                                self.eval_expr(&e, &fs)
+                            };
+                            self.eval_args_ban -= 1;
+                            r?
                         }
                         None => Value::Und,
                     };
@@ -7227,9 +7404,9 @@ impl Interp {
     /// 10.2.1.2 InitializeInstanceElements — install private elements
     /// and run field initializers on `this` in declaration order (base
     /// ctor: during BindThis; derived: right after super() binds `this`).
-    /// `nt` is the ctor's [[NewTarget]] — `new.target` in an initializer
-    /// reads it.
-    fn init_class_fields(&mut self, this: &Value, ctor: &ObjRef, nt: &Value) -> Result<(), Value> {
+    /// `nt` is the ctor's [[NewTarget]] — unused: `new.target` inside an
+    /// initializer is undefined (internal [[Call]], no NewTarget).
+    fn init_class_fields(&mut self, this: &Value, ctor: &ObjRef, _nt: &Value) -> Result<(), Value> {
         let cf = match &ctor.borrow().kind {
             ObjKind::Func(Func::User {
                 inst_fields: Some(cf),
@@ -7240,34 +7417,21 @@ impl Interp {
         let Value::Obj(to) = this else {
             return Ok(());
         };
+        // pass 1: install private methods/accessors before ANY
+        // initializer runs — `a = this.#m()` finds the method even when
+        // #m is declared after the field. Private FIELDS install in
+        // declaration order (reading one early is a TypeError).
         for el in cf.elems.iter() {
             match el {
-                InstElem::Field(key, init, is_priv) => {
-                    let v = match init {
-                        Some(e) => {
-                            let fs = Scope::new(Some(cf.env.clone()), true);
-                            *fs.thisv.borrow_mut() = this.clone();
-                            *fs.new_target.borrow_mut() = nt.clone();
-                            *fs.home.borrow_mut() = Some(cf.home.clone());
-                            self.eval_expr(e, &fs)?
-                        }
-                        None => Value::Und,
-                    };
-                    self.define_field_prop(to, key.clone(), v, *is_priv)?;
-                }
-                InstElem::Method(key, def) => {
-                    // each instance gets its own method object — private
-                    // methods are non-writable slots (TypeError on assign)
-                    let f = self.make_fn_home(
-                        def.clone(),
-                        &cf.env,
-                        Some(cf.home.clone()),
-                        CtorKind::NotClass,
-                    );
+                InstElem::Method(key, f) => {
+                    // the shared fn object — private methods are
+                    // non-writable slots (TypeError on assign); a second
+                    // install on the same object is a TypeError
+                    self.priv_double_init_guard(to, key)?;
                     to.borrow_mut().props.insert(
                         key.clone(),
                         Prop {
-                            val: f,
+                            val: f.clone(),
                             writable: false,
                             enumerable: false,
                             configurable: false,
@@ -7277,24 +7441,9 @@ impl Interp {
                     );
                 }
                 InstElem::Access(key, get, set) => {
-                    let g = match get {
-                        Some(d) => Some(self.make_fn_home(
-                            d.clone(),
-                            &cf.env,
-                            Some(cf.home.clone()),
-                            CtorKind::NotClass,
-                        )),
-                        None => None,
-                    };
-                    let s = match set {
-                        Some(d) => Some(self.make_fn_home(
-                            d.clone(),
-                            &cf.env,
-                            Some(cf.home.clone()),
-                            CtorKind::NotClass,
-                        )),
-                        None => None,
-                    };
+                    let g = get.clone();
+                    let s = set.clone();
+                    self.priv_double_init_guard(to, key)?;
                     to.borrow_mut().props.insert(
                         key.clone(),
                         Prop {
@@ -7307,6 +7456,43 @@ impl Interp {
                         },
                     );
                 }
+                InstElem::Field(..) => {}
+            }
+        }
+        // pass 2: field initializers run in declaration order — private
+        // fields write into their pre-installed slot, public fields
+        // define a fresh own property
+        for el in cf.elems.iter() {
+            match el {
+                InstElem::Field(key, init, is_priv, fname) => {
+                    let v = match init {
+                        Some(e) => {
+                            let fs = Scope::new(Some(cf.env.clone()), true);
+                            *fs.thisv.borrow_mut() = this.clone();
+                            // field inits are invoked by an internal
+                            // [[Call]] — `new.target` is undefined inside
+                            *fs.new_target.borrow_mut() = Value::Und;
+                            *fs.home.borrow_mut() = Some(cf.home.clone());
+                            self.eval_args_ban += 1;
+                            // `x = () => {}` names the fn `x` — and
+                            // `#x = () => {}` names it `#x`
+                            let r = if Self::is_anon_fn_def(e) {
+                                self.eval_expr_named(e, &fs, fname)
+                            } else {
+                                self.eval_expr(e, &fs)
+                            };
+                            self.eval_args_ban -= 1;
+                            r?
+                        }
+                        None => Value::Und,
+                    };
+                    if *is_priv {
+                        self.define_field_prop(to, key.clone(), v, true)?;
+                    } else {
+                        self.define_field_prop(to, key.clone(), v, false)?;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -7899,20 +8085,22 @@ impl Interp {
             let Value::Obj(ctor_obj) = &ctor else {
                 return Err(self.syntax_err("super() call outside constructor"));
             };
-            // a derived ctor's `this` stays uninitialized until exactly
-            // one super() call — a second call is a ReferenceError
+            let parent = ctor_obj.borrow().proto.clone();
+            let Some(parent) = parent else {
+                return Err(self.type_err("super() called on non-derived class"));
+            };
+            // spec order: args evaluate and the super constructor RUNS
+            // before BindThisValue — a second super() calls the base
+            // ctor again, then the already-bound `this` is a
+            // ReferenceError
+            let argv = self.eval_args(args, env)?;
+            let nt = fscope.new_target.borrow().clone();
+            let this = self.construct(&Value::Obj(parent), argv, Some(nt.clone()))?;
             if !fscope.this_uninit.get() {
                 return Err(self.ref_err(
                     "Super constructor may only be called once",
                 ));
             }
-            let parent = ctor_obj.borrow().proto.clone();
-            let Some(parent) = parent else {
-                return Err(self.type_err("super() called on non-derived class"));
-            };
-            let argv = self.eval_args(args, env)?;
-            let nt = fscope.new_target.borrow().clone();
-            let this = self.construct(&Value::Obj(parent), argv, Some(nt.clone()))?;
             *fscope.thisv.borrow_mut() = this.clone();
             fscope.this_uninit.set(false);
             // derived class fields init right after super() binds `this`
@@ -8678,6 +8866,14 @@ impl Interp {
                 Ok(s) => s,
                 Err(e) => return Err(self.syntax_err(e.msg)),
             };
+            // direct eval inside a class field initializer may not
+            // contain `arguments` — early error, checked before running
+            // (an `arguments` reference anywhere in the source aborts)
+            if self.eval_args_ban > 0 && parser::stmts_have_arguments(&stmts) {
+                return Err(self.syntax_err(
+                    "`arguments` is not allowed in eval inside a class field initializer",
+                ));
+            }
             let strict_eval = caller_strict || parser::stmts_strict(&stmts);
             // eval code runs in a fresh declarative env over the caller's;
             // strict eval also gets a fresh variable env (var bindings must
@@ -9150,7 +9346,17 @@ fn expr_uses_arguments(e: &Expr) -> bool {
             expr_uses_arguments(c) || expr_uses_arguments(t) || expr_uses_arguments(f)
         }
         Expr::Call { callee, args } | Expr::New { callee, args } => {
-            expr_uses_arguments(callee)
+            // a direct `eval(...)` may read `arguments` — materialize the
+            // binding so the eval'd source can see it
+            let eval_call = matches!(
+                &**callee,
+                Expr::Ident(n) if n == "eval"
+            ) || matches!(
+                &**callee,
+                Expr::Paren(inner) if matches!(&**inner, Expr::Ident(n) if n == "eval")
+            );
+            eval_call
+                || expr_uses_arguments(callee)
                 || args.iter().any(|a| match a {
                     Arg::Expr(e) | Arg::Spread(e) => expr_uses_arguments(e),
                 })

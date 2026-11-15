@@ -730,6 +730,11 @@ impl Parser {
                     // for contextual names; `{break}` is a SyntaxError
                     let key_was_reserved = matches!(&self.peek().tok, Tok::Kw(k) if !is_contextual_ident_kw(k));
                     let key = self.prop_key(true)?;
+                    // PrivateName is not a valid BindingPattern key —
+                    // `{ #x: y } = o` is an early SyntaxError
+                    if matches!(&key, PropKey::Ident(s) if s.starts_with('#')) {
+                        return Err(self.err("private name is not allowed in destructuring"));
+                    }
                     // `key` or `key: pattern` or `key = default` or `key: pat = d`
                     let (val, default) = if self.eat_punct(":") {
                         let p = self.binding_pattern()?;
@@ -1718,6 +1723,7 @@ impl Parser {
                         | Tok::Punct(";")
                         | Tok::Punct("}")
                         | Tok::Punct(":")
+                        | Tok::Punct("*")
                 )
             {
                 if is_async {
@@ -1728,6 +1734,21 @@ impl Parser {
                 } else {
                     MemberKind::Setter
                 };
+                self.next();
+            }
+            // auto-accessor: `accessor x = v` — a field-like element
+            // (parsed as a field; the keyword requires a same-line name)
+            let is_accessor_field = matches!(&self.peek().tok, Tok::Ident(s) if s == "accessor")
+                && !self.peek2().newline_before
+                && !matches!(
+                    self.peek2().tok,
+                    Tok::Punct("(")
+                        | Tok::Punct("=")
+                        | Tok::Punct(";")
+                        | Tok::Punct("}")
+                        | Tok::Punct(":")
+                );
+            if is_accessor_field {
                 self.next();
             }
             let member_gen = self.eat_punct("*"); // generator marker
@@ -1750,6 +1771,10 @@ impl Parser {
             };
             if is_static && keyname == Some("prototype") {
                 return Err(self.err("static member may not be named `prototype`"));
+            }
+            // `#constructor` is never a valid private element name
+            if keyname == Some("#constructor") {
+                return Err(self.err("private name may not be `#constructor`"));
             }
             // `#name` member — declares a private element. Duplicates
             // error, except one getter may pair with one setter
@@ -1776,8 +1801,14 @@ impl Parser {
                     }
                 }
             }
-            // field declaration `x;` / `x = init;`
-            if self.at_punct("=") || self.at_punct(";") || self.at_punct("}") {
+            // field declaration `x;` / `x = init;` — ASI also completes a
+            // field (`#y\nx(){}` ends the field at the line break)
+            if self.at_punct("=")
+                || self.at_punct(";")
+                || self.at_punct("}")
+                || self.peek().newline_before
+                || self.at_eof()
+            {
                 if is_async || member_gen {
                     return Err(self.err("field name expected after modifier"));
                 }
@@ -1787,8 +1818,11 @@ impl Parser {
                 if keyname == Some("constructor") {
                     return Err(self.err("field may not be named `constructor`"));
                 }
-                self.eat_punct("=");
-                let init = if !self.at_punct(";") && !self.at_punct("}") {
+                // an initializer needs `=` on the same line as the name
+                // (newline terminates the field — `x\n= 1` is not a
+                // field with initializer)
+                let had_eq = !self.peek().newline_before && self.eat_punct("=");
+                let init = if !self.at_punct(";") && !self.at_punct("}") && had_eq {
                     // the initializer runs like a method body: this +
                     // super.prop / new.target available; super() /
                     // arguments / await / enclosing `yield` are not
@@ -1833,6 +1867,15 @@ impl Parser {
                 } else {
                     None
                 };
+                // a field ends at `;`, `}`, EOF, or a line break — anything
+                // else on the same line is a syntax error (`x = 1 y(){}`)
+                if !self.at_punct(";")
+                    && !self.at_punct("}")
+                    && !self.at_eof()
+                    && !self.peek().newline_before
+                {
+                    return Err(self.err("expected `;` after class field"));
+                }
                 self.eat_punct(";");
                 members.push(ClassMember {
                     key,
@@ -4068,7 +4111,9 @@ fn class_has_arguments(c: &ClassDef) -> bool {
     })
 }
 
-fn stmts_have_arguments(stmts: &[Stmt]) -> bool {
+/// true if any statement references `arguments` (direct-eval ban in
+/// class field initializers)
+pub fn stmts_have_arguments(stmts: &[Stmt]) -> bool {
     stmts.iter().any(stmt_has_arguments)
 }
 

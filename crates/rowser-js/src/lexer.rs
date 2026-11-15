@@ -472,7 +472,17 @@ impl Lexer {
                             .ok_or_else(|| self.err("bad unicode escape in identifier"))?
                     };
                     match char::from_u32(cp) {
-                        Some(ch) if is_ident_part(ch) => s.push(ch),
+                        // position 0 needs ID_Start (ZWJ/ZWNJ are
+                        // Continue-only — `\u200D_x` is a syntax error)
+                        Some(ch)
+                            if if s.is_empty() {
+                                is_ident_start(ch)
+                            } else {
+                                is_ident_part(ch)
+                            } =>
+                        {
+                            s.push(ch)
+                        }
                         _ => return Err(self.err("bad unicode escape in identifier")),
                     }
                 }

@@ -10057,9 +10057,13 @@ fn g_eval(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     };
     let src = src.clone();
     let g = i.global.clone();
-    // indirect eval: always enters non-strict regardless of caller
+    // indirect eval: always enters non-strict regardless of caller; the
+    // class-field-initializer `arguments` ban does NOT apply to indirect
+    // eval (only direct eval inherits it)
     let saved = std::mem::replace(&mut i.cur_strict, false);
+    let saved_ban = std::mem::replace(&mut i.eval_args_ban, 0);
     let r = i.eval_source(&src, g);
+    i.eval_args_ban = saved_ban;
     i.cur_strict = saved;
     r
 }
