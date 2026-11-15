@@ -15,6 +15,42 @@ pub fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
     Ok(stmts)
 }
 
+/// Parse eval source: `strict` = strictCaller (a "use strict" directive in
+/// the source ORs on top), `in_fn`/`in_method` seed new.target/super
+/// availability from the calling context.
+pub fn parse_eval(
+    src: &str,
+    strict: bool,
+    in_fn: bool,
+    in_method: bool,
+) -> Result<Vec<Stmt>, Error> {
+    let toks = lex(src)?;
+    let mut p = Parser::new(toks);
+    p.strict = strict;
+    if in_fn {
+        p.fn_depth = 1;
+        p.nonarrow_fn_depth = 1;
+    }
+    if in_method {
+        p.method_depth = 1;
+    }
+    let stmts = p.program()?;
+    validate_strict(&stmts, strict)?;
+    Ok(stmts)
+}
+
+/// Does a statement list begin with a "use strict" directive prologue?
+pub fn stmts_strict(stmts: &[Stmt]) -> bool {
+    for s in stmts {
+        match s {
+            Stmt::Expr(Expr::Str(t)) if t == "use strict" => return true,
+            Stmt::Expr(Expr::Str(_)) => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Parse a single expression from source (used for template interpolations).
 fn parse_expr_src(src: &str) -> Result<Expr, Error> {
     let toks = lex(src)?;
@@ -37,6 +73,9 @@ struct Parser {
     strict: bool,
     /// inside a function body — `return` validity
     fn_depth: usize,
+    /// non-arrow function nesting — `new.target`, `return`, and
+    /// parameter/super checks use this (arrows inherit, so they don't bump)
+    nonarrow_fn_depth: usize,
     /// inside a generator body — `yield` is the yield-expression
     gen_depth: usize,
     /// `yield` is a reserved identifier here ([Yield] static context):
@@ -61,6 +100,7 @@ impl Parser {
             no_in: false,
             strict: false,
             fn_depth: 0,
+            nonarrow_fn_depth: 0,
             gen_depth: 0,
             yield_decl: 0,
             ctor_depth: 0,
@@ -248,6 +288,9 @@ impl Parser {
             self.method_depth,
         );
         self.fn_depth += 1;
+        if !arrow {
+            self.nonarrow_fn_depth += 1;
+        }
         // arrows are transparent to `yield` — a `yield` inside an arrow
         // inside a generator belongs to that generator
         // strictness of this body = inherited strict or own directive —
@@ -278,6 +321,9 @@ impl Parser {
             self.ctor_depth,
             self.method_depth,
         ) = saved;
+        if !arrow {
+            self.nonarrow_fn_depth -= 1;
+        }
         Ok(stmts)
     }
 
@@ -366,6 +412,17 @@ impl Parser {
             Tok::Kw(Kw::For) => self.for_stmt(),
             Tok::Kw(Kw::Switch) => self.switch_stmt(),
             Tok::Kw(Kw::Try) => self.try_stmt(),
+            Tok::Kw(Kw::With) => {
+                if self.strict {
+                    return Err(self.err("`with` is not allowed in strict mode"));
+                }
+                self.next();
+                self.expect_punct("(")?;
+                let obj = self.expression()?;
+                self.expect_punct(")")?;
+                let body = Box::new(self.statement()?);
+                Ok(Stmt::With { obj, body })
+            }
             Tok::Kw(Kw::Throw) => {
                 self.next();
                 if self.peek().newline_before {
@@ -376,7 +433,7 @@ impl Parser {
                 Ok(Stmt::Throw(e))
             }
             Tok::Kw(Kw::Return) => {
-                if self.fn_depth == 0 {
+                if self.nonarrow_fn_depth == 0 {
                     return Err(self.err("`return` outside function"));
                 }
                 self.next();
@@ -1067,6 +1124,7 @@ impl Parser {
             arrow_expr: None,
             is_async: false,
             is_gen: gen,
+                    strict: self.strict,
         })
     }
 
@@ -1299,6 +1357,7 @@ impl Parser {
                     arrow_expr: None,
                     is_async,
                     is_gen: member_gen,
+                    strict: self.strict,
                 }),
                 is_static,
             });
@@ -1482,6 +1541,7 @@ impl Parser {
                 arrow_expr: None,
                 is_async,
                 is_gen: false,
+                    strict: self.strict,
             })))
         } else {
             self.check_params(&params, true)?;
@@ -1497,6 +1557,7 @@ impl Parser {
                 params,
                 body: Vec::new(),
                 is_gen: false,
+                    strict: self.strict,
                 is_arrow: true,
                 arrow_expr: Some(e),
                 is_async,
@@ -1653,7 +1714,7 @@ impl Parser {
                 if name != "target" {
                     return Err(self.err(format!("unsupported meta property new.{name}")));
                 }
-                if self.fn_depth == 0 {
+                if self.nonarrow_fn_depth == 0 {
                     return Err(self.err("new.target outside function"));
                 }
                 Expr::Ident("$new_target".into())
@@ -1886,6 +1947,9 @@ impl Parser {
             }
             Tok::Regex { pattern, flags } => {
                 self.next();
+                if let Err(e) = crate::regexp::Regex::compile(&pattern, &flags) {
+                    return Err(self.err(format!("invalid regular expression: {e}")));
+                }
                 Ok(Expr::Regex { pattern, flags })
             }
             Tok::Kw(Kw::This) => {
@@ -1956,8 +2020,13 @@ impl Parser {
             {
                 // [Yield] early error: `yield` is never an
                 // IdentifierReference inside a [Yield] production
-                if k == Kw::Yield && self.yield_decl > 0 {
-                    return Err(self.err("`yield` is not a valid identifier here"));
+                if (k == Kw::Yield && (self.yield_decl > 0 || self.strict))
+                    || (self.strict && matches!(k, Kw::Let | Kw::Static))
+                {
+                    return Err(self.err(format!(
+                        "`{}` is not a valid identifier here",
+                        k.name()
+                    )));
                 }
                 self.next();
                 Ok(Expr::Ident(k.name().to_string()))
@@ -2041,6 +2110,7 @@ impl Parser {
                             arrow_expr: None,
                             is_async: false,
                             is_gen: false,
+                    strict: self.strict,
                         });
                         props.push(ObjProp {
                             key,
@@ -2078,6 +2148,7 @@ impl Parser {
                                 arrow_expr: None,
                                 is_async: true,
                                 is_gen: member_gen,
+                    strict: self.strict,
                             })),
                         });
                         self.eat_punct(",");
@@ -2101,6 +2172,7 @@ impl Parser {
                                 arrow_expr: None,
                                 is_async: false,
                                 is_gen: true,
+                    strict: self.strict,
                             })),
                         });
                         self.eat_punct(",");
@@ -2131,6 +2203,7 @@ impl Parser {
                             arrow_expr: None,
                             is_async: false,
                             is_gen: false,
+                    strict: self.strict,
                         }))
                     } else {
                         // shorthand / shorthand with default (destructuring pos)
@@ -2188,7 +2261,7 @@ impl Parser {
 
 /// Contextual keywords that are legal as plain identifiers (`as`, `from`,
 /// `let`, `of`, `get`, `set`, `static`, `async`, `await`, `yield`).
-fn is_contextual_ident_kw(k: &Kw) -> bool {
+pub(crate) fn is_contextual_ident_kw(k: &Kw) -> bool {
     matches!(
         k,
         Kw::Let
@@ -2379,6 +2452,24 @@ fn body_strict(stmts: &[Stmt], inherited: bool) -> bool {
 }
 
 fn validate(stmts: &[Stmt]) -> Result<(), Error> {
+    validate_strict(stmts, false)
+}
+
+fn validate_strict(stmts: &[Stmt], strict: bool) -> Result<(), Error> {
+    // Script goal: module declarations are illegal at top level
+    for s in stmts {
+        match s {
+            Stmt::Import(_) | Stmt::Export(_) => {
+                return Err(Error {
+                    msg: "import/export declarations are only allowed in modules"
+                        .into(),
+                    line: 0,
+                    col: 0,
+                })
+            }
+            _ => {}
+        }
+    }
     let mut cx = VCtx {
         lexes: vec![Default::default()],
         hard: vec![Default::default()],
@@ -2389,7 +2480,7 @@ fn validate(stmts: &[Stmt]) -> Result<(), Error> {
         in_fn: 0,
         in_method: 0,
         in_ctor: 0,
-        strict: false,
+        strict: strict || body_strict(stmts, false),
     };
     vstmts(stmts, &mut cx)
 }
@@ -2472,6 +2563,15 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
         Stmt::Expr(e) => vexpr(e, cx),
         Stmt::If { c: cond, t, e } => {
             vexpr(cond, cx)?;
+            // Annex B.3.4: `if (x) function f(){}` is sloppy-only
+            if cx.strict
+                && (matches!(&**t, Stmt::FnDecl(_))
+                    || e.as_ref().is_some_and(|e| matches!(&**e, Stmt::FnDecl(_))))
+            {
+                return Err(cx.err(
+                    "function declaration not allowed in statement position in strict mode",
+                ));
+            }
             vstmt(t, cx)?;
             if let Some(e) = e {
                 vstmt(e, cx)?;
@@ -2480,12 +2580,19 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
         }
         Stmt::While { c, body } => {
             vexpr(c, cx)?;
+            // a bare function declaration is never a valid iteration body
+            if matches!(&**body, Stmt::FnDecl(_)) {
+                return Err(cx.err("function declaration not allowed in statement position"));
+            }
             cx.in_iter += 1;
             let r = vstmt(body, cx);
             cx.in_iter -= 1;
             r
         }
         Stmt::DoWhile { body, c } => {
+            if matches!(&**body, Stmt::FnDecl(_)) {
+                return Err(cx.err("function declaration not allowed in statement position"));
+            }
             cx.in_iter += 1;
             let r = vstmt(body, cx);
             cx.in_iter -= 1;
@@ -2525,6 +2632,9 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             if let Some(u) = update {
                 vexpr(u, cx)?;
             }
+            if matches!(&**body, Stmt::FnDecl(_)) {
+                return Err(cx.err("function declaration not allowed in statement position"));
+            }
             cx.in_iter += 1;
             let r = vstmt(body, cx);
             cx.in_iter -= 1;
@@ -2553,6 +2663,9 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
                 }
             }
             vexpr(right, cx)?;
+            if matches!(&**body, Stmt::FnDecl(_)) {
+                return Err(cx.err("function declaration not allowed in statement position"));
+            }
             cx.in_iter += 1;
             let r = vstmt(body, cx);
             cx.in_iter -= 1;
@@ -2644,6 +2757,11 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             {
                 return Err(cx.err("labelled lexical declaration"));
             }
+            if cx.strict && matches!(&**inner, Stmt::FnDecl(_)) {
+                return Err(cx.err(
+                    "labelled function declaration not allowed in strict mode",
+                ));
+            }
             if cx.labels.iter().any(|(n, _)| n == name) {
                 return Err(cx.err(format!("duplicate label `{name}`")));
             }
@@ -2660,14 +2778,17 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             cx.labels.pop();
             r
         }
-        Stmt::Empty | Stmt::Import(_) => Ok(()),
-        Stmt::Export(rec) => {
-            match rec {
-                ExportRec::Decl(d) => vstmt(d, cx)?,
-                ExportRec::Default(e) => vexpr(e, cx)?,
-                _ => {}
+        Stmt::With { body, .. } => {
+            if cx.strict {
+                return Err(cx.err("`with` is not allowed in strict mode"));
             }
-            Ok(())
+            vstmt(body, cx)
+        }
+        Stmt::Empty => Ok(()),
+        // nested module declarations are always illegal (module top-level
+        // only — and `parse` is the Script goal anyway)
+        Stmt::Import(_) | Stmt::Export(_) => {
+            Err(cx.err("import/export declarations are only allowed in modules"))
         }
     }
 }

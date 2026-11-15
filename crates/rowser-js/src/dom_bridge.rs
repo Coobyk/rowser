@@ -3493,7 +3493,8 @@ fn acc(i: &Interp, o: &ObjRef, name: &str, get: Option<NativeFn>, set: Option<Na
 
 fn gdef(i: &mut Interp, name: &str, v: Value) {
     let g = i.global.clone();
-    i.declare(&g, name, v, true);
+    i.declare(&g, name, v.clone(), true);
+    i.declare_global_prop(name, v);
 }
 
 fn dom_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef) -> Value {

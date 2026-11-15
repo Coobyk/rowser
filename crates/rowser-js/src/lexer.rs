@@ -269,6 +269,11 @@ impl Lexer {
 
     fn run(&mut self) -> Result<Vec<Token>, Error> {
         let mut out = Vec::new();
+        // `{`/`}` context stack: entry = the `{` is an object literal (in
+        // expression position). A `}` closing a BLOCK re-enables regex
+        // literals for the following `/` — `{ if (x) { } /re/g }`
+        let mut brace_expr: Vec<bool> = Vec::new();
+        let mut rbrace_block = false;
         loop {
             self.skip_trivia()?;
             let (line, col, newline_before) = (self.line, self.col, self.newline);
@@ -295,6 +300,10 @@ impl Lexer {
             } else if is_ident_start(c) || c == '\\' {
                 let name = self.ident()?;
                 match keyword(&name) {
+                    // always-reserved words can't appear escaped
+                    Some(kw) if self.tok_escaped && !crate::parser::is_contextual_ident_kw(&kw) => {
+                        return Err(self.err("escaped reserved word"));
+                    }
                     Some(kw) => Tok::Kw(kw),
                     None => Tok::Ident(name),
                 }
@@ -303,7 +312,7 @@ impl Lexer {
                 self.bump();
                 let name = self.ident()?;
                 Tok::Ident(format!("#{name}"))
-            } else if c == '/' && slash_is_regex(out.last()) {
+            } else if c == '/' && (rbrace_block || slash_is_regex(out.last())) {
                 // regex-literal context; if the scan fails (e.g. it was
                 // actually division), fall back to punct tokenization
                 match self.try_regex() {
@@ -313,6 +322,16 @@ impl Lexer {
             } else {
                 self.punct()?
             };
+            match &tok {
+                Tok::Punct("{") => {
+                    brace_expr.push(brace_is_object(out.last()));
+                    rbrace_block = false;
+                }
+                Tok::Punct("}") => {
+                    rbrace_block = !brace_expr.pop().unwrap_or(true);
+                }
+                _ => rbrace_block = false,
+            }
             let (octal, escaped) = (self.tok_octal, self.tok_escaped);
             self.tok_octal = false;
             self.tok_escaped = false;
@@ -330,8 +349,13 @@ impl Lexer {
     fn skip_trivia(&mut self) -> Result<(), Error> {
         loop {
             match self.peek() {
-                // JS whitespace excludes vertical tab (\x0B); BOM is ws
-                Some(c) if (c.is_whitespace() || c == '\u{feff}') && c != '\u{b}' => {
+                // JS WhiteSpace = TAB/VT/FF/SP/NBSP/FEFF + Zs; NEL and
+                // FS/GS/RS/US are not whitespace
+                Some(c)
+                    if (c.is_whitespace()
+                        && !matches!(c, '\u{85}' | '\u{1c}'..='\u{1f}'))
+                        || c == '\u{feff}' =>
+                {
                     self.bump();
                 }
                 // hashbang `#!` only valid as the first two chars of a script
@@ -448,63 +472,67 @@ impl Lexer {
         Some(v)
     }
 
+    /// scan digits of one class; `_` is legal only between two digits.
+    fn scan_num_digits(
+        &mut self,
+        pred: impl Fn(char) -> bool,
+    ) -> Result<String, Error> {
+        let mut out = String::new();
+        let mut last_digit = false;
+        loop {
+            match self.peek() {
+                Some(c) if pred(c) => {
+                    out.push(c);
+                    self.bump();
+                    last_digit = true;
+                }
+                Some('_') => {
+                    if !last_digit {
+                        return Err(self.err(
+                            "numeric separator must be between digits",
+                        ));
+                    }
+                    self.bump();
+                    match self.peek() {
+                        Some(c2) if pred(c2) => {}
+                        _ => {
+                            return Err(self.err(
+                                "numeric separator must be between digits",
+                            ))
+                        }
+                    }
+                    last_digit = false;
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
     fn number(&mut self) -> Result<Tok, Error> {
         let mut s = String::new();
         if self.peek() == Some('0') {
-            match self.peek2() {
-                Some('x') | Some('X') => {
-                    self.bump();
-                    self.bump();
-                    let mut v = String::new();
-                    while let Some(c) = self.peek() {
-                        if c.is_ascii_hexdigit() || c == '_' {
-                            if c != '_' {
-                                v.push(c);
-                            }
-                            self.bump();
-                        } else {
-                            break;
-                        }
-                    }
-                    return u64::from_str_radix(&v, 16)
-                        .map(|n| Tok::Num(n as f64))
-                        .map_err(|_| self.err("bad hex literal"));
+            let radix = match self.peek2() {
+                Some('x') | Some('X') => Some(16u32),
+                Some('o') | Some('O') => Some(8u32),
+                Some('b') | Some('B') => Some(2u32),
+                _ => None,
+            };
+            if let Some(r) = radix {
+                self.bump();
+                self.bump();
+                let v = self.scan_num_digits(|c| c.is_digit(r))?;
+                if v.is_empty() {
+                    return Err(self.err("missing digits in numeric literal"));
                 }
-                Some('o') | Some('O') => {
+                let n = v.chars().fold(0f64, |a, c| {
+                    a * r as f64 + c.to_digit(r).unwrap() as f64
+                });
+                if self.peek() == Some('n') {
                     self.bump();
-                    self.bump();
-                    let mut v = String::new();
-                    while self
-                        .peek()
-                        .is_some_and(|c| ('0'..='7').contains(&c) || c == '_')
-                    {
-                        let c = self.bump().unwrap();
-                        if c != '_' {
-                            v.push(c);
-                        }
-                    }
-                    return u64::from_str_radix(&v, 8)
-                        .map(|n| Tok::Num(n as f64))
-                        .map_err(|_| self.err("bad octal literal"));
+                    return self.number_tail_ok(Tok::BigInt(n));
                 }
-                Some('b') | Some('B') => {
-                    self.bump();
-                    self.bump();
-                    let mut v = String::new();
-                    while self
-                        .peek()
-                        .is_some_and(|c| c == '0' || c == '1' || c == '_')
-                    {
-                        let c = self.bump().unwrap();
-                        if c != '_' {
-                            v.push(c);
-                        }
-                    }
-                    return u64::from_str_radix(&v, 2)
-                        .map(|n| Tok::Num(n as f64))
-                        .map_err(|_| self.err("bad binary literal"));
-                }
-                _ => {}
+                return self.number_tail_ok(Tok::Num(n));
             }
         }
         // legacy octal: `0` followed by octal digits (may include 8/9 which
@@ -554,6 +582,11 @@ impl Lexer {
                                 s.push(self.bump().unwrap());
                             }
                         }
+                        '_' => {
+                            return Err(self.err(
+                                "numeric separator must be between digits",
+                            ))
+                        }
                         _ => break,
                     }
                 }
@@ -573,45 +606,50 @@ impl Lexer {
                 None => Err(self.err("bad number literal")),
             };
         }
-        // leading-zero decimal like `0` alone; general path
+        // leading-zero decimal like `0` alone; `0_…` is invalid —
+        // separators can't follow a leading zero
+        if self.peek() == Some('0') && self.peek2() == Some('_') {
+            return Err(self.err(
+                "numeric separator must be between digits",
+            ));
+        }
+        let mut s = self.scan_num_digits(|c| c.is_ascii_digit())?;
         let mut seen_dot = false;
         let mut seen_exp = false;
-        while let Some(c) = self.peek() {
-            match c {
-                '0'..='9' => {
-                    s.push(c);
-                    self.bump();
-                }
-                '_' => {
-                    self.bump();
-                }
-                '.' if !seen_dot && !seen_exp => {
-                    seen_dot = true;
-                    s.push('.');
-                    self.bump();
-                }
-                'e' | 'E' if !seen_exp => {
-                    seen_exp = true;
-                    s.push('e');
-                    self.bump();
-                    if matches!(self.peek(), Some('+') | Some('-')) {
-                        s.push(self.bump().unwrap());
-                    }
-                }
-                'n' => {
-                    // bigint literal — decimal integers only
-                    self.bump();
-                    if seen_dot || seen_exp {
-                        return Err(self.err("bigint literal must be an integer"));
-                    }
-                    return s
-                        .parse::<f64>()
-                        .map(Tok::BigInt)
-                        .map_err(|_| self.err("bad bigint literal"));
-                }
-                _ => break,
-            }
+        if self.peek() == Some('.')
+            && !matches!(self.peek2(), Some(c) if c.is_alphabetic() || c == '_' || c == '$')
+        {
+            seen_dot = true;
+            s.push('.');
+            self.bump();
+            s.push_str(&self.scan_num_digits(|c| c.is_ascii_digit())?);
         }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            seen_exp = true;
+            s.push('e');
+            self.bump();
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                s.push(self.bump().unwrap());
+            }
+            let exp = self.scan_num_digits(|c| c.is_ascii_digit())?;
+            if exp.is_empty() {
+                return Err(self.err("missing exponent digits"));
+            }
+            s.push_str(&exp);
+        }
+        if self.peek() == Some('n') {
+            // bigint literal — decimal integers only
+            self.bump();
+            if seen_dot || seen_exp {
+                return Err(self.err("bigint literal must be an integer"));
+            }
+            return s
+                .parse::<f64>()
+                .map(Tok::BigInt)
+                .map_err(|_| self.err("bad bigint literal"))
+                .and_then(|t| self.number_tail_ok(t));
+        }
+        let _ = seen_exp;
         self.number_tail(s)
     }
 
@@ -1056,6 +1094,45 @@ impl Lexer {
             "unexpected character `{}`",
             self.peek().unwrap_or('?')
         )))
+    }
+}
+
+/// Is a `{` after `prev` an object literal? True when the `{` sits where
+/// an expression could start — after `(`/`[`/`{`/`,`/`:`/`?`/`=>`, every
+/// binary/unary operator, or an expression-start keyword (`return`,
+/// `typeof`, `case`, …). Everywhere else — statement start, `)`, `]`,
+/// `}`, `;`, identifiers, literals — `{` opens a block.
+fn brace_is_object(prev: Option<&Token>) -> bool {
+    use Kw::*;
+    match prev.map(|t| &t.tok) {
+        None => false,
+        Some(Tok::Num(_))
+        | Some(Tok::BigInt(_))
+        | Some(Tok::Str(_))
+        | Some(Tok::Template(_))
+        | Some(Tok::Ident(_))
+        | Some(Tok::Regex { .. })
+        | Some(Tok::Eof) => false,
+        Some(Tok::Punct(p)) => !matches!(
+            *p,
+            ")" | "]" | "}" | ";" | "." | "++" | "--"
+        ),
+        Some(Tok::Kw(k)) => matches!(
+            k,
+            Return
+                | Throw
+                | Case
+                | Delete
+                | Void
+                | Typeof
+                | Instanceof
+                | In
+                | New
+                | Yield
+                | Await
+                | Of
+                | Extends
+        ),
     }
 }
 

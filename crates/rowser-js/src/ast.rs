@@ -130,6 +130,9 @@ pub struct FnDef {
     /// `function*` — body runs eagerly at call time, yields collected
     /// into a snapshot iterator (see `Interp::gen_stack`).
     pub is_gen: bool,
+    /// strict-mode body: inherited strictness or a "use strict" directive
+    /// prologue (class bodies are always strict)
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +310,8 @@ pub enum Stmt {
     },
     Throw(Expr),
     Labeled(String, Box<Stmt>),
+    /// `with (obj) body` — object environment record (sloppy only)
+    With { obj: Expr, body: Box<Stmt> },
     /// `import ...` — recorded, not resolved.
     Import(ImportRec),
     /// `export` — inner decl executes, exports recorded.

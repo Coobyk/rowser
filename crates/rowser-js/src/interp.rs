@@ -115,6 +115,7 @@ pub const SYM_SEARCH: u64 = 8;
 pub const SYM_MATCHALL: u64 = 9;
 pub const SYM_IS_CONCAT_SPREADABLE: u64 = 10;
 pub const SYM_SPECIES: u64 = 11;
+pub const SYM_UNSCOPABLES: u64 = 12;
 const REST_PAT_KEY: &str = "\u{0}rest";
 
 // ---------------------------------------------------------------------------
@@ -332,6 +333,12 @@ pub struct Obj {
     pub extensible: bool,
     /// deleted indices on array kinds (holes); `None` when dense
     pub holes: Option<std::collections::HashSet<usize>>,
+    /// ArrayBuffer [[ArrayBufferData]] taken by TransferArrayBuffer
+    pub detached: bool,
+    /// Immutable ArrayBuffer (transferToImmutable / sliceToImmutable)
+    pub immutable: bool,
+    /// Resizable-ArrayBuffer max byte length (`{maxByteLength}` option)
+    pub rab_max: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -391,15 +398,22 @@ pub enum ObjKind {
     Set(Vec<Value>),
     /// compiled regular expression
     Regex(Rc<crate::regexp::Regex>),
+    /// IsHTMLDDA-style object — emulates `undefined` (typeof, ToBoolean,
+    /// `==` null) while remaining an object and callable.
+    Und,
     /// ArrayBuffer — shared byte store (Rc so views alias it)
     Bytes(Rc<RefCell<Vec<u8>>>),
     /// TypedArray view: buffer object (kind `Bytes`), byte offset,
-    /// element count, element kind
+    /// element count, element kind. `track` marks a length-tracking
+    /// view on a resizable buffer (created without an explicit length):
+    /// its effective length is recomputed from the buffer's current
+    /// byte size on every access.
     Typed {
         buf: ObjRef,
         off: usize,
         len: usize,
         kind: TAK,
+        track: bool,
     },
     /// DataView: buffer object, byte offset, byte length
     View {
@@ -600,6 +614,38 @@ pub fn buffer_bytes(o: &ObjRef) -> Option<Rc<RefCell<Vec<u8>>>> {
     }
 }
 
+/// Live element capacity of a TypedArray view (`ObjKind::Typed`
+/// internals). Length-tracking views on resizable buffers recompute
+/// their length from the buffer's current byte size; fixed-length views
+/// go out-of-bounds when the buffer shrinks below their byte range.
+/// `None` = detached, out-of-bounds, or malformed buffer — the state
+/// spec `ValidateTypedArray`/`IsValidIntegerIndex` tests reject;
+/// `Some(n)` = current element capacity (may be 0 for a tracking view
+/// that still covers the buffer's end).
+pub(crate) fn typed_state(
+    buf: &ObjRef,
+    off: usize,
+    len: usize,
+    kind: TAK,
+    track: bool,
+) -> Option<usize> {
+    if buf.borrow().detached {
+        return None;
+    }
+    let blen = buffer_bytes(buf)?.borrow().len();
+    if track {
+        if off > blen {
+            None
+        } else {
+            Some((blen - off) / kind.size())
+        }
+    } else if off + len.saturating_mul(kind.size()) > blen {
+        None
+    } else {
+        Some(len)
+    }
+}
+
 /// Virtual own-props for array/binary kinds: `length`/`byteLength`/
 /// `byteOffset`/`buffer` and integer-indexed reads. Returns `Some` when
 /// `key` resolves on the object kind itself (before stored props).
@@ -633,16 +679,15 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
             off,
             len,
             kind,
+            track,
         } => {
-            match key {
-                "length" => return Some(Value::Num(*len as f64)),
-                "byteLength" => return Some(Value::Num((*len * kind.size()) as f64)),
-                "byteOffset" => return Some(Value::Num(*off as f64)),
-                "buffer" => return Some(Value::Obj(buf.clone())),
-                _ => {}
-            }
             if let Some(idx) = arr_index(key) {
-                if idx >= *len {
+                // OOB (resizable shrink) and detached views shadow any
+                // proto-chain value with `undefined` — integer-indexed
+                // exotic behaviour.
+                let eff =
+                    typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
+                if idx >= eff {
                     return Some(Value::Und);
                 }
                 if let Some(bytes) = buffer_bytes(buf) {
@@ -653,21 +698,7 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
             }
             None
         }
-        ObjKind::Bytes(bytes) => {
-            if key == "byteLength" {
-                return Some(Value::Num(bytes.borrow().len() as f64));
-            }
-            None
-        }
-        ObjKind::View { buf, off, len } => {
-            match key {
-                "byteLength" => return Some(Value::Num(*len as f64)),
-                "byteOffset" => return Some(Value::Num(*off as f64)),
-                "buffer" => return Some(Value::Obj(buf.clone())),
-                _ => {}
-            }
-            None
-        }
+        ObjKind::Bytes(_) | ObjKind::View { .. } => None,
         _ => None,
     }
 }
@@ -694,9 +725,15 @@ impl Obj {
             kind,
             extensible: true,
             holes: None,
+            detached: false,
+            immutable: false,
+            rab_max: None,
         }
     }
     pub fn is_callable(&self) -> bool {
+        if matches!(self.kind, ObjKind::Und) {
+            return true;
+        }
         match &self.kind {
             ObjKind::Func(_) | ObjKind::Bound { .. } => true,
             // proxies forward callability to their target
@@ -718,6 +755,11 @@ pub struct Binding {
     /// in the temporal dead zone — reading throws ReferenceError
     /// (parameter bindings instantiate uninit before defaults run)
     pub uninit: bool,
+    /// `delete x` succeeds — eval-declared var/fn bindings only
+    pub deletable: bool,
+    /// let/const/class/catch/block-fn binding — `eval("var x")` colliding
+    /// with a lexical binding in scope is a SyntaxError
+    pub lexical: bool,
 }
 
 pub struct Scope {
@@ -739,6 +781,9 @@ pub struct Scope {
     /// being evaluated — `eval("var arguments")` / `var eval` inside it is
     /// a SyntaxError per EvalDeclarationInstantiation
     pub param_env: std::cell::Cell<bool>,
+    /// `with (obj)` object environment record — bindings resolve as
+    /// properties of `obj` (filtered through @@unscopables)
+    pub obj_env: Option<ObjRef>,
 }
 
 pub type EnvRef = Rc<Scope>;
@@ -755,6 +800,23 @@ impl Scope {
             home: RefCell::new(None),
             ctor_fn: RefCell::new(Value::Und),
             param_env: std::cell::Cell::new(false),
+            obj_env: None,
+        })
+    }
+
+    /// `with (obj)` scope — bindings resolve through `obj`'s properties
+    pub fn with_obj(parent: EnvRef, obj: ObjRef) -> EnvRef {
+        Rc::new(Scope {
+            vars: RefCell::new(FxMap::default()),
+            parent: Some(parent),
+            is_fn: false,
+            var_boundary: std::cell::Cell::new(false),
+            thisv: RefCell::new(Value::Und),
+            new_target: RefCell::new(Value::Und),
+            home: RefCell::new(None),
+            ctor_fn: RefCell::new(Value::Und),
+            param_env: std::cell::Cell::new(false),
+            obj_env: Some(obj),
         })
     }
 }
@@ -787,6 +849,10 @@ pub type ERes = Result<Value, Value>;
 struct Hoisted {
     fns: Vec<Rc<FnDef>>,
     vars: Vec<Rc<str>>,
+    /// Annex B block-level function names — hoisted `undefined` into the
+    /// var environment in sloppy code (block-scoped binding lives in the
+    /// block; see `exec_hoisted_block` + `Stmt::FnDecl` exec)
+    block_fns: Vec<Rc<str>>,
     uses_arguments: bool,
 }
 
@@ -860,6 +926,12 @@ pub struct Interp {
     pub interrupted: bool,
     /// wall-clock bound for the current embedder turn; `None` = unbounded
     pub deadline: Option<std::time::Instant>,
+    /// strict-mode of the currently executing code (function bodies set it
+    /// from `FnDef.strict`; script/eval set it from the directive prologue)
+    pub cur_strict: bool,
+    /// inside eval declaration instantiation — var/fn bindings created now
+    /// are `deletable` (and global props `configurable`)
+    pub eval_decl: bool,
     /// stmt being executed when the interrupt tripped (triage aid)
     pub interrupt_site: Option<String>,
     /// opt-in call tracing (set `ROWSER_CALL_TRACE=1`): when on, each call
@@ -951,6 +1023,8 @@ impl Interp {
             output: Vec::new(),
             modules: Vec::new(),
             pending_label: None,
+            cur_strict: false,
+            eval_decl: false,
             depth: 0,
             sym_counter: 16,
             rng: {
@@ -1113,10 +1187,56 @@ impl Interp {
     /// hit/miss results clone values.
     /// lookup + TDZ state (parameter bindings are uninit until their
     /// initializers run — reading them is a ReferenceError).
+    /// raw own+proto-chain property read — no getters/proxies, used by
+    /// `&self` paths (with-scope checks, fast lookups)
+    fn obj_get_raw_chain(&self, o: &ObjRef, key: &PropKey) -> Option<Value> {
+        let mut c = Some(o.clone());
+        while let Some(cur) = c {
+            if let PropKey::S(k) = key {
+                if let Some(v) = view_own_prop_str(&cur, k.as_ref()) {
+                    return Some(v);
+                }
+            }
+            if let Some(p) = cur.borrow().props.get(key) {
+                return Some(p.val.clone());
+            }
+            let next = cur.borrow().proto.clone();
+            c = next;
+        }
+        None
+    }
+
+    /// WithEnvironmentRecord.HasBinding — `name` binds on the with-object
+    /// iff `HasProperty(obj, name)` and `obj[@@unscopables][name]` isn't
+    /// truthy (raw lookups — spec traps/getters run in the `&mut` paths)
+    fn with_scope_has(&self, o: &ObjRef, name: &str) -> bool {
+        let key = PropKey::from_str(name);
+        if self.obj_get_raw_chain(o, &key).is_none() {
+            return false;
+        }
+        if let Some(Value::Obj(u)) = self.obj_get_raw_chain(o, &PropKey::Sym(SYM_UNSCOPABLES)) {
+            if let Some(v) = self.obj_get_raw_chain(&u, &key) {
+                if self.to_bool(&v) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// WithEnvironmentRecord.GetBindingValue — raw get off the with-object
+    fn with_scope_get(&self, o: &ObjRef, name: &str) -> Option<Value> {
+        self.obj_get_raw_chain(o, &PropKey::from_str(name))
+    }
+
     pub fn env_lookup_st(&self, env: &EnvRef, name: &str) -> Option<(Value, bool)> {
         let mut cur: &EnvRef = env;
         loop {
-            if let Some(b) = cur.vars.borrow().get(name) {
+            if let Some(o) = &cur.obj_env {
+                if self.with_scope_has(o, name) {
+                    return self.with_scope_get(o, name).map(|v| (v, false));
+                }
+            } else if let Some(b) = cur.vars.borrow().get(name) {
                 return Some((b.val.clone(), b.uninit));
             }
             match &cur.parent {
@@ -1136,6 +1256,12 @@ impl Interp {
     pub fn env_assign(&mut self, env: &EnvRef, name: &str, v: Value) -> Result<(), Value> {
         let mut cur: &EnvRef = env;
         loop {
+            if let Some(o) = &cur.obj_env {
+                if self.with_scope_has(o, name) {
+                    let o = Value::Obj(o.clone());
+                    return self.set_prop_str(&o, name, v);
+                }
+            }
             {
                 let mut vars = cur.vars.borrow_mut();
                 if let Some(b) = vars.get_mut(name) {
@@ -1155,13 +1281,16 @@ impl Interp {
                 None => break,
             }
         }
+        if self.cur_strict {
+            return Err(self.ref_err(format!("{name} is not defined")));
+        }
         // sloppy: create global; mirror onto global object
         let k = self.intern(name);
         self.global.vars.borrow_mut().insert(
             k.clone(),
             Binding {
                 val: v.clone(),
-                mutable: true, uninit: false,
+                mutable: true, uninit: false, deletable: false, lexical: false,
             },
         );
         self.p
@@ -1183,6 +1312,9 @@ impl Interp {
     ) -> Option<Result<(f64, f64), Value>> {
         let mut cur: &EnvRef = env;
         loop {
+            if cur.obj_env.is_some() {
+                return None;
+            }
             {
                 let mut vars = cur.vars.borrow_mut();
                 if let Some(b) = vars.get_mut(name) {
@@ -1208,6 +1340,10 @@ impl Interp {
     }
 
     /// declare in the given scope (let/const/block fns)
+    /// `let`/`const`/`class` and other lexical binding creation — never
+    /// mirrors onto the global object (lex declarations don't create
+    /// global-object properties). Use `define_global`/`declare_var` for
+    /// bindings that should also be object properties.
     pub fn declare(&mut self, env: &EnvRef, name: &str, v: Value, mutable: bool) {
         let k = self.intern(name);
         env.vars.borrow_mut().insert(
@@ -1215,16 +1351,21 @@ impl Interp {
             Binding {
                 val: v.clone(),
                 mutable,
-                uninit: false,
+                uninit: false, deletable: false, lexical: true,
             },
         );
-        if Rc::ptr_eq(env, &self.global) {
-            self.p
-                .global
-                .borrow_mut()
-                .props
-                .insert(PropKey::S(k), Prop::data(v));
-        }
+    }
+
+    /// Global-object property install for a global-scope binding: used by
+    /// host code (`define_global`, DOM globals) where the name must exist
+    /// as both an env binding and a global-object property.
+    pub fn declare_global_prop(&mut self, name: &str, v: Value) {
+        let k = self.intern(name);
+        self.p
+            .global
+            .borrow_mut()
+            .props
+            .insert(PropKey::S(k), Prop::data(v));
     }
 
     /// `var` — walks to nearest function scope.
@@ -1244,27 +1385,41 @@ impl Interp {
             cur = next;
         }
         let exists = cur.vars.borrow().contains_key(name.as_ref());
+        let deletable = self.eval_decl;
         if !exists {
             cur.vars.borrow_mut().insert(
                 name.clone(),
                 Binding {
                     val: v.clone(),
-                    mutable: true, uninit: false,
+                    mutable: true, uninit: false, deletable, lexical: false,
                 },
             );
         } else if !matches!(v, Value::Und) {
-            cur.vars
-                .borrow_mut()
-                .get_mut(name.as_ref())
-                .unwrap()
-                .val = v.clone();
+            let mut vv = cur.vars.borrow_mut();
+            let b = vv.get_mut(name.as_ref()).unwrap();
+            b.val = v.clone();
+            b.deletable = deletable;
         }
         if Rc::ptr_eq(&cur, &self.global) {
-            self.p
-                .global
-                .borrow_mut()
+            // CreateGlobalVarBinding/CreateGlobalFunctionBinding checks:
+            // non-extensible → TypeError; existing non-configurable props
+            // may only be overwritten by a compatible var binding
+            let g = self.p.global.clone();
+            let existing = g.borrow().props.get(&PropKey::S(name.clone())).map(|p| {
+                (p.configurable, p.writable, p.get.is_some())
+            });
+            if !g.borrow().extensible && existing.is_none() {
+                // TypeError — but declare_var returns (), so record via a
+                // side channel?  (kept simple: skip and let the assignment
+                // surface)
+            }
+            // script var/fn globals are non-configurable; eval-declared ones
+            // are configurable per CreateGlobalVarBinding(D=true)
+            let mut p = Prop::data(v);
+            p.configurable = deletable;
+            g.borrow_mut()
                 .props
-                .insert(PropKey::S(name.clone()), Prop::data(v));
+                .insert(PropKey::S(name.clone()), p);
         }
     }
 
@@ -1759,17 +1914,33 @@ impl Interp {
                     off,
                     len,
                     kind,
+                    track,
                 } => {
                     if let PropKey::S(s) = &key {
                         if let Some(idx) = arr_index(s) {
-                            let (buf, off, len, kind) = (buf.clone(), *off, *len, *kind);
+                            let (buf, off, len, kind, track) =
+                                (buf.clone(), *off, *len, *kind, *track);
                             drop(b);
-                            if idx >= len {
-                                return Ok(()); // OOB write: silently ignored
-                            }
+                            // spec IntegerIndexedElementSet: ToNumber
+                            // runs before the bounds check — a valueOf
+                            // that resizes/detaches the buffer makes the
+                            // write silently vanish instead of throwing.
                             let n = self.to_num(&v)?;
-                            if let Some(bytes) = buffer_bytes(&buf) {
-                                kind.write(&mut bytes.borrow_mut(), off + idx * kind.size(), n);
+                            if typed_state(&buf, off, len, kind, track)
+                                .is_some_and(|eff| idx < eff)
+                            {
+                                if buf.borrow().immutable {
+                                    return Err(self.type_err(
+                                        "Cannot write to an immutable ArrayBuffer",
+                                    ));
+                                }
+                                if let Some(bytes) = buffer_bytes(&buf) {
+                                    kind.write(
+                                        &mut bytes.borrow_mut(),
+                                        off + idx * kind.size(),
+                                        n,
+                                    );
+                                }
                             }
                             return Ok(());
                         }
@@ -1947,16 +2118,30 @@ impl Interp {
                     off,
                     len,
                     kind,
+                    track,
                 } => {
                     if let Some(idx) = arr_index(key) {
-                        let (buf, off, len, kind) = (buf.clone(), *off, *len, *kind);
+                        let (buf, off, len, kind, track) =
+                            (buf.clone(), *off, *len, *kind, *track);
                         drop(b);
-                        if idx >= len {
-                            return Ok(()); // OOB write: silently ignored
-                        }
+                        // ToNumber before the bounds check (spec
+                        // IntegerIndexedElementSet).
                         let n = self.to_num(&v)?;
-                        if let Some(bytes) = buffer_bytes(&buf) {
-                            kind.write(&mut bytes.borrow_mut(), off + idx * kind.size(), n);
+                        if typed_state(&buf, off, len, kind, track)
+                            .is_some_and(|eff| idx < eff)
+                        {
+                            if buf.borrow().immutable {
+                                return Err(self.type_err(
+                                    "Cannot write to an immutable ArrayBuffer",
+                                ));
+                            }
+                            if let Some(bytes) = buffer_bytes(&buf) {
+                                kind.write(
+                                    &mut bytes.borrow_mut(),
+                                    off + idx * kind.size(),
+                                    n,
+                                );
+                            }
                         }
                         return Ok(());
                     }
@@ -2157,32 +2342,20 @@ impl Interp {
                             }
                         }
                     }
-                    ObjKind::Typed { len, .. } => {
+                    ObjKind::Typed {
+                        buf,
+                        off,
+                        len,
+                        kind,
+                        track,
+                    } => {
                         if let PropKey::S(s) = key {
-                            if matches!(
-                                s.as_ref(),
-                                "length" | "byteLength" | "byteOffset" | "buffer"
-                            ) {
-                                return Ok(true);
-                            }
                             if let Some(i) = arr_index(s) {
-                                if i < *len {
-                                    return Ok(true);
-                                }
-                            }
-                        }
-                    }
-                    ObjKind::Bytes(_) => {
-                        if let PropKey::S(s) = key {
-                            if s.as_ref() == "byteLength" {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    ObjKind::View { .. } => {
-                        if let PropKey::S(s) = key {
-                            if matches!(s.as_ref(), "byteLength" | "byteOffset" | "buffer") {
-                                return Ok(true);
+                                // spec [[HasProperty]]: a canonical
+                                // integer index answers solely with
+                                // IsValidIntegerIndex — never props/proto.
+                                return Ok(typed_state(buf, *off, *len, *kind, *track)
+                                    .is_some_and(|eff| i < eff));
                             }
                         }
                     }
@@ -2285,8 +2458,16 @@ impl Interp {
                             }
                         }
                     }
-                    ObjKind::Typed { len, .. } => {
-                        for i in 0..*len {
+                    ObjKind::Typed {
+                        buf,
+                        off,
+                        len,
+                        kind,
+                        track,
+                    } => {
+                        let eff =
+                            typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
+                        for i in 0..eff {
                             let k = i.to_string();
                             if seen.insert(k.clone()) {
                                 out.push(k);
@@ -2324,8 +2505,15 @@ impl Interp {
                     out.push(i.to_string());
                 }
             }
-            ObjKind::Typed { len, .. } => {
-                for i in 0..*len {
+            ObjKind::Typed {
+                buf,
+                off,
+                len,
+                kind,
+                track,
+            } => {
+                let eff = typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
+                for i in 0..eff {
                     out.push(i.to_string());
                 }
             }
@@ -2356,7 +2544,8 @@ impl Interp {
             Value::Bool(b) => *b,
             Value::Num(n) => *n != 0.0 && !n.is_nan(),
             Value::Str(s) => !s.is_empty(),
-            Value::Sym(..) | Value::Obj(_) => true,
+            Value::Sym(..) => true,
+            Value::Obj(o) => !matches!(o.borrow().kind, ObjKind::Und),
         }
     }
 
@@ -2364,18 +2553,33 @@ impl Interp {
         let Value::Obj(o) = v else {
             return Ok(v.clone());
         };
+        if matches!(o.borrow().kind, ObjKind::Und) {
+            return Ok(Value::Und);
+        }
+        self.to_primitive_hint(v, o.clone(), "default")
+    }
+
+    /// ToPrimitive with an explicit hint — "string" tries `toString`
+    /// before `valueOf`; "number"/"default" the reverse. The hint is
+    /// also forwarded to `@@toPrimitive`.
+    pub fn to_primitive_hint(&mut self, v: &Value, o: ObjRef, hint: &str) -> ERes {
         // Symbol.toPrimitive
         let stp = self.get_prop(v, &PropKey::Sym(SYM_TOPRIMITIVE))?;
         if self.is_callable(&stp) {
-            let hint = Value::Str(Rc::from("default"));
+            let hint = Value::Str(Rc::from(hint));
             let r = self.call(&stp, v.clone(), vec![hint])?;
             if !matches!(r, Value::Obj(_)) {
                 return Ok(r);
             }
             return Err(self.type_err("Cannot convert object to primitive value"));
         }
-        // valueOf then toString (default hint)
-        for name in ["valueOf", "toString"] {
+        // valueOf then toString — "string" hint flips the order
+        let order: [&str; 2] = if hint == "string" {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for name in order {
             let m = self.get_prop(v, &PropKey::from_str(name))?;
             if self.is_callable(&m) {
                 let r = self.call(&m, v.clone(), Vec::new())?;
@@ -2404,8 +2608,8 @@ impl Interp {
             Value::Sym(..) => {
                 return Err(self.type_err("Cannot convert a Symbol value to a number"))
             }
-            Value::Obj(_) => {
-                let p = self.to_primitive(v)?;
+            Value::Obj(o) => {
+                let p = self.to_primitive_hint(v, o.clone(), "number")?;
                 self.to_num(&p)?
             }
         })
@@ -2430,7 +2634,7 @@ impl Interp {
                     }
                     return Ok(parts.join(","));
                 }
-                let p = self.to_primitive(v)?;
+                let p = self.to_primitive_hint(v, o.clone(), "string")?;
                 self.to_str(&p)?
             }
         })
@@ -2467,6 +2671,11 @@ impl Interp {
         Ok(match (a, b) {
             (Und, Und) | (Null, Null) => true,
             (Und, Null) | (Null, Und) => true,
+            (Obj(x), Und) | (Und, Obj(x)) | (Obj(x), Null) | (Null, Obj(x))
+                if matches!(x.borrow().kind, ObjKind::Und) =>
+            {
+                true
+            }
             (Num(x), Num(y)) => x == y,
             (Str(x), Str(y)) => x == y,
             (Bool(x), Bool(y)) => x == y,
@@ -2522,7 +2731,10 @@ impl Interp {
             Value::Str(_) => "string",
             Value::Sym(..) => "symbol",
             Value::Obj(o) => {
-                if o.borrow().is_callable() {
+                let b = o.borrow();
+                if matches!(b.kind, ObjKind::Und) {
+                    "undefined"
+                } else if b.is_callable() {
                     "function"
                 } else {
                     "object"
@@ -2557,6 +2769,7 @@ impl Interp {
                         format!("[Function {name}]")
                     }
                     ObjKind::Bound { .. } => "[Function bound]".into(),
+                    ObjKind::Und => "undefined".into(),
                     ObjKind::Proxy { target, .. } => self.inspect(&target, depth),
             ObjKind::Gen(_) => "[object Generator]".to_string(),
                     ObjKind::Err => {
@@ -2656,7 +2869,48 @@ impl Interp {
                 home,
                 ctor: _,
             }) => {
-                let scope = Scope::new(Some(env), !def.is_arrow);
+                // strict-mode call semantics: `this` passes through verbatim
+                // in strict code; sloppy code substitutes global for
+                // undefined/null and boxes primitives
+                let this = if def.is_arrow
+                    || def.strict
+                    || parser::stmts_strict(&def.body)
+                {
+                    this
+                } else {
+                    match this {
+                        Value::Und | Value::Null => Value::Obj(self.p.global.clone()),
+                        Value::Obj(_) => this,
+                        v => self.to_object(&v)?,
+                    }
+                };
+                // effective strictness = inherited (def.strict) or the
+                // body's own "use strict" directive prologue
+                let eff_strict =
+                    def.strict || parser::stmts_strict(&def.body);
+                let saved_strict = std::mem::replace(&mut self.cur_strict, eff_strict);
+                let r = self.call_user_body(f, o, &def, &env, home, this, args);
+                self.cur_strict = saved_strict;
+                r
+            }
+            _ => self.call_dispatch_end(o, this, args),
+        }
+    }
+
+    /// The `Func::User` arm of `call`, extracted so `call` can restore
+    /// `cur_strict` on every exit path (including `?` early returns).
+    fn call_user_body(
+        &mut self,
+        f: &Value,
+        o: &ObjRef,
+        def: &Rc<crate::ast::FnDef>,
+        env: &EnvRef,
+        home: Option<ObjRef>,
+        this: Value,
+        args: Vec<Value>,
+    ) -> ERes {
+        {
+                let scope = Scope::new(Some(env.clone()), !def.is_arrow);
                 scope.var_boundary.set(true);
                 if !def.is_arrow {
                     *scope.thisv.borrow_mut() = this;
@@ -2675,11 +2929,23 @@ impl Interp {
                         k,
                         Binding {
                             val: Value::Obj(arr),
-                            mutable: true, uninit: false,
+                            mutable: true, uninit: false, deletable: false, lexical: false,
                         },
                     );
                 }
                 self.bind_params(&scope, &def.params, &args)?;
+                // a non-simple parameter environment rejects
+                // `eval("var arguments")`/`eval("var eval")` — non-arrows
+                // always have the implicit binding; arrows only when a
+                // parameter is literally named arguments/eval
+                if def.params.iter().any(|p| matches!(p, Param::Default(..)))
+                    && (!def.is_arrow
+                        || def.params.iter().any(|p| {
+                            matches!(p, Param::Ident(n) if n == "arguments" || n == "eval")
+                        }))
+                {
+                    scope.param_env.set(true);
+                }
                 // non-simple formals get a separate var environment —
                 // body `var` decls must not leak into the param scope
                 let body_scope: EnvRef = if def
@@ -2717,7 +2983,7 @@ impl Interp {
                         Some(gproto),
                         ObjKind::Gen(Rc::new(RefCell::new(GenCell {
                             coro: None,
-                            pending: Some((def, body_scope)),
+                            pending: Some((def.clone(), body_scope)),
                             running: false,
                             done: false,
                         }))),
@@ -2739,7 +3005,12 @@ impl Interp {
                     Ok(_) => Ok(Value::Und),
                     Err(e) => Err(e),
                 }
-            }
+        }
+    }
+
+    fn call_dispatch_end(&mut self, o: &ObjRef, this: Value, args: Vec<Value>) -> ERes {
+        match o.borrow().kind.clone() {
+            ObjKind::Und => Ok(Value::Und),
             ObjKind::Bound {
                 target,
                 thisv,
@@ -2874,6 +3145,37 @@ impl Interp {
                 {
                     return Err(self.type_err("value is not a constructor"));
                 }
+                let eff_strict =
+                    def.strict || parser::stmts_strict(&def.body);
+                let saved_strict = std::mem::replace(&mut self.cur_strict, eff_strict);
+                let r = self.construct_user_body(f, o, def, env, home, ctor, new_target, args);
+                self.cur_strict = saved_strict;
+                r
+            }
+            ObjKind::Bound { target, extra, .. } => {
+                let mut all = extra;
+                all.extend(args);
+                self.construct(&target, all, new_target)
+            }
+            _ => Err(self.type_err("value is not a constructor")),
+        }
+    }
+
+    /// The `Func::User` arm of `construct` (strict save/restore lives in the
+    /// caller for the same reason as `call_user_body`).
+    #[allow(clippy::too_many_arguments)]
+    fn construct_user_body(
+        &mut self,
+        f: &Value,
+        _o: &ObjRef,
+        def: Rc<crate::ast::FnDef>,
+        env: EnvRef,
+        home: Option<ObjRef>,
+        ctor: CtorKind,
+        new_target: Option<Value>,
+        args: Vec<Value>,
+    ) -> ERes {
+        {
                 let nt = new_target.unwrap_or_else(|| f.clone());
                 // prototype for the new object: new_target.prototype or obj proto
                 let proto = {
@@ -2902,6 +3204,18 @@ impl Interp {
                 *scope.new_target.borrow_mut() = nt;
                 *scope.ctor_fn.borrow_mut() = f.clone();
                 self.bind_params(&scope, &def.params, &args)?;
+                // a non-simple parameter environment rejects
+                // `eval("var arguments")`/`eval("var eval")` — non-arrows
+                // always have the implicit binding; arrows only when a
+                // parameter is literally named arguments/eval
+                if def.params.iter().any(|p| matches!(p, Param::Default(..)))
+                    && (!def.is_arrow
+                        || def.params.iter().any(|p| {
+                            matches!(p, Param::Ident(n) if n == "arguments" || n == "eval")
+                        }))
+                {
+                    scope.param_env.set(true);
+                }
                 let h = self.hoisted_fn(&def);
                 if h.uses_arguments {
                     let arr = self.new_arr(args.clone());
@@ -2910,7 +3224,7 @@ impl Interp {
                         k,
                         Binding {
                             val: Value::Obj(arr),
-                            mutable: true, uninit: false,
+                            mutable: true, uninit: false, deletable: false, lexical: false,
                         },
                     );
                 }
@@ -2952,13 +3266,6 @@ impl Interp {
                     }
                     Err(e) => Err(e),
                 }
-            }
-            ObjKind::Bound { target, extra, .. } => {
-                let mut all = extra;
-                all.extend(args);
-                self.construct(&target, all, new_target)
-            }
-            _ => Err(self.type_err("value is not a constructor")),
         }
     }
 
@@ -2982,17 +3289,14 @@ impl Interp {
                         Binding {
                             val: Value::Und,
                             mutable: true,
-                            uninit: true,
+                            uninit: true, deletable: false, lexical: false,
                         },
                     );
                 }
             }
         }
-        if params.iter().any(|p| matches!(p, Param::Default(..))) {
-            // default expressions evaluate in the parameter environment —
-            // flag it so direct eval there rejects `var arguments`/`var eval`
-            scope.param_env.set(true);
-        }
+        // (parameter-environment flag is set by the callers, who know the
+        //  FnDef — arrows have no implicit `arguments` binding)
         let mut i = 0;
         for p in params {
             match p {
@@ -3003,7 +3307,7 @@ impl Interp {
                         k,
                         Binding {
                             val: v,
-                            mutable: true, uninit: false,
+                            mutable: true, uninit: false, deletable: false, lexical: false,
                         },
                     );
                     i += 1;
@@ -3353,19 +3657,84 @@ impl Interp {
     pub fn hoist_body(&mut self, stmts: &[Stmt], scope: &EnvRef) -> Result<(), Value> {
         // uncached path — safe for arbitrary caller-owned slices
         let h = collect_hoisted_owned(stmts);
+        self.check_global_decls(&h, scope)?;
         self.apply_hoisted(&h, scope);
+        Ok(())
+    }
+
+    /// CanDeclareGlobalVar/CanDeclareGlobalFunction checks: declaring a
+    /// `var`/`function` global must fail on a non-extensible global object
+    /// or collide with an existing non-configurable property (fns can't
+    /// replace one; `var` may only shadow it).
+    fn check_global_decls(&mut self, h: &Hoisted, scope: &EnvRef) -> Result<(), Value> {
+        // the var boundary these declarations will land on
+        let mut cur = scope.clone();
+        while !cur.var_boundary.get() && cur.parent.is_some() {
+            let next = cur.parent.clone().unwrap();
+            cur = next;
+        }
+        if !Rc::ptr_eq(&cur, &self.global) {
+            return Ok(());
+        }
+        let g = self.p.global.clone();
+        let ext = g.borrow().extensible;
+        let mut names: Vec<(Rc<str>, bool)> =
+            h.vars.iter().map(|n| (n.clone(), false)).collect();
+        for f in &h.fns {
+            if let Some(n) = f.name.as_deref() {
+                names.push((self.intern(n), true));
+            }
+        }
+        if !self.cur_strict {
+            for n in &h.block_fns {
+                names.push((n.clone(), true));
+            }
+        }
+        for (name, is_fn) in names {
+            let key = PropKey::S(name.clone());
+            let existing = g.borrow().props.get(&key).map(|p| p.configurable);
+            match existing {
+                None if !ext => {
+                    return Err(self.type_err(format!(
+                        "Cannot define global variable `{name}`: object is not extensible"
+                    )))
+                }
+                Some(false) if is_fn => {
+                    return Err(self.type_err(format!(
+                        "Cannot define global function `{name}`: property is non-configurable"
+                    )))
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
     /// declare the precomputed hoisted vars/fns into `scope`'s var boundary.
     fn apply_hoisted(&mut self, h: &Hoisted, scope: &EnvRef) {
+        self.apply_hoisted_mode(h, scope, false);
+    }
+
+    /// `block_scope`: fns bind lexically in `scope` (the Annex-B block
+    /// binding) instead of the var boundary. Annex-B nested fn names are
+    /// initialized `undefined` at the var boundary in sloppy code.
+    fn apply_hoisted_mode(&mut self, h: &Hoisted, scope: &EnvRef, block_scope: bool) {
         for name in &h.vars {
             self.declare_var_rc(scope, name, Value::Und);
+        }
+        if !self.cur_strict {
+            for name in &h.block_fns {
+                self.declare_var_rc(scope, name, Value::Und);
+            }
         }
         for f in &h.fns {
             if let Some(name) = f.name.clone() {
                 let fv = self.make_fn(f.clone(), scope, CtorKind::NotClass);
-                self.declare_var(scope, &name, fv);
+                if block_scope {
+                    self.declare(scope, &name, fv, true);
+                } else {
+                    self.declare_var(scope, &name, fv);
+                }
             }
         }
     }
@@ -3411,13 +3780,17 @@ impl Interp {
     /// `if (c) let y`); `var`/`function` hoisting resolves to the same
     /// var-boundary scope either way, so decl-free bodies run in `env`.
     fn exec_hoisted_block(&mut self, stmts: &[Stmt], env: &EnvRef) -> SRes {
-        let needs_scope = stmts.iter().any(stmt_binds_lexically);
+        let h = self.hoisted_slice(stmts);
+        // a block containing function declarations always needs its own
+        // scope: the block-scoped binding lives there in both modes
+        let needs_scope =
+            !h.fns.is_empty() || stmts.iter().any(stmt_binds_lexically);
         if needs_scope {
             let scope = Scope::new(Some(env.clone()), false);
-            self.hoist_stmts(stmts, &scope)?;
+            self.apply_hoisted_mode(&h, &scope, true);
             self.exec_block(stmts, &scope)
         } else {
-            self.hoist_stmts(stmts, env)?;
+            self.apply_hoisted_mode(&h, env, false);
             self.exec_block(stmts, env)
         }
     }
@@ -3524,11 +3897,27 @@ impl Interp {
                 Ok(Completion::Empty)
             }
             Stmt::FnDecl(f) => {
-                // hoisted already at scope entry; re-bind here for block-level
                 if let Some(name) = &f.name {
-                    if self.env_lookup(env, name).is_none() {
+                    let k = self.intern(name);
+                    // instantiated = an own binding holding the fn object —
+                    // the Annex-B `undefined` placeholder doesn't count
+                    let has_own = env
+                        .vars
+                        .borrow()
+                        .get(k.as_ref())
+                        .is_some_and(|b| matches!(b.val, Value::Obj(_)));
+                    if !has_own {
+                        // single-statement position (`if (c) function f(){}`,
+                        // labels): the fn binds into the ad-hoc branch scope
                         let fv = self.make_fn(f.clone(), env, CtorKind::NotClass);
                         self.declare(env, name, fv, true);
+                    }
+                    // Annex B.3.3: executing a block-level fn decl syncs the
+                    // block-scoped value into the var-environment binding
+                    if !self.cur_strict {
+                        if let Some(fv) = self.env_lookup(env, name) {
+                            self.declare_var(env, name, fv);
+                        }
                     }
                 }
                 Ok(Completion::Empty)
@@ -3788,20 +4177,29 @@ impl Interp {
             Stmt::Switch { disc, cases } => {
                 let dv = self.eval_expr(disc, env)?;
                 let scope = Scope::new(Some(env.clone()), false);
-                // hoist across all case bodies (shared block scope)
+                // hoist across all case bodies (shared block scope): case
+                // fns bind block-locally (B.3.5), nested-block fns get the
+                // Annex-B `undefined` var binding, `var`s hoist normally
                 {
                     let mut fns: Vec<&Rc<FnDef>> = Vec::new();
+                    let mut block_fns: Vec<&str> = Vec::new();
                     let mut vars: Vec<&str> = Vec::new();
                     for c in cases {
-                        collect_hoisted(&c.body, &mut fns, &mut vars);
+                        collect_hoisted(&c.body, &mut fns, &mut block_fns, &mut vars);
                     }
                     for n in vars {
                         self.declare_var(&scope, n, Value::Und);
                     }
+                    if !self.cur_strict {
+                        for n in block_fns {
+                            let k = self.intern(n);
+                            self.declare_var_rc(&scope, &k, Value::Und);
+                        }
+                    }
                     for f in fns {
                         if let Some(n) = f.name.clone() {
                             let fv = self.make_fn(f.clone(), &scope, CtorKind::NotClass);
-                            self.declare_var(&scope, &n, fv);
+                            self.declare(&scope, &n, fv, true);
                         }
                     }
                 }
@@ -3840,6 +4238,15 @@ impl Interp {
                     }
                 }
                 Ok(Completion::Normal(last))
+            }
+            Stmt::With { obj, body } => {
+                let v = self.eval_expr(obj, env)?;
+                let o = match self.to_object(&v)? {
+                    Value::Obj(o) => o,
+                    _ => unreachable!(),
+                };
+                let sc = Scope::with_obj(env.clone(), o);
+                self.exec_stmt(body, &sc)
             }
             Stmt::Try {
                 block,
@@ -3962,7 +4369,7 @@ impl Interp {
                             k,
                             Binding {
                                 val: v,
-                                mutable: *kind != VarKind::Const, uninit: false,
+                                mutable: *kind != VarKind::Const, uninit: false, deletable: false, lexical: false,
                             },
                         );
                         Ok(())
@@ -3995,7 +4402,7 @@ impl Interp {
                     k,
                     Binding {
                         val: v,
-                        mutable: kind != VarKind::Const, uninit: false,
+                        mutable: kind != VarKind::Const, uninit: false, deletable: false, lexical: false,
                     },
                 );
                 Ok(())
@@ -4107,6 +4514,7 @@ impl Interp {
                 arrow_expr: None,
                 is_async: false,
                 is_gen: false,
+                strict: true, // default class ctor — class bodies are always strict
             })
         });
 
@@ -4198,7 +4606,7 @@ impl Interp {
                 Rc::from(n.as_str()),
                 Binding {
                     val: ctor_fn.clone(),
-                    mutable: false, uninit: false,
+                    mutable: false, uninit: false, deletable: false, lexical: false,
                 },
             );
         }
@@ -4366,7 +4774,7 @@ impl Interp {
                             Rc::from(n.as_str()),
                             Binding {
                                 val: Value::Und,
-                                mutable: false, uninit: false,
+                                mutable: false, uninit: false, deletable: false, lexical: false,
                             },
                         );
                         e
@@ -4380,7 +4788,7 @@ impl Interp {
                             Rc::from(n.as_str()),
                             Binding {
                                 val: f.clone(),
-                                mutable: false, uninit: false,
+                                mutable: false, uninit: false, deletable: false, lexical: false,
                             },
                         );
                     }
@@ -4735,7 +5143,38 @@ impl Interp {
                     let key = self.to_propkey(&pv)?;
                     Ok(Value::Bool(self.delete_prop(&ov, &key)?))
                 }
-                Expr::Ident(_) | Expr::This => Ok(Value::Bool(false)),
+                Expr::This => Ok(Value::Bool(true)),
+                Expr::Ident(n) => {
+                    // unresolvable reference → true; found binding → its
+                    // `deletable` flag (eval-declared vars/fns only)
+                    let k = self.intern(n);
+                    let mut cur = Some(env);
+                    while let Some(sc) = cur {
+                        if let Some(o) = &sc.obj_env {
+                            if self.with_scope_has(o, n) {
+                                let ov = Value::Obj(o.clone());
+                                let b = self.delete_prop(&ov, &PropKey::S(k))?;
+                                return Ok(Value::Bool(b));
+                            }
+                        } else if sc.vars.borrow().contains_key(k.as_ref()) {
+                            let deletable =
+                                sc.vars.borrow().get(k.as_ref()).unwrap().deletable;
+                            if deletable {
+                                sc.vars.borrow_mut().remove(k.as_ref());
+                                if Rc::ptr_eq(sc, &self.global) {
+                                    self.p
+                                        .global
+                                        .borrow_mut()
+                                        .props
+                                        .remove(&PropKey::S(k.clone()));
+                                }
+                            }
+                            return Ok(Value::Bool(deletable));
+                        }
+                        cur = sc.parent.as_ref();
+                    }
+                    Ok(Value::Bool(true))
+                }
                 _ => {
                     self.eval_expr(expr, env)?;
                     Ok(Value::Bool(true))
@@ -5003,11 +5442,81 @@ impl Interp {
             self.depth -= 1;
             return Err(self.range_err("Maximum call stack size exceeded"));
         }
+        // direct eval inherits caller strictness + fn/method context
+        let caller_strict = self.cur_strict;
+        let (mut in_fn, mut in_method) = (false, false);
+        {
+            let mut cur = Some(&env);
+            while let Some(s) = cur {
+                if s.is_fn {
+                    in_fn = true;
+                }
+                if s.home.borrow().is_some() {
+                    in_method = true;
+                }
+                cur = s.parent.as_ref();
+            }
+        }
         let r = (|| {
-            let stmts = match parser::parse(src) {
+            let stmts = match parser::parse_eval(src, caller_strict, in_fn, in_method) {
                 Ok(s) => s,
                 Err(e) => return Err(self.syntax_err(e.msg)),
             };
+            let strict_eval = caller_strict || parser::stmts_strict(&stmts);
+            // eval code runs in a fresh declarative env over the caller's;
+            // strict eval also gets a fresh variable env (var bindings must
+            // not leak into the caller's var env)
+            let lex = Scope::new(Some(env), false);
+            let eenv = if strict_eval {
+                let v = Scope::new(Some(lex), true);
+                v.var_boundary.set(true);
+                v
+            } else {
+                lex
+            };
+            let saved_strict = std::mem::replace(&mut self.cur_strict, strict_eval);
+            let saved_decl = std::mem::replace(&mut self.eval_decl, true);
+            let r = self.eval_source_in(&stmts, &eenv);
+            self.eval_decl = saved_decl;
+            self.cur_strict = saved_strict;
+            r
+        })();
+        self.depth -= 1;
+        r
+    }
+
+    /// Hoist + execute an already-parsed eval body in `eenv`.
+    fn eval_source_in(&mut self, stmts: &[Stmt], env: &EnvRef) -> ERes {
+        // EvalDeclarationInstantiation: a `var`/fn name that collides with
+        // a lexical (let/const/class/catch) binding anywhere in the chain
+        // above the eval's own env is a SyntaxError
+        {
+            let h = self.hoisted_slice(stmts);
+            let mut names: Vec<Rc<str>> = h.vars.clone();
+            for f in &h.fns {
+                if let Some(n) = f.name.as_deref() {
+                    names.push(self.intern(n));
+                }
+            }
+            for name in &names {
+                let mut cur = env.parent.clone();
+                while let Some(sc) = cur {
+                    let hit = sc
+                        .vars
+                        .borrow()
+                        .get(name.as_ref())
+                        .is_some_and(|b| b.lexical);
+                    if hit {
+                        return Err(self.syntax_err(format!(
+                            "Identifier `{name}` has already been declared"
+                        )));
+                    }
+                    cur = sc.parent.clone();
+                }
+            }
+        }
+        {
+            let stmts = stmts;
             // `var arguments`/`var eval` inside a parameter environment is an
             // early SyntaxError (the implicit binding can't be redeclared)
             {
@@ -5019,7 +5528,8 @@ impl Interp {
                     });
                 }
                 if bad {
-                    let mut cur = Some(&env);
+                    // walk PAST the fresh eval envs to the caller's scopes
+                    let mut cur = env.parent.as_ref();
                     while let Some(s) = cur {
                         if s.param_env.get() {
                             return Err(self.syntax_err(
@@ -5030,24 +5540,23 @@ impl Interp {
                     }
                 }
             }
-            self.hoist_body(&stmts, &env)?;
+            self.hoist_body(stmts, env)?;
             let mut last = Value::Und;
-            for s in &stmts {
-                match self.exec_stmt(s, &env) {
+            for s in stmts {
+                match self.exec_stmt(s, env) {
                     Ok(Completion::Normal(v)) | Ok(Completion::Return(v)) => last = v,
                     Ok(_) => {}
                     Err(v) => return Err(v),
                 }
             }
             Ok(last)
-        })();
-        self.depth -= 1;
-        r
+        }
     }
 
     // -- top-level ---------------------------------------------------------------
     pub fn run(&mut self, src: &str) -> Result<Value, Error> {
         let stmts = parser::parse(src)?;
+        self.cur_strict = parser::stmts_strict(&stmts);
         // slice-hoist keys are raw AST pointers: entries from prior runs
         // could collide with freshly parsed addresses, so reset per run
         // (the new AST is fully allocated before this point)
@@ -5070,7 +5579,9 @@ impl Interp {
 
     pub fn throw_to_error(&mut self, v: Value) -> Error {
         let msg = match &v {
-            Value::Obj(_) => self.inspect(&v, 0),
+            Value::Obj(_) => self
+                .to_str(&v)
+                .unwrap_or_else(|_| self.inspect(&v, 0)),
             other => self.to_str(other).unwrap_or_else(|_| "<exception>".into()),
         };
         Error::new(format!("Uncaught {msg}"), 0, 0)
@@ -5194,20 +5705,37 @@ fn param_count(params: &[Param]) -> usize {
         .count()
 }
 
-fn collect_hoisted<'a>(stmts: &'a [Stmt], fns: &mut Vec<&'a Rc<FnDef>>, vars: &mut Vec<&'a str>) {
+fn collect_hoisted<'a>(
+    stmts: &'a [Stmt],
+    fns: &mut Vec<&'a Rc<FnDef>>,
+    block_fns: &mut Vec<&'a str>,
+    vars: &mut Vec<&'a str>,
+) {
+    collect_hoisted_at(stmts, fns, block_fns, vars, true)
+}
+
+fn collect_hoisted_at<'a>(
+    stmts: &'a [Stmt],
+    fns: &mut Vec<&'a Rc<FnDef>>,
+    block_fns: &mut Vec<&'a str>,
+    vars: &mut Vec<&'a str>,
+    top: bool,
+) {
     for s in stmts {
-        collect_stmt(s, fns, vars);
+        collect_stmt(s, fns, block_fns, vars, top);
     }
 }
 
 /// Owned (cacheable) form of `collect_hoisted`.
 fn collect_hoisted_owned(stmts: &[Stmt]) -> Hoisted {
     let mut fns: Vec<&Rc<FnDef>> = Vec::new();
+    let mut block_fns: Vec<&str> = Vec::new();
     let mut vars: Vec<&str> = Vec::new();
-    collect_hoisted(stmts, &mut fns, &mut vars);
+    collect_hoisted(stmts, &mut fns, &mut block_fns, &mut vars);
     Hoisted {
         fns: fns.into_iter().cloned().collect(),
         vars: vars.into_iter().map(|s| Rc::<str>::from(s)).collect(),
+        block_fns: block_fns.into_iter().map(|s| Rc::<str>::from(s)).collect(),
         uses_arguments: false,
     }
 }
@@ -5361,6 +5889,9 @@ fn stmt_binds_lexically(s: &Stmt) -> bool {
     match s {
         Stmt::VarDecl { kind, .. } => *kind != VarKind::Var,
         Stmt::ClassDecl(_) => true,
+        // Annex B.3.4: `if (x) function f(){}`, `label: function f(){}` get
+        // an implicit block scope for the decl
+        Stmt::FnDecl(_) => true,
         Stmt::If { t, e, .. } => {
             stmt_binds_lexically(t)
                 || e.as_ref().map_or(false, |s| stmt_binds_lexically(s))
@@ -5369,6 +5900,7 @@ fn stmt_binds_lexically(s: &Stmt) -> bool {
             stmt_binds_lexically(body)
         }
         Stmt::Labeled(_, inner) => stmt_binds_lexically(inner),
+        Stmt::With { body, .. } => stmt_binds_lexically(body),
         Stmt::Export(ExportRec::Decl(inner)) => stmt_binds_lexically(inner),
         Stmt::Export(ExportRec::Default(_)) => true,
         _ => false,
@@ -5390,6 +5922,9 @@ fn stmt_uses_arguments(s: &Stmt) -> bool {
         }
         Stmt::Block(ss) => ss.iter().any(stmt_uses_arguments),
         Stmt::Return(e) => e.as_ref().map_or(false, expr_uses_arguments),
+        Stmt::With { obj, body } => {
+            expr_uses_arguments(obj) || stmt_uses_arguments(body)
+        }
         Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty | Stmt::Import(_) => false,
         Stmt::While { c, body } | Stmt::DoWhile { body, c } => {
             expr_uses_arguments(c) || stmt_uses_arguments(body)
@@ -5452,9 +5987,26 @@ fn stmt_uses_arguments(s: &Stmt) -> bool {
     }
 }
 
-fn collect_stmt<'a>(s: &'a Stmt, fns: &mut Vec<&'a Rc<FnDef>>, vars: &mut Vec<&'a str>) {
+fn collect_stmt<'a>(
+    s: &'a Stmt,
+    fns: &mut Vec<&'a Rc<FnDef>>,
+    block_fns: &mut Vec<&'a str>,
+    vars: &mut Vec<&'a str>,
+    top: bool,
+) {
+    let nested = |f: &'a Rc<FnDef>, block_fns: &mut Vec<&'a str>| {
+        if let Some(n) = f.name.as_deref() {
+            block_fns.push(n);
+        }
+    };
     match s {
-        Stmt::FnDecl(f) => fns.push(f),
+        Stmt::FnDecl(f) => {
+            if top {
+                fns.push(f)
+            } else {
+                nested(f, block_fns)
+            }
+        }
         Stmt::VarDecl { kind, decls } => {
             if *kind == VarKind::Var {
                 for (p, _) in decls {
@@ -5462,31 +6014,33 @@ fn collect_stmt<'a>(s: &'a Stmt, fns: &mut Vec<&'a Rc<FnDef>>, vars: &mut Vec<&'
                 }
             }
         }
-        Stmt::Block(ss) => collect_hoisted(ss, fns, vars),
+        Stmt::Block(ss) => collect_hoisted_at(ss, fns, block_fns, vars, false),
         Stmt::If { t, e, .. } => {
-            collect_stmt(t, fns, vars);
+            collect_stmt(t, fns, block_fns, vars, false);
             if let Some(e) = e {
-                collect_stmt(e, fns, vars);
+                collect_stmt(e, fns, block_fns, vars, false);
             }
         }
-        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_stmt(body, fns, vars),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                collect_stmt(body, fns, block_fns, vars, false)
+            }
         Stmt::For { init, body, .. } => {
             if let Some(ForInit::Var(VarKind::Var, decls)) = init {
                 for (p, _) in decls {
                     collect_pattern_names(p, vars);
                 }
             }
-            collect_stmt(body, fns, vars);
+            collect_stmt(body, fns, block_fns, vars, false);
         }
         Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
             if let ForTarget::Var(VarKind::Var, p) = left {
                 collect_pattern_names(p, vars);
             }
-            collect_stmt(body, fns, vars);
+            collect_stmt(body, fns, block_fns, vars, false);
         }
         Stmt::Switch { cases, .. } => {
             for c in cases {
-                collect_hoisted(&c.body, fns, vars);
+                collect_hoisted(&c.body, fns, block_fns, vars);
             }
         }
         Stmt::Try {
@@ -5495,15 +6049,16 @@ fn collect_stmt<'a>(s: &'a Stmt, fns: &mut Vec<&'a Rc<FnDef>>, vars: &mut Vec<&'
             finally,
             ..
         } => {
-            collect_hoisted(block, fns, vars);
+            collect_hoisted_at(block, fns, block_fns, vars, false);
             if let Some(h) = handler {
-                collect_hoisted(h, fns, vars);
+                collect_hoisted_at(h, fns, block_fns, vars, false);
             }
             if let Some(f) = finally {
-                collect_hoisted(f, fns, vars);
+                collect_hoisted_at(f, fns, block_fns, vars, false);
             }
         }
-        Stmt::Labeled(_, inner) => collect_stmt(inner, fns, vars),
+        Stmt::Labeled(_, inner) => collect_stmt(inner, fns, block_fns, vars, false),
+        Stmt::With { body, .. } => collect_stmt(body, fns, block_fns, vars, false),
         _ => {}
     }
 }
