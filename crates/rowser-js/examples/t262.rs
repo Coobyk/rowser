@@ -76,14 +76,12 @@ const SKIP_FEATURES: &[&str] = &[
     "decorators", "RegExp.escape", "regexp-duplicate-named-groups",
     "tail-call-optimization", "async-functions",
     "async-iteration", "regexp-v-flag",
-    "set-methods", "promise-with-resolvers", "array-grouping",
+    "set-methods",
     "regexp-modifiers", "json-parse-with-source", "source-phase-imports",
     "ShadowRealm", "Array.fromAsync",
     "regexp-unicode-property-escapes",
-    "AggregateError", "weakrefs",
-    "symbols-as-weakmap-keys", "change-array-by-copy",
+    "weakrefs",
     "uint8array-base64",
-    "caller",
     // $262.createRealm / Error.isError — APIs we don't expose
     "cross-realm", "Error.isError", "host-gc-required",
     // stage-3 Error.prototype.stack accessor proposal — unimplemented

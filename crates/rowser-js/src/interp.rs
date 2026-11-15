@@ -227,6 +227,58 @@ impl Prop {
     }
 }
 
+/// A Property Descriptor in field form — each `Option` carries the
+/// field's *presence*; `get`/`set` keep the raw value (a present
+/// `undefined` differs from an absent field).
+#[derive(Clone, Default)]
+pub struct PDesc {
+    pub value: Option<Value>,
+    pub writable: Option<bool>,
+    pub get: Option<Value>,
+    pub set: Option<Value>,
+    pub enumerable: Option<bool>,
+    pub configurable: Option<bool>,
+}
+
+impl PDesc {
+    /// IsAccessorDescriptor — has a [[Get]] or [[Set]] field
+    pub fn is_accessor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
+    }
+    /// IsDataDescriptor — has a [[Value]] or [[Writable]] field
+    pub fn is_data(&self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+    /// IsGenericDescriptor — neither accessor nor data fields
+    pub fn is_generic(&self) -> bool {
+        !self.is_accessor() && !self.is_data()
+    }
+    /// an empty descriptor "has no fields" (ValidateAndApply early-out)
+    pub fn is_empty(&self) -> bool {
+        self.value.is_none()
+            && self.writable.is_none()
+            && self.get.is_none()
+            && self.set.is_none()
+            && self.enumerable.is_none()
+            && self.configurable.is_none()
+    }
+    /// CompletePropertyDescriptor — fills absent fields: accessor descs
+    /// get [[Get]]/[[Set]] = undefined, data/generic descs get
+    /// [[Value]] = undefined + [[Writable]] = false; both default
+    /// [[Enumerable]]/[[Configurable]] to false.
+    pub fn complete(&mut self) {
+        if self.is_accessor() {
+            self.get.get_or_insert(Value::Und);
+            self.set.get_or_insert(Value::Und);
+        } else {
+            self.value.get_or_insert(Value::Und);
+            self.writable.get_or_insert(false);
+        }
+        self.enumerable.get_or_insert(false);
+        self.configurable.get_or_insert(false);
+    }
+}
+
 /// Insertion-ordered property map (JS preserves key insertion order).
 ///
 /// String keys live in `map` (keyed by `Rc<str>`) so lookups can borrow
@@ -810,11 +862,14 @@ fn view_own_prop_str(i: &Interp, o: &ObjRef, key: &str) -> Option<Value> {
                         let bb = bytes.borrow();
                         let n = kind.read(&bb, *off + idx * kind.size());
                         // [[ContentType]]: bigint-kind TAs surface bigint
-                        // stand-in objects, not raw numbers
-                        if crate::binary::ta_is_big(&Value::Obj(o.clone())) {
-                            return Some(i.bigint_obj(n));
-                        }
-                        return Some(Value::Num(n));
+                        // stand-in objects — rebuilt from the exact
+                        // 64-bit pattern stored bit-cast in the f64
+                        // slot, never from the f64 magnitude
+                        return Some(crate::binary::ta_stored_pub(
+                            i,
+                            &Value::Obj(o.clone()),
+                            n,
+                        ));
                     }
                 }
                 return Some(Value::Und);
@@ -862,7 +917,7 @@ pub(crate) fn is_internal_key(i: &Interp, b: &Obj, s: &str) -> bool {
         "__taIterProto" => true,
         // wrapper/promise/date internal slots — engine installs them
         // non-enumerable; a non-enum `$`-slot is the signature
-        "$value" | "$handlers" | "$ms" => b
+        "$value" | "$handlers" | "$ms" | "__wm" | "__ws" => b
             .props
             .get_str(s)
             .is_some_and(|p| !p.enumerable),
@@ -1466,17 +1521,7 @@ impl Interp {
             }
         };
         if let Some((t, h)) = proxy {
-            return match self.proxy_trap(&h, "has")? {
-                Some(trap) => {
-                    let r = self.call(
-                        &trap,
-                        h,
-                        vec![t, Value::Str(Rc::from(name))],
-                    )?;
-                    Ok(self.to_bool(&r))
-                }
-                None => self.has_prop(&t, &PropKey::from_str(name)),
-            };
+            return self.proxy_has(&t, &h, &PropKey::from_str(name));
         }
         self.has_prop(&Value::Obj(o.clone()), &PropKey::from_str(name))
     }
@@ -2084,6 +2129,504 @@ impl Interp {
         }
     }
 
+    // -- proxy trap machinery (spec 10.5.x) ------------------------------------
+    //
+    // A REVOKED proxy carries `target: Null, handler: Null` — `proxy_trap`
+    // then fails on the Null handler with a TypeError, which is exactly
+    // the spec's "[[ProxyHandler]] is null → throw" first step of every
+    // internal method.
+
+    /// spec ToPropertyDescriptor — the six fields read through
+    /// HasProperty/Get (getters fire); get/set must be
+    /// callable-or-undefined; accessor+data mixing throws.
+    pub(crate) fn pdesc_from_obj(&mut self, desc: &Value) -> Result<PDesc, Value> {
+        let mut d = PDesc::default();
+        if self.has_prop(desc, &PropKey::from_str("enumerable"))? {
+            let v = self.get_prop_str(desc, "enumerable")?;
+            d.enumerable = Some(self.to_bool(&v));
+        }
+        if self.has_prop(desc, &PropKey::from_str("configurable"))? {
+            let v = self.get_prop_str(desc, "configurable")?;
+            d.configurable = Some(self.to_bool(&v));
+        }
+        if self.has_prop(desc, &PropKey::from_str("value"))? {
+            d.value = Some(self.get_prop_str(desc, "value")?);
+        }
+        if self.has_prop(desc, &PropKey::from_str("writable"))? {
+            let v = self.get_prop_str(desc, "writable")?;
+            d.writable = Some(self.to_bool(&v));
+        }
+        if self.has_prop(desc, &PropKey::from_str("get"))? {
+            let g = self.get_prop_str(desc, "get")?;
+            if !matches!(g, Value::Und) && !self.is_callable(&g) {
+                return Err(self.type_err("Getter must be a function"));
+            }
+            d.get = Some(g);
+        }
+        if self.has_prop(desc, &PropKey::from_str("set"))? {
+            let s = self.get_prop_str(desc, "set")?;
+            if !matches!(s, Value::Und) && !self.is_callable(&s) {
+                return Err(self.type_err("Setter must be a function"));
+            }
+            d.set = Some(s);
+        }
+        if (d.get.is_some() || d.set.is_some())
+            && (d.value.is_some() || d.writable.is_some())
+        {
+            return Err(self.type_err(
+                "Invalid property descriptor. Cannot both specify accessors and a value or writable attribute",
+            ));
+        }
+        Ok(d)
+    }
+
+    /// spec FromPropertyDescriptor — a fresh object carrying only the
+    /// descriptor's present fields, in spec emission order.
+    pub(crate) fn pdesc_to_obj(&mut self, d: &PDesc) -> ObjRef {
+        let o = self.new_obj();
+        if let Some(v) = &d.value {
+            self.set_data(&o, "value", v.clone());
+        }
+        if let Some(w) = d.writable {
+            self.set_data(&o, "writable", Value::Bool(w));
+        }
+        if let Some(g) = &d.get {
+            self.set_data(&o, "get", g.clone());
+        }
+        if let Some(s) = &d.set {
+            self.set_data(&o, "set", s.clone());
+        }
+        if let Some(e) = d.enumerable {
+            self.set_data(&o, "enumerable", Value::Bool(e));
+        }
+        if let Some(c) = d.configurable {
+            self.set_data(&o, "configurable", Value::Bool(c));
+        }
+        o
+    }
+
+    /// `target.[[GetOwnProperty]](P)` through the full MOP — a proxy
+    /// target fires its own trap (invariants applied at that level too).
+    pub(crate) fn proxy_target_desc(
+        &mut self,
+        t: &Value,
+        key: &PropKey,
+    ) -> Result<Option<PDesc>, Value> {
+        let kv = self.key_to_value(key);
+        let d = crate::builtins::obj_get_own_prop_desc(
+            self,
+            &Value::Und,
+            &[t.clone(), kv],
+        )?;
+        match d {
+            Value::Und => Ok(None),
+            _ => Ok(Some(self.pdesc_from_obj(&d)?)),
+        }
+    }
+
+    /// `IsExtensible(target)` through the MOP — proxy targets fire their
+    /// own `isExtensible` trap.
+    pub(crate) fn proxy_target_ext(&mut self, t: &Value) -> Result<bool, Value> {
+        match t {
+            Value::Obj(o) => crate::builtins::ord_is_extensible(self, o),
+            _ => Ok(false),
+        }
+    }
+
+    /// `target.[[GetPrototypeOf]]()` through the MOP.
+    pub(crate) fn proxy_target_proto(&mut self, t: &Value) -> Result<Value, Value> {
+        crate::builtins::obj_get_prototype_of(
+            self,
+            &Value::Und,
+            &[t.clone()],
+        )
+    }
+
+    /// spec IsCompatiblePropertyDescriptor — can `d` apply over an
+    /// existing (complete) `cur` on a target with `extensible`?
+    fn desc_compatible(
+        &mut self,
+        extensible: bool,
+        d: &PDesc,
+        cur: Option<&PDesc>,
+    ) -> Result<bool, Value> {
+        let Some(c) = cur else {
+            return Ok(extensible);
+        };
+        if d.is_empty() {
+            return Ok(true);
+        }
+        if c.configurable == Some(false) {
+            if d.configurable == Some(true) {
+                return Ok(false);
+            }
+            if let Some(e) = d.enumerable {
+                if e != c.enumerable.unwrap_or(false) {
+                    return Ok(false);
+                }
+            }
+            if !d.is_generic() && d.is_accessor() != c.is_accessor() {
+                return Ok(false);
+            }
+            if c.is_accessor() {
+                if let Some(g) = &d.get {
+                    let cg = c.get.clone().unwrap_or(Value::Und);
+                    if !self.same_value(g, &cg)? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(s) = &d.set {
+                    let cs = c.set.clone().unwrap_or(Value::Und);
+                    if !self.same_value(s, &cs)? {
+                        return Ok(false);
+                    }
+                }
+            } else if c.writable == Some(false) {
+                if d.writable == Some(true) {
+                    return Ok(false);
+                }
+                if let Some(v) = &d.value {
+                    let cv = c.value.clone().unwrap_or(Value::Und);
+                    if !self.same_value(v, &cv)? {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// proxy [[Get]](P, Receiver) — the `get` trap plus the 10.5.8
+    /// invariants (non-config non-writable data ⇒ SameValue result;
+    /// non-config getter-less accessor ⇒ undefined result).
+    pub(crate) fn proxy_get(
+        &mut self,
+        t: &Value,
+        h: &Value,
+        key: &PropKey,
+        receiver: &Value,
+    ) -> ERes {
+        match self.proxy_trap(h, "get")? {
+            Some(trap) => {
+                let kv = self.key_to_value(key);
+                let r = self.call(
+                    &trap,
+                    h.clone(),
+                    vec![t.clone(), kv, receiver.clone()],
+                )?;
+                if let Some(td) = self.proxy_target_desc(t, key)? {
+                    if td.configurable == Some(false) {
+                        if !td.is_accessor() && td.writable == Some(false) {
+                            let tv = td.value.clone().unwrap_or(Value::Und);
+                            if !self.same_value(&r, &tv)? {
+                                return Err(self.type_err(
+                                    "'get' on proxy: property is a non-configurable, non-writable own data property of the target",
+                                ));
+                            }
+                        } else if td.is_accessor()
+                            && matches!(td.get.as_ref(), None | Some(Value::Und))
+                            && !matches!(r, Value::Und)
+                        {
+                            return Err(self.type_err(
+                                "'get' on proxy: property is a non-configurable accessor property of the target without a getter",
+                            ));
+                        }
+                    }
+                }
+                Ok(r)
+            }
+            // spec fallback: target.[[Get]](P, Receiver)
+            None => match t {
+                Value::Obj(to) => {
+                    let to = to.clone();
+                    self.obj_get(&to, key, receiver)
+                }
+                _ => Ok(Value::Und),
+            },
+        }
+    }
+
+    /// proxy [[Set]](P, V, Receiver) — the `set` trap plus the 10.5.9
+    /// invariants. A falsy trap result routes through `set_fail` so
+    /// strict callers throw and Reflect.set reads `false`.
+    pub(crate) fn proxy_set(
+        &mut self,
+        t: &Value,
+        h: &Value,
+        key: &PropKey,
+        v: Value,
+        receiver: &Value,
+    ) -> Result<(), Value> {
+        match self.proxy_trap(h, "set")? {
+            Some(trap) => {
+                let kv = self.key_to_value(key);
+                let r = self.call(
+                    &trap,
+                    h.clone(),
+                    vec![t.clone(), kv, v.clone(), receiver.clone()],
+                )?;
+                if !self.to_bool(&r) {
+                    let kn = self.key_to_name(key);
+                    return self.set_fail(&kn);
+                }
+                if let Some(td) = self.proxy_target_desc(t, key)? {
+                    if td.configurable == Some(false) {
+                        if !td.is_accessor() && td.writable == Some(false) {
+                            let tv = td.value.clone().unwrap_or(Value::Und);
+                            if !self.same_value(&v, &tv)? {
+                                return Err(self.type_err(
+                                    "'set' on proxy: trap returned truish for a non-configurable, non-writable property with a different value",
+                                ));
+                            }
+                        } else if td.is_accessor()
+                            && matches!(td.set.as_ref(), None | Some(Value::Und))
+                        {
+                            return Err(self.type_err(
+                                "'set' on proxy: trap returned truish for a non-configurable accessor property without a setter",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            // spec fallback: target.[[Set]](P, V, Receiver)
+            None => match t {
+                Value::Obj(to) => {
+                    let to = to.clone();
+                    self.obj_set(&to, key.clone(), v, receiver)
+                }
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// proxy [[HasProperty]](P) — the `has` trap plus the 10.5.7
+    /// invariant (a falsy result is illegal when the target has the key
+    /// non-configurably, or on a non-extensible target at all).
+    pub(crate) fn proxy_has(
+        &mut self,
+        t: &Value,
+        h: &Value,
+        key: &PropKey,
+    ) -> Result<bool, Value> {
+        match self.proxy_trap(h, "has")? {
+            Some(trap) => {
+                let kv = self.key_to_value(key);
+                let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
+                let br = self.to_bool(&r);
+                if !br {
+                    if let Some(td) = self.proxy_target_desc(t, key)? {
+                        if td.configurable == Some(false) {
+                            return Err(self.type_err(
+                                "'has' on proxy: trap returned falsish for a non-configurable property",
+                            ));
+                        }
+                        if !self.proxy_target_ext(t)? {
+                            return Err(self.type_err(
+                                "'has' on proxy: trap returned falsish for an existing property on a non-extensible target",
+                            ));
+                        }
+                    }
+                }
+                Ok(br)
+            }
+            None => self.has_prop(t, key),
+        }
+    }
+
+    /// proxy [[Delete]](P) — the `deleteProperty` trap plus the 10.5.10
+    /// invariants (can't report a non-configurable target prop deleted,
+    /// nor any prop on a non-extensible target).
+    pub(crate) fn proxy_delete(
+        &mut self,
+        t: &Value,
+        h: &Value,
+        key: &PropKey,
+    ) -> Result<bool, Value> {
+        match self.proxy_trap(h, "deleteProperty")? {
+            Some(trap) => {
+                let kv = self.key_to_value(key);
+                let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
+                if !self.to_bool(&r) {
+                    return Ok(false);
+                }
+                match self.proxy_target_desc(t, key)? {
+                    None => Ok(true),
+                    Some(td) => {
+                        if td.configurable == Some(false) {
+                            return Err(self.type_err(
+                                "'deleteProperty' on proxy: trap returned truish for a non-configurable property",
+                            ));
+                        }
+                        if !self.proxy_target_ext(t)? {
+                            return Err(self.type_err(
+                                "'deleteProperty' on proxy: trap returned truish for a property on a non-extensible target",
+                            ));
+                        }
+                        Ok(true)
+                    }
+                }
+            }
+            None => self.delete_prop(t, key),
+        }
+    }
+
+    /// proxy [[GetOwnProperty]](P) — the `getOwnPropertyDescriptor` trap
+    /// plus the 10.5.5 invariants. Returns the completed result
+    /// descriptor (None = the trap reported the key missing).
+    pub(crate) fn proxy_gopd(
+        &mut self,
+        t: &Value,
+        h: &Value,
+        key: &PropKey,
+    ) -> Result<Option<PDesc>, Value> {
+        match self.proxy_trap(h, "getOwnPropertyDescriptor")? {
+            Some(trap) => {
+                let kv = self.key_to_value(key);
+                let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
+                if !matches!(r, Value::Und | Value::Obj(_)) {
+                    return Err(self.type_err(
+                        "proxy getOwnPropertyDescriptor trap must return object or undefined",
+                    ));
+                }
+                let td = self.proxy_target_desc(t, key)?;
+                if matches!(r, Value::Und) {
+                    let Some(td) = td else {
+                        return Ok(None);
+                    };
+                    if td.configurable == Some(false) {
+                        return Err(self.type_err(
+                            "'getOwnPropertyDescriptor' on proxy: cannot report a non-configurable property as missing",
+                        ));
+                    }
+                    if !self.proxy_target_ext(t)? {
+                        return Err(self.type_err(
+                            "'getOwnPropertyDescriptor' on proxy: cannot report an existing property as missing on a non-extensible target",
+                        ));
+                    }
+                    return Ok(None);
+                }
+                let ext = self.proxy_target_ext(t)?;
+                let mut rd = self.pdesc_from_obj(&r)?;
+                rd.complete();
+                if !self.desc_compatible(ext, &rd, td.as_ref())? {
+                    return Err(self.type_err(
+                        "'getOwnPropertyDescriptor' on proxy: reported descriptor is incompatible with the target property",
+                    ));
+                }
+                if rd.configurable == Some(false) {
+                    let bad = match &td {
+                        None => true,
+                        Some(td) => td.configurable != Some(false),
+                    };
+                    if bad {
+                        return Err(self.type_err(
+                            "'getOwnPropertyDescriptor' on proxy: cannot report a configurable or missing property as non-configurable",
+                        ));
+                    }
+                    if rd.writable == Some(false)
+                        && td.as_ref().is_some_and(|td| td.writable == Some(true))
+                    {
+                        return Err(self.type_err(
+                            "'getOwnPropertyDescriptor' on proxy: cannot report a writable property as non-writable",
+                        ));
+                    }
+                }
+                Ok(Some(rd))
+            }
+            // spec fallback: target.[[GetOwnProperty]](P)
+            None => self.proxy_target_desc(t, key),
+        }
+    }
+
+    /// proxy [[DefineOwnProperty]] invariant pass (10.5.6) — run after a
+    /// truish `defineProperty` trap result; `desc` is the descriptor the
+    /// calling abstract op passed in.
+    pub(crate) fn proxy_define_invariant(
+        &mut self,
+        t: &Value,
+        key: &PropKey,
+        desc: &PDesc,
+    ) -> Result<(), Value> {
+        let td = self.proxy_target_desc(t, key)?;
+        let ext = self.proxy_target_ext(t)?;
+        let cfg_false = desc.configurable == Some(false);
+        match &td {
+            None => {
+                if !ext {
+                    return Err(self.type_err(
+                        "'defineProperty' on proxy: trap returned truish for adding a property to a non-extensible target",
+                    ));
+                }
+                if cfg_false {
+                    return Err(self.type_err(
+                        "'defineProperty' on proxy: trap returned truish for defining a non-configurable property absent from the target",
+                    ));
+                }
+            }
+            Some(td) => {
+                if !self.desc_compatible(ext, desc, Some(td))? {
+                    return Err(self.type_err(
+                        "'defineProperty' on proxy: trap returned truish for an incompatible property descriptor",
+                    ));
+                }
+                if cfg_false && td.configurable != Some(false) {
+                    return Err(self.type_err(
+                        "'defineProperty' on proxy: trap returned truish for defining a configurable target property as non-configurable",
+                    ));
+                }
+                if td.configurable == Some(false)
+                    && !td.is_accessor()
+                    && td.writable == Some(false)
+                    && desc.writable == Some(true)
+                {
+                    return Err(self.type_err(
+                        "'defineProperty' on proxy: trap returned truish for making a non-configurable, non-writable property writable",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// proxy [[GetPrototypeOf]] invariant — on a non-extensible target
+    /// the trap result must equal the target's real prototype.
+    pub(crate) fn proxy_getproto_invariant(
+        &mut self,
+        t: &Value,
+        r: &Value,
+    ) -> Result<(), Value> {
+        if self.proxy_target_ext(t)? {
+            return Ok(());
+        }
+        let tp = self.proxy_target_proto(t)?;
+        if !self.same_value(r, &tp)? {
+            return Err(self.type_err(
+                "'getPrototypeOf' on proxy: trap result does not match the non-extensible target's prototype",
+            ));
+        }
+        Ok(())
+    }
+
+    /// proxy [[SetPrototypeOf]] invariant — a truish result on a
+    /// non-extensible target must set the SAME prototype it already has.
+    pub(crate) fn proxy_setproto_invariant(
+        &mut self,
+        t: &Value,
+        v: &Value,
+    ) -> Result<(), Value> {
+        if self.proxy_target_ext(t)? {
+            return Ok(());
+        }
+        let tp = self.proxy_target_proto(t)?;
+        if !self.same_value(v, &tp)? {
+            return Err(self.type_err(
+                "'setPrototypeOf' on proxy: trap returned truish for a different prototype on a non-extensible target",
+            ));
+        }
+        Ok(())
+    }
+
     /// PropKey → the JS value traps receive (`"a"` → Str, symbol → Sym)
     /// human-readable key name for error messages
     pub fn key_to_name(&self, k: &PropKey) -> String {
@@ -2316,28 +2859,19 @@ impl Interp {
                     let (t, h, r) =
                         (target.clone(), handler.clone(), receiver.clone());
                     drop(b);
-                    return match self.proxy_trap(&h, "get")? {
-                        Some(trap) => self.call(
-                            &trap,
-                            h,
-                            vec![t, self.key_to_value(key), r],
-                        ),
-                        // spec fallback: target.[[Get]](P, Receiver)
-                        None => match t {
-                            Value::Obj(to) => self.obj_get(&to, key, &r),
-                            _ => Ok(Value::Und),
-                        },
-                    };
+                    return self.proxy_get(&t, &h, key, &r);
                 }
                 if let Some(p) = b.props.get(key) {
                     if p.is_accessor() {
                         match &p.get {
-                            Some(g) => {
+                            // an accessor defined with `get: undefined`
+                            // stores Some(Und) — present but not callable
+                            Some(g) if self.is_callable(g) => {
                                 let g = g.clone();
                                 drop(b);
                                 return self.call(&g, receiver.clone(), Vec::new());
                             }
-                            None => return Ok(Value::Und),
+                            _ => return Ok(Value::Und),
                         }
                     }
                     return Ok(p.val.clone());
@@ -2362,27 +2896,22 @@ impl Interp {
                     let (t, h, r) =
                         (target.clone(), handler.clone(), receiver.clone());
                     drop(b);
-                    return match self.proxy_trap(&h, "get")? {
-                        Some(trap) => self.call(
-                            &trap,
-                            h,
-                            vec![t, Value::Str(Rc::from(key)), r],
-                        ),
-                        None => match t {
-                            Value::Obj(to) => self.obj_get_str(&to, key, &r),
-                            _ => Ok(Value::Und),
-                        },
-                    };
+                    return self.proxy_get(
+                        &t,
+                        &h,
+                        &PropKey::from_str(key),
+                        &r,
+                    );
                 }
                 if let Some(p) = b.props.get_str(key) {
                     if p.is_accessor() {
                         match &p.get {
-                            Some(g) => {
+                            Some(g) if self.is_callable(g) => {
                                 let g = g.clone();
                                 drop(b);
                                 return self.call(&g, receiver.clone(), Vec::new());
                             }
-                            None => return Ok(Value::Und),
+                            _ => return Ok(Value::Und),
                         }
                     }
                     return Ok(p.val.clone());
@@ -2432,7 +2961,11 @@ impl Interp {
                     if let Some(p) = c.borrow().props.get(&key) {
                         if let Some(s) = &p.set {
                             let s = s.clone();
-                            return self.call(&s, base.clone(), vec![v]).map(|_| ());
+                            if self.is_callable(&s) {
+                                return self
+                                    .call(&s, base.clone(), vec![v])
+                                    .map(|_| ());
+                            }
                         }
                         // non-setter accessor or data prop on the proto —
                         // primitives can't create own props → [[Set]] fails
@@ -2454,27 +2987,20 @@ impl Interp {
         v: Value,
         receiver: &Value,
     ) -> Result<(), Value> {
-        // proxy set trap fires before anything else
-        if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
-            let (t, h, r) = (target.clone(), handler.clone(), receiver.clone());
-            return match self.proxy_trap(&h, "set")? {
-                Some(trap) => {
-                    let kv = self.key_to_value(&key);
-                    let r2 = self.call(&trap, h, vec![t, kv, v, r])?;
-                    if self.to_bool(&r2) {
-                        Ok(())
-                    } else {
-                        // [[Set]] returns false — strict callers throw,
-                        // Reflect.set reads it back as `false`
-                        self.set_fail(&self.key_to_name(&key))
-                    }
+        // proxy set trap fires before anything else (borrow scoped —
+        // a trap may revoke/mutate the proxy mid-call)
+        let proxy = {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Proxy { target, handler } => {
+                    Some((target.clone(), handler.clone()))
                 }
-                // spec fallback: target.[[Set]](P, V, Receiver)
-                None => match t {
-                    Value::Obj(to) => self.obj_set(&to, key, v, &r),
-                    _ => Ok(()),
-                },
-            };
+                _ => None,
+            }
+        };
+        if let Some((t, h)) = proxy {
+            let r = receiver.clone();
+            return self.proxy_set(&t, &h, &key, v, &r);
         }
         // integer-indexed writes + read-only virtuals on binary views
         {
@@ -2712,7 +3238,16 @@ impl Interp {
             let (found_accessor, found_data, is_own) = {
                 let b = c.borrow();
                 match b.props.get(&key) {
-                    Some(p) if p.is_accessor() => (Some(p.set.clone()), None, false),
+                    // `set: undefined` stores Some(Und) — present in the
+                    // descriptor but not callable → [[Set]] fails like None
+                    Some(p) if p.is_accessor() => (
+                        Some(p
+                            .set
+                            .clone()
+                            .filter(|s| matches!(s, Value::Obj(_)))),
+                        None,
+                        false,
+                    ),
                     Some(p) => (None, Some(p.writable), Rc::ptr_eq(&c, o)),
                     None => {
                         // a live dense element is an own writable data
@@ -2754,6 +3289,10 @@ impl Interp {
                         if !Rc::ptr_eq(ro, o) {
                             return self.set_on_receiver(receiver, key, v);
                         }
+                    } else {
+                        // OrdinarySetWithOwnDescriptor 4b: a primitive
+                        // receiver can't hold the shadow — [[Set]] fails
+                        return self.set_fail(&self.key_to_name(&key));
                     }
                     // a virtual dense element has no props entry — route
                     // the write through obj_define_data so items[i] (and
@@ -3244,32 +3783,11 @@ impl Interp {
             }
         };
         if let Some((t, h)) = proxy {
-            return match self.proxy_trap(&h, "getOwnPropertyDescriptor")? {
-                Some(trap) => {
-                    let kv = self.key_to_value(key);
-                    let r = self.call(&trap, h, vec![t, kv])?;
-                    match r {
-                        Value::Und => Ok(None),
-                        Value::Obj(_) => {
-                            let g = self.get_prop_str(&r, "get")?;
-                            let st = self.get_prop_str(&r, "set")?;
-                            let is_acc = !matches!(
-                                (g, st),
-                                (Value::Und, Value::Und)
-                            );
-                            let w = self.get_prop_str(&r, "writable")?;
-                            Ok(Some((is_acc, self.to_bool(&w))))
-                        }
-                        _ => Err(self.type_err(
-                            "proxy getOwnPropertyDescriptor trap must                              return object or undefined",
-                        )),
-                    }
+            return match self.proxy_gopd(&t, &h, key)? {
+                Some(d) => {
+                    Ok(Some((d.is_accessor(), d.writable.unwrap_or(false))))
                 }
-                // no trap → forward to the target
-                None => match t {
-                    Value::Obj(to) => self.recv_own_desc(&to, key),
-                    _ => Ok(None),
-                },
+                None => Ok(None),
             };
         }
         // ordinary: a stored props entry wins over dense/virtual slots —
@@ -3333,8 +3851,19 @@ impl Interp {
                     }
                     let kv = self.key_to_value(key);
                     let r =
-                        self.call(&trap, h, vec![t, kv, Value::Obj(d)])?;
+                        self.call(&trap, h, vec![t.clone(), kv, Value::Obj(d)])?;
                     if self.to_bool(&r) {
+                        // 10.5.6 invariants — a truish trap result must be
+                        // backed by a compatible target-side define
+                        let pd = PDesc {
+                            value: Some(v),
+                            writable: full.then_some(true),
+                            get: None,
+                            set: None,
+                            enumerable: full.then_some(true),
+                            configurable: full.then_some(true),
+                        };
+                        self.proxy_define_invariant(&t, key, &pd)?;
                         Ok(())
                     } else {
                         self.set_fail(&self.key_to_name(key))
@@ -3399,7 +3928,11 @@ impl Interp {
                     if let Some(p) = c.borrow().props.get_str(key) {
                         if let Some(s) = &p.set {
                             let s = s.clone();
-                            return self.call(&s, base.clone(), vec![v]).map(|_| ());
+                            if self.is_callable(&s) {
+                                return self
+                                    .call(&s, base.clone(), vec![v])
+                                    .map(|_| ());
+                            }
                         }
                         // non-setter accessor or data prop on the proto —
                         // primitives can't create own props → [[Set]] fails
@@ -3414,27 +3947,20 @@ impl Interp {
 
     /// `obj_set` by borrowed string key.
     fn obj_set_str(&mut self, o: &ObjRef, key: &str, v: Value, receiver: &Value) -> Result<(), Value> {
-        // proxy set trap fires before anything else
-        if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
-            let (t, h, r) = (target.clone(), handler.clone(), receiver.clone());
-            return match self.proxy_trap(&h, "set")? {
-                Some(trap) => {
-                    let kv = Value::Str(Rc::from(key));
-                    let r2 = self.call(&trap, h, vec![t, kv, v, r])?;
-                    if self.to_bool(&r2) {
-                        Ok(())
-                    } else {
-                        // [[Set]] returns false — strict callers throw,
-                        // Reflect.set reads it back as `false`
-                        self.set_fail(key)
-                    }
+        // proxy set trap fires before anything else (borrow scoped —
+        // a trap may revoke/mutate the proxy mid-call)
+        let proxy = {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Proxy { target, handler } => {
+                    Some((target.clone(), handler.clone()))
                 }
-                // spec fallback: target.[[Set]](P, V, Receiver)
-                None => match t {
-                    Value::Obj(to) => self.obj_set_str(&to, key, v, &r),
-                    _ => Ok(()),
-                },
-            };
+                _ => None,
+            }
+        };
+        if let Some((t, h)) = proxy {
+            let r = receiver.clone();
+            return self.proxy_set(&t, &h, &PropKey::from_str(key), v, &r);
         }
         // integer-indexed writes + read-only virtuals on binary views
         {
@@ -3457,9 +3983,13 @@ impl Interp {
                         let (buf, off, len, kind, track) =
                             (buf.clone(), *off, *len, *kind, *track);
                         drop(b);
-                        // ToNumber before the bounds check (spec
-                        // IntegerIndexedElementSet).
-                        let n = self.to_num(&v)?;
+                        // ToNumber/ToBigInt before the bounds check (spec
+                        // IntegerIndexedElementSet honors [[ContentType]]).
+                        let n = crate::binary::ta_elem_write(
+                            self,
+                            &Value::Obj(o.clone()),
+                            &v,
+                        )?;
                         if valid
                             && typed_state(&buf, off, len, kind, track)
                                 .is_some_and(|eff| idx < eff)
@@ -3611,7 +4141,14 @@ impl Interp {
             let (found_accessor, found_data, is_own) = {
                 let b = c.borrow();
                 match b.props.get_str(key) {
-                    Some(p) if p.is_accessor() => (Some(p.set.clone()), None, false),
+                    Some(p) if p.is_accessor() => (
+                        Some(p
+                            .set
+                            .clone()
+                            .filter(|s| matches!(s, Value::Obj(_)))),
+                        None,
+                        false,
+                    ),
                     Some(p) => (None, Some(p.writable), Rc::ptr_eq(&c, o)),
                     None => {
                         // a live dense element is an own writable data
@@ -3813,14 +4350,7 @@ impl Interp {
                 if let ObjKind::Proxy { target, handler } = &b.kind {
                     let (t, h) = (target.clone(), handler.clone());
                     drop(b);
-                    return match self.proxy_trap(&h, "has")? {
-                        Some(trap) => {
-                            let kv = self.key_to_value(key);
-                            let r = self.call(&trap, h, vec![t, kv])?;
-                            Ok(self.to_bool(&r))
-                        }
-                        None => self.has_prop(&t, key),
-                    };
+                    return self.proxy_has(&t, &h, key);
                 }
                 match &b.kind {
                     ObjKind::Arr(items) => {
@@ -3880,16 +4410,17 @@ impl Interp {
         let Value::Obj(o) = base else {
             return Ok(true);
         };
-        if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
-            let (t, h) = (target.clone(), handler.clone());
-            return match self.proxy_trap(&h, "deleteProperty")? {
-                Some(trap) => {
-                    let kv = self.key_to_value(key);
-                    let r = self.call(&trap, h, vec![t, kv])?;
-                    Ok(self.to_bool(&r))
+        let proxy = {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Proxy { target, handler } => {
+                    Some((target.clone(), handler.clone()))
                 }
-                None => self.delete_prop(&t, key),
-            };
+                _ => None,
+            }
+        };
+        if let Some((t, h)) = proxy {
+            return self.proxy_delete(&t, &h, key);
         }
         let mut b = o.borrow_mut();
         if let PropKey::S(s) = key {
@@ -3958,20 +4489,62 @@ impl Interp {
     }
 
     /// enumerable own + inherited string keys (for..in), deduped
-    pub fn enum_keys(&self, base: &Value) -> Vec<String> {
+    pub fn enum_keys(&mut self, base: &Value) -> Result<Vec<String>, Value> {
         let mut out = Vec::new();
         let mut seen: FxSet<String> = FxSet::default();
         if let Value::Str(s) = base {
             for i in 0..s.chars().count() {
                 out.push(i.to_string());
             }
-            return out;
+            return Ok(out);
         }
         let Value::Obj(o) = base else {
-            return out;
+            return Ok(out);
         };
-        let mut cur = Some(o.clone());
+        let mut cur: Option<ObjRef> = Some(o.clone());
         while let Some(c) = cur {
+            // a proxy level enumerates through traps per spec
+            // EnumerateObjectProperties: [[OwnPropertyKeys]] → per-key
+            // [[GetOwnProperty]] (enumerable filter) → [[GetPrototypeOf]].
+            // (the borrow() is scoped — traps may touch the object)
+            if { matches!(&c.borrow().kind, ObjKind::Proxy { .. }) } {
+                let cv = Value::Obj(c.clone());
+                for k in crate::builtins::own_keys_all(self, &cv)? {
+                    let PropKey::S(s) = &k else {
+                        continue;
+                    };
+                    let sname = s.to_string();
+                    if seen.contains(&sname) {
+                        continue;
+                    }
+                    let kv = self.key_to_value(&k);
+                    let d = crate::builtins::obj_get_own_prop_desc(
+                        self,
+                        &Value::Und,
+                        &[cv.clone(), kv],
+                    )?;
+                    // spec: a key reported by ownKeys but missing from
+                    // [[GetOwnProperty]] does NOT block the proto chain
+                    if let Value::Obj(dv) = d {
+                        seen.insert(sname.clone());
+                        let en =
+                            self.get_prop_str(&Value::Obj(dv), "enumerable")?;
+                        if self.to_bool(&en) {
+                            out.push(sname);
+                        }
+                    }
+                }
+                let pv = crate::builtins::obj_get_prototype_of(
+                    self,
+                    &Value::Und,
+                    &[cv],
+                )?;
+                cur = match pv {
+                    Value::Obj(po) => Some(po),
+                    _ => None,
+                };
+                continue;
+            }
             {
                 let b = c.borrow();
                 // spec for-in order per level: integer-index keys ascending
@@ -4060,7 +4633,7 @@ impl Interp {
             }
             cur = c.borrow().proto.clone();
         }
-        out
+        Ok(out)
     }
 
     /// enumerable own string keys
@@ -4735,13 +5308,19 @@ impl Interp {
                     .iter()
                     .any(|p| !matches!(p, Param::Ident(_)))
                 {
-                    let bs = Scope::new(Some(scope.clone()), true);
+                    // arrows keep is_fn=false so `this`/`new.target`/
+                    // `home`/`arguments` lookups pass through to the
+                    // enclosing function scope — their scope's own slots
+                    // were never initialized
+                    let bs = Scope::new(Some(scope.clone()), !def.is_arrow);
                     bs.var_boundary.set(true);
-                    *bs.thisv.borrow_mut() = scope.thisv.borrow().clone();
-                    *bs.new_target.borrow_mut() =
-                        scope.new_target.borrow().clone();
-                    *bs.home.borrow_mut() = scope.home.borrow().clone();
-                    *bs.ctor_fn.borrow_mut() = scope.ctor_fn.borrow().clone();
+                    if !def.is_arrow {
+                        *bs.thisv.borrow_mut() = scope.thisv.borrow().clone();
+                        *bs.new_target.borrow_mut() =
+                            scope.new_target.borrow().clone();
+                        *bs.home.borrow_mut() = scope.home.borrow().clone();
+                        *bs.ctor_fn.borrow_mut() = scope.ctor_fn.borrow().clone();
+                    }
                     bs
                 } else {
                     scope.clone()
@@ -4813,7 +5392,10 @@ impl Interp {
     }
 
     fn call_dispatch_end(&mut self, o: &ObjRef, this: Value, args: Vec<Value>) -> ERes {
-        match o.borrow().kind.clone() {
+        // scoped borrow — a proxy's `apply` trap / `revoke()` may
+        // mutate the object while the call runs
+        let kind = { o.borrow().kind.clone() };
+        match kind {
             ObjKind::Und => Ok(Value::Und),
             ObjKind::Bound {
                 target,
@@ -4825,6 +5407,12 @@ impl Interp {
                 self.call(&target, thisv, all)
             }
             ObjKind::Proxy { target, handler } => {
+                // spec: a proxy is callable only when its target is —
+                // reaching [[Call]] on a non-callable proxy (or a
+                // revoked one) is "not a function" before any trap
+                if !matches!(&target, Value::Obj(t) if t.borrow().is_callable()) {
+                    return Err(self.type_err("value is not a function"));
+                }
                 match self.proxy_trap(&handler, "apply")? {
                     Some(trap) => {
                         let args_arr = Value::Obj(self.new_arr(args));
@@ -4869,9 +5457,16 @@ impl Interp {
                 return Err(self.type_err("newTarget is not a constructor"));
             }
         }
-        let kind = o.borrow().kind.clone();
+        // scoped borrow — a proxy's `construct` trap / `revoke()` may
+        // mutate the object mid-call
+        let kind = { o.borrow().kind.clone() };
         match kind {
             ObjKind::Proxy { target, handler } => {
+                // spec: [[Construct]] exists on a proxy only when the
+                // target is a constructor (a revoked target fails here)
+                if !matches!(&target, Value::Obj(t) if self.is_constructor(&Value::Obj(t.clone()))) {
+                    return Err(self.type_err("value is not a constructor"));
+                }
                 match self.proxy_trap(&handler, "construct")? {
                     Some(trap) => {
                         let args_arr = Value::Obj(self.new_arr(args));
@@ -4888,7 +5483,13 @@ impl Interp {
                         }
                         Ok(r)
                     }
-                    None => self.construct(&target, args, new_target),
+                    // spec: absent trap forwards to target.[[Construct]]
+                    // with the ORIGINAL newTarget — for `new p()` that is
+                    // the proxy itself (its `prototype` get traps)
+                    None => {
+                        let nt = new_target.or_else(|| Some(f.clone()));
+                        self.construct(&target, args, nt)
+                    }
                 }
             }
             ObjKind::Func(Func::Native { f: nf, name, ctor: nctor }) => {
@@ -4902,11 +5503,13 @@ impl Interp {
                 if !nctor {
                     return Err(self.type_err(format!("{name} is not a constructor")));
                 }
-                // OrdinaryCreateFromConstructor: new_target.prototype wins
+                // OrdinaryCreateFromConstructor: new_target.prototype wins —
+                // read through [[Get]] so a proxy newTarget fires its
+                // `get` trap (revoked / throwing traps propagate)
                 let nt_proto = match &new_target {
-                    Some(Value::Obj(nto)) => self
-                        .obj_get_raw(nto, &PropKey::from_str("prototype"))
-                        .unwrap_or(Value::Und),
+                    Some(ntv @ Value::Obj(_)) => {
+                        self.get_prop(ntv, &PropKey::from_str("prototype"))?
+                    }
                     _ => Value::Und,
                 };
                 let proto_v = if matches!(nt_proto, Value::Obj(_)) {
@@ -4985,22 +5588,19 @@ impl Interp {
         {
                 let nt = new_target.unwrap_or_else(|| f.clone());
                 // prototype for the new object: new_target.prototype or obj proto
-                let proto = {
-                    let nt_obj = if let Value::Obj(no) = &nt {
-                        Some(no.clone())
-                    } else {
-                        None
-                    };
-                    match nt_obj {
-                        Some(no) => {
-                            let pp = self.obj_get_raw(&no, &PropKey::from_str("prototype"));
-                            match pp {
-                                Some(Value::Obj(p)) => Some(p),
-                                _ => Some(self.p.obj.clone()),
-                            }
+                // GetPrototypeFromConstructor reads newTarget.prototype
+                // through [[Get]] — a proxy newTarget fires its `get`
+                // trap; a non-object result falls back to %Object.prototype%
+                let proto = match &nt {
+                    Value::Obj(_) => {
+                        match self
+                            .get_prop(&nt, &PropKey::from_str("prototype"))?
+                        {
+                            Value::Obj(p) => Some(p),
+                            _ => Some(self.p.obj.clone()),
                         }
-                        None => Some(self.p.obj.clone()),
                     }
+                    _ => Some(self.p.obj.clone()),
                 };
                 let this = match ctor {
                     CtorKind::Derived => Value::Und, // allocated at super()
@@ -5697,14 +6297,14 @@ impl Interp {
                                 self.to_object(&v)?
                             };
                             let rest = self.new_obj();
-                            if let Value::Obj(src) = &v {
-                                let mut taken: HashSet<String> = elems
+                            if let Value::Obj(_src) = &v {
+                                let mut taken: HashSet<PropKey> = elems
                                     .iter()
                                     .filter_map(|x| match &x.key {
                                         ast::PropKey::Str(s) | ast::PropKey::Ident(s)
                                             if s.as_str() != REST_PAT_KEY =>
                                         {
-                                            Some(s.to_string())
+                                            Some(PropKey::from_str(s))
                                         }
                                         _ => None,
                                     })
@@ -5714,43 +6314,39 @@ impl Interp {
                                 for x in elems {
                                     if let ast::PropKey::Computed(ex) = &x.key {
                                         let kv = self.eval_expr(ex, scope)?;
-                                        if let Ok(PropKey::S(pk)) =
+                                        if let Ok(pk) =
                                             self.to_propkey(&kv)
                                         {
-                                            taken.insert(pk.to_string());
+                                            taken.insert(pk);
                                         }
                                     }
                                 }
-                                let keys = self.own_keys(&v);
-                                for k in keys {
-                                    if !taken.contains(&k) {
-                                        // CopyDataProperties uses [[Get]]
-                                        let val = self.get_prop(
-                                            &v,
-                                            &PropKey::from_str(&k),
-                                        )?;
-                                        self.set_data(&rest, &k, val);
+                                // CopyDataProperties: [[OwnPropertyKeys]] +
+                                // gOPD-enum filter + [[Get]] per key — a
+                                // proxy source runs the full trap set
+                                for (k, val) in
+                                    crate::builtins::own_enum_entries_full(
+                                        self, &v, true,
+                                    )?
+                                {
+                                    if taken.contains(&k) {
+                                        continue;
                                     }
-                                }
-                                // enumerable symbol keys copy too
-                                if let Value::Obj(so) = &v {
-                                    let syms: Vec<u64> = so
-                                        .borrow()
-                                        .props
-                                        .iter()
-                                        .filter_map(|(k, p)| match k {
-                                            PropKey::Sym(id) if p.enumerable => Some(*id),
-                                            _ => None,
-                                        })
-                                        .collect();
-                                    for id in syms {
-                                        let val = self
-                                            .get_prop(&v, &PropKey::Sym(id))?;
-                                        let mut pb = rest.borrow_mut();
-                                        pb.props.insert(
-                                            PropKey::Sym(id),
-                                            crate::interp::Prop::data(val),
-                                        );
+                                    match &k {
+                                        PropKey::S(s) => {
+                                            self.set_data(
+                                                &rest,
+                                                &s.to_string(),
+                                                val,
+                                            );
+                                        }
+                                        PropKey::Sym(id) => {
+                                            let mut pb = rest.borrow_mut();
+                                            pb.props.insert(
+                                                PropKey::Sym(*id),
+                                                crate::interp::Prop::data(val),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -6507,7 +7103,7 @@ impl Interp {
                     _ => env,
                 };
                 let rv = self.eval_expr(right, head_env)?;
-                let keys = self.enum_keys(&rv);
+                let keys = self.enum_keys(&rv)?;
                 // `let`/`const` loop targets need a per-iteration scope
                 // (CreatePerIterationEnvironment), seeded from the previous
                 // iteration's for-head bindings; `var`/expr targets resolve
@@ -6562,8 +7158,38 @@ impl Interp {
                         scope
                     };
                     // spec: keys deleted since enumeration are skipped;
-                    // keys added during iteration are never visited
-                    if !self.has_prop(&rv_obj, &PropKey::from_str(k.as_str()))? {
+                    // keys added during iteration are never visited. A
+                    // proxy re-checks through [[GetOwnProperty]] (the
+                    // trap keeps seeing each key exactly as for-in does)
+                    let rv_is_proxy = match &rv_obj {
+                        Value::Obj(ro) => {
+                            matches!(&ro.borrow().kind, ObjKind::Proxy { .. })
+                        }
+                        _ => false,
+                    };
+                    let keep = if rv_is_proxy {
+                        let d = crate::builtins::obj_get_own_prop_desc(
+                            self,
+                            &Value::Und,
+                            &[
+                                rv_obj.clone(),
+                                Value::Str(Rc::from(k.as_str())),
+                            ],
+                        )?;
+                        match d {
+                            Value::Obj(dv) => {
+                                let en = self.get_prop_str(
+                                    &Value::Obj(dv),
+                                    "enumerable",
+                                )?;
+                                self.to_bool(&en)
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        self.has_prop(&rv_obj, &PropKey::from_str(k.as_str()))?
+                    };
+                    if !keep {
                         continue;
                     }
                     self.bind_for_target(scope, left, Value::Str(Rc::from(k.as_str())))?;
@@ -7636,17 +8262,28 @@ impl Interp {
             }
             Expr::Array(elems) => {
                 let mut items = Vec::with_capacity(elems.len());
+                let mut hole_idx: Vec<usize> = Vec::new();
                 for el in elems {
                     match el {
                         ArrElem::Expr(ex) => items.push(self.eval_expr(ex, env)?),
-                        ArrElem::Hole => items.push(Value::Und),
+                        ArrElem::Hole => {
+                            hole_idx.push(items.len());
+                            items.push(Value::Und);
+                        }
                         ArrElem::Spread(ex) | ArrElem::SpreadTrail(ex) => {
                             let v = self.eval_expr(ex, env)?;
                             items.extend(self.iter_values(&v)?);
                         }
                     }
                 }
-                Ok(Value::Obj(self.new_arr(items)))
+                let arr = self.new_arr(items);
+                if !hole_idx.is_empty() {
+                    let mut h = arr.borrow_mut();
+                    for k in hole_idx {
+                        h.holes.get_or_insert_with(Default::default).insert(k);
+                    }
+                }
+                Ok(Value::Obj(arr))
             }
             Expr::ObjDup(_) => {
                 Err(self.syntax_err("duplicate __proto__ property"))
@@ -7657,31 +8294,30 @@ impl Interp {
                     match &p.val {
                         PropVal::Spread(ex) | PropVal::SpreadTrail(ex) => {
                             let sv = self.eval_expr(ex, env)?;
-                            if let Value::Obj(src) = &sv {
-                                // CopyDataProperties: Get per key (getters
-                                // fire) in [[OwnPropertyKeys]] order
-                                for k in self.own_keys(&sv) {
-                                    let v = self.get_prop(
-                                        &sv,
-                                        &PropKey::from_str(&k),
-                                    )?;
-                                    self.set_data(&o, &k, v);
-                                }
-                                // symbol props — same Get treatment
-                                let symkeys: Vec<PropKey> = src
-                                    .borrow()
-                                    .props
-                                    .iter()
-                                    .filter(|(_, pr)| pr.enumerable)
-                                    .filter(|(k, _)| matches!(k, PropKey::Sym(_)))
-                                    .map(|(k, _)| k.clone())
-                                    .collect();
-                                for k in symkeys {
-                                    let v = self.get_prop(&sv, &k)?;
-                                    o.borrow_mut().props.insert(
-                                        k,
-                                        Prop::data(v),
-                                    );
+                            if let Value::Obj(_src) = &sv {
+                                // CopyDataProperties: [[OwnPropertyKeys]] +
+                                // gOPD-enum filter + [[Get]] per key — a
+                                // proxy source runs the full trap set
+                                for (k, v) in
+                                    crate::builtins::own_enum_entries_full(
+                                        self, &sv, true,
+                                    )?
+                                {
+                                    match &k {
+                                        PropKey::S(s) => {
+                                            self.set_data(
+                                                &o,
+                                                &s.to_string(),
+                                                v,
+                                            );
+                                        }
+                                        PropKey::Sym(id) => {
+                                            o.borrow_mut().props.insert(
+                                                PropKey::Sym(*id),
+                                                Prop::data(v),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -8448,7 +9084,9 @@ impl Interp {
                                 "Cannot convert undefined or null to object",
                             ));
                         }
-                        self.delete_prop_str(&ov, s)
+                        // route through delete_prop — proxies fire the
+                        // deleteProperty trap (delete_prop_str can't)
+                        self.delete_prop(&ov, &PropKey::from_str(s))?
                     } else {
                         let pv = self.eval_expr(prop, env)?;
                         let key = self.to_propkey(&pv)?;

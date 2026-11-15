@@ -216,13 +216,28 @@ fn bu64_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
 }
 
 /// `[[TypedArrayName]]` — BigInt stand-ins share TAK::F64 and carry
-/// their real name in the hidden `__name` slot instead.
+/// their real name in the hidden `__name` slot instead. The slot may
+/// live on the instance (`big_ta_ctor`) or anywhere up the proto chain
+/// (the intrinsic protos, or a subclass chain).
 fn ta_intrinsic_name(v: &Value, kind: TAK) -> String {
     if let Value::Obj(o) = v {
-        if let Some(p) = o.borrow().props.get_str("__name") {
-            if let Value::Str(s) = &p.val {
-                return s.to_string();
+        let mut cur = Some(o.clone());
+        while let Some(c) = cur {
+            let hit = {
+                let b = c.borrow();
+                let hit = b
+                    .props
+                    .get_str("__name")
+                    .and_then(|p| match &p.val {
+                        Value::Str(s) => Some(s.to_string()),
+                        _ => None,
+                    });
+                (hit, b.proto.clone())
+            };
+            if let Some(name) = hit.0 {
+                return name;
             }
+            cur = hit.1;
         }
     }
     kind.type_name().to_string()
@@ -279,7 +294,13 @@ fn bigint_to_string(i: &mut Interp, this: &Value, a: &[Value]) -> NR {
     let radix = match a.first() {
         Some(Value::Und) | None => 10,
         Some(v) => {
-            let n = i.to_num(v)?;
+            // ToIntegerOrInfinity: a bigint radix is a TypeError (ToNumber
+            // rejects bigints), not a magnitude read
+            let p = i.to_primitive(v)?;
+            if bigint_is_prim(&p) {
+                return Err(i.type_err("Cannot convert a BigInt value to a number"));
+            }
+            let n = i.to_num(&p)?;
             if !(2.0..=36.0).contains(&n) || n.fract() != 0.0 {
                 return Err(i.range_err("toString() radix must be between 2 and 36"));
             }
@@ -458,7 +479,14 @@ fn install_typed_arrays(i: &mut Interp) {
         i.set_builtin(&bp, "toString", i.native("toString", bigint_to_string));
         bp.borrow_mut().props.insert(
             PropKey::Sym(SYM_TOSTRINGTAG),
-            Prop::builtin(Value::Str(Rc::from("BigInt"))),
+            Prop {
+                val: Value::Str(Rc::from("BigInt")),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                get: None,
+                set: None,
+            },
         );
     }
     // tolerant stubs — exist so `typeof BigInt64Array === "function"`;
@@ -472,6 +500,16 @@ fn install_typed_arrays(i: &mut Interp) {
         // it to detect bigint element kind before the instance slot is
         // installed (inside the constructor body) and for subclasses.
         hid(i, &proto, "__name", Value::Str(Rc::from(name)));
+        // BYTES_PER_ELEMENT on the proto as well as the ctor —
+        // `ta.BYTES_PER_ELEMENT` must resolve through the instance
+        // (resizable-buffer tests compute expected lengths from it).
+        i.set_attr(
+            &proto,
+            "BYTES_PER_ELEMENT",
+            Value::Num(8.0),
+            false,
+            false,
+        );
         let ctor = i.native(name, cf);
         if let Value::Obj(co) = &ctor {
             if let ObjKind::Func(Func::Native { ctor, .. }) = &mut co.borrow_mut().kind {
@@ -637,12 +675,30 @@ fn ta_elem(i: &mut Interp, this: &Value, k: usize) -> Result<Value, Value> {
     i.get_prop(this, &ta_elem_key(k))
 }
 
+/// Re-materialize a *stored* element f64 as the JS-visible value.
+/// Number-kind elements pass through unchanged. Bigint-kind elements
+/// keep their exact 64-bit two's-complement pattern bit-cast into the
+/// f64 element store — `to_bits` recovers it and `bigint_obj_b`
+/// rebuilds an exact stand-in (never routed through f64 precision).
+pub(crate) fn ta_stored_pub(i: &Interp, this: &Value, n: f64) -> Value {
+    if !ta_is_big(this) {
+        return Value::Num(n);
+    }
+    let u = n.to_bits();
+    if ta_intrinsic_name(this, TAK::F64) == "BigInt64Array" {
+        let v = u as i64;
+        i.bigint_obj_b(v < 0, &format!("{:b}", v.unsigned_abs()))
+    } else {
+        i.bigint_obj_b(false, &format!("{:b}", u))
+    }
+}
+
 /// wrap a raw element value for JS visibility — bigint-kind arrays
 /// expose bigint stand-in objects; everything else passes through.
-pub(crate) fn ta_pubify(i: &mut Interp, this: &Value, v: Value) -> Value {
+pub(crate) fn ta_pubify(i: &Interp, this: &Value, v: Value) -> Value {
     if let Value::Num(n) = &v {
         if ta_is_big(this) {
-            return i.bigint_obj(*n);
+            return ta_stored_pub(i, this, *n);
         }
     }
     v
@@ -657,14 +713,26 @@ fn ta_pub_elem(i: &mut Interp, this: &Value, k: usize) -> Result<Value, Value> {
 }
 
 /// element-vs-searchElement comparison honoring [[ContentType]] —
-/// a bigint-kind element only matches a bigint stand-in argument
-/// (magnitude compared), and a number-kind element never matches a
-/// stand-in. `svz` picks SameValueZero (includes) vs strict (indexOf).
+/// a bigint-kind element only matches a bigint primitive argument
+/// (compared on the exact bit-strings, never f64 magnitude), and a
+/// number-kind element never matches a stand-in. `svz` picks
+/// SameValueZero (includes) vs strict (indexOf / lastIndexOf).
 fn ta_elem_matches(v: &Value, needle: &Value, big: bool, svz: bool) -> bool {
     if big {
-        return match bigint_magnitude(needle) {
-            Some(n) => matches!(v, Value::Num(e) if *e == n),
-            None => false,
+        // elements arrive as bigint stand-ins (or `undefined` for
+        // out-of-bounds reads); a non-bigint needle can only match
+        // via SameValueZero/strict-undefined semantics.
+        if let Some(n) = bigint_bits(needle) {
+            return matches!(
+                bigint_bits(v),
+                Some(e) if scmp_bits((e.0, &e.1), (n.0, &n.1))
+                    == std::cmp::Ordering::Equal
+            );
+        }
+        return if svz {
+            ta_same_value_zero(v, needle)
+        } else {
+            ta_strict_eq(v, needle)
         };
     }
     if bigint_magnitude(needle).is_some() {
@@ -706,8 +774,17 @@ fn ta_to_int(i: &mut Interp, v: &Value) -> Result<f64, Value> {
 
 /// spec ToIndex — ToIntegerOrInfinity then assert 0 ≤ n < 2^53.
 /// NaN → +0; negative / ±∞ / ≥ 2^53 → RangeError.
-fn to_index(i: &mut Interp, v: &Value) -> Result<usize, Value> {
-    let n = i.to_num(v)?.trunc();
+pub(crate) fn to_index(i: &mut Interp, v: &Value) -> Result<usize, Value> {
+    // ToNumber resolves objects first (number hint) — a bigint
+    // primitive (direct or unwrapped) is a TypeError, not a number
+    let p = match v {
+        Value::Obj(o) => i.to_primitive_hint(v, o.clone(), "number")?,
+        _ => v.clone(),
+    };
+    if bigint_is_prim(&p) {
+        return Err(i.type_err("Cannot convert a BigInt value to a number"));
+    }
+    let n = i.to_num(&p)?.trunc();
     if n.is_nan() {
         return Ok(0);
     }
@@ -772,6 +849,25 @@ fn str_to_bigint_num(i: &mut Interp, s: &str) -> Result<f64, Value> {
 /// a ToBigInt approximation for bigint-kind ones (stand-in objects
 /// carry their magnitude in `__bigint`; real engines throw TypeError
 /// converting BigInt↔Number, which we emulate).
+/// exact ToBigInt element coercion — like `ta_elem_num(big=true)` but
+/// keeps the full precision bit-string
+pub(crate) fn ta_elem_bits(i: &mut Interp, v: &Value) -> Result<(bool, String), Value> {
+    match v {
+        Value::Num(_) | Value::Und | Value::Null | Value::Sym(..) => {
+            Err(i.type_err("Cannot convert value to a BigInt"))
+        }
+        Value::Bool(b) => Ok((false, if *b { "1".into() } else { "0".into() })),
+        Value::Str(s) => str_to_bigint_bits(i, s),
+        Value::Obj(o) => match bigint_bits(v) {
+            Some((neg, mag)) => Ok((neg, mag.to_string())),
+            None => {
+                let p = i.to_primitive_hint(v, o.clone(), "number")?;
+                ta_elem_bits(i, &p)
+            }
+        },
+    }
+}
+
 pub(crate) fn ta_elem_num(i: &mut Interp, v: &Value, big: bool) -> Result<f64, Value> {
     if big {
         return match v {
@@ -796,6 +892,22 @@ pub(crate) fn ta_elem_num(i: &mut Interp, v: &Value, big: bool) -> Result<f64, V
     i.to_num(v)
 }
 
+/// coerce a value to the f64 the element store should hold —
+/// ToNumber for number-kind receivers; for bigint-kind receivers
+/// ToBigInt followed by the ToBigInt64/ToBigUint64 mod-2^64 wrap,
+/// whose exact low-64-bit two's-complement pattern is stored
+/// bit-cast as f64 (TAK::F64's read/write are pure transmutes, so
+/// `to_bits` recovers the u64 verbatim on the way out).
+pub(crate) fn ta_elem_stored(i: &mut Interp, v: &Value, big: bool) -> Result<f64, Value> {
+    if !big {
+        return ta_elem_num(i, v, false);
+    }
+    let (neg, mag) = ta_elem_bits(i, v)?;
+    let (_, m64) = bigint_as_int((neg, &mag), 64, false);
+    let u = u64::from_str_radix(&m64, 2).unwrap_or(0);
+    Ok(f64::from_bits(u))
+}
+
 /// coerce a value for a (possibly bigint-kind) typed-array element
 /// write — ToNumber/ToBigInt + the ToBigInt64/ToBigUint64 mod-2^64 wrap.
 pub(crate) fn ta_elem_write(
@@ -803,20 +915,7 @@ pub(crate) fn ta_elem_write(
     this: &Value,
     v: &Value,
 ) -> Result<f64, Value> {
-    let big = ta_is_big(this);
-    let n = ta_elem_num(i, v, big)?;
-    Ok(if big {
-        // f64 stand-ins approximate the arbitrary-precision spec: the
-        // wrap keeps at least the magnitude's sign/parity right.
-        const M: f64 = 18446744073709551616.0; // 2^64
-        let mut r = n.rem_euclid(M);
-        if ta_intrinsic_name(this, TAK::F64) == "BigInt64Array" && r >= M / 2.0 {
-            r -= M;
-        }
-        r
-    } else {
-        n
-    })
+    ta_elem_stored(i, v, ta_is_big(this))
 }
 
 /// spec [[ContentType]] check — bigint-kind TypedArrays carry the
@@ -1091,7 +1190,7 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bo
                      -> Result<Vec<f64>, Value> {
                         let mut elems = Vec::with_capacity(items.len());
                         for it in items {
-                            elems.push(ta_elem_num(i, &it, target_big)?);
+                            elems.push(ta_elem_stored(i, &it, target_big)?);
                         }
                         Ok(elems)
                     };
@@ -1133,7 +1232,7 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bo
                                         Vec::with_capacity(n.min(1_000_000));
                                     for k in 0..n {
                                         let it = i.get_prop(&src, &ta_elem_key(k))?;
-                                        elems.push(ta_elem_num(i, &it, target_big)?);
+                                        elems.push(ta_elem_stored(i, &it, target_big)?);
                                     }
                                     elems
                                 }
@@ -1403,7 +1502,7 @@ fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         // spec Set propagates the element conversion first —
         // conversion side effects (detach/resize) make the write
         // itself silently vanish.
-        let nv = ta_elem_num(i, &v, target_big)?;
+        let nv = ta_elem_stored(i, &v, target_big)?;
         t.set_num(i, to + k, nv)?;
     }
     Ok(Value::Und)
@@ -1511,7 +1610,7 @@ fn m_ta_fill(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let t = need_ta_write(i, this)?;
     let len = t.eff().unwrap_or(0);
     // spec: ToBigInt on bigint-kind receivers, ToNumber otherwise
-    let v = ta_elem_num(i, &arg(args, 0), ta_is_big(this))?;
+    let v = ta_elem_stored(i, &arg(args, 0), ta_is_big(this))?;
     let start = clamp_index(ta_to_int(i, &arg(args, 1))?, len);
     let end = match arg(args, 2) {
         Value::Und => len,
@@ -1586,10 +1685,10 @@ fn ta_sort_elems(
     for k in 0..len {
         items.push(ta_elem(i, this, k)?);
     }
+    let big = ta_is_big(this);
     if i.is_callable(cmp) {
         // bigint-kind arrays hand stand-ins to the comparator so user
         // code observes bigint-typed elements
-        let big = ta_is_big(this);
         let mut err: Option<Value> = None;
         let mut work = items.clone();
         merge_sort(&mut items, &mut work, &mut |a, b| {
@@ -1632,6 +1731,17 @@ fn ta_sort_elems(
     } else {
         // default numeric compare; NaN (incl. undefined elements) last
         items.sort_by(|a, b| {
+            if big {
+                // bigint-kind: spec orders on the bigint value —
+                // exact bit-strings, never the f64 magnitude cache.
+                // Numeric elements sort before non-numeric (undefined).
+                return match (bigint_bits(a), bigint_bits(b)) {
+                    (Some(x), Some(y)) => scmp_bits((x.0, &x.1), (y.0, &y.1)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                };
+            }
             let (x, y) = match (a, b) {
                 (Value::Num(x), Value::Num(y)) => (*x, *y),
                 (Value::Num(_), _) => return std::cmp::Ordering::Less,
@@ -1644,6 +1754,13 @@ fn ta_sort_elems(
                 std::cmp::Ordering::Greater
             } else if y.is_nan() {
                 std::cmp::Ordering::Less
+            } else if x == y {
+                // spec SortCompare: -0 sorts before +0
+                match (x.is_sign_negative(), y.is_sign_negative()) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => std::cmp::Ordering::Equal,
+                }
             } else {
                 x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
             }
@@ -1689,6 +1806,12 @@ fn m_ta_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         (n as usize).min(len)
     };
     for k in start..len {
+        // spec kPresent = HasProperty — a detached or out-of-bounds
+        // view reports no integer-indexed properties at all, so the
+        // element is never read (indexOf(undefined) → -1).
+        if t.get(k).is_none() {
+            continue;
+        }
         let v = ta_elem(i, this, k)?;
         if ta_elem_matches(&v, &needle, big, false) {
             return Ok(Value::Num(k as f64));
@@ -1721,6 +1844,10 @@ fn m_ta_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     }
     let big = ta_is_big(this);
     for k in (0..=k as usize).rev() {
+        // same HasProperty gate as indexOf — absent index → skip
+        if t.get(k).is_none() {
+            continue;
+        }
         let v = ta_elem(i, this, k)?;
         if ta_elem_matches(&v, &needle, big, false) {
             return Ok(Value::Num(k as f64));
@@ -1844,7 +1971,6 @@ fn m_ta_map(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         vec![Value::Num(len as f64)],
         Some(len),
     )?;
-    let a_big = ta_is_big(&a);
     for k in 0..len {
         let kv = ta_pub_elem(i, this, k)?;
         let rv = i.call(
@@ -1852,10 +1978,9 @@ fn m_ta_map(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             this_arg.clone(),
             vec![kv, Value::Num(k as f64), this.clone()],
         )?;
-        // the Set inside the spec coerces with ToNumber/ToBigInt —
-        // doing it here stores a plain number without double valueOf
-        let cv = Value::Num(ta_elem_num(i, &rv, a_big)?);
-        i.set_prop(&a, ta_elem_key(k), cv)?;
+        // spec Set — the integer-indexed [[Set]] performs the
+        // ToNumber/ToBigInt coercion exactly once
+        i.set_prop(&a, ta_elem_key(k), rv)?;
     }
     Ok(a)
 }
@@ -2082,39 +2207,23 @@ fn iter_result(i: &mut Interp, v: Value, done: bool) -> NR {
     Ok(Value::Obj(r))
 }
 
-/// `%TypedArray Iterator%.prototype` — per-interp singleton stashed
-/// on `Object.prototype` (a hidden, non-enumerable slot). Inherits
-/// the array-iterator proto for `@@iterator`; its own `next` and
-/// `@@toStringTag` make it a distinct intrinsic as the spec requires.
-fn ta_iter_proto(i: &mut Interp) -> ObjRef {
-    let op = i.p.obj.clone();
-    if let Some(Value::Obj(p)) =
-        i.obj_get_raw(&op, &PropKey::from_str("__taIterProto"))
-    {
-        return p;
-    }
-    let p = plain(Some(i.p.array_iter.clone()));
-    i.set_builtin(&p, "next", i.native("next", ta_iter_next));
-    p.borrow_mut().props.insert(
-        PropKey::Sym(SYM_TOSTRINGTAG),
-        Prop::builtin(Value::Str(Rc::from("Typed Array Iterator"))),
-    );
-    op.borrow_mut()
-        .props
-        .insert_str("__taIterProto", Prop::builtin(Value::Obj(p.clone())));
-    p
-}
-
-/// TypedArray iterator — reads the live view on every `next()` so
-/// resizable-buffer length changes are observed dynamically.
+/// TypedArray iterator — spec CreateArrayIterator, so the object's
+/// [[Prototype]] is the shared `%ArrayIteratorPrototype%` (spec tests
+/// pin that identity) and `next` is installed as an own prop backed
+/// by the TypedArray-aware implementation — the shared `next` reads
+/// the `length` getter (0 for OOB) where spec requires a TypeError.
+/// Reads the live view on every `next()` so resizable-buffer length
+/// changes are observed dynamically.
 /// `mode`: 0 = keys, 1 = values, 2 = entries.
 fn mk_ta_iter(i: &mut Interp, this: &Value, mode: u8) -> Value {
-    let it = plain(Some(ta_iter_proto(i)));
+    let it = plain(Some(i.p.array_iter.clone()));
     {
         let mut b = it.borrow_mut();
         b.props.insert_str("__src", Prop::builtin(this.clone()));
         b.props.insert_str("__i", Prop::builtin(Value::Num(0.0)));
         b.props.insert_str("__m", Prop::builtin(Value::Num(mode as f64)));
+        b.props
+            .insert_str("next", Prop::builtin(i.native("next", ta_iter_next)));
     }
     Value::Obj(it)
 }
@@ -2226,8 +2335,10 @@ fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     // value conversion runs before the index validity check (a
     // valueOf may resize the buffer and invalidate the index); spec
-    // uses ToBigInt on bigint-kind receivers, ToNumber otherwise
-    let v = ta_elem_num(i, &arg(args, 1), ta_is_big(this))?;
+    // uses ToBigInt on bigint-kind receivers, ToNumber otherwise.
+    // `v` is the raw stored-element f64 — for bigint-kind receivers it
+    // is the exact 64-bit pattern, NOT a number to re-coerce.
+    let v = ta_elem_stored(i, &arg(args, 1), ta_is_big(this))?;
     let Some(eff) = t.eff() else {
         return Err(i.range_err("Invalid index"));
     };
@@ -2237,12 +2348,15 @@ fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let actual = actual as usize;
     let a = ta_fresh_typed(i, this, t.kind, len)?;
     for k in 0..len {
-        let kv = if k == actual {
-            Value::Num(v)
+        if k == actual {
+            // raw write — `v` was already coerced above; routing it
+            // back through [[Set]] would wrongly reject the Num form
+            // on a bigint-kind destination
+            ta_parts(&a).unwrap().set_num(i, actual, v)?;
         } else {
-            ta_elem(i, this, k)?
-        };
-        i.set_prop(&a, ta_elem_key(k), kv)?;
+            let kv = ta_elem(i, this, k)?;
+            i.set_prop(&a, ta_elem_key(k), kv)?;
+        }
     }
     Ok(a)
 }
@@ -2960,6 +3074,34 @@ fn dv_set_index(
     Ok((b, off + idx, v))
 }
 
+fn dv_set_index_big(
+    i: &mut Interp,
+    this: &Value,
+    args: &[Value],
+    sz: usize,
+) -> Result<(Rc<RefCell<Vec<u8>>>, usize, u64), Value> {
+    let (buf, off, len) = need_view(i, this)?;
+    if buf.borrow().immutable {
+        return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+    }
+    let idx = to_index(i, &arg(args, 0))?;
+    // spec order: ToBigInt runs before the bounds check — a valueOf may
+    // detach or resize the buffer
+    let (neg, mag) = ta_elem_bits(i, &arg(args, 1))?;
+    let (_, m64) = bigint_as_int((neg, &mag), 64, false);
+    let u = u64::from_str_radix(&m64, 2).unwrap_or(0);
+    let Some(vlen) = dv_state(&buf, off, len) else {
+        return Err(
+            i.type_err("Cannot perform operation on a detached or out-of-bounds DataView")
+        );
+    };
+    if idx > vlen || sz > vlen - idx {
+        return Err(i.range_err("Offset is outside the bounds of the DataView"));
+    }
+    let b = buffer_bytes(&buf).unwrap();
+    Ok((b, off + idx, u))
+}
+
 fn dv_le(i: &mut Interp, args: &[Value], n: usize) -> bool {
     i.to_bool(&arg(args, n))
 }
@@ -3152,7 +3294,7 @@ fn dv_get_i64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     } else {
         i64::from_be_bytes(s)
     };
-    Ok(i.bigint_obj(v as f64))
+    Ok(i.bigint_obj_b(v < 0, &format!("{:b}", v.unsigned_abs())))
 }
 fn dv_get_u64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let (b, at) = dv_get_index(i, this, args, 8)?;
@@ -3164,7 +3306,7 @@ fn dv_get_u64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     } else {
         u64::from_be_bytes(s)
     };
-    Ok(i.bigint_obj(v as f64))
+    Ok(i.bigint_obj_b(false, &format!("{:b}", v)))
 }
 fn dv_set_u8(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let (b, at, v) = dv_set_index(i, this, args, 1, false)?;
@@ -3213,21 +3355,22 @@ fn dv_set_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Und)
 }
 fn dv_set_i64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at, v) = dv_set_index(i, this, args, 8, true)?;
+    let (b, at, u) = dv_set_index_big(i, this, args, 8)?;
+    let v = u as i64;
     let s = if dv_le(i, args, 2) {
-        (v as i64).to_le_bytes()
+        v.to_le_bytes()
     } else {
-        (v as i64).to_be_bytes()
+        v.to_be_bytes()
     };
     b.borrow_mut()[at..at + 8].copy_from_slice(&s);
     Ok(Value::Und)
 }
 fn dv_set_u64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at, v) = dv_set_index(i, this, args, 8, true)?;
+    let (b, at, u) = dv_set_index_big(i, this, args, 8)?;
     let s = if dv_le(i, args, 2) {
-        (v as u64).to_le_bytes()
+        u.to_le_bytes()
     } else {
-        (v as u64).to_be_bytes()
+        u.to_be_bytes()
     };
     b.borrow_mut()[at..at + 8].copy_from_slice(&s);
     Ok(Value::Und)
@@ -5634,6 +5777,21 @@ pub(crate) fn bigint_loose_cmp(a: &Value, b: &Value) -> Option<bool> {
 pub(crate) fn bigint_as_int(bits: (bool, &str), n: usize, signed: bool) -> (bool, String) {
     if n == 0 {
         return (false, "0".into());
+    }
+    let mag_len = bits.1.len();
+    if n > mag_len {
+        if signed || !bits.0 {
+            // |value| < 2^(n-1) (signed) resp. < 2^n (unsigned & positive)
+            // — the mod wraps back to the same value
+            return (bits.0, bits.1.to_string());
+        }
+        // asUintN of a negative: result is 2^n - mag — n - mag_len
+        // leading ones over the low two's-complement tail
+        let mut s = "1".repeat(n - mag_len);
+        for b in to_tc(true, bits.1, mag_len) {
+            s.push((b'0' + b) as char);
+        }
+        return (false, bnorm(&s).to_string());
     }
     let tc = to_tc(bits.0, bits.1, n);
     if signed {
