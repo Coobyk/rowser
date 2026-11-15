@@ -2,11 +2,13 @@
 //! std only.
 //!
 //! The pattern is parsed into an AST (`Node`) and matched by recursive
-//! backtracking with continuation-passing over `&[char]` (JS works on
-//! UTF-16 code units; we approximate with code points). A global step cap
-//! keeps catastrophic backtracking from hanging the engine — when the cap
-//! is exceeded the match attempt fails rather than hanging.
+//! backtracking with continuation-passing over `&[u16]` — JS strings are
+//! UTF-16: non-unicode patterns match code units, `u`/`v` patterns match
+//! whole code points (a surrogate pair is a single char). A global step
+//! cap keeps catastrophic backtracking from hanging the engine — when the
+//! cap is exceeded the match attempt fails rather than hanging.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// Max backtracking steps per match attempt.
@@ -17,7 +19,10 @@ const MAX_DEPTH: u32 = 4_000;
 #[derive(Debug)]
 pub enum Node {
     Empty,
-    Ch(char),
+    /// a single character: a code point in unicode patterns (astral values
+    /// consume a surrogate pair — surrogate code points arise from `\uXXXX`
+    /// escapes and only match lone units), a UTF-16 code unit otherwise
+    Ch(u32),
     /// `.` — any char except line terminators (unless `s` flag)
     Any,
     Class {
@@ -39,8 +44,9 @@ pub enum Node {
     },
     /// `\1`..`\9` backreference
     Backref(u32),
-    /// `\k<name>` — resolved to Backref after parse
-    BackrefName(String),
+    /// `\k<name>` — resolved to Backref after parse; carries the normalized
+    /// name plus the raw source text (Annex-B literal fallback needs it)
+    BackrefName(String, String),
     Anchor(Anchor),
     /// `(?=..)` `(?!..)` `(?<=..)` `(?<!..)`
     Look {
@@ -52,8 +58,9 @@ pub enum Node {
 
 #[derive(Debug, Clone)]
 pub enum ClassItem {
-    Ch(char),
-    Range(char, char),
+    /// single char — code point in unicode patterns, code unit otherwise
+    Ch(u32),
+    Range(u32, u32),
     Pre(Pre),
 }
 
@@ -78,7 +85,7 @@ pub enum Anchor {
 #[derive(Debug)]
 pub struct Regex {
     pub source: String,
-    /// flags in spec order (subset of `dgimsuy` present)
+    /// flags in spec order (subset of `dgimsuvy` present)
     pub flags: String,
     pub root: Node,
     pub n_groups: usize,
@@ -91,13 +98,15 @@ pub struct Regex {
     pub sticky: bool,
     pub has_indices: bool,
     pub unicode: bool,
+    pub unicode_sets: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct RxMatch {
     pub start: usize,
     pub end: usize,
-    /// caps[0] = whole match; caps[g] = capture group g (1-based)
+    /// caps[0] = whole match; caps[g] = capture group g (1-based) — indices
+    /// are UTF-16 unit offsets into the haystack
     pub caps: Vec<Option<(usize, usize)>>,
 }
 
@@ -105,7 +114,7 @@ impl Regex {
     pub fn compile(source: &str, flags: &str) -> Result<Rc<Regex>, String> {
         let mut seen = String::new();
         for f in flags.chars() {
-            if !"dgimsuy".contains(f) {
+            if !"dgimsuvy".contains(f) {
                 return Err(format!("invalid flag '{f}'"));
             }
             if seen.contains(f) {
@@ -113,14 +122,22 @@ impl Regex {
             }
             seen.push(f);
         }
+        if seen.contains('u') && seen.contains('v') {
+            return Err("flags 'u' and 'v' are mutually exclusive".into());
+        }
         let icase = seen.contains('i');
+        let (total_groups, has_named) = count_capture_groups(source);
         let mut p = ReParser {
             s: source.chars().collect(),
             i: 0,
             n_groups: 0,
             names: Vec::new(),
-            total_groups: count_capture_groups(source),
-            unicode: seen.contains('u'),
+            total_groups,
+            has_named,
+            unicode: seen.contains('u') || seen.contains('v'),
+            pending: None,
+            pending_class: None,
+            name_scope: Vec::new(),
         };
         let root = p.alt()?;
         if p.i < p.s.len() {
@@ -128,7 +145,10 @@ impl Regex {
         }
         let names = p.names.clone();
         let root = resolve_names(root, &names, p.unicode)?;
-        let canonical: String = "dgimsuy".chars().filter(|c| seen.contains(*c)).collect();
+        let canonical: String = "dgimsuvy"
+            .chars()
+            .filter(|c| seen.contains(*c))
+            .collect();
         Ok(Rc::new(Regex {
             source: source.to_string(),
             flags: canonical,
@@ -142,11 +162,41 @@ impl Regex {
             sticky: seen.contains('y'),
             has_indices: seen.contains('d'),
             unicode: seen.contains('u'),
+            unicode_sets: seen.contains('v'),
         }))
     }
 
+    /// unicode-matching: atoms consume whole code points (`u` or `v` flag)
+    fn umatch(&self) -> bool {
+        self.unicode || self.unicode_sets
+    }
+
+    /// index of the code point containing unit `p` — for unicode matching a
+    /// lastIndex inside a surrogate pair maps to the pair's character
+    /// (spec RegExpBuiltinExec's `inputIndex` computation)
+    fn boundary(&self, s: &[u16], p: usize) -> usize {
+        if self.umatch() && p > 0 && p < s.len() && is_hi(s[p - 1]) && is_lo(s[p]) {
+            p - 1
+        } else {
+            p
+        }
+    }
+
+    /// spec AdvanceStringIndex — +2 over a surrogate pair in unicode mode
+    fn advance(&self, s: &[u16], p: usize) -> usize {
+        if self.umatch()
+            && p + 1 < s.len()
+            && is_hi(s[p])
+            && is_lo(s[p + 1])
+        {
+            p + 2
+        } else {
+            p + 1
+        }
+    }
+
     /// Leftmost match starting at or after `start` (honors `y`/sticky).
-    pub fn exec(&self, s: &[char], start: usize) -> Option<RxMatch> {
+    pub fn exec(&self, s: &[u16], start: usize) -> Option<RxMatch> {
         if start > s.len() {
             return None;
         }
@@ -161,13 +211,13 @@ impl Regex {
             if p >= s.len() {
                 return None;
             }
-            p += 1;
+            p = self.advance(s, p);
         }
     }
 
     /// Leftmost match at or after `from`, ignoring stickiness — used by
     /// string ops that drive their own position.
-    pub fn find(&self, s: &[char], from: usize) -> Option<RxMatch> {
+    pub fn find(&self, s: &[u16], from: usize) -> Option<RxMatch> {
         if from > s.len() {
             return None;
         }
@@ -179,12 +229,16 @@ impl Regex {
             if p >= s.len() {
                 return None;
             }
-            p += 1;
+            p = self.advance(s, p);
         }
     }
 
     /// Anchored match attempt at exactly `pos`.
-    pub fn try_at(&self, s: &[char], pos: usize) -> Option<RxMatch> {
+    pub fn try_at(&self, s: &[u16], pos: usize) -> Option<RxMatch> {
+        let pos = self.boundary(s, pos);
+        if pos > s.len() {
+            return None;
+        }
         let mut c = Ctx {
             s,
             caps: vec![None; self.n_groups + 1],
@@ -194,6 +248,7 @@ impl Regex {
             icase: self.ignore_case,
             multiline: self.multiline,
             dotall: self.dot_all,
+            umatch: self.umatch(),
             end: usize::MAX,
         };
         let found = mat(&mut c, &self.root, pos, &mut |c2, e| {
@@ -217,6 +272,23 @@ impl Regex {
 // pattern parser
 // ===========================================================================
 
+/// split an astral code point into its UTF-16 surrogate halves
+fn split_pair(v: u32) -> (u32, u32) {
+    (0xD800 + ((v - 0x10000) >> 10), 0xDC00 + ((v - 0x10000) & 0x3FF))
+}
+
+/// a literal char node — astral chars become a unit sequence outside
+/// unicode patterns
+fn lit_node(c: char, unicode: bool) -> Node {
+    let v = c as u32;
+    if v > 0xFFFF && !unicode {
+        let (hi, lo) = split_pair(v);
+        Node::Seq(vec![Node::Ch(hi), Node::Ch(lo)])
+    } else {
+        Node::Ch(v)
+    }
+}
+
 struct ReParser {
     s: Vec<char>,
     i: usize,
@@ -225,9 +297,24 @@ struct ReParser {
     /// total capture groups in the whole pattern (prescan) — needed to tell
     /// `\1` backreferences from legacy octal escapes
     total_groups: usize,
-    /// `u` flag — Annex-B extensions (quantifiable assertions, lone `]`/`}`/`{`)
-    /// are disabled and stray syntax is a hard error
+    /// the pattern contains at least one `(?<name>...)` — `\k<name>` is
+    /// only a named backreference then (Annex-B literal fallback else)
+    has_named: bool,
+    /// `u`/`v` flag — Annex-B extensions (quantifiable assertions, lone
+    /// `]`/`}`/`{`, octals) are disabled and stray syntax is a hard error
     unicode: bool,
+    /// pending UTF-16 unit from an astral literal split in a non-unicode
+    /// pattern — the low half is the *next* atom (a quantifier binds to it)
+    pending: Option<u32>,
+    /// same, inside a character class
+    pending_class: Option<u32>,
+    /// per-open-disjunction group-name scopes: `(union, arm)` — `arm` is
+    /// the names defined inside the alternative currently being parsed
+    /// (a second use in the SAME alternative is a SyntaxError), `union`
+    /// accumulates every arm's names and propagates to the enclosing
+    /// alternative when the disjunction ends — this is the spec's
+    /// "duplicate names are allowed only in different `|` arms" rule
+    name_scope: Vec<(HashSet<String>, HashSet<String>)>,
 }
 
 impl ReParser {
@@ -258,10 +345,55 @@ impl ReParser {
         }
     }
 
+    /// a literal pattern char → an atom. Astral literals in non-unicode
+    /// patterns are two UTF-16 units: the high half is returned and the
+    /// low half is queued in `pending` as the following atom (so a
+    /// quantifier binds to the low unit, matching unit-level parsing).
+    fn lit_char(&mut self, c: char) -> Node {
+        let v = c as u32;
+        if v > 0xFFFF && !self.unicode {
+            let (hi, lo) = split_pair(v);
+            self.pending = Some(lo);
+            Node::Ch(hi)
+        } else {
+            Node::Ch(v)
+        }
+    }
+
+    /// same, as a character-class item (`pending_class` queues the low half)
+    fn lit_class(&mut self, c: char) -> ClassItem {
+        let v = c as u32;
+        if v > 0xFFFF && !self.unicode {
+            let (hi, lo) = split_pair(v);
+            self.pending_class = Some(lo);
+            ClassItem::Ch(hi)
+        } else {
+            ClassItem::Ch(v)
+        }
+    }
+
     fn alt(&mut self) -> Result<Node, String> {
+        self.name_scope.push((HashSet::new(), HashSet::new()));
         let mut arms = vec![self.seq()?];
         while self.eat('|') {
+            // a new alternative: names defined so far stay reachable only
+            // within the previous arm — a fresh arm may reuse them
+            self.name_scope.last_mut().unwrap().1.clear();
             arms.push(self.seq()?);
+        }
+        let (mut union, arm) = self.name_scope.pop().unwrap();
+        union.extend(arm);
+        // all names defined inside this disjunction "occur" in the
+        // enclosing alternative — a collision there means two same-named
+        // groups are reachable on one match path → SyntaxError
+        if let Some((_u, p_arm)) = self.name_scope.last_mut() {
+            for n in union {
+                if !p_arm.insert(n.clone()) {
+                    return Err(format!(
+                        "duplicate group name '{n}' in the same alternative"
+                    ));
+                }
+            }
         }
         Ok(if arms.len() == 1 {
             arms.pop().unwrap()
@@ -272,11 +404,26 @@ impl ReParser {
 
     fn seq(&mut self) -> Result<Node, String> {
         let mut items = Vec::new();
-        while let Some(c) = self.peek() {
-            if c == '|' || c == ')' {
-                break;
-            }
-            items.push(self.term()?);
+        loop {
+            let atom = if let Some(u) = self.pending.take() {
+                Node::Ch(u)
+            } else {
+                match self.peek() {
+                    Some('|') | Some(')') | None => break,
+                    _ => {
+                        let a = self.atom()?;
+                        if self.pending.is_some() {
+                            // astral literal split — the high half is a
+                            // finished atom; the pending low half takes
+                            // the quantifier slot
+                            items.push(a);
+                            continue;
+                        }
+                        a
+                    }
+                }
+            };
+            items.push(self.quant(atom)?);
         }
         match items.len() {
             0 => Ok(Node::Empty),
@@ -285,9 +432,8 @@ impl ReParser {
         }
     }
 
-    /// term = atom + optional quantifier
-    fn term(&mut self) -> Result<Node, String> {
-        let atom = self.atom()?;
+    /// optional quantifier following an atom
+    fn quant(&mut self, atom: Node) -> Result<Node, String> {
         let (min, max) = match self.peek() {
             Some('*') => {
                 self.i += 1;
@@ -301,7 +447,7 @@ impl ReParser {
                 self.i += 1;
                 (0, 1)
             }
-            Some('{') => match self.try_brace_quant() {
+            Some('{') => match self.try_brace_quant()? {
                 Some(mm) => mm,
                 None => return Ok(atom),
             },
@@ -322,8 +468,6 @@ impl ReParser {
             _ => {}
         }
         let lazy = self.eat('?');
-        // a second `*`/`+`/`?`/`{` after the quantifier falls back through
-        // `atom` → "nothing to repeat" (or a lone-`{` literal under Annex B)
         Ok(Node::Rep {
             inner: Box::new(atom),
             min,
@@ -332,17 +476,20 @@ impl ReParser {
         })
     }
 
-    /// `{n}` `{n,}` `{n,m}` — returns None (no consumption) if not valid form.
-    fn try_brace_quant(&mut self) -> Option<(u32, u32)> {
+    /// `{n}` `{n,}` `{n,m}` — Ok(None) (no consumption) if not a valid
+    /// form; Err if the quantifier is well-formed but out of order
+    fn try_brace_quant(&mut self) -> Result<Option<(u32, u32)>, String> {
         let save = self.i;
         self.i += 1; // {
-        let lo = self.digits()?;
+        let Some(lo) = self.digits() else {
+            self.i = save;
+            return Ok(None);
+        };
         let (min, max) = if self.eat(',') {
             if self.peek().is_some_and(|c| c.is_ascii_digit()) {
-                let hi = self.digits()?;
+                let hi = self.digits().unwrap();
                 if hi < lo {
-                    self.i = save;
-                    return None;
+                    return Err("numbers out of order in {} quantifier".into());
                 }
                 (lo, hi)
             } else {
@@ -353,11 +500,30 @@ impl ReParser {
         };
         if self.peek() == Some('}') {
             self.i += 1;
-            Some((min, max))
+            Ok(Some((min, max)))
         } else {
             self.i = save;
-            None
+            Ok(None)
         }
+    }
+
+    /// does the text starting at `at` (which must be `{`) parse as a
+    /// braced quantifier shape `{d}`, `{d,}` or `{d,d}`? lookahead only
+    fn brace_quant_shape_at(&self, at: usize) -> bool {
+        let mut i = at + 1;
+        if !self.s.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        while self.s.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
+        }
+        if self.s.get(i) == Some(&',') {
+            i += 1;
+            while self.s.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                i += 1;
+            }
+        }
+        self.s.get(i) == Some(&'}')
     }
 
     fn digits(&mut self) -> Option<u32> {
@@ -385,10 +551,15 @@ impl ReParser {
             // error in every mode ("nothing to repeat")
             '*' | '+' | '?' => Err("nothing to repeat".into()),
             // lone `]`, `}`, `{` are literals only under Annex-B leniency;
-            // with the `u` flag they are a SyntaxError
+            // with `u`/`v` they are a SyntaxError
             ']' | '}' | '{' if self.unicode => Err(format!("unexpected '{c}'")),
+            // `{` in atom position: if it parses as a braced quantifier it
+            // is a SyntaxError (InvalidBracedQuantifier) — else a literal
+            '{' if self.brace_quant_shape_at(self.i - 1) => {
+                Err("quantifier without atom".into())
+            }
             // stray `]`/`}`/`{` are treated as literals (Annex-B leniency)
-            c => Ok(Node::Ch(c)),
+            c => Ok(self.lit_char(c)),
         }
     }
 
@@ -448,14 +619,17 @@ impl ReParser {
                         }
                         _ => {
                             // named group (?<name>...)
-                            let mut name = String::new();
-                            loop {
-                                match self.next() {
-                                    Some('>') => break,
-                                    Some(c) => name.push(c),
-                                    None => return Err("unterminated group name".into()),
-                                }
+                            let (name, _raw) = self.parse_group_name()?;
+                            // a name may be reused across different `|`
+                            // alternatives but never twice in the same one
+                            let (union, arm) =
+                                self.name_scope.last_mut().expect("inside alt()");
+                            if !arm.insert(name.clone()) {
+                                return Err(format!(
+                                    "duplicate group name '{name}' in the same alternative"
+                                ));
                             }
+                            union.insert(name.clone());
                             self.n_groups += 1;
                             let idx = self.n_groups;
                             self.names.push((name, idx));
@@ -488,6 +662,76 @@ impl ReParser {
         }
     }
 
+    /// GroupName after `(?<` or `\k<` — RegExpIdentifierName code points:
+    /// literal chars or `\uXXXX` / `\u{cp}` escapes (both allowed in either
+    /// mode here); a `\u` lead-surrogate escape followed by a `\u`
+    /// trail-surrogate escape combines into a single code point. Validates
+    /// ID_Start / ID_Continue and returns (normalized name, raw source).
+    fn parse_group_name(&mut self) -> Result<(String, String), String> {
+        let raw_start = self.i;
+        let mut cps: Vec<u32> = Vec::new();
+        loop {
+            let cp = match self.next() {
+                None => return Err("unterminated group name".into()),
+                Some('>') => break,
+                Some('\\') => match self.next() {
+                    Some('u') => self.name_escape()?,
+                    _ => return Err("invalid escape in group name".into()),
+                },
+                Some(c) => c as u32,
+            };
+            let ok = if cps.is_empty() {
+                is_id_start_cp(cp)
+            } else {
+                is_id_continue_cp(cp)
+            };
+            if !ok {
+                return Err(format!("invalid group name character U+{cp:X}"));
+            }
+            cps.push(cp);
+        }
+        if cps.is_empty() {
+            return Err("empty group name".into());
+        }
+        let raw: String = self.s[raw_start..self.i - 1].iter().collect();
+        let name: String = cps.iter().filter_map(|&cp| char::from_u32(cp)).collect();
+        Ok((name, raw))
+    }
+
+    /// `\u` escape inside a group name — `\uXXXX` or `\u{cp}`, with
+    /// surrogate-pair combining (`\uD800\uDC00` → U+10000)
+    fn name_escape(&mut self) -> Result<u32, String> {
+        let v = if self.eat('{') {
+            let mut v: u32 = 0;
+            let mut any = false;
+            while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
+                any = true;
+                v = v.saturating_mul(16).saturating_add(d);
+                self.i += 1;
+            }
+            if !self.eat('}') || !any || v > 0x10FFFF {
+                return Err("invalid \\u escape in group name".into());
+            }
+            v
+        } else {
+            self.hex(4).ok_or("invalid \\u escape in group name")?
+        };
+        if (0xD800..0xDC00).contains(&v)
+            && self.peek() == Some('\\')
+            && self.peek2() == Some('u')
+        {
+            let save = self.i;
+            self.i += 2;
+            if let Some(t) = self.hex(4) {
+                if (0xDC00..0xE000).contains(&t) {
+                    return Ok(0x10000 + ((v - 0xD800) << 10) + (t - 0xDC00));
+                }
+            }
+            self.i = save;
+        }
+        Ok(v)
+    }
+
     /// `\x` outside a char class
     fn escape(&mut self) -> Result<Node, String> {
         let c = self.next().ok_or("trailing backslash")?;
@@ -500,11 +744,11 @@ impl ReParser {
             'S' => pre_node(Pre::NotSpace),
             'b' => Node::Anchor(Anchor::WordB),
             'B' => Node::Anchor(Anchor::NotWordB),
-            'n' => Node::Ch('\n'),
-            't' => Node::Ch('\t'),
-            'r' => Node::Ch('\r'),
-            'f' => Node::Ch('\u{c}'),
-            'v' => Node::Ch('\u{b}'),
+            'n' => Node::Ch(0x0A),
+            't' => Node::Ch(0x09),
+            'r' => Node::Ch(0x0D),
+            'f' => Node::Ch(0x0C),
+            'v' => Node::Ch(0x0B),
             '0' => {
                 if self.unicode && self.peek().is_some_and(|d| d.is_ascii_digit()) {
                     return Err("octal escapes are not allowed in unicode mode".into());
@@ -515,26 +759,26 @@ impl ReParser {
             'x' => {
                 let save = self.i;
                 match self.hex(2) {
-                    Some(ch) => Node::Ch(ch),
+                    Some(v) => Node::Ch(v),
                     None if self.unicode => {
                         return Err("invalid \\x escape".into());
                     }
                     None => {
                         self.i = save;
-                        Node::Ch('x')
+                        Node::Ch('x' as u32)
                     }
                 }
             }
             'u' => {
                 let save = self.i;
                 match self.uesc_opt() {
-                    Some(ch) => Node::Ch(ch),
+                    Some(v) => Node::Ch(v),
                     None if self.unicode => {
                         return Err("invalid \\u escape".into());
                     }
                     None => {
                         self.i = save;
-                        Node::Ch('u')
+                        Node::Ch('u' as u32)
                     }
                 }
             }
@@ -543,29 +787,30 @@ impl ReParser {
                 match self.peek() {
                     Some(l) if l.is_ascii_alphabetic() => {
                         self.i += 1;
-                        Node::Ch((l as u8 % 32) as char)
+                        Node::Ch((l as u32) % 32)
                     }
                     _ if self.unicode => {
                         return Err("invalid \\c escape".into());
                     }
-                    _ => Node::Ch('c'),
+                    _ => Node::Ch('c' as u32),
                 }
             }
             'k' => {
                 if self.eat('<') {
-                    let mut name = String::new();
-                    loop {
-                        match self.next() {
-                            Some('>') => break,
-                            Some(c) => name.push(c),
-                            None => return Err("unterminated \\k<name>".into()),
-                        }
+                    if !self.unicode && !self.has_named {
+                        // Annex-B: `\k` is literal when the pattern has no
+                        // named groups at all — the `<` starts a fresh
+                        // literal atom
+                        self.i -= 1;
+                        Node::Ch('k' as u32)
+                    } else {
+                        let (name, raw) = self.parse_group_name()?;
+                        Node::BackrefName(name, raw)
                     }
-                    Node::BackrefName(name)
                 } else if self.unicode {
                     return Err("invalid \\k escape".into());
                 } else {
-                    Node::Ch('k')
+                    Node::Ch('k' as u32)
                 }
             }
             '1'..='9' => {
@@ -592,7 +837,7 @@ impl ReParser {
                     let first = digits.chars().next().unwrap();
                     if first == '8' || first == '9' {
                         self.i -= digits.len() - 1;
-                        Node::Ch(first)
+                        Node::Ch(first as u32)
                     } else {
                         let cap = if first <= '3' { 3 } else { 2 };
                         let od: String = digits
@@ -602,7 +847,7 @@ impl ReParser {
                             .collect();
                         self.i -= digits.len() - od.len();
                         let v = u32::from_str_radix(&od, 8).unwrap_or(0);
-                        Node::Ch(char::from_u32(v).unwrap_or('\0'))
+                        Node::Ch(v)
                     }
                 }
             }
@@ -612,7 +857,7 @@ impl ReParser {
                 if self.unicode && !"^$\\.*+?()[]{}|/".contains(other) {
                     return Err(format!("invalid escape '\\{other}'"));
                 }
-                Node::Ch(other)
+                self.lit_char(other)
             }
         })
     }
@@ -627,12 +872,12 @@ impl ReParser {
             'W' => ClassItem::Pre(Pre::NotWord),
             's' => ClassItem::Pre(Pre::Space),
             'S' => ClassItem::Pre(Pre::NotSpace),
-            'b' => ClassItem::Ch('\u{8}'), // backspace inside []
-            'n' => ClassItem::Ch('\n'),
-            't' => ClassItem::Ch('\t'),
-            'r' => ClassItem::Ch('\r'),
-            'f' => ClassItem::Ch('\u{c}'),
-            'v' => ClassItem::Ch('\u{b}'),
+            'b' => ClassItem::Ch(0x08), // backspace inside []
+            'n' => ClassItem::Ch(0x0A),
+            't' => ClassItem::Ch(0x09),
+            'r' => ClassItem::Ch(0x0D),
+            'f' => ClassItem::Ch(0x0C),
+            'v' => ClassItem::Ch(0x0B),
             '0' => {
                 if self.unicode && self.peek().is_some_and(|d| d.is_ascii_digit()) {
                     return Err("octal escapes are not allowed in unicode mode".into());
@@ -642,33 +887,33 @@ impl ReParser {
             'x' => {
                 let save = self.i;
                 match self.hex(2) {
-                    Some(ch) => ClassItem::Ch(ch),
+                    Some(v) => ClassItem::Ch(v),
                     None if self.unicode => {
                         return Err("invalid \\x escape".into());
                     }
                     None => {
                         self.i = save;
-                        ClassItem::Ch('x')
+                        ClassItem::Ch('x' as u32)
                     }
                 }
             }
             'u' => {
                 let save = self.i;
                 match self.uesc_opt() {
-                    Some(ch) => ClassItem::Ch(ch),
+                    Some(v) => ClassItem::Ch(v),
                     None if self.unicode => {
                         return Err("invalid \\u escape".into());
                     }
                     None => {
                         self.i = save;
-                        ClassItem::Ch('u')
+                        ClassItem::Ch('u' as u32)
                     }
                 }
             }
             'c' => match self.peek() {
                 Some(l) if l.is_ascii_alphabetic() => {
                     self.i += 1;
-                    ClassItem::Ch((l as u8 % 32) as char)
+                    ClassItem::Ch((l as u32) % 32)
                 }
                 _ if self.unicode => {
                     return Err("invalid \\c escape".into());
@@ -677,9 +922,9 @@ impl ReParser {
                 // chars formed from the second char's codepoint % 32
                 Some(l) if l == '_' || l.is_ascii_digit() => {
                     self.i += 1;
-                    ClassItem::Ch((l as u8 % 32) as char)
+                    ClassItem::Ch((l as u32) % 32)
                 }
-                _ => ClassItem::Ch('c'),
+                _ => ClassItem::Ch('c' as u32),
             },
             '1'..='9' => {
                 if self.unicode {
@@ -687,7 +932,7 @@ impl ReParser {
                 }
                 if c >= '8' {
                     // `[\8]` `[\9]` — NonOctalDecimalEscape → literal digit
-                    return Ok(ClassItem::Ch(c));
+                    return Ok(ClassItem::Ch(c as u32));
                 }
                 // legacy octal inside class — `0`-`3` take up to 3 digits,
                 // `4`-`7` only 2 (spec LegacyOctalEscapeSequence)
@@ -702,11 +947,10 @@ impl ReParser {
                         None => break,
                     }
                 }
-                ClassItem::Ch(char::from_u32(v).unwrap_or('\0'))
+                ClassItem::Ch(v)
             }
             'k' if self.unicode => {
-                // \k<name> is valid inside classes for named backrefs? —
-                // spec: \k is only an atom escape; inside a class it's an
+                // \k is only an atom escape; inside a class it's an
                 // invalid escape in unicode mode
                 return Err("invalid class escape \\k".into());
             }
@@ -714,13 +958,13 @@ impl ReParser {
                 if self.unicode && !"^$\\.*+?()[]{}|/-".contains(other) {
                     return Err(format!("invalid class escape '\\{other}'"));
                 }
-                ClassItem::Ch(other)
+                self.lit_class(other)
             }
         })
     }
 
     /// additional octal digits after a leading `\0`
-    fn octal_after(&mut self, v: u32) -> char {
+    fn octal_after(&mut self, v: u32) -> u32 {
         let mut v = v;
         for _ in 0..2 {
             match self.peek().and_then(|d| d.to_digit(8)) {
@@ -731,23 +975,26 @@ impl ReParser {
                 None => break,
             }
         }
-        char::from_u32(v).unwrap_or('\0')
+        v
     }
 
-    fn hex(&mut self, n: usize) -> Option<char> {
+    /// exactly `n` hex digits → the code unit value (≤ 0xFFFF)
+    fn hex(&mut self, n: usize) -> Option<u32> {
         let mut v: u32 = 0;
         for _ in 0..n {
             let d = self.peek()?.to_digit(16)?;
             v = v * 16 + d;
             self.i += 1;
         }
-        char::from_u32(v)
+        Some(v)
     }
 
-    /// `\uNNNN` or `\u{NNNNN}` — Option variant for strict unicode parsing:
-    /// out-of-range code points and malformed sequences are `None`.
-    fn uesc_opt(&mut self) -> Option<char> {
-        if self.eat('{') {
+    /// `\uNNNN`, `\u{NNNNN}` (unicode patterns only), and in unicode
+    /// patterns `\uD800`-style lead escapes combine with a following
+    /// `\uDC00`-style trail escape into one code point. Returns None for
+    /// malformed or out-of-range escapes (callers decide leniency).
+    fn uesc_opt(&mut self) -> Option<u32> {
+        if self.unicode && self.eat('{') {
             let mut v: u32 = 0;
             let mut any = false;
             while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
@@ -758,9 +1005,28 @@ impl ReParser {
             if !self.eat('}') || !any {
                 return None;
             }
-            char::from_u32(v)
+            if v > 0x10FFFF {
+                return None;
+            }
+            Some(v)
         } else {
-            self.hex(4)
+            let v = self.hex(4)?;
+            // \uLead \uTrail → a single code point (unicode patterns only)
+            if self.unicode
+                && (0xD800..0xDC00).contains(&v)
+                && self.peek() == Some('\\')
+                && self.peek2() == Some('u')
+            {
+                let save = self.i;
+                self.i += 2;
+                if let Some(t) = self.hex(4) {
+                    if (0xDC00..0xE000).contains(&t) {
+                        return Some(0x10000 + ((v - 0xD800) << 10) + (t - 0xDC00));
+                    }
+                }
+                self.i = save;
+            }
+            Some(v)
         }
     }
 
@@ -769,7 +1035,7 @@ impl ReParser {
         if c == '\\' {
             self.class_escape()
         } else {
-            Ok(ClassItem::Ch(c))
+            Ok(self.lit_class(c))
         }
     }
 
@@ -777,15 +1043,27 @@ impl ReParser {
         let neg = self.eat('^');
         let mut items = Vec::new();
         loop {
-            match self.peek() {
-                None => return Err("unterminated character class".into()),
-                Some(']') => {
-                    self.i += 1;
-                    break;
+            let a = if let Some(u) = self.pending_class.take() {
+                ClassItem::Ch(u)
+            } else {
+                match self.peek() {
+                    None => return Err("unterminated character class".into()),
+                    Some(']') => {
+                        self.i += 1;
+                        break;
+                    }
+                    _ => {
+                        let it = self.class_atom()?;
+                        if self.pending_class.is_some() {
+                            // astral literal split — the `-` (if any)
+                            // binds to the pending low half
+                            items.push(it);
+                            continue;
+                        }
+                        it
+                    }
                 }
-                _ => {}
-            }
-            let a = self.class_atom()?;
+            };
             // range? `a-z` — only when both sides are single chars and the
             // `-` isn't trailing (before `]`)
             if self.peek() == Some('-') && self.peek2().is_some() && self.peek2() != Some(']') {
@@ -793,7 +1071,7 @@ impl ReParser {
                 let b = self.class_atom()?;
                 match (a, b) {
                     (ClassItem::Ch(lo), ClassItem::Ch(hi)) => {
-                        if self.unicode && hi < lo {
+                        if hi < lo {
                             return Err("range out of order in character class".into());
                         }
                         items.push(ClassItem::Range(lo, hi));
@@ -801,13 +1079,11 @@ impl ReParser {
                     (a, b) => {
                         if self.unicode {
                             // `[\d-z]` — invalid range with the `u` flag
-                            return Err(
-                                "invalid character class range".into()
-                            );
+                            return Err("invalid character class range".into());
                         }
                         // `[\d-z]` — not a real range; keep '-' literal
                         items.push(a);
-                        items.push(ClassItem::Ch('-'));
+                        items.push(ClassItem::Ch('-' as u32));
                         items.push(b);
                     }
                 }
@@ -827,11 +1103,13 @@ fn pre_node(p: Pre) -> Node {
 }
 
 /// Count capture groups `(`, `(` not followed by `?`, and `(?<name>` —
-/// skipping escapes and `[...]` classes. Used to disambiguate `\1` as a
-/// backreference vs a legacy octal escape.
-fn count_capture_groups(src: &str) -> usize {
+/// skipping escapes and `[...]` classes. Returns (count, has_named) —
+/// used to disambiguate `\1` as a backreference vs a legacy octal escape
+/// and `\k<name>` as a named backref vs Annex-B literal text.
+fn count_capture_groups(src: &str) -> (usize, bool) {
     let s: Vec<char> = src.chars().collect();
     let mut n = 0;
+    let mut named = false;
     let mut i = 0;
     let mut in_class = false;
     while i < s.len() {
@@ -857,31 +1135,35 @@ fn count_capture_groups(src: &str) -> usize {
                 };
                 if g {
                     n += 1;
+                    if s.get(i + 1) == Some(&'?') {
+                        named = true;
+                    }
                 }
                 i += 1;
             }
             _ => i += 1,
         }
     }
-    n
+    (n, named)
 }
 
 /// Resolve `\k<name>` backreferences to numeric group indices. Annex-B
 /// leniency: in non-unicode patterns with NO named groups at all, `\k<name>`
-/// is just literal text (`k`, `<`, name chars, `>`).
+/// is just literal text (`k`, `<`, name chars, `>`) — those never reach
+/// here because the parser emits literal atoms for them.
 fn resolve_names(
     n: Node,
     names: &[(String, usize)],
     unicode: bool,
 ) -> Result<Node, String> {
     Ok(match n {
-        Node::BackrefName(name) => match names.iter().find(|(nm, _)| *nm == name) {
+        Node::BackrefName(name, raw) => match names.iter().find(|(nm, _)| *nm == name) {
             Some((_, idx)) => Node::Backref(*idx as u32),
             None => {
                 if !unicode && names.is_empty() {
-                    let mut items = vec![Node::Ch('k'), Node::Ch('<')];
-                    items.extend(name.chars().map(Node::Ch));
-                    items.push(Node::Ch('>'));
+                    let mut items = vec![lit_node('k', unicode), lit_node('<', unicode)];
+                    items.extend(raw.chars().map(|c| lit_node(c, unicode)));
+                    items.push(lit_node('>', unicode));
                     Node::Seq(items)
                 } else {
                     return Err(format!("unknown group name '{name}'"));
@@ -895,7 +1177,8 @@ fn resolve_names(
                 .collect::<Result<_, _>>()?,
         ),
         Node::Alt(arms) => Node::Alt(
-            arms.into_iter()
+            arms
+                .into_iter()
                 .map(|x| resolve_names(x, names, unicode))
                 .collect::<Result<_, _>>()?,
         ),
@@ -923,12 +1206,159 @@ fn resolve_names(
     })
 }
 
+/// Unicode ID_Start: `char::is_alphabetic` approximates the Letters/Nl
+/// categories; Other_ID_Start chars are added explicitly.
+fn is_id_start_cp(cp: u32) -> bool {
+    if cp == '$' as u32 || cp == '_' as u32 {
+        return true;
+    }
+    let Some(c) = char::from_u32(cp) else {
+        return false;
+    };
+    c.is_alphabetic()
+        || matches!(
+            c,
+            '\u{1885}' | '\u{1886}' | '\u{2118}' | '\u{212e}' | '\u{309b}' | '\u{309c}'
+        )
+}
+
+/// Unicode ID_Continue: ID_Start + digits + combining marks + connector
+/// punctuation + ZWNJ/ZWJ (approximated via the common mark ranges).
+fn is_id_continue_cp(cp: u32) -> bool {
+    if cp == 0x200C || cp == 0x200D {
+        return true;
+    }
+    if is_id_start_cp(cp) {
+        return true;
+    }
+    let Some(c) = char::from_u32(cp) else {
+        return false;
+    };
+    c.is_numeric() || is_combining_mark(c)
+}
+
+/// Mn/Mc/Pc — combining marks and connector punctuation (broad ranges
+/// covering the common scripts; enough for identifier validation).
+fn is_combining_mark(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036f}' | '\u{0483}'..='\u{0489}' | '\u{0591}'..='\u{05bd}'
+        | '\u{05bf}'..='\u{05c2}' | '\u{05c4}'..='\u{05c5}' | '\u{05c7}'
+        | '\u{0610}'..='\u{061a}' | '\u{064b}'..='\u{065f}' | '\u{0670}'
+        | '\u{06d6}'..='\u{06e4}' | '\u{06e7}'..='\u{06e8}' | '\u{06ea}'..='\u{06ed}'
+        | '\u{0711}' | '\u{0730}'..='\u{074a}' | '\u{07a6}'..='\u{07b0}'
+        | '\u{07eb}'..='\u{07f3}' | '\u{0816}'..='\u{0819}' | '\u{081b}'..='\u{0823}'
+        | '\u{0825}'..='\u{0827}' | '\u{0829}'..='\u{082d}' | '\u{0859}'..='\u{085b}'
+        | '\u{08d3}'..='\u{0902}' | '\u{093a}' | '\u{093c}' | '\u{0941}'..='\u{0948}'
+        | '\u{094d}' | '\u{0951}'..='\u{0957}' | '\u{0962}'..='\u{0963}'
+        | '\u{0981}' | '\u{09bc}' | '\u{09c1}'..='\u{09c4}' | '\u{09cd}'
+        | '\u{09e2}'..='\u{09e3}' | '\u{0a01}'..='\u{0a02}' | '\u{0a3c}'
+        | '\u{0a41}'..='\u{0a42}' | '\u{0a47}'..='\u{0a48}' | '\u{0a4b}'..='\u{0a4d}'
+        | '\u{0a51}' | '\u{0a70}'..='\u{0a71}' | '\u{0a75}' | '\u{0a81}'..='\u{0a82}'
+        | '\u{0abc}' | '\u{0ac1}'..='\u{0ac5}' | '\u{0ac7}'..='\u{0ac8}' | '\u{0acd}'
+        | '\u{0ae2}'..='\u{0ae3}' | '\u{0afa}'..='\u{0aff}' | '\u{0b01}' | '\u{0b3c}'
+        | '\u{0b3f}' | '\u{0b41}'..='\u{0b44}' | '\u{0b4d}' | '\u{0b56}'
+        | '\u{0b62}'..='\u{0b63}' | '\u{0b82}' | '\u{0bc0}' | '\u{0bcd}'
+        | '\u{0c00}' | '\u{0c04}' | '\u{0c3e}'..='\u{0c40}' | '\u{0c46}'..='\u{0c48}'
+        | '\u{0c4a}'..='\u{0c4d}' | '\u{0c55}'..='\u{0c56}' | '\u{0c62}'..='\u{0c63}'
+        | '\u{0c81}' | '\u{0cbc}' | '\u{0cbf}' | '\u{0cc6}' | '\u{0ccc}'..='\u{0ccd}'
+        | '\u{0ce2}'..='\u{0ce3}' | '\u{0d00}'..='\u{0d01}' | '\u{0d3b}'..='\u{0d3c}'
+        | '\u{0d41}'..='\u{0d44}' | '\u{0d4d}' | '\u{0d62}'..='\u{0d63}'
+        | '\u{0d81}' | '\u{0dca}' | '\u{0dd2}'..='\u{0dd4}' | '\u{0dd6}'
+        | '\u{0e31}' | '\u{0e34}'..='\u{0e3a}' | '\u{0e47}'..='\u{0e4e}'
+        | '\u{0eb1}' | '\u{0eb4}'..='\u{0ebc}' | '\u{0ec8}'..='\u{0ecd}'
+        | '\u{0f18}'..='\u{0f19}' | '\u{0f35}' | '\u{0f37}' | '\u{0f39}'
+        | '\u{0f71}'..='\u{0f7e}' | '\u{0f80}'..='\u{0f84}' | '\u{0f86}'..='\u{0f87}'
+        | '\u{0f8d}'..='\u{0f97}' | '\u{0f99}'..='\u{0fbc}' | '\u{0fc6}'
+        | '\u{102d}'..='\u{1030}' | '\u{1032}'..='\u{1037}' | '\u{1039}'..='\u{103a}'
+        | '\u{103d}'..='\u{103e}' | '\u{1058}'..='\u{1059}' | '\u{105e}'..='\u{1060}'
+        | '\u{1071}'..='\u{1074}' | '\u{1082}' | '\u{1085}'..='\u{1086}' | '\u{108d}'
+        | '\u{109d}' | '\u{135d}'..='\u{135f}' | '\u{1712}'..='\u{1714}'
+        | '\u{1732}'..='\u{1734}' | '\u{1752}'..='\u{1753}' | '\u{1772}'..='\u{1773}'
+        | '\u{17b4}'..='\u{17b5}' | '\u{17b7}'..='\u{17bd}' | '\u{17c6}'
+        | '\u{17c9}'..='\u{17d3}' | '\u{17dd}' | '\u{180b}'..='\u{180e}'
+        | '\u{18a9}' | '\u{1920}'..='\u{1922}' | '\u{1927}'..='\u{1928}' | '\u{1932}'
+        | '\u{1939}'..='\u{193b}' | '\u{1a17}'..='\u{1a18}' | '\u{1a1b}' | '\u{1a56}'
+        | '\u{1a58}'..='\u{1a5e}' | '\u{1a60}' | '\u{1a62}' | '\u{1a65}'..='\u{1a6c}'
+        | '\u{1a73}'..='\u{1a7c}' | '\u{1a7f}' | '\u{1ab0}'..='\u{1ace}'
+        | '\u{1b00}'..='\u{1b03}' | '\u{1b34}' | '\u{1b36}'..='\u{1b3a}' | '\u{1b3c}'
+        | '\u{1b42}' | '\u{1b6b}'..='\u{1b73}' | '\u{1b80}'..='\u{1b81}'
+        | '\u{1ba2}'..='\u{1ba5}' | '\u{1ba8}'..='\u{1ba9}' | '\u{1bab}'..='\u{1bad}'
+        | '\u{1be6}' | '\u{1be8}'..='\u{1be9}' | '\u{1bed}' | '\u{1bef}'..='\u{1bf1}'
+        | '\u{1c2c}'..='\u{1c33}' | '\u{1c36}'..='\u{1c37}' | '\u{1cd0}'..='\u{1cd2}'
+        | '\u{1cd4}'..='\u{1ce0}' | '\u{1ce2}'..='\u{1ce8}' | '\u{1ced}' | '\u{1cf4}'
+        | '\u{1cf8}'..='\u{1cf9}' | '\u{1dc0}'..='\u{1dff}' | '\u{203f}'..='\u{2040}'
+        | '\u{2054}' | '\u{20d0}'..='\u{20f0}' | '\u{2cef}'..='\u{2cf1}' | '\u{2d7f}'
+        | '\u{2de0}'..='\u{2dff}' | '\u{302a}'..='\u{302f}' | '\u{3099}'..='\u{309a}'
+        | '\u{a66f}'..='\u{a672}' | '\u{a674}'..='\u{a67d}' | '\u{a69e}'..='\u{a69f}'
+        | '\u{a6f0}'..='\u{a6f1}' | '\u{a802}' | '\u{a806}' | '\u{a80b}'
+        | '\u{a825}'..='\u{a826}' | '\u{a82c}' | '\u{a8c4}'..='\u{a8c5}'
+        | '\u{a8e0}'..='\u{a8f1}' | '\u{a8ff}' | '\u{a926}'..='\u{a92d}'
+        | '\u{a947}'..='\u{a951}' | '\u{a980}'..='\u{a982}' | '\u{a9b3}'
+        | '\u{a9b6}'..='\u{a9b9}' | '\u{a9bc}'..='\u{a9bd}' | '\u{a9e5}'
+        | '\u{aa29}'..='\u{aa2e}' | '\u{aa31}'..='\u{aa32}' | '\u{aa35}'..='\u{aa36}'
+        | '\u{aa43}' | '\u{aa4c}' | '\u{aa7c}' | '\u{aab0}' | '\u{aab2}'..='\u{aab4}'
+        | '\u{aab7}'..='\u{aab8}' | '\u{aabe}'..='\u{aabf}' | '\u{aac1}'
+        | '\u{aaec}'..='\u{aaed}' | '\u{aaf6}' | '\u{abe5}' | '\u{abe8}' | '\u{abed}'
+        | '\u{fb1e}' | '\u{fe00}'..='\u{fe0f}' | '\u{fe20}'..='\u{fe2f}'
+        | '\u{fe33}'..='\u{fe34}' | '\u{fe4d}'..='\u{fe4f}' | '\u{ff3f}'
+        | '\u{101fd}' | '\u{102e0}' | '\u{10376}'..='\u{1037a}'
+        | '\u{10a01}'..='\u{10a03}' | '\u{10a05}'..='\u{10a06}' | '\u{10a0c}'..='\u{10a0f}'
+        | '\u{10a38}'..='\u{10a3a}' | '\u{10a3f}' | '\u{10ae5}'..='\u{10ae6}'
+        | '\u{10d24}'..='\u{10d27}' | '\u{10eab}'..='\u{10eac}' | '\u{10f46}'..='\u{10f50}'
+        | '\u{10f82}'..='\u{10f85}' | '\u{11001}' | '\u{11038}'..='\u{11046}'
+        | '\u{11070}' | '\u{11073}'..='\u{11074}' | '\u{1107f}'..='\u{11081}'
+        | '\u{110b3}'..='\u{110b6}' | '\u{110b9}'..='\u{110ba}' | '\u{11100}'..='\u{11102}'
+        | '\u{11127}'..='\u{1112b}' | '\u{1112d}'..='\u{11134}' | '\u{11173}'
+        | '\u{11180}'..='\u{11181}' | '\u{111b6}'..='\u{111be}' | '\u{111c9}'..='\u{111cc}'
+        | '\u{111cf}' | '\u{1122f}'..='\u{11231}' | '\u{11234}' | '\u{11236}'..='\u{11237}'
+        | '\u{1123e}' | '\u{112df}' | '\u{112e3}'..='\u{112ea}' | '\u{11300}'..='\u{11301}'
+        | '\u{1133b}'..='\u{1133c}' | '\u{11340}' | '\u{11366}'..='\u{1136c}'
+        | '\u{11370}'..='\u{11374}' | '\u{11438}'..='\u{1143f}' | '\u{11442}'..='\u{11444}'
+        | '\u{11446}' | '\u{1145e}' | '\u{114b3}'..='\u{114b8}' | '\u{114ba}'
+        | '\u{114bf}'..='\u{114c0}' | '\u{114c2}'..='\u{114c3}' | '\u{115b2}'..='\u{115b5}'
+        | '\u{115bc}'..='\u{115bd}' | '\u{115bf}'..='\u{115c0}' | '\u{115dc}'..='\u{115dd}'
+        | '\u{11633}'..='\u{1163a}' | '\u{1163d}' | '\u{1163f}'..='\u{11640}' | '\u{116ab}'
+        | '\u{116ad}' | '\u{116b0}'..='\u{116b5}' | '\u{116b7}' | '\u{1171d}'..='\u{1171f}'
+        | '\u{11722}'..='\u{11725}' | '\u{11727}'..='\u{1172b}' | '\u{1182f}'..='\u{11837}'
+        | '\u{11839}'..='\u{1183a}' | '\u{1193b}'..='\u{1193c}' | '\u{1193e}' | '\u{11943}'
+        | '\u{119d4}'..='\u{119d7}' | '\u{119da}'..='\u{119db}' | '\u{119e0}'
+        | '\u{11a01}'..='\u{11a0a}' | '\u{11a33}'..='\u{11a38}' | '\u{11a3b}'..='\u{11a3e}'
+        | '\u{11a47}' | '\u{11a51}'..='\u{11a56}' | '\u{11a59}'..='\u{11a5b}'
+        | '\u{11a8a}'..='\u{11a96}' | '\u{11a98}'..='\u{11a99}' | '\u{11c30}'..='\u{11c36}'
+        | '\u{11c38}'..='\u{11c3d}' | '\u{11c3f}' | '\u{11c92}'..='\u{11ca7}'
+        | '\u{11caa}'..='\u{11cb0}' | '\u{11cb2}'..='\u{11cb3}' | '\u{11cb5}'..='\u{11cb6}'
+        | '\u{11d31}'..='\u{11d36}' | '\u{11d3a}' | '\u{11d3c}'..='\u{11d3d}'
+        | '\u{11d3f}'..='\u{11d45}' | '\u{11d47}' | '\u{11d90}'..='\u{11d91}' | '\u{11d95}'
+        | '\u{11d97}' | '\u{11ef3}'..='\u{11ef4}' | '\u{16af0}'..='\u{16af4}'
+        | '\u{16b30}'..='\u{16b36}' | '\u{16f4f}' | '\u{16f8f}'..='\u{16f92}' | '\u{16fe4}'
+        | '\u{1bc9d}'..='\u{1bc9e}' | '\u{1cf00}'..='\u{1cf2d}' | '\u{1cf30}'..='\u{1cf46}'
+        | '\u{1d165}' | '\u{1d167}'..='\u{1d169}' | '\u{1d173}'..='\u{1d17b}'
+        | '\u{1d17e}'..='\u{1d182}' | '\u{1d185}'..='\u{1d18b}' | '\u{1d1aa}'..='\u{1d1ad}'
+        | '\u{1d242}'..='\u{1d244}' | '\u{1da00}'..='\u{1da36}' | '\u{1da3b}'..='\u{1da6c}'
+        | '\u{1da75}' | '\u{1da84}' | '\u{1da9b}'..='\u{1da9f}' | '\u{1daa1}'..='\u{1daaf}'
+        | '\u{1e000}'..='\u{1e006}' | '\u{1e008}'..='\u{1e018}' | '\u{1e01b}'..='\u{1e021}'
+        | '\u{1e023}'..='\u{1e024}' | '\u{1e026}'..='\u{1e02a}' | '\u{1e130}'..='\u{1e136}'
+        | '\u{1e2ae}' | '\u{1e2ec}'..='\u{1e2ef}' | '\u{1e8d0}'..='\u{1e8d6}'
+        | '\u{1e944}'..='\u{1e94a}' | '\u{e0100}'..='\u{e01ef}'
+    )
+}
+
 // ===========================================================================
 // matcher
 // ===========================================================================
 
+fn is_hi(u: u16) -> bool {
+    (0xD800..0xDC00).contains(&u)
+}
+fn is_lo(u: u16) -> bool {
+    (0xDC00..0xE000).contains(&u)
+}
+fn join_pair(hi: u32, lo: u32) -> u32 {
+    0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+}
+
 struct Ctx<'h> {
-    s: &'h [char],
+    s: &'h [u16],
     caps: Vec<Option<(usize, usize)>>,
     steps: u64,
     depth: u32,
@@ -936,11 +1366,40 @@ struct Ctx<'h> {
     icase: bool,
     multiline: bool,
     dotall: bool,
+    /// match at code-point granularity — surrogate pairs are single chars
+    umatch: bool,
     /// set by the top-level continuation when the whole pattern matched
     end: usize,
 }
 
 type K<'a, 'h> = &'a mut dyn FnMut(&mut Ctx<'h>, usize) -> bool;
+
+/// decode the "character" starting at `pos` — in unicode mode a surrogate
+/// pair is one code point consuming 2 units. Returns (code point, len).
+fn cp_at(c: &Ctx, pos: usize) -> Option<(u32, usize)> {
+    let u = *c.s.get(pos)? as u32;
+    if c.umatch && (0xD800..0xDC00).contains(&u) {
+        if let Some(&lo) = c.s.get(pos + 1) {
+            if (0xDC00..0xE000).contains(&(lo as u32)) {
+                return Some((join_pair(u, lo as u32), 2));
+            }
+        }
+    }
+    Some((u, 1))
+}
+
+/// decode the "character" ending just before `pos` — for lookbehind's
+/// backward matching
+fn cp_before(c: &Ctx, pos: usize) -> Option<(u32, usize)> {
+    let u = *c.s.get(pos.checked_sub(1)?)? as u32;
+    if c.umatch && (0xDC00..0xE000).contains(&u) && pos >= 2 {
+        let hi = c.s[pos - 2] as u32;
+        if (0xD800..0xDC00).contains(&hi) {
+            return Some((join_pair(hi, u), 2));
+        }
+    }
+    Some((u, 1))
+}
 
 fn mat<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
     if c.aborted {
@@ -953,26 +1412,9 @@ fn mat<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
     }
     match n {
         Node::Empty => k(c, pos),
-        Node::Ch(w) => {
-            if pos < c.s.len() && ch_eq(c.s[pos], *w, c.icase) {
-                k(c, pos + 1)
-            } else {
-                false
-            }
-        }
-        Node::Any => {
-            if pos < c.s.len() && (c.dotall || !is_lineterm(c.s[pos])) {
-                k(c, pos + 1)
-            } else {
-                false
-            }
-        }
-        Node::Class { neg, items } => {
-            if pos < c.s.len() && (class_match(items, c.s[pos], c.icase) != *neg) {
-                k(c, pos + 1)
-            } else {
-                false
-            }
+        Node::Ch(_) | Node::Any | Node::Class { .. } => {
+            let l = match_len_fwd(c, n, pos);
+            l > 0 && k(c, pos + l)
         }
         Node::Seq(items) => seq(c, items, pos, k),
         Node::Alt(arms) => {
@@ -1002,48 +1444,123 @@ fn mat<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
             }
             r
         }
-        Node::Backref(g) => {
-            let r = match c.caps.get(*g as usize).copied().flatten() {
-                Some((a, b)) => {
-                    let l = b - a;
-                    pos + l <= c.s.len()
-                        && (0..l).all(|i| ch_eq(c.s[pos + i], c.s[a + i], c.icase))
-                        && k(c, pos + l)
-                }
-                // unmatched group → backref matches empty
-                None => k(c, pos),
-            };
-            r
-        }
-        Node::BackrefName(_) => false, // resolved at compile
+        Node::Backref(g) => match c.caps.get(*g as usize).copied().flatten() {
+            Some((a, b)) => {
+                let l = b - a;
+                pos + l <= c.s.len() && units_eq(c, pos, a, l) && k(c, pos + l)
+            }
+            // unmatched group → backref matches empty
+            None => k(c, pos),
+        },
+        Node::BackrefName(..) => false, // resolved at compile
         Node::Anchor(a) => {
             let ok = match a {
-                Anchor::Start => pos == 0 || (c.multiline && is_lineterm(c.s[pos - 1])),
-                Anchor::End => {
-                    pos == c.s.len() || (c.multiline && pos < c.s.len() && is_lineterm(c.s[pos]))
+                Anchor::Start => {
+                    pos == 0 || (c.multiline && is_lineterm_cp(c.s[pos - 1] as u32))
                 }
-                Anchor::WordB => at_wordb(c.s, pos),
-                Anchor::NotWordB => !at_wordb(c.s, pos),
+                Anchor::End => {
+                    pos == c.s.len()
+                        || (c.multiline
+                            && pos < c.s.len()
+                            && is_lineterm_cp(c.s[pos] as u32))
+                }
+                Anchor::WordB => at_wordb(c, pos),
+                Anchor::NotWordB => !at_wordb(c, pos),
             };
             ok && k(c, pos)
         }
         Node::Look { inner, neg, behind } => {
             let saved = c.caps.clone();
             let ok = if *behind {
-                // lookbehind: some start ≤ pos must match ending exactly at pos
-                let mut found = false;
-                let mut st = pos + 1;
-                while st > 0 {
-                    st -= 1;
-                    if mat(c, inner, st, &mut |_c2, e| e == pos) {
-                        found = true;
-                        break;
-                    }
-                    if c.aborted {
-                        break;
-                    }
+                // lookbehind matches right-to-left ending at pos — the
+                // captures land left-to-right via the backward matcher
+                mat_bwd(c, inner, pos, &mut |_c2, _e| true)
+            } else {
+                mat(c, inner, pos, &mut |_c2, _e| true)
+            };
+            let proceed = ok != *neg;
+            if !ok || *neg {
+                c.caps = saved;
+            }
+            proceed && k(c, pos)
+        }
+    }
+}
+
+/// backward matcher — used for `(?<=)`/`(?<!)`: `pos` is the right edge
+/// and the continuation receives the new (smaller) position. Captures
+/// are still recorded left-to-right.
+fn mat_bwd<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
+    if c.aborted {
+        return false;
+    }
+    c.steps += 1;
+    if c.steps > MAX_STEPS {
+        c.aborted = true;
+        return false;
+    }
+    match n {
+        Node::Empty => k(c, pos),
+        Node::Ch(_) | Node::Any | Node::Class { .. } => {
+            let l = match_len_bwd(c, n, pos);
+            l > 0 && k(c, pos - l)
+        }
+        Node::Seq(items) => seq_bwd(c, items, pos, k),
+        Node::Alt(arms) => {
+            for a in arms {
+                if mat_bwd(c, a, pos, &mut *k) {
+                    return true;
                 }
-                found
+            }
+            false
+        }
+        Node::Rep {
+            inner,
+            min,
+            max,
+            lazy,
+        } => rep_bwd(c, inner, pos, 0, *min, *max, *lazy, k),
+        Node::Group { idx, inner } => {
+            let g = *idx;
+            let saved = c.caps[g];
+            c.caps[g] = Some((pos, pos));
+            let r = mat_bwd(c, inner, pos, &mut |c2, p| {
+                c2.caps[g] = Some((p, pos));
+                k(c2, p)
+            });
+            if !r {
+                c.caps[g] = saved;
+            }
+            r
+        }
+        Node::Backref(g) => match c.caps.get(*g as usize).copied().flatten() {
+            Some((a, b)) => {
+                let l = b - a;
+                pos >= l && units_eq(c, pos - l, a, l) && k(c, pos - l)
+            }
+            None => k(c, pos),
+        },
+        Node::BackrefName(..) => false,
+        Node::Anchor(a) => {
+            let ok = match a {
+                Anchor::Start => {
+                    pos == 0 || (c.multiline && is_lineterm_cp(c.s[pos - 1] as u32))
+                }
+                Anchor::End => {
+                    pos == c.s.len()
+                        || (c.multiline
+                            && pos < c.s.len()
+                            && is_lineterm_cp(c.s[pos] as u32))
+                }
+                Anchor::WordB => at_wordb(c, pos),
+                Anchor::NotWordB => !at_wordb(c, pos),
+            };
+            ok && k(c, pos)
+        }
+        Node::Look { inner, neg, behind } => {
+            let saved = c.caps.clone();
+            let ok = if *behind {
+                mat_bwd(c, inner, pos, &mut |_c2, _e| true)
             } else {
                 mat(c, inner, pos, &mut |_c2, _e| true)
             };
@@ -1066,6 +1583,17 @@ fn seq<'h>(c: &mut Ctx<'h>, items: &[Node], pos: usize, k: K<'_, 'h>) -> bool {
     }
 }
 
+/// sequence matched right-to-left — last item first
+fn seq_bwd<'h>(c: &mut Ctx<'h>, items: &[Node], pos: usize, k: K<'_, 'h>) -> bool {
+    if c.aborted {
+        return false;
+    }
+    match items.split_last() {
+        None => k(c, pos),
+        Some((h, t)) => mat_bwd(c, h, pos, &mut |c2, p| seq_bwd(c2, t, p, &mut *k)),
+    }
+}
+
 /// A node that consumes exactly one char and has no side effects — these
 /// get a fast iterative repetition path (avoids deep recursion for `.*`
 /// over long inputs).
@@ -1078,14 +1606,91 @@ fn is_simple(n: &Node) -> bool {
     }
 }
 
-fn one_match(c: &Ctx, n: &Node, pos: usize) -> bool {
+/// units consumed when single-char node `n` matches starting at `pos`
+/// (0 = no match). Only valid for Ch/Any/Class nodes.
+fn match_len_fwd(c: &Ctx, n: &Node, pos: usize) -> usize {
+    let Some((cp, len)) = cp_at(c, pos) else {
+        return 0;
+    };
+    let ok = match n {
+        Node::Ch(w) => ch_eq_cp(cp, *w, c.icase, c.umatch),
+        Node::Any => c.dotall || !is_lineterm_cp(cp),
+        Node::Class { neg, items } => class_match(items, cp, c.icase, c.umatch) != *neg,
+        _ => return 0,
+    };
+    if ok {
+        len
+    } else {
+        0
+    }
+}
+
+/// same, ending just before `pos` (backward)
+fn match_len_bwd(c: &Ctx, n: &Node, pos: usize) -> usize {
+    let Some((cp, len)) = cp_before(c, pos) else {
+        return 0;
+    };
+    let ok = match n {
+        Node::Ch(w) => ch_eq_cp(cp, *w, c.icase, c.umatch),
+        Node::Any => c.dotall || !is_lineterm_cp(cp),
+        Node::Class { neg, items } => class_match(items, cp, c.icase, c.umatch) != *neg,
+        _ => return 0,
+    };
+    if ok {
+        len
+    } else {
+        0
+    }
+}
+
+/// `match_len_fwd` unwrapping the Seq-of-1/Alt shapes `is_simple` allows
+fn one_match_fwd(c: &Ctx, n: &Node, pos: usize) -> usize {
     match n {
-        Node::Ch(w) => ch_eq(c.s[pos], *w, c.icase),
-        Node::Any => c.dotall || !is_lineterm(c.s[pos]),
-        Node::Class { neg, items } => class_match(items, c.s[pos], c.icase) != *neg,
-        Node::Seq(items) if items.len() == 1 => one_match(c, &items[0], pos),
-        Node::Alt(arms) => arms.iter().any(|a| one_match(c, a, pos)),
-        _ => false,
+        Node::Seq(items) if items.len() == 1 => one_match_fwd(c, &items[0], pos),
+        Node::Alt(arms) => {
+            for a in arms {
+                let l = one_match_fwd(c, a, pos);
+                if l > 0 {
+                    return l;
+                }
+            }
+            0
+        }
+        _ => match_len_fwd(c, n, pos),
+    }
+}
+
+fn one_match_bwd(c: &Ctx, n: &Node, pos: usize) -> usize {
+    match n {
+        Node::Seq(items) if items.len() == 1 => one_match_bwd(c, &items[0], pos),
+        Node::Alt(arms) => {
+            for a in arms {
+                let l = one_match_bwd(c, a, pos);
+                if l > 0 {
+                    return l;
+                }
+            }
+            0
+        }
+        _ => match_len_bwd(c, n, pos),
+    }
+}
+
+/// all capture-group indices inside an atom — RepeatMatcher clears them
+/// before every iteration
+fn group_ids(n: &Node, out: &mut Vec<usize>) {
+    match n {
+        Node::Group { idx, inner } => {
+            out.push(*idx);
+            group_ids(inner, out);
+        }
+        Node::Seq(items) | Node::Alt(items) => {
+            for x in items {
+                group_ids(x, out);
+            }
+        }
+        Node::Rep { inner, .. } | Node::Look { inner, .. } => group_ids(inner, out),
+        _ => {}
     }
 }
 
@@ -1112,20 +1717,61 @@ fn rep<'h>(
         c.depth -= 1;
         return false;
     }
+    let mut gids = Vec::new();
+    group_ids(inner, &mut gids);
     let r = if lazy {
         (count >= min && k(c, pos))
-            || (count < max && rep_step(c, inner, pos, count, min, max, lazy, k))
+            || (count < max && rep_step(c, inner, &gids, pos, count, min, max, lazy, k))
     } else {
-        (count < max && rep_step(c, inner, pos, count, min, max, lazy, k))
+        (count < max && rep_step(c, inner, &gids, pos, count, min, max, lazy, k))
             || (count >= min && k(c, pos))
     };
     c.depth -= 1;
     r
 }
 
-/// Match one more iteration of a (non-simple) repetition.
+/// Match one more iteration of a (non-simple) repetition. The atom's
+/// capture groups are cleared first (spec RepeatMatcher step 4–5) and the
+/// capture state is restored when the iteration can't complete.
 #[allow(clippy::too_many_arguments)]
 fn rep_step<'h>(
+    c: &mut Ctx<'h>,
+    inner: &Node,
+    gids: &[usize],
+    pos: usize,
+    count: u32,
+    min: u32,
+    max: u32,
+    lazy: bool,
+    k: K<'_, 'h>,
+) -> bool {
+    let saved = c.caps.clone();
+    for &g in gids {
+        if g < c.caps.len() {
+            c.caps[g] = None;
+        }
+    }
+    let ok = mat(c, inner, pos, &mut |c2, e| {
+        if e == pos {
+            // a zero-length iteration is only allowed while required
+            // iterations remain (spec: `min = 0 && y.end = x.end` → fail)
+            if count >= min {
+                return false;
+            }
+            rep(c2, inner, e, min, min, max, lazy, &mut *k)
+        } else {
+            rep(c2, inner, e, count + 1, min, max, lazy, &mut *k)
+        }
+    });
+    if !ok {
+        c.caps = saved;
+    }
+    ok
+}
+
+/// backward mirrors of rep/rep_step for lookbehind bodies
+#[allow(clippy::too_many_arguments)]
+fn rep_bwd<'h>(
     c: &mut Ctx<'h>,
     inner: &Node,
     pos: usize,
@@ -1135,18 +1781,68 @@ fn rep_step<'h>(
     lazy: bool,
     k: K<'_, 'h>,
 ) -> bool {
-    mat(c, inner, pos, &mut |c2, e| {
-        if e == pos {
-            // zero-length iteration — further reps can't progress; the rest
-            // of the required minimum is satisfied by empty matches
-            k(c2, e)
-        } else {
-            rep(c2, inner, e, count + 1, min, max, lazy, &mut *k)
-        }
-    })
+    if c.aborted {
+        return false;
+    }
+    if is_simple(inner) {
+        return rep_simple_bwd(c, inner, pos, min, max, lazy, k);
+    }
+    c.depth += 1;
+    if c.depth > MAX_DEPTH {
+        c.aborted = true;
+        c.depth -= 1;
+        return false;
+    }
+    let mut gids = Vec::new();
+    group_ids(inner, &mut gids);
+    let r = if lazy {
+        (count >= min && k(c, pos))
+            || (count < max && rep_step_bwd(c, inner, &gids, pos, count, min, max, lazy, k))
+    } else {
+        (count < max && rep_step_bwd(c, inner, &gids, pos, count, min, max, lazy, k))
+            || (count >= min && k(c, pos))
+    };
+    c.depth -= 1;
+    r
 }
 
-/// Greedy/lazy repetition of a single-char consumer — iterative, no recursion.
+#[allow(clippy::too_many_arguments)]
+fn rep_step_bwd<'h>(
+    c: &mut Ctx<'h>,
+    inner: &Node,
+    gids: &[usize],
+    pos: usize,
+    count: u32,
+    min: u32,
+    max: u32,
+    lazy: bool,
+    k: K<'_, 'h>,
+) -> bool {
+    let saved = c.caps.clone();
+    for &g in gids {
+        if g < c.caps.len() {
+            c.caps[g] = None;
+        }
+    }
+    let ok = mat_bwd(c, inner, pos, &mut |c2, e| {
+        if e == pos {
+            if count >= min {
+                return false;
+            }
+            rep_bwd(c2, inner, e, min, min, max, lazy, &mut *k)
+        } else {
+            rep_bwd(c2, inner, e, count + 1, min, max, lazy, &mut *k)
+        }
+    });
+    if !ok {
+        c.caps = saved;
+    }
+    ok
+}
+
+/// Greedy/lazy repetition of a single-char consumer — iterative, no
+/// recursion. Items may consume 1 or 2 units (astral chars), so the run
+/// is tracked as unit positions.
 fn rep_simple<'h>(
     c: &mut Ctx<'h>,
     inner: &Node,
@@ -1156,83 +1852,249 @@ fn rep_simple<'h>(
     lazy: bool,
     k: K<'_, 'h>,
 ) -> bool {
-    let mut run = 0usize;
-    let limit = (max as usize).min(c.s.len() - pos);
-    while run < limit && one_match(c, inner, pos + run) {
-        run += 1;
+    let mut pts: Vec<usize> = Vec::with_capacity(16);
+    pts.push(pos);
+    let mut p = pos;
+    while (pts.len() as u32) <= max {
+        let l = one_match_fwd(c, inner, p);
+        if l == 0 {
+            break;
+        }
+        p += l;
+        pts.push(p);
     }
-    let need = min as usize;
-    if need > run {
+    let run = pts.len() - 1;
+    if (run as u32) < min {
         return false;
     }
     if lazy {
-        for a in need..=run {
-            if k(c, pos + a) {
+        for a in (min as usize)..=run {
+            if k(c, pts[a]) {
                 return true;
             }
             if c.aborted {
                 return false;
             }
         }
-        false
     } else {
-        for a in (need..=run).rev() {
-            if k(c, pos + a) {
+        for a in (min as usize..=run).rev() {
+            if k(c, pts[a]) {
                 return true;
             }
             if c.aborted {
                 return false;
             }
         }
-        false
     }
+    false
+}
+
+fn rep_simple_bwd<'h>(
+    c: &mut Ctx<'h>,
+    inner: &Node,
+    pos: usize,
+    min: u32,
+    max: u32,
+    lazy: bool,
+    k: K<'_, 'h>,
+) -> bool {
+    let mut pts: Vec<usize> = Vec::with_capacity(16);
+    pts.push(pos);
+    let mut p = pos;
+    while (pts.len() as u32) <= max {
+        let l = one_match_bwd(c, inner, p);
+        if l == 0 {
+            break;
+        }
+        p -= l;
+        pts.push(p);
+    }
+    let run = pts.len() - 1;
+    if (run as u32) < min {
+        return false;
+    }
+    // pts[0] = pos (fewest consumed), pts[run] = deepest — greedy takes
+    // the longest match first
+    if lazy {
+        for a in (min as usize)..=run {
+            if k(c, pts[a]) {
+                return true;
+            }
+            if c.aborted {
+                return false;
+            }
+        }
+    } else {
+        for a in (min as usize..=run).rev() {
+            if k(c, pts[a]) {
+                return true;
+            }
+            if c.aborted {
+                return false;
+            }
+        }
+    }
+    false
 }
 
 // -- char predicates ---------------------------------------------------------
 
-fn is_lineterm(c: char) -> bool {
-    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+fn is_lineterm_cp(cp: u32) -> bool {
+    matches!(cp, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
 
-fn is_word(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+/// `\w` — ASCII only, even in unicode patterns
+fn is_word_cp(cp: u32) -> bool {
+    matches!(cp, 0x30..=0x39 | 0x41..=0x5A | 0x5F | 0x61..=0x7A)
 }
 
-fn at_wordb(s: &[char], pos: usize) -> bool {
-    let before = pos > 0 && is_word(s[pos - 1]);
-    let after = pos < s.len() && is_word(s[pos]);
+/// `\b`/`\B` — spec IsWordChar tests the *canonicalized* char under `i`
+fn at_wordb(c: &Ctx, pos: usize) -> bool {
+    let w = |u: u16| {
+        let cp = u as u32;
+        is_word_cp(if c.icase { canon_cp(cp, c.umatch) } else { cp })
+    };
+    let before = pos > 0 && w(c.s[pos - 1]);
+    let after = pos < c.s.len() && w(c.s[pos]);
     before != after
 }
 
-fn is_re_space(c: char) -> bool {
-    c.is_whitespace() || c == '\u{feff}'
+/// `\s` — exactly the JS WhiteSpace + LineTerminator set
+/// (tab, LF, VT, FF, CR, SP, NBSP, ZWSP-ogham, the Zs block 2000–200A,
+/// LS, PS, NNBSP, MMSP, IDSP, and BOM/FEFF — notably NOT U+0085 NEL)
+fn is_re_space(cp: u32) -> bool {
+    matches!(cp,
+        0x0009 | 0x000A | 0x000B | 0x000C | 0x000D | 0x0020 | 0x00A0
+        | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F
+        | 0x3000 | 0xFEFF)
 }
 
-fn fold(c: char) -> char {
-    c.to_uppercase().next().unwrap_or(c)
-}
-
-fn ch_eq(a: char, b: char, icase: bool) -> bool {
-    a == b || (icase && fold(a) == fold(b))
-}
-
-fn pre_match(p: Pre, c: char) -> bool {
-    match p {
-        Pre::Digit => c.is_ascii_digit(),
-        Pre::NotDigit => !c.is_ascii_digit(),
-        Pre::Word => is_word(c),
-        Pre::NotWord => !is_word(c),
-        Pre::Space => is_re_space(c),
-        Pre::NotSpace => !is_re_space(c),
+/// Canonicalize — spec-correct case folding for the `i` flag.
+/// Non-unicode patterns uppercase-fold with two exclusions (multi-char
+/// results and non-ASCII→ASCII folds are ignored); `u`/`v` patterns use
+/// Unicode simple case folding instead.
+fn canon_cp(cp: u32, umatch: bool) -> u32 {
+    if umatch {
+        scf_cp(cp)
+    } else {
+        canon_nonu(cp)
     }
 }
 
-fn class_match(items: &[ClassItem], c: char, icase: bool) -> bool {
-    items.iter().any(|it| match it {
-        ClassItem::Ch(w) => ch_eq(c, *w, icase),
-        ClassItem::Range(lo, hi) => {
-            (*lo..=*hi).contains(&c) || (icase && (fold(*lo)..=fold(*hi)).contains(&fold(c)))
+/// spec Canonicalize for non-unicode patterns: `ch.toUpperCase()` unless
+/// the result is more than one code unit (`ß`→`SS` stays `ß`) or `ch`'s
+/// code point is ≥ 0x80 while the result's is < 0x80 (`ſ`/`ı`/`K` fold
+/// to themselves)
+fn canon_nonu(cp: u32) -> u32 {
+    let Some(c) = char::from_u32(cp) else {
+        return cp;
+    };
+    let mut it = c.to_uppercase();
+    let Some(u) = it.next() else {
+        return cp;
+    };
+    if it.next().is_some() {
+        return cp;
+    }
+    let uv = u as u32;
+    if cp >= 128 && uv < 128 {
+        return cp;
+    }
+    uv
+}
+
+/// Unicode simple case folding (CaseFolding status C/S) — toLowercase
+/// covers nearly everything; the exceptions are chars whose simple fold
+/// differs from their lowercase (Greek letter variants, `ſ`, `ς`, `µ`)
+fn scf_cp(cp: u32) -> u32 {
+    match cp {
+        0x00B5 => 0x03BC, // µ → μ
+        0x017F => 0x0073, // ſ → s
+        0x03BE => 0x03BA, // Ͼ → κ
+        0x03BF => 0x03C3, // Ͽ → σ
+        0x03C2 => 0x03C3, // ς → σ
+        0x03D0 => 0x03B2, // ϐ → β
+        0x03D1 => 0x03B8, // ϑ → θ
+        0x03D5 => 0x03C6, // ϕ → φ
+        0x03D6 => 0x03C0, // ϖ → π
+        0x03F0 => 0x03BA, // ϰ → κ
+        0x03F1 => 0x03C1, // ϱ → ρ
+        0x03F5 => 0x03B5, // ϵ → ε
+        0x1E9B => 0x1E61, // ẛ → ṡ
+        _ => {
+            let Some(c) = char::from_u32(cp) else {
+                return cp;
+            };
+            let mut it = c.to_lowercase();
+            match it.next() {
+                Some(l) if it.next().is_none() => l as u32,
+                _ => cp,
+            }
         }
-        ClassItem::Pre(p) => pre_match(*p, c),
+    }
+}
+
+fn ch_eq_cp(a: u32, b: u32, icase: bool, umatch: bool) -> bool {
+    a == b || (icase && canon_cp(a, umatch) == canon_cp(b, umatch))
+}
+
+/// compare `l` units at `x` against the units at `y` — plain equality
+/// unless `i`, and code-point-wise folding for unicode patterns (a case
+/// difference can hide inside an astral char)
+fn units_eq(c: &Ctx, x: usize, y: usize, l: usize) -> bool {
+    if !c.icase {
+        return c.s[x..x + l] == c.s[y..y + l];
+    }
+    if !c.umatch {
+        return (0..l)
+            .all(|i| ch_eq_cp(c.s[x + i] as u32, c.s[y + i] as u32, true, false));
+    }
+    let (mut a, mut b) = (x, y);
+    let end = x + l;
+    while a < end {
+        let Some((ca, la)) = cp_at(c, a) else {
+            return false;
+        };
+        let Some((cb, lb)) = cp_at(c, b) else {
+            return false;
+        };
+        if la != lb || !ch_eq_cp(ca, cb, true, true) {
+            return false;
+        }
+        a += la;
+        b += lb;
+    }
+    a == end
+}
+
+fn pre_match(p: Pre, cp: u32) -> bool {
+    match p {
+        Pre::Digit => (0x30..=0x39).contains(&cp),
+        Pre::NotDigit => !(0x30..=0x39).contains(&cp),
+        Pre::Word => is_word_cp(cp),
+        Pre::NotWord => !is_word_cp(cp),
+        Pre::Space => is_re_space(cp),
+        Pre::NotSpace => !is_re_space(cp),
+    }
+}
+
+fn class_match(items: &[ClassItem], cp: u32, icase: bool, umatch: bool) -> bool {
+    items.iter().any(|it| match it {
+        ClassItem::Ch(w) => ch_eq_cp(cp, *w, icase, umatch),
+        ClassItem::Range(lo, hi) => {
+            (*lo..=*hi).contains(&cp)
+                || (icase && {
+                    // spec canonicalizes the range's character set too —
+                    // `[a-z]`/i holds A-Z after folding
+                    let (l2, h2) = (canon_cp(*lo, umatch), canon_cp(*hi, umatch));
+                    l2 <= h2 && (l2..=h2).contains(&canon_cp(cp, umatch))
+                })
+        }
+        // `\w`/`\d`/`\s` sets are canonicalized too — under `i` the input
+        // char folds into the set (u-mode `ſ`→`s` makes it a word char)
+        ClassItem::Pre(p) => {
+            let q = if icase { canon_cp(cp, umatch) } else { cp };
+            pre_match(*p, q)
+        }
     })
 }

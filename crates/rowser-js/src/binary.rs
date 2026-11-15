@@ -4,7 +4,7 @@
 //! crypto) — all std-only, installed by `builtins::install`.
 
 use crate::builtins::{
-    clamp_index, make_iter, make_iter_in, merge_sort, promise_resolve_static, to_elems,
+    clamp_index, make_iter, merge_sort, promise_resolve_static, to_elems,
 };
 use crate::interp::*;
 use std::cell::RefCell;
@@ -17,7 +17,16 @@ fn arg(args: &[Value], n: usize) -> Value {
 }
 
 fn met(i: &Interp, o: &ObjRef, name: &str, f: NativeFn) {
-    i.set_builtin(o, name, i.native(name, f));
+    met_a(i, o, name, f, 0.0);
+}
+
+/// `met` with an explicit function `.length` (spec method arities).
+fn met_a(i: &Interp, o: &ObjRef, name: &str, f: NativeFn, len: f64) {
+    let v = i.native(name, f);
+    if let Value::Obj(fo) = &v {
+        i.set_attr(fo, "length", Value::Num(len), false, true);
+    }
+    i.set_builtin(o, name, v);
 }
 
 fn acc(i: &Interp, o: &ObjRef, name: &str, get: Option<NativeFn>, set: Option<NativeFn>) {
@@ -33,6 +42,13 @@ fn plain(proto: Option<ObjRef>) -> ObjRef {
 }
 
 fn mk_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef) -> Value {
+    mk_ctor_len(i, name, f, proto, 0.0)
+}
+
+/// built-in constructor function object — spec property attributes:
+/// `name`/`length` {writable:false, enumerable:false, configurable:true},
+/// `prototype` {writable:false, enumerable:false, configurable:false}.
+fn mk_ctor_len(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef, len: f64) -> Value {
     let o = Rc::new(RefCell::new(Obj::new(
         Some(i.p.func.clone()),
         ObjKind::Func(Func::Native {
@@ -40,8 +56,19 @@ fn mk_ctor(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef) -> Value {
             f,
         }),
     )));
-    i.set_builtin(&o, "name", Value::Str(Rc::from(name)));
-    i.set_builtin(&o, "prototype", Value::Obj(proto.clone()));
+    i.set_attr(&o, "name", Value::Str(Rc::from(name)), false, true);
+    i.set_attr(&o, "length", Value::Num(len), false, true);
+    o.borrow_mut().props.insert(
+        PropKey::from_str("prototype"),
+        Prop {
+            val: Value::Obj(proto.clone()),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            get: None,
+            set: None,
+        },
+    );
     i.set_builtin(proto, "constructor", Value::Obj(o.clone()));
     Value::Obj(o)
 }
@@ -55,7 +82,7 @@ fn gdef(i: &mut Interp, name: &str, v: Value) {
 /// by internals rather than `new`).
 fn global_ctor_proto(i: &mut Interp, name: &str) -> Option<ObjRef> {
     let g = i.global.clone();
-    let v = i.env_lookup(&g, name)?;
+    let v = i.env_lookup(&g, name).ok()??;
     if let Value::Obj(o) = &v {
         if let Some(Value::Obj(p)) = i.obj_get_raw(o, &PropKey::from_str("prototype")) {
             return Some(p.clone());
@@ -79,6 +106,34 @@ pub fn install(i: &mut Interp) {
     install_text_codecs(i);
     install_url(i);
     install_stubs(i);
+    install_host_hooks(i);
+}
+
+// ===========================================================================
+// host hooks ($262 — test262-style harness API)
+// ===========================================================================
+
+fn install_host_hooks(i: &mut Interp) {
+    let o = plain(Some(i.p.obj.clone()));
+    met_a(i, &o, "detachArrayBuffer", h_detach_buffer, 1.0);
+    gdef(i, "$262", Value::Obj(o));
+}
+
+/// `$262.detachArrayBuffer(buf)` — DetachArrayBuffer: byte length → 0,
+/// all views become detached / out-of-bounds.
+fn h_detach_buffer(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
+    let Value::Obj(o) = arg(args, 0) else {
+        return Err(i.type_err("detachArrayBuffer expects an ArrayBuffer"));
+    };
+    let Some(b) = buffer_bytes(&o) else {
+        return Err(i.type_err("detachArrayBuffer expects an ArrayBuffer"));
+    };
+    if is_shared(&o) {
+        return Err(i.type_err("SharedArrayBuffer cannot be detached"));
+    }
+    b.borrow_mut().clear();
+    o.borrow_mut().detached = true;
+    Ok(Value::Und)
 }
 
 // ===========================================================================
@@ -124,8 +179,57 @@ fn f32_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
 fn f64_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
     ta_ctor(i, t, a, TAK::F64)
 }
-fn big_ta_ctor(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
-    Err(i.type_err("BigInt typed arrays are not supported"))
+/// BigInt64Array / BigUint64Array — the engine has no real bigint
+/// representation, so these behave as 8-byte float arrays (bigint
+/// stand-in objects still coerce via their `__bigint` value). A
+/// hidden `__name` slot records the real TypedArrayName since both
+/// share TAK::F64 — `ta_intrinsic_name` resolves it.
+fn big_ta_ctor(i: &mut Interp, t: &Value, a: &[Value], name: &'static str) -> NR {
+    let r = ta_ctor(i, t, a, TAK::F64)?;
+    if let Value::Obj(o) = &r {
+        hid(i, o, "__name", Value::Str(Rc::from(name)));
+    }
+    Ok(r)
+}
+fn b64_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
+    big_ta_ctor(i, t, a, "BigInt64Array")
+}
+fn bu64_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
+    big_ta_ctor(i, t, a, "BigUint64Array")
+}
+
+/// `[[TypedArrayName]]` — BigInt stand-ins share TAK::F64 and carry
+/// their real name in the hidden `__name` slot instead.
+fn ta_intrinsic_name(v: &Value, kind: TAK) -> String {
+    if let Value::Obj(o) = v {
+        if let Some(p) = o.borrow().props.get_str("__name") {
+            if let Value::Str(s) = &p.val {
+                return s.to_string();
+            }
+        }
+    }
+    kind.type_name().to_string()
+}
+
+/// `%BigInt.prototype%.valueOf` — stand-ins carry their magnitude in a
+/// non-enumerable `__bigint` slot; returning it lets Number() /
+/// ToNumber treat them like real bigints.
+fn bigint_value_of(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    if let Value::Obj(o) = this {
+        if let Some(v) = o.borrow().props.get_str("__bigint").map(|p| p.val.clone()) {
+            return Ok(v);
+        }
+    }
+    Err(i.type_err("not a BigInt"))
+}
+
+fn bigint_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    if let Value::Obj(o) = this {
+        if let Some(v) = o.borrow().props.get_str("__bigint").map(|p| p.val.clone()) {
+            return i.to_str(&v).map(|s| Value::Str(Rc::from(s.as_str())));
+        }
+    }
+    Err(i.type_err("not a BigInt"))
 }
 
 const TA_CTORS: [NativeFn; 9] = [
@@ -267,6 +371,9 @@ fn install_typed_arrays(i: &mut Interp) {
                 false,
                 false,
             );
+            // every concrete TypedArray ctor declares (buffer,
+            // byteOffset, length) → .length = 3
+            i.set_attr(co, "length", Value::Num(3.0), false, true);
         }
         i.set_attr(
             &proto,
@@ -278,10 +385,29 @@ fn install_typed_arrays(i: &mut Interp) {
         i.set_builtin(&proto, "constructor", ctor.clone());
         gdef(i, name, ctor);
     }
-    // tolerant stubs — exist so `typeof BigInt64Array === "function"`
-    for name in ["BigInt64Array", "BigUint64Array"] {
+    // bigint stand-in objects get coercible so they behave like real
+    // bigints through ToPrimitive → valueOf.
+    {
+        let bp = i.p.bigint.clone();
+        i.set_builtin(&bp, "valueOf", i.native("valueOf", bigint_value_of));
+        i.set_builtin(&bp, "toString", i.native("toString", bigint_to_string));
+        bp.borrow_mut().props.insert(
+            PropKey::Sym(SYM_TOSTRINGTAG),
+            Prop::builtin(Value::Str(Rc::from("BigInt"))),
+        );
+    }
+    // tolerant stubs — exist so `typeof BigInt64Array === "function"`;
+    // they behave as 8-byte float arrays (see big_ta_ctor).
+    for (name, cf) in [
+        ("BigInt64Array", b64_ctor as NativeFn),
+        ("BigUint64Array", bu64_ctor),
+    ] {
         let proto = plain(Some(shared.clone()));
-        let ctor = i.native(name, big_ta_ctor);
+        // spec [[TypedArrayName]] on the proto too — `ta_is_big` uses
+        // it to detect bigint element kind before the instance slot is
+        // installed (inside the constructor body) and for subclasses.
+        hid(i, &proto, "__name", Value::Str(Rc::from(name)));
+        let ctor = i.native(name, cf);
         if let Value::Obj(co) = &ctor {
             co.borrow_mut().proto = Some(ta_intr.clone());
             co.borrow_mut().props.insert(
@@ -296,6 +422,7 @@ fn install_typed_arrays(i: &mut Interp) {
                 },
             );
             i.set_attr(co, "BYTES_PER_ELEMENT", Value::Num(8.0), false, false);
+            i.set_attr(co, "length", Value::Num(3.0), false, true);
             i.set_builtin(&proto, "constructor", ctor.clone());
         }
         gdef(i, name, ctor);
@@ -316,7 +443,7 @@ fn ta_get_species(_i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 /// TypedArrayName, or undefined for non-TypedArray receivers.
 fn ta_get_tag(_i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
     Ok(match ta_parts(this) {
-        Some(t) => Value::Str(Rc::from(t.kind.type_name())),
+        Some(t) => Value::Str(Rc::from(ta_intrinsic_name(this, t.kind))),
         None => Value::Und,
     })
 }
@@ -442,10 +569,191 @@ fn ta_elem(i: &mut Interp, this: &Value, k: usize) -> Result<Value, Value> {
     i.get_prop(this, &ta_elem_key(k))
 }
 
+/// wrap a raw element value for JS visibility — bigint-kind arrays
+/// expose bigint stand-in objects; everything else passes through.
+fn ta_pubify(i: &mut Interp, this: &Value, v: Value) -> Value {
+    if let Value::Num(n) = &v {
+        if ta_is_big(this) {
+            return i.bigint_obj(*n);
+        }
+    }
+    v
+}
+
+/// element value as JS code should observe it — bigint-kind arrays
+/// wrap the raw f64 magnitude in the engine's bigint stand-in object
+/// (used for `.at`, callback arguments, iterator values, `find`).
+fn ta_pub_elem(i: &mut Interp, this: &Value, k: usize) -> Result<Value, Value> {
+    let v = ta_elem(i, this, k)?;
+    Ok(ta_pubify(i, this, v))
+}
+
+/// element-vs-searchElement comparison honoring [[ContentType]] —
+/// a bigint-kind element only matches a bigint stand-in argument
+/// (magnitude compared), and a number-kind element never matches a
+/// stand-in. `svz` picks SameValueZero (includes) vs strict (indexOf).
+fn ta_elem_matches(v: &Value, needle: &Value, big: bool, svz: bool) -> bool {
+    if big {
+        return match bigint_magnitude(needle) {
+            Some(n) => matches!(v, Value::Num(e) if *e == n),
+            None => false,
+        };
+    }
+    if bigint_magnitude(needle).is_some() {
+        return false;
+    }
+    if svz {
+        ta_same_value_zero(v, needle)
+    } else {
+        ta_strict_eq(v, needle)
+    }
+}
+
+/// the element conversion performed inside integer-indexed [[Set]]
+/// (ToNumber / ToBigInt) — rejects the mismatched primitive before
+/// delegating to the ordinary property write used by species-created
+/// destinations and `of`/`from`.
+#[allow(dead_code)]
+fn ta_store_val(
+    i: &mut Interp,
+    a: &Value,
+    k: usize,
+    v: &Value,
+    big: bool,
+) -> Result<(), Value> {
+    if !big && bigint_magnitude(v).is_some() {
+        return Err(i.type_err("Cannot convert a BigInt value to a number"));
+    }
+    if big && matches!(v, Value::Num(_)) {
+        return Err(i.type_err("Cannot convert a number to a BigInt"));
+    }
+    i.set_prop(a, ta_elem_key(k), v.clone())
+}
+
 /// ? ToIntegerOrInfinity — NaN → 0, fraction truncated, ±∞ preserved.
 fn ta_to_int(i: &mut Interp, v: &Value) -> Result<f64, Value> {
     let n = i.to_num(v)?;
     Ok(if n.is_nan() { 0.0 } else { n.trunc() })
+}
+
+/// spec ToIndex — ToIntegerOrInfinity then assert 0 ≤ n < 2^53.
+/// NaN → +0; negative / ±∞ / ≥ 2^53 → RangeError.
+fn to_index(i: &mut Interp, v: &Value) -> Result<usize, Value> {
+    let n = i.to_num(v)?.trunc();
+    if n.is_nan() {
+        return Ok(0);
+    }
+    if !n.is_finite() || n < 0.0 || n >= 9007199254740992.0 {
+        return Err(i.range_err("index out of range"));
+    }
+    Ok(n as usize)
+}
+
+/// magnitude of a bigint stand-in object (the non-enumerable
+/// `__bigint` slot installed by `Interp::bigint_obj`).
+fn bigint_magnitude(v: &Value) -> Option<f64> {
+    if let Value::Obj(o) = v {
+        if let Some(Value::Num(n)) =
+            o.borrow().props.get_str("__bigint").map(|p| p.val.clone())
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// spec StringToBigInt — a StringIntegerLiteral (decimal / 0x / 0o /
+/// 0b, optional sign for decimal only); empty → 0n; malformed →
+/// SyntaxError. Values are approximated as f64.
+fn str_to_bigint_num(i: &mut Interp, s: &str) -> Result<f64, Value> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(0.0);
+    }
+    let (sign, body) = match t.strip_prefix('-') {
+        Some(r) => (-1.0, r),
+        None => match t.strip_prefix('+') {
+            Some(r) => (1.0, r),
+            None => (1.0, t),
+        },
+    };
+    let signed = sign < 0.0 || t.starts_with('+');
+    let (digits, radix) = if let Some(h) =
+        body.strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
+    {
+        (h, 16)
+    } else if let Some(h) =
+        body.strip_prefix("0o").or_else(|| body.strip_prefix("0O"))
+    {
+        (h, 8)
+    } else if let Some(h) =
+        body.strip_prefix("0b").or_else(|| body.strip_prefix("0B"))
+    {
+        (h, 2)
+    } else {
+        (body, 10)
+    };
+    if digits.is_empty()
+        || !digits.chars().all(|c| c.is_digit(radix))
+        || (signed && radix != 10)
+    {
+        return Err(i.syntax_err("Cannot convert string to a BigInt"));
+    }
+    let n = u128::from_str_radix(digits, radix)
+        .map(|v| v as f64)
+        .unwrap_or(f64::INFINITY);
+    Ok(sign * n)
+}
+
+/// spec element conversion — ToNumber for number-kind TypedArrays and
+/// a ToBigInt approximation for bigint-kind ones (stand-in objects
+/// carry their magnitude in `__bigint`; real engines throw TypeError
+/// converting BigInt↔Number, which we emulate).
+fn ta_elem_num(i: &mut Interp, v: &Value, big: bool) -> Result<f64, Value> {
+    if big {
+        return match v {
+            Value::Num(_) | Value::Und | Value::Null | Value::Sym(..) => {
+                Err(i.type_err("Cannot convert value to a BigInt"))
+            }
+            Value::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+            Value::Str(s) => str_to_bigint_num(i, s),
+            Value::Obj(o) => match bigint_magnitude(v) {
+                Some(n) => Ok(n),
+                None => {
+                    // ToPrimitive (number hint) then retry the conversion
+                    let p = i.to_primitive_hint(v, o.clone(), "number")?;
+                    ta_elem_num(i, &p, true)
+                }
+            },
+        };
+    }
+    if bigint_magnitude(v).is_some() {
+        return Err(i.type_err("Cannot convert a BigInt value to a number"));
+    }
+    i.to_num(v)
+}
+
+/// spec [[ContentType]] check — bigint-kind TypedArrays carry the
+/// hidden `__name` slot either directly (installed by `big_ta_ctor`)
+/// or on their prototype (installed at bootstrap for the intrinsic
+/// names); a proto-chain walk covers both plus subclasses.
+fn ta_is_big(v: &Value) -> bool {
+    let Value::Obj(o) = v else {
+        return false;
+    };
+    let mut cur = Some(o.clone());
+    while let Some(c) = cur {
+        if c
+            .borrow()
+            .props
+            .get_str("__name")
+            .is_some_and(|p| matches!(p.val, Value::Str(_)))
+        {
+            return true;
+        }
+        cur = c.borrow().proto.clone();
+    }
+    false
 }
 
 /// SameValueZero for element comparisons (includes).
@@ -512,9 +820,13 @@ fn mk_buf_of(i: &Interp, elems: &[f64], kind: TAK) -> (ObjRef, usize) {
 
 /// `new <matching intrinsic ctor>(len)` — spec TypedArrayCreateSameType
 /// (toReversed / toSorted / with) and the default species path.
-fn ta_fresh_typed(i: &mut Interp, kind: TAK, len: usize) -> NR {
+/// `src` supplies `[[TypedArrayName]]` (BigInt stand-ins differ from
+/// their element kind).
+fn ta_fresh_typed(i: &mut Interp, src: &Value, kind: TAK, len: usize) -> NR {
     let g = i.global.clone();
-    let cv = i.env_lookup(&g, kind.type_name()).unwrap_or(Value::Und);
+    let cv = i
+        .env_lookup(&g, &ta_intrinsic_name(src, kind))?
+        .unwrap_or(Value::Und);
     i.construct(&cv, vec![Value::Num(len as f64)], None)
 }
 
@@ -524,6 +836,9 @@ fn ta_species_ctor(i: &mut Interp, this: &Value) -> Result<Option<Value>, Value>
     let c = i.get_prop_str(this, "constructor")?;
     if matches!(c, Value::Und) {
         return Ok(None);
+    }
+    if !matches!(c, Value::Obj(_)) {
+        return Err(i.type_err("constructor is not an object"));
     }
     let s = i.get_prop(&c, &PropKey::Sym(SYM_SPECIES))?;
     match s {
@@ -548,7 +863,9 @@ fn ta_species_result(
         Some(c) => i.construct(&c, args, None)?,
         None => {
             let g = i.global.clone();
-            let cv = i.env_lookup(&g, kind.type_name()).unwrap_or(Value::Und);
+            let cv = i
+                .env_lookup(&g, &ta_intrinsic_name(this, kind))?
+                .unwrap_or(Value::Und);
             i.construct(&cv, args, None)?
         }
     };
@@ -560,8 +877,10 @@ fn ta_species_result(
             "species constructor returned a detached or out-of-bounds TypedArray",
         ));
     };
+    // the single-Number-argument check only applies to fixed-length
+    // results — tracking views carry "auto" for [[ArrayLength]].
     if let Some(n) = min_len {
-        if eff < n {
+        if !t.track && eff < n {
             return Err(i.type_err(
                 "species constructor returned a TypedArray that is too short",
             ));
@@ -575,36 +894,48 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
     if i.new_target_native.is_none() {
         return Err(i.type_err("TypedArray constructor cannot be invoked without 'new'"));
     }
+    // spec OrdinaryCreateFromConstructor happens before argument
+    // processing — `construct` resolved the proto without invoking
+    // getters, so replay the observable Get(newTarget,"prototype"):
+    // a getter may detach or resize a source buffer.
+    if let Some(nt) = i.new_target_native.clone() {
+        let _ = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
+    }
     let sz = kind.size();
     let src = arg(args, 0);
+    // spec [[ContentType]] of the array being constructed — resolved
+    // through the proto chain before the instance slot exists
+    let target_big = ta_is_big(this);
     // (buffer obj, byte offset, elem count, length-tracking)
     let (buf, off, len, track): (ObjRef, usize, usize, bool) = match &src {
         Value::Obj(o) => {
+            // a bigint stand-in reaches ToIndex → spec TypeError
+            if bigint_magnitude(&src).is_some() {
+                return Err(i.type_err("Cannot convert a BigInt value to a number"));
+            }
             let kind_of_src = o.borrow().kind.clone();
             match kind_of_src {
                 ObjKind::Bytes(b) => {
+                    let resizable = o.borrow().rab_max.is_some();
+                    // spec InitializeTypedArrayFromArrayBuffer — both
+                    // ToIndex coercions run before the detached check.
+                    let off = match arg(args, 1) {
+                        Value::Und => 0,
+                        v => to_index(i, &v)?,
+                    };
+                    let explen = match arg(args, 2) {
+                        Value::Und => None,
+                        v => Some(to_index(i, &v)?),
+                    };
                     if o.borrow().detached {
                         return Err(i.type_err("Cannot construct a TypedArray on a detached ArrayBuffer"));
                     }
-                    let resizable = o.borrow().rab_max.is_some();
                     let blen = b.borrow().len();
-                    let off = match arg(args, 1) {
-                        Value::Und => 0,
-                        v => {
-                            let n = i.to_num(&v)?.trunc();
-                            if n < 0.0 || !n.is_finite() {
-                                return Err(
-                                    i.range_err("start offset of typed array is out of range")
-                                );
-                            }
-                            n as usize
-                        }
-                    };
                     if off % sz != 0 || off > blen {
                         return Err(i.range_err("start offset of typed array is out of bounds"));
                     }
-                    let (len, track) = match arg(args, 2) {
-                        Value::Und => {
+                    let (len, track) = match explen {
+                        None => {
                             if resizable {
                                 // length-tracking view — no alignment
                                 // constraint on the initial byte size
@@ -618,15 +949,8 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
                                 ((blen - off) / sz, false)
                             }
                         }
-                        v => {
-                            let n = i.to_num(&v)?.trunc();
-                            if n < 0.0 || !n.is_finite() {
-                                return Err(
-                                    i.range_err("length of typed array is out of range")
-                                );
-                            }
-                            let n = n as usize;
-                            if off + n.saturating_mul(sz) > blen {
+                        Some(n) => {
+                            if n.saturating_mul(sz) > blen - off {
                                 return Err(i.range_err("length of typed array out of bounds"));
                             }
                             (n, false)
@@ -634,28 +958,39 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
                     };
                     (o.clone(), off, len, track)
                 }
-                ObjKind::Typed {
-                    buf: sbuf, ..
-                } => {
-                    // InitializeTypedArrayFromTypedArray — detached
-                    // source throws; an OOB source contributes 0 elems.
-                    if sbuf.borrow().detached {
-                        return Err(i.type_err("source TypedArray is detached"));
+                ObjKind::Typed { .. } => {
+                    // InitializeTypedArrayFromTypedArray — a detached or
+                    // out-of-bounds source throws; differing content
+                    // types (bigint vs number) also throw.
+                    let s = ta_parts(&src).unwrap();
+                    if s.eff().is_none() {
+                        return Err(i.type_err("source TypedArray is detached or out of bounds"));
+                    }
+                    if ta_is_big(&src) != target_big {
+                        return Err(
+                            i.type_err("Cannot mix BigInt and non-BigInt TypedArrays")
+                        );
                     }
                     let elems = ta_f64s(&src);
                     let (buf, n) = mk_buf_of(i, &elems, kind);
                     (buf, 0, n, false)
                 }
                 _ => {
-                    // array-like / iterable
-                    let items = if i.has_prop(&src, &PropKey::Sym(SYM_ITERATOR))? {
-                        i.iter_values(&src)?
-                    } else {
+                    // array-like / iterable — spec GetMethod: undefined
+                    // or null means "not iterable"; a non-callable
+                    // method is a TypeError.
+                    let iterm = i.get_prop(&src, &PropKey::Sym(SYM_ITERATOR))?;
+                    let items = if matches!(iterm, Value::Und | Value::Null) {
                         to_elems(i, &src)?
+                    } else {
+                        if !i.is_callable(&iterm) {
+                            return Err(i.type_err("value is not iterable"));
+                        }
+                        i.iter_values(&src)?
                     };
                     let mut elems = Vec::with_capacity(items.len());
                     for it in items {
-                        elems.push(i.to_num(&it)?);
+                        elems.push(ta_elem_num(i, &it, target_big)?);
                     }
                     let (buf, n) = mk_buf_of(i, &elems, kind);
                     (buf, 0, n, false)
@@ -664,16 +999,14 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
         }
         Value::Und | Value::Null => (mk_buffer(i, Vec::new()), 0, 0, false),
         other => {
-            let n = i.to_num(other)?;
-            if n.is_nan() {
-                (mk_buffer(i, Vec::new()), 0, 0, false)
-            } else {
-                if !n.is_finite() || n < 0.0 || n > 268435456.0 {
-                    return Err(i.range_err("Invalid typed array length"));
-                }
-                let n = n as usize;
-                (mk_buffer(i, vec![0u8; n * sz]), 0, n, false)
+            // spec InitializeTypedArrayFromLength — ToIndex semantics:
+            // NaN → +0, fractions truncate, negatives / ±∞ / ≥ 2^53 are
+            // RangeErrors.
+            let n = to_index(i, other)?;
+            if n > 268435456 {
+                return Err(i.range_err("Invalid typed array length"));
             }
+            (mk_buffer(i, vec![0u8; n * sz]), 0, n, false)
         }
     };
     let o = match this {
@@ -696,11 +1029,21 @@ fn ta_static_of(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
         return Err(i.type_err("of called on a non-constructor"));
     }
     let obj = i.construct(t, vec![Value::Num(args.len() as f64)], None)?;
-    if ta_parts(&obj).is_none() {
+    // spec TypedArrayCreateFromConstructor — the single-argument length
+    // check plus ValidateTypedArray.
+    let Some(tp) = ta_parts(&obj) else {
         return Err(i.type_err("of result is not a TypedArray"));
+    };
+    if tp.eff().is_none() {
+        return Err(i.type_err("of result is a detached or out-of-bounds TypedArray"));
     }
+    if tp.eff().unwrap_or(0) < args.len() {
+        return Err(i.type_err("of result is too short"));
+    }
+    let big = ta_is_big(&obj);
     for (k, v) in args.iter().enumerate() {
-        i.set_prop(&obj, ta_elem_key(k), v.clone())?;
+        let cv = Value::Num(ta_elem_num(i, v, big)?);
+        i.set_prop(&obj, ta_elem_key(k), cv)?;
     }
     Ok(obj)
 }
@@ -747,13 +1090,15 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
         if ta_parts(&obj).is_none() {
             return Err(i.type_err("from result is not a TypedArray"));
         }
+        let big = ta_is_big(&obj);
         for (k, it) in items.into_iter().enumerate() {
             let v = if use_map {
                 i.call(&mapf, this_arg.clone(), vec![it, Value::Num(k as f64)])?
             } else {
                 it
             };
-            i.set_prop(&obj, ta_elem_key(k), v)?;
+            let cv = Value::Num(ta_elem_num(i, &v, big)?);
+            i.set_prop(&obj, ta_elem_key(k), cv)?;
         }
         return Ok(obj);
     }
@@ -770,6 +1115,7 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
     if ta_parts(&obj).is_none() {
         return Err(i.type_err("from result is not a TypedArray"));
     }
+    let big = ta_is_big(&obj);
     for k in 0..len {
         let kv = i.get_prop(&src, &ta_elem_key(k))?;
         let v = if use_map {
@@ -777,7 +1123,8 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
         } else {
             kv
         };
-        i.set_prop(&obj, ta_elem_key(k), v)?;
+        let cv = Value::Num(ta_elem_num(i, &v, big)?);
+        i.set_prop(&obj, ta_elem_key(k), cv)?;
     }
     Ok(obj)
 }
@@ -803,37 +1150,55 @@ fn need_ta(i: &mut Interp, this: &Value) -> Result<Tap, Value> {
     Ok(t)
 }
 
-fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    // spec ValidateTypedArray precedes the offset coercion.
+/// spec ValidateTypedArray in write mode — additionally rejects buffers
+/// marked immutable *before* any argument coercion runs.
+fn need_ta_write(i: &mut Interp, this: &Value) -> Result<Tap, Value> {
     let t = need_ta(i, this)?;
+    if t.buf.borrow().immutable {
+        return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+    }
+    Ok(t)
+}
+
+fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    // spec order: RequireInternalSlot → immutable check → offset
+    // coercion → detached / out-of-bounds check → source handling.
+    // (immutable throws before ANY coercion; detached throws only
+    // after the offset's valueOf has run.)
+    let t = ta_parts(this).ok_or_else(|| {
+        i.type_err("Method called on incompatible receiver (expected TypedArray)")
+    })?;
+    if t.buf.borrow().immutable {
+        return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+    }
     let tof = ta_to_int(i, &arg(args, 1))?;
+    // spec: a negative or +∞ offset is a RangeError, checked before the
+    // detached / out-of-bounds validation inside the sub-ops.
     if tof < 0.0 || tof == f64::INFINITY {
         return Err(i.range_err("offset is out of bounds"));
     }
     let to = tof as usize;
-    // target detached / out-of-bounds validated after offset coercion
-    let Some(tlen) = t.eff() else {
-        return Err(
-            i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray")
-        );
-    };
     let src = arg(args, 0);
+    let target_big = ta_is_big(this);
     if let Some(s) = ta_parts(&src) {
-        // TypedArray source — internal-slot reads, buffer snapshot
-        // (handles shared-buffer aliasing).
-        if s.buf.borrow().detached {
-            return Err(i.type_err("source TypedArray is detached"));
-        }
-        // an out-of-bounds source contributes zero elements (spec:
-        // TypedArrayLength of an OOB record is 0)
-        let slen = s.eff().unwrap_or(0);
+        // TypedArray source — spec SetTypedArrayFromTypedArray:
+        // ValidateTypedArray(target), ValidateTypedArray(source),
+        // lengths, range checks, content-type check, then copy.
+        let Some(tlen) = t.eff() else {
+            return Err(
+                i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray")
+            );
+        };
+        let Some(slen) = s.eff() else {
+            return Err(i.type_err("source TypedArray is detached or out of bounds"));
+        };
         if to.saturating_add(slen) > tlen {
             return Err(i.range_err("source array is too long"));
         }
-        let elems = ta_f64s(&src);
-        if !elems.is_empty() && t.buf.borrow().immutable {
-            return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+        if ta_is_big(&src) != target_big {
+            return Err(i.type_err("Cannot mix BigInt and non-BigInt TypedArrays"));
         }
+        let elems = ta_f64s(&src);
         if let Some(bytes) = buffer_bytes(&t.buf) {
             let mut bb = bytes.borrow_mut();
             let sz = t.kind.size();
@@ -843,8 +1208,15 @@ fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         }
         return Ok(Value::Und);
     }
-    // array-like / primitive source — spec per-element Get → ToNumber →
-    // write (live-bounded: source getters may resize the target)
+    // array-like / primitive source — spec SetTypedArrayFromArrayLike:
+    // ValidateTypedArray(target) and targetLength come BEFORE
+    // ToObject(source) / LengthOfArrayLike(source), so length getters
+    // observe the original bounds while writes stay live-bounded.
+    let Some(tlen) = t.eff() else {
+        return Err(
+            i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray")
+        );
+    };
     if matches!(src, Value::Und | Value::Null) {
         return Err(i.type_err("set source must be an object"));
     }
@@ -861,17 +1233,25 @@ fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     for k in 0..slen {
         // ? Get — an abrupt completion leaves earlier writes in place.
         let v = i.get_prop(&src, &ta_elem_key(k))?;
-        // spec Set propagates ToNumber first — conversion side effects
-        // (detach/resize) make the write itself silently vanish.
-        let nv = i.to_num(&v)?;
+        // spec Set propagates the element conversion first —
+        // conversion side effects (detach/resize) make the write
+        // itself silently vanish.
+        let nv = ta_elem_num(i, &v, target_big)?;
         t.set_num(i, to + k, nv)?;
     }
     Ok(Value::Und)
 }
 
 fn m_ta_subarray(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
-    let len = t.eff().unwrap_or(0);
+    // spec requires only the internal-slot check — begin/end still get
+    // coerced when the buffer is detached or out-of-bounds, and any
+    // failure surfaces from the species construction below.
+    let t = ta_parts(this).ok_or_else(|| {
+        i.type_err("Method called on incompatible receiver (expected TypedArray)")
+    })?;
+    // srcLength = O.[[ArrayLength]]: live length for tracking views, the
+    // stored length for fixed views (even when currently out of bounds).
+    let len = if t.track { t.eff().unwrap_or(0) } else { t.len };
     let begin = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
     let end = match arg(args, 1) {
         Value::Und => len,
@@ -911,35 +1291,63 @@ fn m_ta_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Some(count),
     )?;
     if count > 0 {
-        if t.buf.borrow().detached {
-            return Err(i.type_err("Cannot perform slice on a detached ArrayBuffer"));
+        if t.eff().is_none() {
+            return Err(
+                i.type_err("Cannot perform slice on a detached or out-of-bounds ArrayBuffer")
+            );
         }
-        // snapshot the source range first — a custom species result
-        // may alias this buffer (same-typed results get a byte copy
-        // per spec; per-element copy is observably identical)
-        let mut vals = Vec::with_capacity(count);
-        for k in 0..count {
-            vals.push(ta_elem(i, this, begin + k)?);
+        // spec: same element kind → byte-level copy (requires the same
+        // [[ContentType]] too — bigint-kind storage shares TAK::F64
+        // with Float64Array). Source bytes past the live (possibly
+        // shrunk) buffer read as zero — the fresh destination buffer
+        // is already zero-initialised.
+        let src_big = ta_is_big(this);
+        let a_big = ta_is_big(&a);
+        if a_big != src_big {
+            // per-element Set would fail on the first conversion —
+            // ToNumber(bigint) / ToBigInt(number) both throw
+            return Err(i.type_err("Cannot mix BigInt and non-BigInt TypedArrays"));
         }
-        for (k, v) in vals.into_iter().enumerate() {
-            i.set_prop(&a, ta_elem_key(k), v)?;
+        if ta_parts(&a).is_some_and(|d| d.kind == t.kind) {
+            let d = ta_parts(&a).unwrap();
+            let sz = t.kind.size();
+            let src_at = t.off + begin * sz;
+            if let (Some(sb), Some(db)) = (buffer_bytes(&t.buf), buffer_bytes(&d.buf)) {
+                let avail = sb.borrow().len().saturating_sub(src_at);
+                let n_bytes = (count * sz)
+                    .min(avail)
+                    .min(db.borrow().len().saturating_sub(d.off));
+                let tmp: Vec<u8> = sb.borrow()[src_at..src_at + n_bytes].to_vec();
+                db.borrow_mut()[d.off..d.off + n_bytes].copy_from_slice(&tmp);
+            }
+        } else {
+            // different element kinds — per-element Get → Set; a custom
+            // species result may alias this buffer so snapshot first.
+            let mut vals = Vec::with_capacity(count);
+            for k in 0..count {
+                vals.push(ta_elem(i, this, begin + k)?);
+            }
+            for (k, v) in vals.into_iter().enumerate() {
+                i.set_prop(&a, ta_elem_key(k), v)?;
+            }
         }
     }
     Ok(a)
 }
 
 fn m_ta_fill(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
+    let t = need_ta_write(i, this)?;
     let len = t.eff().unwrap_or(0);
-    let v = i.to_num(&arg(args, 0))?;
+    // spec: ToBigInt on bigint-kind receivers, ToNumber otherwise
+    let v = ta_elem_num(i, &arg(args, 0), ta_is_big(this))?;
     let start = clamp_index(ta_to_int(i, &arg(args, 1))?, len);
     let end = match arg(args, 2) {
         Value::Und => len,
         x => clamp_index(ta_to_int(i, &x)?, len),
     };
-    // coercion may have detached the buffer
-    if t.buf.borrow().detached {
-        return Err(i.type_err("Cannot perform fill on a detached ArrayBuffer"));
+    // coercion may have detached the buffer or shrunk it out of bounds
+    if t.eff().is_none() {
+        return Err(i.type_err("Cannot perform fill on a detached or out-of-bounds TypedArray"));
     }
     for k in start..end {
         t.set_num(i, k, v)?;
@@ -948,7 +1356,7 @@ fn m_ta_fill(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_copy_within(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
+    let t = need_ta_write(i, this)?;
     let len = t.eff().unwrap_or(0);
     let target = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
     let start = clamp_index(ta_to_int(i, &arg(args, 1))?, len);
@@ -958,25 +1366,34 @@ fn m_ta_copy_within(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     let count = end.saturating_sub(start).min(len - target);
     if count > 0 {
-        if t.buf.borrow().detached {
+        // spec re-validates after coercion — detachment or an
+        // out-of-bounds view throws.
+        if t.eff().is_none() {
             return Err(
-                i.type_err("Cannot perform copyWithin on a detached ArrayBuffer")
+                i.type_err("Cannot perform copyWithin on a detached or out-of-bounds TypedArray")
             );
         }
-        // byte-copy via an element snapshot; out-of-range source
-        // positions (shrunk buffer) read as 0
-        let tmp: Vec<f64> = (0..count)
-            .map(|k| t.get(start + k).unwrap_or(0.0))
-            .collect();
-        for k in 0..count {
-            t.set_num(i, target + k, tmp[k])?;
-        }
+        // byte-level copy against the LIVE buffer — a shrunk source
+        // range contributes only the still-present bytes.
+        let sz = t.kind.size();
+        let Some(b) = buffer_bytes(&t.buf) else {
+            return Ok(this.clone());
+        };
+        let mut bb = b.borrow_mut();
+        let blen = bb.len();
+        let to_byte = (t.off + target * sz).min(blen);
+        let from_byte = (t.off + start * sz).min(blen);
+        let count_bytes = (count * sz)
+            .min(blen - to_byte)
+            .min(blen - from_byte);
+        let tmp: Vec<u8> = bb[from_byte..from_byte + count_bytes].to_vec();
+        bb[to_byte..to_byte + count_bytes].copy_from_slice(&tmp);
     }
     Ok(this.clone())
 }
 
 fn m_ta_reverse(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
+    let t = need_ta_write(i, this)?;
     let _ = args;
     let len = t.eff().unwrap_or(0);
     let tmp = ta_f64s(this);
@@ -998,13 +1415,30 @@ fn ta_sort_elems(
         items.push(ta_elem(i, this, k)?);
     }
     if i.is_callable(cmp) {
+        // bigint-kind arrays hand stand-ins to the comparator so user
+        // code observes bigint-typed elements
+        let big = ta_is_big(this);
         let mut err: Option<Value> = None;
         let mut work = items.clone();
         merge_sort(&mut items, &mut work, &mut |a, b| {
             if err.is_some() {
                 return std::cmp::Ordering::Equal;
             }
-            match i.call(cmp, Value::Und, vec![a.clone(), b.clone()]) {
+            let (av, bv) = if big {
+                (
+                    match a {
+                        Value::Num(n) => i.bigint_obj(*n),
+                        v => v.clone(),
+                    },
+                    match b {
+                        Value::Num(n) => i.bigint_obj(*n),
+                        v => v.clone(),
+                    },
+                )
+            } else {
+                (a.clone(), b.clone())
+            };
+            match i.call(cmp, Value::Und, vec![av, bv]) {
                 Ok(v) => match i.to_num(&v) {
                     Ok(n) if n < 0.0 => std::cmp::Ordering::Less,
                     Ok(n) if n > 0.0 => std::cmp::Ordering::Greater,
@@ -1047,12 +1481,13 @@ fn ta_sort_elems(
 }
 
 fn m_ta_sort(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
-    let len = t.eff().unwrap_or(0);
+    // spec checks comparefn callability before ValidateTypedArray
     let cmp = arg(args, 0);
     if !matches!(cmp, Value::Und) && !i.is_callable(&cmp) {
         return Err(i.type_err("comparefn must be a function or undefined"));
     }
+    let t = need_ta_write(i, this)?;
+    let len = t.eff().unwrap_or(0);
     let items = ta_sort_elems(i, this, len, &cmp)?;
     // write-back via Set — live bounds; immutable throws TypeError
     for (k, v) in items.into_iter().enumerate() {
@@ -1075,6 +1510,7 @@ fn m_ta_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     if n == f64::INFINITY {
         return Ok(Value::Num(-1.0));
     }
+    let big = ta_is_big(this);
     let start = if n < 0.0 {
         len.saturating_sub((-n) as usize)
     } else {
@@ -1082,7 +1518,7 @@ fn m_ta_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     for k in start..len {
         let v = ta_elem(i, this, k)?;
-        if ta_strict_eq(&v, &needle) {
+        if ta_elem_matches(&v, &needle, big, false) {
             return Ok(Value::Num(k as f64));
         }
     }
@@ -1111,9 +1547,10 @@ fn m_ta_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     if k < 0 {
         return Ok(Value::Num(-1.0));
     }
+    let big = ta_is_big(this);
     for k in (0..=k as usize).rev() {
         let v = ta_elem(i, this, k)?;
-        if ta_strict_eq(&v, &needle) {
+        if ta_elem_matches(&v, &needle, big, false) {
             return Ok(Value::Num(k as f64));
         }
     }
@@ -1134,6 +1571,7 @@ fn m_ta_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     if n == f64::INFINITY {
         return Ok(Value::Bool(false));
     }
+    let big = ta_is_big(this);
     let start = if n < 0.0 {
         len.saturating_sub((-n) as usize)
     } else {
@@ -1141,7 +1579,7 @@ fn m_ta_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     for k in start..len {
         let v = ta_elem(i, this, k)?;
-        if ta_same_value_zero(&v, &needle) {
+        if ta_elem_matches(&v, &needle, big, true) {
             return Ok(Value::Bool(true));
         }
     }
@@ -1206,7 +1644,7 @@ fn m_ta_at(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     if idx < 0 || idx >= len as i64 {
         return Ok(Value::Und);
     }
-    ta_elem(i, this, idx as usize)
+    ta_pub_elem(i, this, idx as usize)
 }
 
 /// spec callback-preamble for map/filter/forEach/find*/some/every:
@@ -1231,14 +1669,18 @@ fn m_ta_map(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         vec![Value::Num(len as f64)],
         Some(len),
     )?;
+    let a_big = ta_is_big(&a);
     for k in 0..len {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         let rv = i.call(
             &cb,
             this_arg.clone(),
             vec![kv, Value::Num(k as f64), this.clone()],
         )?;
-        i.set_prop(&a, ta_elem_key(k), rv)?;
+        // the Set inside the spec coerces with ToNumber/ToBigInt —
+        // doing it here stores a plain number without double valueOf
+        let cv = Value::Num(ta_elem_num(i, &rv, a_big)?);
+        i.set_prop(&a, ta_elem_key(k), cv)?;
     }
     Ok(a)
 }
@@ -1251,10 +1693,11 @@ fn m_ta_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let mut kept = Vec::new();
     for k in 0..len {
         let kv = ta_elem(i, this, k)?;
+        let pv = ta_pubify(i, this, kv.clone());
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![kv.clone(), Value::Num(k as f64), this.clone()],
+            vec![pv, Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
             kept.push(kv);
@@ -1278,7 +1721,7 @@ fn m_ta_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
     for k in 0..len {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         i.call(
             &cb,
             this_arg.clone(),
@@ -1303,11 +1746,11 @@ fn m_ta_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
                 return Err(i.type_err("Reduce of empty array with no initial value"));
             }
             k = 1;
-            ta_elem(i, this, 0)?
+            ta_pub_elem(i, this, 0)?
         }
     };
     while k < len {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         acc = i.call(
             &cb,
             Value::Und,
@@ -1333,12 +1776,12 @@ fn m_ta_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
                 return Err(i.type_err("Reduce of empty array with no initial value"));
             }
             k = len - 1;
-            ta_elem(i, this, len - 1)?
+            ta_pub_elem(i, this, len - 1)?
         }
     };
     while k > 0 {
         k -= 1;
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         acc = i.call(
             &cb,
             Value::Und,
@@ -1353,7 +1796,7 @@ fn m_ta_find(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
     for k in 0..len {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
@@ -1371,7 +1814,7 @@ fn m_ta_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
     for k in 0..len {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
@@ -1389,7 +1832,7 @@ fn m_ta_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
     for k in (0..len).rev() {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
@@ -1407,7 +1850,7 @@ fn m_ta_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
     for k in (0..len).rev() {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
@@ -1425,7 +1868,7 @@ fn m_ta_some(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
     for k in 0..len {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
@@ -1443,7 +1886,7 @@ fn m_ta_every(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let len = t.eff().unwrap_or(0);
     let (cb, this_arg) = ta_cb(i, args)?;
     for k in 0..len {
-        let kv = ta_elem(i, this, k)?;
+        let kv = ta_pub_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
@@ -1456,41 +1899,124 @@ fn m_ta_every(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Bool(true))
 }
 
+/// `{value, done}` iteration-result object.
+fn iter_result(i: &mut Interp, v: Value, done: bool) -> NR {
+    let r = i.new_obj();
+    i.set_data(&r, "value", v);
+    i.set_data(&r, "done", Value::Bool(done));
+    Ok(Value::Obj(r))
+}
+
+/// `%TypedArray Iterator%.prototype` — per-interp singleton stashed
+/// on `Object.prototype` (a hidden, non-enumerable slot). Inherits
+/// the array-iterator proto for `@@iterator`; its own `next` and
+/// `@@toStringTag` make it a distinct intrinsic as the spec requires.
+fn ta_iter_proto(i: &mut Interp) -> ObjRef {
+    let op = i.p.obj.clone();
+    if let Some(Value::Obj(p)) =
+        i.obj_get_raw(&op, &PropKey::from_str("__taIterProto"))
+    {
+        return p;
+    }
+    let p = plain(Some(i.p.array_iter.clone()));
+    i.set_builtin(&p, "next", i.native("next", ta_iter_next));
+    p.borrow_mut().props.insert(
+        PropKey::Sym(SYM_TOSTRINGTAG),
+        Prop::builtin(Value::Str(Rc::from("Typed Array Iterator"))),
+    );
+    op.borrow_mut()
+        .props
+        .insert_str("__taIterProto", Prop::builtin(Value::Obj(p.clone())));
+    p
+}
+
+/// TypedArray iterator — reads the live view on every `next()` so
+/// resizable-buffer length changes are observed dynamically.
+/// `mode`: 0 = keys, 1 = values, 2 = entries.
+fn mk_ta_iter(i: &mut Interp, this: &Value, mode: u8) -> Value {
+    let it = plain(Some(ta_iter_proto(i)));
+    {
+        let mut b = it.borrow_mut();
+        b.props.insert_str("__src", Prop::builtin(this.clone()));
+        b.props.insert_str("__i", Prop::builtin(Value::Num(0.0)));
+        b.props.insert_str("__m", Prop::builtin(Value::Num(mode as f64)));
+    }
+    Value::Obj(it)
+}
+
+fn ta_iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let Value::Obj(it) = this else {
+        return Err(i.type_err("not a TypedArray iterator"));
+    };
+    // an exhausted iterator stays done forever — spec clears the
+    // iterated-object slot, so a subsequent out-of-bounds/detach does
+    // not make later next() calls throw.
+    let (src, k, mode) = {
+        let b = it.borrow();
+        if b.props.contains_str("__done") {
+            return iter_result(i, Value::Und, true);
+        }
+        let src = b
+            .props
+            .get_str("__src")
+            .map(|p| p.val.clone())
+            .unwrap_or(Value::Und);
+        let k = match b.props.get_str("__i").map(|p| p.val.clone()) {
+            Some(Value::Num(n)) => n as usize,
+            _ => 0,
+        };
+        let mode = match b.props.get_str("__m").map(|p| p.val.clone()) {
+            Some(Value::Num(n)) => n as u8,
+            _ => 1,
+        };
+        (src, k, mode)
+    };
+    let Some(t) = ta_parts(&src) else {
+        return Err(i.type_err("not a TypedArray iterator"));
+    };
+    let Some(eff) = t.eff() else {
+        return Err(i.type_err("Cannot iterate a detached or out-of-bounds TypedArray"));
+    };
+    if k >= eff {
+        it.borrow_mut()
+            .props
+            .insert_str("__done", Prop::builtin(Value::Bool(true)));
+        return iter_result(i, Value::Und, true);
+    }
+    if let Some(p) = it.borrow_mut().props.get_str_mut("__i") {
+        p.val = Value::Num(k as f64 + 1.0);
+    }
+    let v = match mode {
+        0 => Value::Num(k as f64),
+        2 => {
+            let e = ta_pub_elem(i, &src, k)?;
+            Value::Obj(i.new_arr(vec![Value::Num(k as f64), e]))
+        }
+        _ => ta_pub_elem(i, &src, k)?,
+    };
+    iter_result(i, v, false)
+}
+
 fn m_ta_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
-    let len = t.eff().unwrap_or(0);
-    let ks: Vec<Value> = (0..len).map(|k| Value::Num(k as f64)).collect();
-    Ok(make_iter_in(ks, i.p.array_iter.clone()))
+    need_ta(i, this)?;
+    Ok(mk_ta_iter(i, this, 0))
 }
 
 fn m_ta_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
-    let len = t.eff().unwrap_or(0);
-    let mut vs = Vec::with_capacity(len);
-    for k in 0..len {
-        vs.push(ta_elem(i, this, k)?);
-    }
-    Ok(make_iter_in(vs, i.p.array_iter.clone()))
+    need_ta(i, this)?;
+    Ok(mk_ta_iter(i, this, 1))
 }
 
 fn m_ta_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
-    let len = t.eff().unwrap_or(0);
-    let mut out = Vec::with_capacity(len);
-    for k in 0..len {
-        let v = ta_elem(i, this, k)?;
-        out.push(Value::Obj(
-            i.new_arr(vec![Value::Num(k as f64), v]),
-        ));
-    }
-    Ok(make_iter_in(out, i.p.array_iter.clone()))
+    need_ta(i, this)?;
+    Ok(mk_ta_iter(i, this, 2))
 }
 
 fn m_ta_to_reversed(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let _ = args;
     let t = need_ta(i, this)?;
     let len = t.eff().unwrap_or(0);
-    let a = ta_fresh_typed(i, t.kind, len)?;
+    let a = ta_fresh_typed(i, this, t.kind, len)?;
     for k in 0..len {
         let v = ta_elem(i, this, len - 1 - k)?;
         i.set_prop(&a, ta_elem_key(k), v)?;
@@ -1506,7 +2032,7 @@ fn m_ta_to_sorted(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         return Err(i.type_err("comparefn must be a function or undefined"));
     }
     let items = ta_sort_elems(i, this, len, &cmp)?;
-    let a = ta_fresh_typed(i, t.kind, len)?;
+    let a = ta_fresh_typed(i, this, t.kind, len)?;
     for (k, v) in items.into_iter().enumerate() {
         i.set_prop(&a, ta_elem_key(k), v)?;
     }
@@ -1523,8 +2049,9 @@ fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         n.min(i64::MAX as f64) as i64
     };
     // value conversion runs before the index validity check (a
-    // valueOf may resize the buffer and invalidate the index)
-    let v = i.to_num(&arg(args, 1))?;
+    // valueOf may resize the buffer and invalidate the index); spec
+    // uses ToBigInt on bigint-kind receivers, ToNumber otherwise
+    let v = ta_elem_num(i, &arg(args, 1), ta_is_big(this))?;
     let Some(eff) = t.eff() else {
         return Err(i.range_err("Invalid index"));
     };
@@ -1532,7 +2059,7 @@ fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         return Err(i.range_err("Invalid index"));
     }
     let actual = actual as usize;
-    let a = ta_fresh_typed(i, t.kind, len)?;
+    let a = ta_fresh_typed(i, this, t.kind, len)?;
     for k in 0..len {
         let kv = if k == actual {
             Value::Num(v)
@@ -1550,12 +2077,12 @@ fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 
 fn install_array_buffer(i: &mut Interp) {
     let p = i.p.arraybuffer.clone();
-    met(i, &p, "slice", m_ab_slice);
-    met(i, &p, "sliceToImmutable", m_ab_slice_to_immutable);
-    met(i, &p, "resize", m_ab_resize);
-    met(i, &p, "transfer", m_ab_transfer);
-    met(i, &p, "transferToFixedLength", m_ab_transfer);
-    met(i, &p, "transferToImmutable", m_ab_transfer_immutable);
+    met_a(i, &p, "slice", m_ab_slice, 2.0);
+    met_a(i, &p, "sliceToImmutable", m_ab_slice_to_immutable, 2.0);
+    met_a(i, &p, "resize", m_ab_resize, 1.0);
+    met_a(i, &p, "transfer", m_ab_transfer, 1.0);
+    met_a(i, &p, "transferToFixedLength", m_ab_transfer_fixed, 1.0);
+    met_a(i, &p, "transferToImmutable", m_ab_transfer_immutable, 0.0);
     acc(i, &p, "byteLength", Some(ab_get_byte_len), None);
     acc(i, &p, "detached", Some(ab_get_detached), None);
     acc(i, &p, "maxByteLength", Some(ab_get_max_byte_len), None);
@@ -1565,83 +2092,183 @@ fn install_array_buffer(i: &mut Interp) {
         PropKey::Sym(SYM_TOSTRINGTAG),
         Prop::builtin(Value::Str(Rc::from("ArrayBuffer"))),
     );
-    let ctor = mk_ctor(i, "ArrayBuffer", ab_ctor, &p.clone());
+    let ctor = mk_ctor_len(i, "ArrayBuffer", ab_ctor, &p.clone(), 1.0);
     if let Value::Obj(co) = &ctor {
-        i.set_builtin(co, "isView", i.native("isView", ab_is_view));
+        met_a(i, co, "isView", ab_is_view, 1.0);
         i.set_builtin(co, "maxByteLength", Value::Num(268435456.0));
+        // get %ArrayBuffer%[Symbol.species] — returns `this`
+        let sp = i.native("get [Symbol.species]", |_i, t, _a| Ok(t.clone()));
+        co.borrow_mut()
+            .props
+            .insert(PropKey::Sym(SYM_SPECIES), Prop::accessor(Some(sp), None));
     }
     gdef(i, "ArrayBuffer", ctor.clone());
-    gdef(i, "SharedArrayBuffer", ctor);
+    // SharedArrayBuffer — a distinct constructor whose instances are
+    // marked `__shared`; every %ArrayBuffer.prototype% member rejects
+    // them (the spec forbids shared receivers there).
+    let sp = plain(Some(i.p.obj.clone()));
+    met_a(i, &sp, "slice", m_sab_slice, 2.0);
+    acc(i, &sp, "byteLength", Some(sab_get_byte_len), None);
+    acc(i, &sp, "maxByteLength", Some(sab_get_max_byte_len), None);
+    acc(i, &sp, "resizable", Some(sab_get_resizable), None);
+    acc(i, &sp, "growable", Some(sab_get_growable), None);
+    acc(i, &sp, "immutable", Some(sab_get_immutable), None);
+    acc(i, &sp, "detached", Some(sab_get_detached), None);
+    sp.borrow_mut().props.insert(
+        PropKey::Sym(SYM_TOSTRINGTAG),
+        Prop::builtin(Value::Str(Rc::from("SharedArrayBuffer"))),
+    );
+    let sctor = mk_ctor_len(i, "SharedArrayBuffer", sab_ctor, &sp, 1.0);
+    gdef(i, "SharedArrayBuffer", sctor);
 }
 
+/// host limit on a real ArrayBuffer allocation — the spec allows the
+/// host to fail a CreateByteDataBlock at its own discretion.
+const AB_HOST_MAX: usize = 268435456;
+
 fn ab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    if i.new_target_native.is_none() {
+        return Err(i.type_err("Constructor ArrayBuffer requires 'new'"));
+    }
+    // spec OrdinaryCreateFromConstructor precedes argument coercion —
+    // replay the observable Get(newTarget, "prototype") since
+    // `construct` resolved the proto without invoking getters.
+    if let Some(nt) = i.new_target_native.clone() {
+        let _ = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
+    }
+    // spec: byteLength is ToIndex'd — NaN → +0, negatives and
+    // out-of-range values are RangeErrors.
     let n = match arg(args, 0) {
-        Value::Und => 0.0,
-        v => i.to_num(&v)?,
+        Value::Und => 0,
+        v => to_index(i, &v)?,
     };
-    if !n.is_finite() || n < 0.0 || n > 268435456.0 {
+    if n > AB_HOST_MAX {
         return Err(i.range_err("Invalid array buffer length"));
     }
+    // options.maxByteLength — Get runs in order after the length
+    // coercion; only an Object `options` is consulted per spec.
+    let max = match arg(args, 1) {
+        Value::Obj(opts) => {
+            let v =
+                i.get_prop(&Value::Obj(opts.clone()), &PropKey::from_str("maxByteLength"))?;
+            if matches!(v, Value::Und) {
+                None
+            } else {
+                let m = to_index(i, &v)?;
+                if m > AB_HOST_MAX {
+                    return Err(i.range_err("maxByteLength is out of range"));
+                }
+                if m < n {
+                    return Err(i.range_err("maxByteLength is smaller than byteLength"));
+                }
+                Some(m)
+            }
+        }
+        _ => None,
+    };
     let o = match this {
         Value::Obj(o) => o.clone(),
         _ => plain(Some(i.p.arraybuffer.clone())),
     };
-    // host limit: engine max byte length (spec allows up to 2^53-1)
-    if !n.is_finite() || n < 0.0 || n > 4294967296.0 {
-        return Err(i.range_err("Invalid array buffer length"));
-    }
-    if let Value::Obj(opts) = arg(args, 1) {
-        if let Ok(v) = i.get_prop(&Value::Obj(opts.clone()), &PropKey::from_str("maxByteLength")) {
-            if !matches!(v, Value::Und) {
-                let m = i.to_num(&v)?;
-                if !m.is_finite() || m < 0.0 || m > 4294967296.0 {
-                    return Err(i.range_err("maxByteLength is out of range"));
-                }
-                if (m as usize) < n as usize {
-                    return Err(i.range_err("maxByteLength is smaller than byteLength"));
-                }
-                o.borrow_mut().rab_max = Some(m as usize);
-            }
-        }
-    }
-    o.borrow_mut().kind = ObjKind::Bytes(Rc::new(RefCell::new(vec![0u8; n as usize])));
+    o.borrow_mut().rab_max = max;
+    o.borrow_mut().kind = ObjKind::Bytes(Rc::new(RefCell::new(vec![0u8; n])));
     Ok(Value::Obj(o))
 }
 
-fn m_ab_noop(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
-    Ok(Value::Und)
+/// `true` for SharedArrayBuffer instances — %ArrayBuffer.prototype%
+/// members must reject them.
+fn is_shared(o: &ObjRef) -> bool {
+    o.borrow().props.contains_str("__shared")
 }
 
 fn m_ab_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Value::Obj(o) = this else {
         return Err(i.type_err("slice called on non-ArrayBuffer"));
     };
+    if buffer_bytes(o).is_none() || is_shared(o) {
+        return Err(i.type_err("slice called on non-ArrayBuffer"));
+    }
     if o.borrow().detached {
         return Err(i.type_err("Cannot perform slice on a detached ArrayBuffer"));
     }
-    let data = if let Some(b) = buffer_bytes(o) {
-        b.borrow().clone()
-    } else {
-        return Err(i.type_err("slice called on non-ArrayBuffer"));
-    };
-    let len = data.len();
-    let start = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
+    let len = buffer_bytes(o).unwrap().borrow().len();
+    let start = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
     let end = match arg(args, 1) {
         Value::Und => len,
-        v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
+        v => clamp_index(ta_to_int(i, &v)?, len),
     };
-    let out = if start < end {
-        data[start..end].to_vec()
-    } else {
-        Vec::new()
+    let new_len = end.saturating_sub(start);
+    // SpeciesConstructor(O, %ArrayBuffer%)
+    let ctor = match i.get_prop_str(this, "constructor")? {
+        Value::Und => None,
+        c @ Value::Obj(_) => {
+            let s = i.get_prop(&c, &PropKey::Sym(SYM_SPECIES))?;
+            match s {
+                Value::Und | Value::Null => None,
+                s if i.is_constructor(&s) => Some(s),
+                _ => {
+                    return Err(
+                        i.type_err("constructor[Symbol.species] is not a constructor")
+                    )
+                }
+            }
+        }
+        _ => return Err(i.type_err("constructor is not an object")),
     };
-    Ok(Value::Obj(mk_buffer(i, out)))
+    let nv = match ctor {
+        Some(c) => i.construct(&c, vec![Value::Num(new_len as f64)], None)?,
+        None => {
+            let g = i.global.clone();
+            let cv = i
+                .env_lookup(&g, "ArrayBuffer")?
+                .unwrap_or(Value::Und);
+            i.construct(&cv, vec![Value::Num(new_len as f64)], None)?
+        }
+    };
+    // result validation
+    let Value::Obj(no) = &nv else {
+        return Err(i.type_err("slice result is not an ArrayBuffer"));
+    };
+    if is_shared(no) || buffer_bytes(no).is_none() {
+        return Err(i.type_err("slice result is not an ArrayBuffer"));
+    }
+    if Rc::ptr_eq(no, o) {
+        return Err(i.type_err("slice result must not be the same ArrayBuffer"));
+    }
+    if no.borrow().detached {
+        return Err(i.type_err("slice result is a detached ArrayBuffer"));
+    }
+    if buffer_bytes(no).unwrap().borrow().len() < new_len {
+        return Err(i.type_err("slice result is too small"));
+    }
+    // a user species constructor may have detached the source
+    if o.borrow().detached {
+        return Err(i.type_err("Cannot perform slice on a detached ArrayBuffer"));
+    }
+    if no.borrow().immutable {
+        return Err(i.type_err("slice result is an immutable ArrayBuffer"));
+    }
+    let sb = buffer_bytes(o).unwrap();
+    let db = buffer_bytes(no).unwrap();
+    // spec re-reads the source length: side effects may have shrunk it,
+    // in which case only the still-present bytes are copied (the fresh
+    // destination tail is already zero).
+    let sb_len = sb.borrow().len();
+    let copy_len = new_len.min(sb_len.saturating_sub(start));
+    if copy_len > 0 {
+        db.borrow_mut()[..copy_len]
+            .copy_from_slice(&sb.borrow()[start..start + copy_len]);
+    }
+    Ok(nv)
 }
 
 fn need_ab(i: &mut Interp, this: &Value) -> Result<(ObjRef, Rc<RefCell<Vec<u8>>>), Value> {
     let Value::Obj(o) = this else {
         return Err(i.type_err("Method called on incompatible receiver (expected ArrayBuffer)"));
     };
+    if is_shared(o) {
+        return Err(i.type_err("operation not permitted on a SharedArrayBuffer"));
+    }
     let Some(b) = buffer_bytes(o) else {
         return Err(i.type_err("Method called on incompatible receiver (expected ArrayBuffer)"));
     };
@@ -1689,55 +2316,75 @@ fn ab_get_immutable(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 
 fn m_ab_resize(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let (o, b) = need_ab(i, this)?;
-    if o.borrow().detached {
-        return Err(i.type_err("Cannot resize a detached ArrayBuffer"));
-    }
+    // internal-slot validations run before the argument coercion —
+    // immutable buffers also cannot be resized at all.
     let Some(max) = o.borrow().rab_max else {
         return Err(i.type_err("ArrayBuffer is not resizable"));
     };
-    let n = i.to_num(&arg(args, 0))?;
-    if !n.is_finite() || n < 0.0 || n as usize > max {
+    if o.borrow().immutable {
+        return Err(i.type_err("Cannot resize an immutable ArrayBuffer"));
+    }
+    // the coercion itself may detach the buffer, so the detached
+    // check comes only after ToIndex runs.
+    let n = to_index(i, &arg(args, 0))?;
+    if o.borrow().detached {
+        return Err(i.type_err("Cannot resize a detached ArrayBuffer"));
+    }
+    if n > max || n > AB_HOST_MAX {
         return Err(i.range_err("new length is out of bounds"));
     }
-    b.borrow_mut().resize(n as usize, 0);
+    b.borrow_mut().resize(n, 0);
     Ok(Value::Und)
 }
 
-fn ab_transfer_into(i: &mut Interp, this: &Value, args: &[Value], immutable: bool) -> NR {
+/// `mode`: 0 = `transfer` (resizability preserved), 1 =
+/// `transferToFixedLength`, 2 = `transferToImmutable`.
+fn ab_transfer_into(i: &mut Interp, this: &Value, args: &[Value], mode: u8) -> NR {
     let (o, b) = need_ab(i, this)?;
+    // spec ArrayBufferCopyAndDetach: the newLength coercion runs
+    // BEFORE the detached / immutable checks — a valueOf must still
+    // fire on a doomed receiver.
+    let old_len = b.borrow().len();
+    let new_len = match arg(args, 0) {
+        Value::Und => old_len,
+        v => to_index(i, &v)?,
+    };
     if o.borrow().detached {
         return Err(i.type_err("Cannot transfer a detached ArrayBuffer"));
     }
     if o.borrow().immutable {
         return Err(i.type_err("Cannot transfer an immutable ArrayBuffer"));
     }
-    let old_len = b.borrow().len();
-    let new_len = match arg(args, 0) {
-        Value::Und => old_len,
-        v => {
-            let n = i.to_num(&v)?;
-            if !n.is_finite() || n < 0.0 || n > 268435456.0 {
-                return Err(i.range_err("new length is out of bounds"));
-            }
-            n as usize
-        }
-    };
-    let data = std::mem::take(&mut *b.borrow_mut());
+    if new_len > AB_HOST_MAX {
+        return Err(i.range_err("new length is out of bounds"));
+    }
+    let max = o.borrow().rab_max;
+    let mut data = std::mem::take(&mut *b.borrow_mut());
     o.borrow_mut().detached = true;
-    let mut data = data;
     data.resize(new_len, 0);
     data.truncate(new_len);
     let nb = mk_buffer(i, data);
-    nb.borrow_mut().immutable = immutable;
+    match mode {
+        // spec: preserve-resizability keeps a resizable buffer resizable
+        // with newMax = max(newByteLength, oldMax); the other modes
+        // produce fixed-length (or immutable fixed-length) buffers.
+        0 => nb.borrow_mut().rab_max = max.map(|m| m.max(new_len)),
+        2 => nb.borrow_mut().immutable = true,
+        _ => {}
+    }
     Ok(Value::Obj(nb))
 }
 
 fn m_ab_transfer(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    ab_transfer_into(i, this, args, false)
+    ab_transfer_into(i, this, args, 0)
+}
+
+fn m_ab_transfer_fixed(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    ab_transfer_into(i, this, args, 1)
 }
 
 fn m_ab_transfer_immutable(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    ab_transfer_into(i, this, args, true)
+    ab_transfer_into(i, this, args, 2)
 }
 
 fn m_ab_slice_to_immutable(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1754,6 +2401,133 @@ fn ab_is_view(_i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
     Ok(Value::Bool(r))
 }
 
+// -- SharedArrayBuffer --------------------------------------------------------
+
+/// `new SharedArrayBuffer(length[, options])` — byte storage marked
+/// `__shared` so %ArrayBuffer.prototype% members reject it.
+fn sab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    if i.new_target_native.is_none() {
+        return Err(i.type_err("Constructor SharedArrayBuffer requires 'new'"));
+    }
+    // spec OrdinaryCreateFromConstructor precedes argument coercion —
+    // replay the observable Get(newTarget, "prototype") since
+    // `construct` resolved the proto without invoking getters.
+    if let Some(nt) = i.new_target_native.clone() {
+        let _ = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
+    }
+    let n = match arg(args, 0) {
+        Value::Und => 0,
+        v => to_index(i, &v)?,
+    };
+    if n > AB_HOST_MAX {
+        return Err(i.range_err("Invalid array buffer length"));
+    }
+    // growable SharedArrayBuffers — options.maxByteLength
+    let max = match arg(args, 1) {
+        Value::Obj(opts) => {
+            let v =
+                i.get_prop(&Value::Obj(opts.clone()), &PropKey::from_str("maxByteLength"))?;
+            if matches!(v, Value::Und) {
+                None
+            } else {
+                let m = to_index(i, &v)?;
+                if m > AB_HOST_MAX {
+                    return Err(i.range_err("maxByteLength is out of range"));
+                }
+                if m < n {
+                    return Err(i.range_err("maxByteLength is smaller than byteLength"));
+                }
+                Some(m)
+            }
+        }
+        _ => None,
+    };
+    let o = match this {
+        Value::Obj(o) => o.clone(),
+        _ => plain(global_ctor_proto(i, "SharedArrayBuffer")),
+    };
+    o.borrow_mut().rab_max = max;
+    o.borrow_mut().kind = ObjKind::Bytes(Rc::new(RefCell::new(vec![0u8; n])));
+    o.borrow_mut()
+        .props
+        .insert_str("__shared", Prop::builtin(Value::Bool(true)));
+    Ok(Value::Obj(o))
+}
+
+/// spec RequireInternalSlot — a %SharedArrayBuffer.prototype% member
+/// only accepts objects carrying the `__shared` marker.
+fn need_sab(i: &mut Interp, this: &Value) -> Result<(ObjRef, Rc<RefCell<Vec<u8>>>), Value> {
+    let Value::Obj(o) = this else {
+        return Err(i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)"));
+    };
+    if !is_shared(o) {
+        return Err(i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)"));
+    }
+    let Some(b) = buffer_bytes(o) else {
+        return Err(i.type_err("Method called on incompatible receiver (expected SharedArrayBuffer)"));
+    };
+    Ok((o.clone(), b))
+}
+
+fn sab_get_byte_len(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (_, b) = need_sab(i, this)?;
+    let n = b.borrow().len();
+    Ok(Value::Num(n as f64))
+}
+
+fn sab_get_max_byte_len(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (o, b) = need_sab(i, this)?;
+    let n = o.borrow().rab_max.unwrap_or_else(|| b.borrow().len());
+    Ok(Value::Num(n as f64))
+}
+
+fn sab_get_resizable(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let _ = need_sab(i, this)?;
+    Ok(Value::Bool(false))
+}
+
+fn sab_get_growable(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (o, _) = need_sab(i, this)?;
+    let g = o.borrow().rab_max.is_some();
+    Ok(Value::Bool(g))
+}
+
+fn sab_get_immutable(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let _ = need_sab(i, this)?;
+    Ok(Value::Bool(false))
+}
+
+fn sab_get_detached(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let _ = need_sab(i, this)?;
+    Ok(Value::Bool(false))
+}
+
+/// `SharedArrayBuffer.prototype.slice` — returns a *new shared* buffer.
+fn m_sab_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let (_, b) = need_sab(i, this)?;
+    let len = b.borrow().len();
+    let start = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
+    let end = match arg(args, 1) {
+        Value::Und => len,
+        v => clamp_index(ta_to_int(i, &v)?, len),
+    };
+    let new_len = end.saturating_sub(start);
+    let data = b.borrow()[start..start + new_len].to_vec();
+    let nb = mk_buffer(i, data);
+    nb.borrow_mut()
+        .props
+        .insert_str("__shared", Prop::builtin(Value::Bool(true)));
+    // slice results keep the SharedArrayBuffer prototype
+    if let Value::Obj(no) = this {
+        if let Some(p) = global_ctor_proto(i, "SharedArrayBuffer") {
+            nb.borrow_mut().proto = Some(p);
+        } else {
+            nb.borrow_mut().proto = no.borrow().proto.clone();
+        }
+    }
+    Ok(Value::Obj(nb))
+}
+
 // ===========================================================================
 // DataView
 // ===========================================================================
@@ -1767,37 +2541,72 @@ fn install_data_view(i: &mut Interp) {
         ("getInt16", dv_get_i16),
         ("getUint32", dv_get_u32),
         ("getInt32", dv_get_i32),
+        ("getFloat16", dv_get_f16),
         ("getFloat32", dv_get_f32),
         ("getFloat64", dv_get_f64),
-        ("getBigInt64", dv_get_i32),
-        ("getBigUint64", dv_get_u32),
+        ("getBigInt64", dv_get_i64),
+        ("getBigUint64", dv_get_u64),
         ("setUint8", dv_set_u8),
         ("setInt8", dv_set_u8),
         ("setUint16", dv_set_u16),
         ("setInt16", dv_set_u16),
         ("setUint32", dv_set_u32),
         ("setInt32", dv_set_u32),
+        ("setFloat16", dv_set_f16),
         ("setFloat32", dv_set_f32),
         ("setFloat64", dv_set_f64),
-        ("setBigInt64", dv_set_u32),
-        ("setBigUint64", dv_set_u32),
+        ("setBigInt64", dv_set_i64),
+        ("setBigUint64", dv_set_u64),
     ] {
-        met(i, &p, n, f);
+        let arity = if n.starts_with("get") { 1.0 } else { 2.0 };
+        met_a(i, &p, n, f, arity);
     }
     acc(i, &p, "buffer", Some(dv_get_buffer), None);
     acc(i, &p, "byteLength", Some(dv_get_byte_len), None);
     acc(i, &p, "byteOffset", Some(dv_get_byte_off), None);
-    let ctor = mk_ctor(i, "DataView", dv_ctor, &p);
+    p.borrow_mut().props.insert(
+        PropKey::Sym(SYM_TOSTRINGTAG),
+        Prop::builtin(Value::Str(Rc::from("DataView"))),
+    );
+    let ctor = mk_ctor_len(i, "DataView", dv_ctor, &p, 1.0);
     gdef(i, "DataView", ctor);
 }
 
-/// (bytes Rc, absolute byte offset, byte length)
+/// `ObjKind::View.len` sentinel for a length-tracking DataView on a
+/// resizable buffer (`new DataView(rab)` with no byteLength argument).
+const DV_AUTO: usize = usize::MAX;
+
+/// spec GetViewByteLength — the live byte length of the view; `None`
+/// when the buffer is detached or the view is out of bounds.
+fn dv_state(buf: &ObjRef, off: usize, len: usize) -> Option<usize> {
+    let b = buf.borrow();
+    if b.detached {
+        return None;
+    }
+    let ObjKind::Bytes(bytes) = &b.kind else {
+        return None;
+    };
+    let blen = bytes.borrow().len();
+    if off > blen {
+        return None;
+    }
+    if len == DV_AUTO {
+        Some(blen - off)
+    } else if len > blen - off {
+        None
+    } else {
+        Some(len)
+    }
+}
+
+/// (bytes Rc, absolute byte offset, live byte length) — `None` for
+/// non-views and detached / out-of-bounds views.
 fn dv_parts(v: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize)> {
     if let Value::Obj(o) = v {
         if let ObjKind::View { buf, off, len } = &o.borrow().kind {
-            if let Some(b) = buffer_bytes(buf) {
-                return Some((b, *off, *len));
-            }
+            let vlen = dv_state(buf, *off, *len)?;
+            let b = buffer_bytes(buf)?;
+            return Some((b, *off, vlen));
         }
     }
     None
@@ -1818,53 +2627,79 @@ fn dv_get_buffer(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 }
 
 fn dv_get_byte_len(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let (buf, _, len) = need_view(i, this)?;
-    if buf.borrow().detached {
-        return Err(i.type_err("Cannot read byteLength of a detached DataView"));
-    }
-    Ok(Value::Num(len as f64))
+    let (buf, off, len) = need_view(i, this)?;
+    // detached / out-of-bounds views report 0
+    Ok(Value::Num(dv_state(&buf, off, len).unwrap_or(0) as f64))
 }
 
 fn dv_get_byte_off(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let (buf, off, _) = need_view(i, this)?;
-    if buf.borrow().detached {
-        return Err(i.type_err("Cannot read byteOffset of a detached DataView"));
-    }
-    Ok(Value::Num(off as f64))
+    let (buf, off, len) = need_view(i, this)?;
+    Ok(Value::Num(if dv_state(&buf, off, len).is_some() {
+        off as f64
+    } else {
+        0.0
+    }))
 }
 
 fn dv_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    if i.new_target_native.is_none() {
+        return Err(i.type_err("Constructor DataView requires 'new'"));
+    }
     let Value::Obj(bo) = &arg(args, 0) else {
         return Err(i.type_err("First argument to DataView constructor must be an ArrayBuffer"));
     };
     let Some(b) = buffer_bytes(bo) else {
         return Err(i.type_err("First argument to DataView constructor must be an ArrayBuffer"));
     };
-    let blen = b.borrow().len();
+    // spec order: ToIndex(offset) → detached → offset bounds →
+    // (explicit byteLength only) ToIndex(length) → detached → bounds
     let off = match arg(args, 1) {
         Value::Und => 0,
-        v => i.to_num(&v)?.max(0.0) as usize,
+        v => to_index(i, &v)?,
     };
+    if bo.borrow().detached {
+        return Err(i.type_err("Cannot construct a DataView on a detached ArrayBuffer"));
+    }
+    let blen = b.borrow().len();
     if off > blen {
         return Err(i.range_err("Start offset is outside the bounds of the buffer"));
     }
+    let resizable = bo.borrow().rab_max.is_some();
     let len = match arg(args, 2) {
+        Value::Und if resizable => DV_AUTO,
         Value::Und => blen - off,
         v => {
-            let n = i.to_num(&v)?.max(0.0) as usize;
-            if off + n > blen {
+            let l = to_index(i, &v)?;
+            if bo.borrow().detached {
+                return Err(i.type_err("Cannot construct a DataView on a detached ArrayBuffer"));
+            }
+            let blen = b.borrow().len();
+            if l > blen - off {
                 return Err(i.range_err("Invalid DataView length"));
             }
-            n
+            l
         }
     };
-    let proto = match this {
-        Value::Obj(o) => o.borrow().proto.clone(),
-        _ => global_ctor_proto(i, "DataView"),
-    };
+    // spec OrdinaryCreateFromConstructor — `construct` resolved the
+    // prototype without invoking getters, so replay the observable
+    // Get(newTarget, "prototype") here: a getter may detach/resize
+    // the buffer, after which the detached + bounds checks rerun.
+    if let Some(nt) = i.new_target_native.clone() {
+        let _ = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
+    }
+    if bo.borrow().detached {
+        return Err(i.type_err("Cannot construct a DataView on a detached ArrayBuffer"));
+    }
+    let blen = b.borrow().len();
+    if off > blen {
+        return Err(i.range_err("Start offset is outside the bounds of the buffer"));
+    }
+    if len != DV_AUTO && len > blen - off {
+        return Err(i.range_err("Invalid DataView length"));
+    }
     let o = match this {
         Value::Obj(o) => o.clone(),
-        _ => plain(proto),
+        _ => plain(global_ctor_proto(i, "DataView")),
     };
     o.borrow_mut().kind = ObjKind::View {
         buf: bo.clone(),
@@ -1874,56 +2709,166 @@ fn dv_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Obj(o))
 }
 
-fn dv_bounds(
+/// spec GetViewValue — ToIndex first, then the detached / out-of-bounds
+/// check, then the range check.
+fn dv_get_index(
     i: &mut Interp,
     this: &Value,
     args: &[Value],
     sz: usize,
 ) -> Result<(Rc<RefCell<Vec<u8>>>, usize), Value> {
-    if let Value::Obj(o) = this {
-        if let ObjKind::View { buf, .. } = &o.borrow().kind {
-            if buf.borrow().detached {
-                return Err(i.type_err("Cannot perform operation on a detached ArrayBuffer"));
-            }
-        }
-    }
-    let Some((b, off, len)) = dv_parts(this) else {
-        return Err(i.type_err("Method called on incompatible receiver (expected DataView)"));
+    let (buf, off, len) = need_view(i, this)?;
+    let idx = to_index(i, &arg(args, 0))?;
+    let Some(vlen) = dv_state(&buf, off, len) else {
+        return Err(
+            i.type_err("Cannot perform operation on a detached or out-of-bounds DataView")
+        );
     };
-    let at = i.to_num(&arg(args, 0))?;
-    if !at.is_finite() || at < 0.0 || at as usize + sz > len {
+    if idx > vlen || sz > vlen - idx {
         return Err(i.range_err("Offset is outside the bounds of the DataView"));
     }
-    Ok((b, off + at as usize))
+    let b = buffer_bytes(&buf).unwrap();
+    Ok((b, off + idx))
 }
 
-fn dv_check_write(i: &mut Interp, this: &Value) -> Result<(), Value> {
-    if let Value::Obj(o) = this {
-        if let ObjKind::View { buf, .. } = &o.borrow().kind {
-            if buf.borrow().immutable {
-                return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
-            }
-        }
+/// spec SetViewValue — the immutable check runs BEFORE any argument
+/// coercion; then ToIndex, the value conversion (which may detach or
+/// resize), bounds checks.
+/// `big` selects ToBigInt for the BigInt64 setters, ToNumber else.
+fn dv_set_index(
+    i: &mut Interp,
+    this: &Value,
+    args: &[Value],
+    sz: usize,
+    big: bool,
+) -> Result<(Rc<RefCell<Vec<u8>>>, usize, f64), Value> {
+    let (buf, off, len) = need_view(i, this)?;
+    if buf.borrow().immutable {
+        return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
     }
-    Ok(())
+    let idx = to_index(i, &arg(args, 0))?;
+    let v = ta_elem_num(i, &arg(args, 1), big)?;
+    let Some(vlen) = dv_state(&buf, off, len) else {
+        return Err(
+            i.type_err("Cannot perform operation on a detached or out-of-bounds DataView")
+        );
+    };
+    if idx > vlen || sz > vlen - idx {
+        return Err(i.range_err("Offset is outside the bounds of the DataView"));
+    }
+    let b = buffer_bytes(&buf).unwrap();
+    Ok((b, off + idx, v))
 }
 
 fn dv_le(i: &mut Interp, args: &[Value], n: usize) -> bool {
     i.to_bool(&arg(args, n))
 }
 
+/// IEEE-754 binary16 → f64 (exact — every f16 is representable).
+fn f16_bits_to_f64(h: u16) -> f64 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = (h >> 10) & 0x1f;
+    let f = (h & 0x3ff) as f64;
+    if e == 0 {
+        sign * f * 5.9604644775390625e-8 // subnormals: f * 2^-24
+    } else if e == 0x1f {
+        if f == 0.0 {
+            sign * f64::INFINITY
+        } else {
+            f64::NAN
+        }
+    } else {
+        sign * (1.0 + f / 1024.0) * 2f64.powi(e as i32 - 15)
+    }
+}
+
+/// f64 → IEEE-754 binary16 bits, round-to-nearest-even.
+fn f64_to_f16_bits(v: f64) -> u16 {
+    if v.is_nan() {
+        return 0x7e00;
+    }
+    // f64 → f32 preserves order; the second rounding can't be
+    // observed for values that land exactly on an f16 boundary.
+    let bits = (v as f32).to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let man = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | if man == 0 { 0x7c00 } else { 0x7e00 };
+    }
+    let e16 = exp - 127 + 15;
+    if e16 >= 0x1f {
+        return sign | 0x7c00; // overflow → ±Inf
+    }
+    if e16 <= 0 {
+        // subnormal / underflow — shift the implicit-1 mantissa down
+        if e16 < -10 {
+            return sign; // too small → ±0
+        }
+        let m = man | 0x0080_0000;
+        let sh = (14 - e16) as u32;
+        let rem = m & ((1u32 << sh) - 1);
+        let half = 1u32 << (sh - 1);
+        let mut out = m >> sh;
+        if rem > half || (rem == half && out & 1 == 1) {
+            out += 1;
+        }
+        return sign | out as u16;
+    }
+    // normal — round mantissa 23 → 10 bits
+    let rem = man & 0x1fff;
+    let mut m = (man >> 13) as u16;
+    let mut e = e16 as u16;
+    if rem > 0x1000 || (rem == 0x1000 && m & 1 == 1) {
+        m += 1;
+        if m == 0x400 {
+            m = 0;
+            e += 1;
+        }
+    }
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    sign | (e << 10) | m
+}
+
+fn dv_get_f16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let (b, at) = dv_get_index(i, this, args, 2)?;
+    let bb = b.borrow();
+    let mut s = [0u8; 2];
+    s.copy_from_slice(&bb[at..at + 2]);
+    let h = if dv_le(i, args, 1) {
+        u16::from_le_bytes(s)
+    } else {
+        u16::from_be_bytes(s)
+    };
+    Ok(Value::Num(f16_bits_to_f64(h)))
+}
+
+fn dv_set_f16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let (b, at, v) = dv_set_index(i, this, args, 2, false)?;
+    let h = f64_to_f16_bits(v);
+    let s = if dv_le(i, args, 2) {
+        h.to_le_bytes()
+    } else {
+        h.to_be_bytes()
+    };
+    b.borrow_mut()[at..at + 2].copy_from_slice(&s);
+    Ok(Value::Und)
+}
+
 fn dv_get_u8(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at) = dv_bounds(i, this, args, 1)?;
+    let (b, at) = dv_get_index(i, this, args, 1)?;
     let v = b.borrow()[at] as f64;
     Ok(Value::Num(v))
 }
 fn dv_get_i8(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at) = dv_bounds(i, this, args, 1)?;
+    let (b, at) = dv_get_index(i, this, args, 1)?;
     let v = b.borrow()[at] as i8 as f64;
     Ok(Value::Num(v))
 }
 fn dv_get_u16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at) = dv_bounds(i, this, args, 2)?;
+    let (b, at) = dv_get_index(i, this, args, 2)?;
     let bb = b.borrow();
     let mut s = [0u8; 2];
     s.copy_from_slice(&bb[at..at + 2]);
@@ -1935,7 +2880,7 @@ fn dv_get_u16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Num(v as f64))
 }
 fn dv_get_i16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at) = dv_bounds(i, this, args, 2)?;
+    let (b, at) = dv_get_index(i, this, args, 2)?;
     let bb = b.borrow();
     let mut s = [0u8; 2];
     s.copy_from_slice(&bb[at..at + 2]);
@@ -1947,7 +2892,7 @@ fn dv_get_i16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Num(v as f64))
 }
 fn dv_get_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at) = dv_bounds(i, this, args, 4)?;
+    let (b, at) = dv_get_index(i, this, args, 4)?;
     let bb = b.borrow();
     let mut s = [0u8; 4];
     s.copy_from_slice(&bb[at..at + 4]);
@@ -1959,7 +2904,7 @@ fn dv_get_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Num(v as f64))
 }
 fn dv_get_i32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at) = dv_bounds(i, this, args, 4)?;
+    let (b, at) = dv_get_index(i, this, args, 4)?;
     let bb = b.borrow();
     let mut s = [0u8; 4];
     s.copy_from_slice(&bb[at..at + 4]);
@@ -1971,7 +2916,7 @@ fn dv_get_i32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Num(v as f64))
 }
 fn dv_get_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at) = dv_bounds(i, this, args, 4)?;
+    let (b, at) = dv_get_index(i, this, args, 4)?;
     let bb = b.borrow();
     let mut s = [0u8; 4];
     s.copy_from_slice(&bb[at..at + 4]);
@@ -1983,7 +2928,7 @@ fn dv_get_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Num(v as f64))
 }
 fn dv_get_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (b, at) = dv_bounds(i, this, args, 8)?;
+    let (b, at) = dv_get_index(i, this, args, 8)?;
     let bb = b.borrow();
     let mut s = [0u8; 8];
     s.copy_from_slice(&bb[at..at + 8]);
@@ -1994,17 +2939,40 @@ fn dv_get_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     Ok(Value::Num(v))
 }
+
+/// BigInt element reads return the engine's bigint stand-in object so
+/// `typeof`/`instanceof`-agnostic numeric consumers still work.
+fn dv_get_i64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let (b, at) = dv_get_index(i, this, args, 8)?;
+    let bb = b.borrow();
+    let mut s = [0u8; 8];
+    s.copy_from_slice(&bb[at..at + 8]);
+    let v = if dv_le(i, args, 1) {
+        i64::from_le_bytes(s)
+    } else {
+        i64::from_be_bytes(s)
+    };
+    Ok(i.bigint_obj(v as f64))
+}
+fn dv_get_u64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let (b, at) = dv_get_index(i, this, args, 8)?;
+    let bb = b.borrow();
+    let mut s = [0u8; 8];
+    s.copy_from_slice(&bb[at..at + 8]);
+    let v = if dv_le(i, args, 1) {
+        u64::from_le_bytes(s)
+    } else {
+        u64::from_be_bytes(s)
+    };
+    Ok(i.bigint_obj(v as f64))
+}
 fn dv_set_u8(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    dv_check_write(i, this)?;
-    let (b, at) = dv_bounds(i, this, args, 1)?;
-    let v = i.to_num(&arg(args, 1))?;
+    let (b, at, v) = dv_set_index(i, this, args, 1, false)?;
     b.borrow_mut()[at] = to_u32(v) as u8;
     Ok(Value::Und)
 }
 fn dv_set_u16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    dv_check_write(i, this)?;
-    let (b, at) = dv_bounds(i, this, args, 2)?;
-    let v = i.to_num(&arg(args, 1))?;
+    let (b, at, v) = dv_set_index(i, this, args, 2, false)?;
     let s = if dv_le(i, args, 2) {
         (to_u32(v) as u16).to_le_bytes()
     } else {
@@ -2014,9 +2982,7 @@ fn dv_set_u16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Und)
 }
 fn dv_set_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    dv_check_write(i, this)?;
-    let (b, at) = dv_bounds(i, this, args, 4)?;
-    let v = i.to_num(&arg(args, 1))?;
+    let (b, at, v) = dv_set_index(i, this, args, 4, false)?;
     let s = if dv_le(i, args, 2) {
         to_u32(v).to_le_bytes()
     } else {
@@ -2026,9 +2992,8 @@ fn dv_set_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Und)
 }
 fn dv_set_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    dv_check_write(i, this)?;
-    let (b, at) = dv_bounds(i, this, args, 4)?;
-    let v = i.to_num(&arg(args, 1))? as f32;
+    let (b, at, v) = dv_set_index(i, this, args, 4, false)?;
+    let v = v as f32;
     let s = if dv_le(i, args, 2) {
         v.to_le_bytes()
     } else {
@@ -2038,13 +3003,31 @@ fn dv_set_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Und)
 }
 fn dv_set_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    dv_check_write(i, this)?;
-    let (b, at) = dv_bounds(i, this, args, 8)?;
-    let v = i.to_num(&arg(args, 1))?;
+    let (b, at, v) = dv_set_index(i, this, args, 8, false)?;
     let s = if dv_le(i, args, 2) {
         v.to_le_bytes()
     } else {
         v.to_be_bytes()
+    };
+    b.borrow_mut()[at..at + 8].copy_from_slice(&s);
+    Ok(Value::Und)
+}
+fn dv_set_i64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let (b, at, v) = dv_set_index(i, this, args, 8, true)?;
+    let s = if dv_le(i, args, 2) {
+        (v as i64).to_le_bytes()
+    } else {
+        (v as i64).to_be_bytes()
+    };
+    b.borrow_mut()[at..at + 8].copy_from_slice(&s);
+    Ok(Value::Und)
+}
+fn dv_set_u64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let (b, at, v) = dv_set_index(i, this, args, 8, true)?;
+    let s = if dv_le(i, args, 2) {
+        (v as u64).to_le_bytes()
+    } else {
+        (v as u64).to_be_bytes()
     };
     b.borrow_mut()[at..at + 8].copy_from_slice(&s);
     Ok(Value::Und)
@@ -2168,7 +3151,8 @@ fn view_bytes(v: &Value) -> Option<Vec<u8>> {
             let b = buffer_bytes(buf)?;
             let bb = b.borrow();
             let start = (*off).min(bb.len());
-            let end = (*off + *len).min(bb.len());
+            let vlen = dv_state(buf, *off, *len).unwrap_or(0);
+            let end = (*off + vlen).min(bb.len());
             Some(bb[start..end].to_vec())
         }
         _ => None,

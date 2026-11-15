@@ -4695,6 +4695,7 @@ dependencies = [
  "rowser-dom",
  "rowser-html",
  "rowser-net",
+ "unicode-ident",
 ]
 
 [[package]]

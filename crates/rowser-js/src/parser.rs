@@ -71,6 +71,9 @@ struct Parser {
     no_in: bool,
     /// strict-mode context (directive prologue, class body, inherited)
     strict: bool,
+    /// >0 while inside `(` — the contents may reinterpret as a
+    /// destructuring pattern, suppressing ObjectLiteral early errors
+    paren_depth: u32,
     /// inside a function body — `return` validity
     fn_depth: usize,
     /// non-arrow function nesting — `new.target`, `return`, and
@@ -99,6 +102,7 @@ impl Parser {
             pos: 0,
             no_in: false,
             strict: false,
+            paren_depth: 0,
             fn_depth: 0,
             nonarrow_fn_depth: 0,
             gen_depth: 0,
@@ -425,7 +429,20 @@ impl Parser {
                 self.expect_punct("(")?;
                 let obj = self.expression()?;
                 self.expect_punct(")")?;
-                let body = Box::new(self.statement()?);
+                let body = self.stmt_body(false)?;
+                // early error: IsLabelledFunction(body)
+                let mut inner: &Stmt = &body;
+                loop {
+                    match inner {
+                        Stmt::Labeled(_, i) => inner = i,
+                        Stmt::FnDecl(_) => {
+                            return Err(self.err(
+                                "labelled function declaration not allowed as with body",
+                            ));
+                        }
+                        _ => break,
+                    }
+                }
                 Ok(Stmt::With { obj, body })
             }
             Tok::Kw(Kw::Throw) => {
@@ -486,8 +503,8 @@ impl Parser {
             Tok::Ident(name) if matches!(self.peek2().tok, Tok::Punct(":")) => {
                 self.next();
                 self.next();
-                let inner = self.statement()?;
-                Ok(Stmt::Labeled(name, Box::new(inner)))
+                let inner = self.stmt_body(true)?;
+                Ok(Stmt::Labeled(name, inner))
             }
             _ => {
                 let e = self.expression()?;
@@ -657,19 +674,9 @@ impl Parser {
         self.expect_punct("(")?;
         let c = self.expression()?;
         self.expect_punct(")")?;
-        let t = Box::new(self.statement()?);
-        if self.strict && matches!(&*t, Stmt::FnDecl(_)) {
-            return Err(self.err(
-                "function declaration not allowed in statement position",
-            ));
-        }
+        let t = self.stmt_body(true)?;
         let e = if self.eat_kw(Kw::Else) {
-            let inner = Box::new(self.statement()?);
-            if self.strict && matches!(&*inner, Stmt::FnDecl(_)) {
-                return Err(self.err(
-                    "function declaration not allowed in statement position",
-                ));
-            }
+            let inner = self.stmt_body(true)?;
             Some(inner)
         } else {
             None
@@ -679,14 +686,51 @@ impl Parser {
 
     /// a `for`/`do`/`while` body — FunctionDeclaration is never legal in
     /// these statement positions (Annex-B only permits if/else/label)
-    fn loop_body(&mut self) -> Result<Box<Stmt>, Error> {
-        let body = self.statement()?;
-        if matches!(body, Stmt::FnDecl(_)) {
-            return Err(self.err(
-                "function declaration not allowed in statement position",
-            ));
+    /// Parse a `Statement` (single-statement body position — if/else,
+    /// loops, with, labelled items). Lexical declarations are
+    /// StatementListItems, never legal here; `function` is only legal via
+    /// Annex B.3.2/B.3.3 contexts (`fn_ok` = sloppy if/else or label).
+    fn stmt_body(&mut self, fn_ok: bool) -> Result<Box<Stmt>, Error> {
+        // `let` in statement position is an ExpressionStatement under the
+        // `let [` lookahead restriction — never a lexical declaration.
+        // `let\nx`/`let\n{}` split via ASI into `let;` + a statement.
+        let body = if matches!(self.peek().tok, Tok::Kw(Kw::Let)) {
+            if matches!(self.peek2().tok, Tok::Punct("[")) {
+                return Err(
+                    self.err("`let [` is not allowed in statement position")
+                );
+            }
+            let e = self.expression()?;
+            self.semi()?;
+            Stmt::Expr(e)
+        } else {
+            self.statement()?
+        };
+        match &body {
+            Stmt::VarDecl { kind, .. }
+                if matches!(kind, VarKind::Let | VarKind::Const) =>
+            {
+                return Err(self.err(
+                    "lexical declaration not allowed in statement position",
+                ));
+            }
+            Stmt::ClassDecl(_) => {
+                return Err(self.err(
+                    "class declaration not allowed in statement position",
+                ));
+            }
+            Stmt::FnDecl(_) if !(fn_ok && !self.strict) => {
+                return Err(self.err(
+                    "function declaration not allowed in statement position",
+                ));
+            }
+            _ => {}
         }
         Ok(Box::new(body))
+    }
+
+    fn loop_body(&mut self) -> Result<Box<Stmt>, Error> {
+        self.stmt_body(false)
     }
 
     fn for_stmt(&mut self) -> Result<Stmt, Error> {
@@ -1483,7 +1527,7 @@ impl Parser {
             _ => return Ok(lhs),
         };
         self.next();
-        if !is_assignable(&lhs) {
+        if !is_assignable(&lhs, self.strict) {
             return Err(self.err("invalid assignment target"));
         }
         if self.strict {
@@ -1715,7 +1759,7 @@ impl Parser {
             let inc = self.at_punct("++");
             self.next();
             let t = self.unary_expr()?;
-            if !is_assignable(&t) {
+            if !is_assignable(&t, self.strict) {
                 return Err(self.err("invalid ++/-- target"));
             }
             return Ok(Expr::Update {
@@ -1729,7 +1773,7 @@ impl Parser {
         if (self.at_punct("++") || self.at_punct("--")) && !self.peek().newline_before {
             let inc = self.at_punct("++");
             self.next();
-            if !is_assignable(&e) {
+            if !is_assignable(&e, self.strict) {
                 return Err(self.err("invalid ++/-- target"));
             }
             return Ok(Expr::Update {
@@ -2074,9 +2118,15 @@ impl Parser {
             }
             Tok::Punct("(") => {
                 self.next();
-                let e = self.expression()?;
+                // inside `(` the `{`/`[` productions may reinterpret as
+                // destructuring patterns — ObjectLiteral-only early
+                // errors (duplicate __proto__) don't apply to a cover
+                self.paren_depth += 1;
+                let e = self.expression();
+                self.paren_depth -= 1;
+                let e = e?;
                 self.expect_punct(")")?;
-                Ok(e)
+                Ok(Expr::Paren(Box::new(e)))
             }
             Tok::Punct("[") => {
                 self.next();
@@ -2088,7 +2138,16 @@ impl Parser {
                         continue;
                     }
                     if self.eat_punct("...") {
-                        elems.push(ArrElem::Spread(self.assign_expr()?));
+                        let ex = self.assign_expr()?;
+                        // `...x,]` — trailing comma marks the element so
+                        // pattern conversion can reject it
+                        let trail = self.at_punct(",")
+                            && matches!(self.peek2().tok, Tok::Punct("]"));
+                        elems.push(if trail {
+                            ArrElem::SpreadTrail(ex)
+                        } else {
+                            ArrElem::Spread(ex)
+                        });
                     } else {
                         elems.push(ArrElem::Expr(self.assign_expr()?));
                     }
@@ -2105,11 +2164,19 @@ impl Parser {
                 // spec: two `__proto__: v` DATA properties → early error
                 // (getters/setters/methods/computed don't count)
                 let mut proto_seen = false;
+                let mut dup_proto = false;
                 while !self.at_punct("}") {
                     if self.eat_punct("...") {
+                        let ex = self.assign_expr()?;
+                        let trail = self.at_punct(",")
+                            && matches!(self.peek2().tok, Tok::Punct("}"));
                         props.push(ObjProp {
                             key: PropKey::Str(String::new()),
-                            val: PropVal::Spread(self.assign_expr()?),
+                            val: if trail {
+                                PropVal::SpreadTrail(ex)
+                            } else {
+                                PropVal::Spread(ex)
+                            },
                         });
                         self.eat_punct(",");
                         continue;
@@ -2228,7 +2295,7 @@ impl Parser {
                         && self.at_punct(":")
                     {
                         if proto_seen {
-                            return Err(self.err("duplicate __proto__ property"));
+                            dup_proto = true;
                         }
                         proto_seen = true;
                     }
@@ -2303,7 +2370,11 @@ impl Parser {
                     }
                 }
                 self.expect_punct("}")?;
-                Ok(Expr::Object(props))
+                Ok(if dup_proto {
+                    Expr::ObjDup(props)
+                } else {
+                    Expr::Object(props)
+                })
             }
             _ => Err(self.err(format!("unexpected {}", self.describe()))),
         }
@@ -2338,11 +2409,52 @@ fn prop_key_name(k: &PropKey) -> Option<String> {
 
 /// Can `e` be an assignment/update target? (destructuring forms included —
 /// their element validity is checked at bind time)
-fn is_assignable(e: &Expr) -> bool {
+/// Static Semantics: AssignmentTargetType — a LeftHandSideExpression
+/// that is an array/object literal must additionally satisfy the
+/// destructuring pattern grammar (rest last, no methods/get/set,
+/// no optional chains).
+fn is_assignable(e: &Expr, strict: bool) -> bool {
     match e {
-        Expr::Ident(_) | Expr::Member { .. } | Expr::Array(_) | Expr::Object(_) => true,
-        Expr::Call { .. } => false,
+        Expr::Paren(inner) => return is_assignable(inner, strict),
+        // `new.target` desugars to a synthetic ident — not a target;
+        // strict mode forbids `eval`/`arguments` as assignment targets
+        Expr::Ident(n) => {
+            n.as_str() != "$new_target"
+                && !(strict && matches!(n.as_str(), "eval" | "arguments"))
+        }
+        Expr::Member { optional, .. } => !optional,
+        Expr::Array(elems) => elems.iter().enumerate().all(|(i, el)| match el {
+            ArrElem::Hole => true,
+            ArrElem::Expr(ex) => is_assignable_elem(ex, strict),
+            ArrElem::Spread(ex) => {
+                i + 1 == elems.len() && is_assignable(ex, strict)
+            }
+            ArrElem::SpreadTrail(_) => false,
+        }),
+        Expr::Object(props) | Expr::ObjDup(props) => {
+            props.iter().enumerate().all(|(i, p)| match &p.val {
+            PropVal::Expr(ex) => is_assignable_elem(ex, strict),
+            PropVal::Spread(ex) => {
+                i + 1 == props.len() && is_assignable(ex, strict)
+            }
+            PropVal::SpreadTrail(_) => false,
+                PropVal::Method(_) | PropVal::Get(_) | PropVal::Set(_) => false,
+            })
+        }
         _ => false,
+    }
+}
+
+/// an array/object literal element: either an assignable target or
+/// `target = default`
+fn is_assignable_elem(ex: &Expr, strict: bool) -> bool {
+    match ex {
+        Expr::Assign {
+            op: AssignOp::Assign,
+            target,
+            ..
+        } => is_assignable(target, strict),
+        _ => is_assignable(ex, strict),
     }
 }
 
@@ -2726,10 +2838,10 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
                     }
                 }
                 ForTarget::Expr(e) => {
-                    if !is_assignable(e) {
+                    if !is_assignable(e, cx.strict) {
                         return Err(cx.err("invalid for-in/of target"));
                     }
-                    vexpr(e, cx)?;
+                    vexpr_pat(e, cx)?;
                 }
             }
             vexpr(right, cx)?;
@@ -2990,7 +3102,7 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
             Ok(())
         }
         Expr::Assign { target, value, .. } => {
-            if !is_assignable(target) {
+            if !is_assignable(target, cx.strict) {
                 return Err(cx.err("invalid assignment target"));
             }
             if cx.strict {
@@ -3000,15 +3112,16 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
                     }
                 }
             }
-            vexpr(target, cx)?;
+            vexpr_pat(target, cx)?;
             vexpr(value, cx)
         }
         Expr::Update { target, .. } => {
-            if !is_assignable(target) {
+            if !is_assignable(target, cx.strict) {
                 return Err(cx.err("invalid ++/-- target"));
             }
             vexpr(target, cx)
         }
+        Expr::Paren(inner) => vexpr(inner, cx),
         Expr::Unary { expr, .. } => vexpr(expr, cx),
         Expr::Binary { l, r, .. } | Expr::Logical { l, r, .. } => {
             vexpr(l, cx)?;
@@ -3037,11 +3150,14 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
         Expr::Array(elems) => {
             for el in elems {
                 match el {
-                    ArrElem::Expr(e) | ArrElem::Spread(e) => vexpr(e, cx)?,
+                    ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => vexpr(e, cx)?,
                     ArrElem::Hole => {}
                 }
             }
             Ok(())
+        }
+        Expr::ObjDup(_) => {
+            return Err(cx.err("duplicate __proto__ property"));
         }
         Expr::Object(props) => {
             for p in props {
@@ -3050,7 +3166,7 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
                 }
                 match &p.val {
                     PropVal::Expr(e) => vexpr(e, cx)?,
-                    PropVal::Spread(e) => vexpr(e, cx)?,
+                    PropVal::Spread(e) | PropVal::SpreadTrail(e) => vexpr(e, cx)?,
                     PropVal::Get(f) | PropVal::Set(f) | PropVal::Method(f) => {
                         vfn(f, cx, Some(false))?;
                     }
@@ -3090,5 +3206,54 @@ impl BinKind {
             BinKind::Pow => Some(BinOp::Pow),
             BinKind::Log(_) => None,
         }
+    }
+}
+
+/// Expression validation in destructuring-assignment target position:
+/// `Expr::ObjDup` is legal here (the `__proto__` keys read as ordinary
+/// property names), and nested pattern structure recurses; anything
+/// else falls back to ordinary expression validation.
+fn vexpr_pat(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
+    match e {
+        Expr::Paren(inner) => vexpr_pat(inner, cx),
+        Expr::ObjDup(props) | Expr::Object(props) => {
+            for p in props {
+                match &p.val {
+                    PropVal::Expr(ex) => vexpr_pat(ex, cx)?,
+                    PropVal::Spread(ex) | PropVal::SpreadTrail(ex) => {
+                        vexpr_pat(ex, cx)?
+                    }
+                    PropVal::Method(d) | PropVal::Get(d) | PropVal::Set(d) => {
+                        vfn(d, cx, Some(false))?
+                    }
+                }
+            }
+            Ok(())
+        }
+        Expr::Array(elems) => {
+            for el in elems {
+                match el {
+                    ArrElem::Expr(ex) | ArrElem::Spread(ex)
+                    | ArrElem::SpreadTrail(ex) => vexpr_pat(ex, cx)?,
+                    ArrElem::Hole => {}
+                }
+            }
+            Ok(())
+        }
+        // `a = default` inside a pattern: the target side stays a
+        // pattern; the default is an ordinary expression
+        Expr::Assign {
+            op: AssignOp::Assign,
+            target,
+            value,
+        } => {
+            vexpr_pat(target, cx)?;
+            vexpr(value, cx)
+        }
+        Expr::Member { obj, prop, .. } => {
+            vexpr(obj, cx)?;
+            vexpr(prop, cx)
+        }
+        _ => vexpr(e, cx),
     }
 }

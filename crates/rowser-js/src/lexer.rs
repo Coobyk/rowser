@@ -1196,8 +1196,11 @@ fn slash_is_regex(prev: Option<&Token>) -> bool {
 }
 
 fn is_ident_start(c: char) -> bool {
-    c == '_' || c == '$' || c.is_alphabetic() || c as u32 > 127
+    c == '_' || c == '$' || unicode_ident::is_xid_start(c)
 }
 fn is_ident_part(c: char) -> bool {
-    is_ident_start(c) || c.is_ascii_digit() || c == '\u{200c}' || c == '\u{200d}'
+    is_ident_start(c)
+        || unicode_ident::is_xid_continue(c)
+        || c == '\u{200c}'
+        || c == '\u{200d}'
 }

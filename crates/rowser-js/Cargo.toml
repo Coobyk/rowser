@@ -10,3 +10,4 @@ rowser-html = { path = "../rowser-html" }
 rowser-css = { path = "../rowser-css" }
 rowser-net = { path = "../rowser-net" }
 corosensei = "0.3.4"
+unicode-ident = "1.0.27"

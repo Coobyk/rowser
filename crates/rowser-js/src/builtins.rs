@@ -3200,7 +3200,16 @@ fn install_globals(i: &mut Interp) {
         method(i, &dp, "getUTCMilliseconds", |i, t, _| {
             date_getter(i, t, |d| d.7 as f64)
         });
-        method(i, &dp, "getTimezoneOffset", |_i, _t, _| Ok(Value::Num(0.0)));
+        // legacy getYear = getFullYear - 1900
+        method(i, &dp, "getYear", |i, t, _| {
+            date_getter(i, t, |d| (d.0 - 1900) as f64)
+        });
+        method(i, &dp, "getTimezoneOffset", |i, t, _| {
+            // UTC-only engine → offset is always 0, but the spec still
+            // TypeErrors on non-Date receivers and returns NaN on NaN dates
+            let t = this_time_value(i, t)?;
+            Ok(Value::Num(if t.is_nan() { f64::NAN } else { 0.0 }))
+        });
         // setters — UTC-only engine: local == UTC. slots = y,mo,d,h,mi,s,ms
         method(i, &dp, "setTime", date_set_time);
         method(i, &dp, "setMilliseconds", |i, t, a| {
@@ -3246,16 +3255,64 @@ fn install_globals(i: &mut Interp) {
         method(i, &dp, "setUTCFullYear", |i, t, a| {
             date_set(i, t, a, &[0, 1, 2], true)
         });
-        // Date.prototype[@@toPrimitive]
+        // Date.prototype[@@toPrimitive] — name "[Symbol.toPrimitive]", length 1
         let stp = native(i, "[Symbol.toPrimitive]", date_to_primitive);
+        if let Value::Obj(fo) = &stp {
+            i.set_attr(fo, "length", Value::Num(1.0), false, true);
+        }
         dp.borrow_mut()
             .props
             .insert(PropKey::Sym(SYM_TOPRIMITIVE), Prop::builtin(stp));
+        // Date.prototype[@@toStringTag] === "Date" — n.w, n.e, configurable
+        dp.borrow_mut().props.insert(
+            PropKey::Sym(SYM_TOSTRINGTAG),
+            Prop {
+                val: Value::Str(Rc::from("Date")),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                get: None,
+                set: None,
+            },
+        );
+        // spec function lengths differ from the `native()` default of 0
+        for (name, len) in [
+            ("toJSON", 1.0),
+            ("setTime", 1.0),
+            ("setMilliseconds", 1.0),
+            ("setUTCMilliseconds", 1.0),
+            ("setSeconds", 2.0),
+            ("setUTCSeconds", 2.0),
+            ("setMinutes", 3.0),
+            ("setUTCMinutes", 3.0),
+            ("setHours", 4.0),
+            ("setUTCHours", 4.0),
+            ("setDate", 1.0),
+            ("setUTCDate", 1.0),
+            ("setMonth", 2.0),
+            ("setUTCMonth", 2.0),
+            ("setFullYear", 3.0),
+            ("setUTCFullYear", 3.0),
+            ("setYear", 1.0),
+        ] {
+            let f = i.obj_get_raw_str(&dp, name).unwrap_or(Value::Und);
+            if let Value::Obj(fo) = f {
+                i.set_attr(&fo, "length", Value::Num(len), false, true);
+            }
+        }
         let ctor = make_ctor(i, "Date", date_ctor, dp.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         i.set_builtin(o, "now", native(i, "now", date_now));
         i.set_builtin(o, "UTC", native(i, "UTC", date_utc));
         i.set_builtin(o, "parse", native(i, "parse", date_parse));
+        for (name, len) in [("UTC", 7.0), ("parse", 1.0)] {
+            let f = i.get_prop_str(&ctor, name).unwrap_or(Value::Und);
+            if let Value::Obj(fo) = f {
+                i.set_attr(&fo, "length", Value::Num(len), false, true);
+            }
+        }
+        // new Date(...) accepts up to 7 components
+        i.set_attr(o, "length", Value::Num(7.0), false, true);
         define_global(i, "Date", ctor);
     }
 
@@ -3334,7 +3391,7 @@ fn install_globals(i: &mut Interp) {
     // caller-environment path
     {
         let g = i.global.clone();
-        if let Some(v) = i.env_lookup(&g, "eval") {
+        if let Ok(Some(v)) = i.env_lookup(&g, "eval") {
             i.eval_fn = Some(v);
         }
     }
@@ -7318,96 +7375,136 @@ fn date_now(_i: &mut Interp, _t: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Num(now_millis()))
 }
 
-/// spec TimeClip: |v| > 8.64e15 or NaN → NaN; else integer part.
+/// spec TimeClip: |v| > 8.64e15 or NaN → NaN; else integer part (+0 for -0).
 fn time_clip(n: f64) -> f64 {
     if !n.is_finite() || n.abs() > 8.64e15 {
         f64::NAN
     } else {
-        n.trunc()
+        n.trunc() + 0.0
     }
 }
 
-fn date_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
-    if !matches!(this, Value::Obj(_)) {
-        // Date() called as function → string
-        return Ok(Value::Str(Rc::from(
-            format!("{} (rowser-js date)", now_millis()).as_str(),
-        )));
-    }
-    let ms = if args.len() >= 2 {
-        // multi-arg ctor: MakeDate(MakeDay(y,m,d), MakeTime(h,mi,s,ms))
-        // — coerce every arg via ToNumber first (missing = spec defaults)
-        let mut n = |k: usize, d: f64| -> Result<f64, Value> {
-            match args.get(k) {
-                Some(v) => Ok(i.to_num(v)?),
-                None => Ok(d),
+/// `ObjKind::Host("date")` marks objects carrying a [[DateValue]] internal
+/// slot; the value itself lives in the hidden `$ms` prop.
+fn is_date(v: &Value) -> bool {
+    matches!(v, Value::Obj(o)
+        if matches!(&o.borrow().kind, ObjKind::Host(tag) if tag.as_ref() == "date"))
+}
+
+/// spec thisTimeValue — the slot value, or TypeError for non-Date receivers.
+fn this_time_value(i: &mut Interp, this: &Value) -> Result<f64, Value> {
+    if is_date(this) {
+        if let Value::Obj(o) = this {
+            if let Some(Value::Num(n)) = i.obj_get_raw_str(o, "$ms") {
+                return Ok(n);
             }
-        };
-        let mut y = n(0, 0.0)?.trunc();
-        if (0.0..=99.0).contains(&y) {
-            y += 1900.0;
         }
-        let mo = n(1, 0.0)?.trunc();
-        let d = n(2, 1.0)?.trunc();
-        let h = n(3, 0.0)?.trunc();
-        let mi = n(4, 0.0)?.trunc();
-        let s = n(5, 0.0)?.trunc();
-        let ms = n(6, 0.0)?.trunc();
-        if [y, mo, d, h, mi, s, ms].iter().any(|v| v.is_nan()) {
-            f64::NAN
-        } else {
-            let y_adj = y + (mo / 12.0).floor();
-            let mo_adj = mo.rem_euclid(12.0);
-            let day = days_from_civil(y_adj as i64, (mo_adj + 1.0) as u32, 1)
-                + d as i64 - 1;
-            time_clip(
-                day as f64 * 86_400_000.0
-                    + h * 3_600_000.0
-                    + mi * 60_000.0
-                    + s * 1000.0
-                    + ms,
-            )
-        }
-    } else {
-        match arg(args, 0) {
-            Value::Und => now_millis(),
-            Value::Num(n) => time_clip(n),
-            Value::Str(_) => {
-                let v = arg(args, 0);
-                match date_parse(i, &Value::Und, &[v]) {
-                    Ok(Value::Num(n)) => time_clip(n),
-                    _ => f64::NAN,
+    }
+    Err(i.type_err("this is not a Date object"))
+}
+
+/// spec MakeDay (year, month, date) — ToInteger on each, f64 arithmetic.
+fn make_day(y: f64, m: f64, d: f64) -> f64 {
+    if !y.is_finite() || !m.is_finite() || !d.is_finite() {
+        return f64::NAN;
+    }
+    let (y, m, d) = (y.trunc(), m.trunc(), d.trunc());
+    let ym = y + (m / 12.0).floor();
+    let mn = m.rem_euclid(12.0);
+    if ym.abs() > 9.0e18 {
+        // unrepresentable — TimeClip would NaN the result anyway
+        return f64::NAN;
+    }
+    days_from_civil(ym as i64, (mn + 1.0) as u32, 1) as f64 + d - 1.0
+}
+
+/// spec MakeTime (hour, min, sec, ms) — ToInteger on each, spec f64 grouping.
+fn make_time(h: f64, m: f64, s: f64, ms: f64) -> f64 {
+    if !h.is_finite() || !m.is_finite() || !s.is_finite() || !ms.is_finite() {
+        return f64::NAN;
+    }
+    h.trunc() * 3_600_000.0 + m.trunc() * 60_000.0 + s.trunc() * 1_000.0 + ms.trunc()
+}
+
+/// spec MakeDate (day, time).
+fn make_date(day: f64, time: f64) -> f64 {
+    if !day.is_finite() || !time.is_finite() {
+        return f64::NAN;
+    }
+    day * 86_400_000.0 + time
+}
+
+fn date_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // `new_target_native` is only Some inside a native [[Construct]] — but a
+    // plain `Date()` nested in one still sees it, so additionally require
+    // `this` to be the freshly allocated object (same check as RegExp).
+    let fresh_this = matches!(this, Value::Obj(o)
+        if matches!(o.borrow().kind, ObjKind::Ord) && o.borrow().props.is_empty());
+    if !(i.new_target_native.is_some() && fresh_this) {
+        // called as a function — the spec's ToDateString(current time)
+        return Ok(Value::Str(Rc::from(date_str(now_millis()))));
+    }
+    let ms = match args.len() {
+        0 => now_millis(),
+        1 => {
+            let v = arg(args, 0);
+            if is_date(&v) {
+                // a Date arg copies its [[DateValue]] — no coercion happens
+                if let Value::Obj(o) = &v {
+                    match i.obj_get_raw_str(o, "$ms") {
+                        Some(Value::Num(n)) => n,
+                        _ => f64::NAN,
+                    }
+                } else {
+                    f64::NAN
+                }
+            } else {
+                match i.to_primitive(&v)? {
+                    s @ Value::Str(_) => match date_parse(i, &Value::Und, &[s]) {
+                        Ok(Value::Num(n)) => n,
+                        _ => f64::NAN,
+                    },
+                    v2 => i.to_num(&v2)?,
                 }
             }
-            v => time_clip(i.to_num(&v).unwrap_or(f64::NAN)),
+        }
+        _ => {
+            // multi-arg ctor: MakeDate(MakeDay(y,m,d), MakeTime(h,mi,s,ms))
+            // — coerce every arg via ToNumber first (missing = spec defaults)
+            let mut n = |k: usize, d: f64| -> Result<f64, Value> {
+                match args.get(k) {
+                    Some(v) => i.to_num(v),
+                    None => Ok(d),
+                }
+            };
+            let y = n(0, 0.0)?;
+            let mo = n(1, 0.0)?;
+            let d = n(2, 1.0)?;
+            let h = n(3, 0.0)?;
+            let mi = n(4, 0.0)?;
+            let s = n(5, 0.0)?;
+            let msec = n(6, 0.0)?;
+            // 0 ≤ ToInteger(y) ≤ 99 → 1900 + ToInteger(y)
+            let yr = {
+                let yi = y.trunc();
+                if !y.is_nan() && (0.0..=99.0).contains(&yi) {
+                    1900.0 + yi
+                } else {
+                    y
+                }
+            };
+            time_clip(make_date(make_day(yr, mo, d), make_time(h, mi, s, msec)))
         }
     };
     if let Value::Obj(o) = this {
-        i.set_builtin(o, "$ms", Value::Num(ms));
+        o.borrow_mut().kind = ObjKind::Host(Rc::from("date"));
+        i.set_builtin(o, "$ms", Value::Num(time_clip(ms)));
     }
     Ok(this.clone())
 }
 
 fn date_get_time(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    if let Value::Obj(o) = this {
-        if let Some(v) = i.obj_get_raw_str(o, "$ms") {
-            return Ok(v);
-        }
-    }
-    Ok(Value::Num(f64::NAN))
-}
-
-fn date_ms(i: &mut Interp, this: &Value) -> f64 {
-    if let Value::Obj(o) = this {
-        i.obj_get_raw_str(o, "$ms")
-            .and_then(|v| match v {
-                Value::Num(n) => Some(n),
-                _ => None,
-            })
-            .unwrap_or(f64::NAN)
-    } else {
-        f64::NAN
-    }
+    Ok(Value::Num(this_time_value(i, this)?))
 }
 
 /// (year, month 1-12, day, weekday 0=Sun, hour, min, sec, ms) for UTC epoch ms.
@@ -7452,7 +7549,7 @@ fn date_getter(
     this: &Value,
     f: impl Fn((i64, u32, u32, u32, u32, u32, u32, u32)) -> f64,
 ) -> NResult {
-    let ms = date_ms(i, this);
+    let ms = this_time_value(i, this)?;
     if !ms.is_finite() {
         return Ok(Value::Num(f64::NAN));
     }
@@ -7475,20 +7572,25 @@ fn date_set(
     slots: &[usize],
     zero_base: bool,
 ) -> NResult {
-    // coerce all provided args first — ToNumber order matters
-    let mut given: Vec<f64> = Vec::with_capacity(args.len());
+    // spec order: read [[DateValue]] first (TypeError on a non-Date), then
+    // ToNumber the provided args left-to-right, then the NaN check on t.
+    let t = this_time_value(i, this)?;
+    let mut given: Vec<f64> = Vec::with_capacity(args.len().min(slots.len()));
     for a in args.iter().take(slots.len()) {
         given.push(i.to_num(a)?);
     }
-    let cur = date_ms(i, this);
-    if given.iter().any(|v| v.is_nan()) || (!cur.is_finite() && !zero_base) {
-        return Ok(date_store(i, this, f64::NAN));
-    }
-    let base = if cur.is_finite() {
-        date_parts(cur)
+    let t = if t.is_nan() {
+        if zero_base {
+            0.0
+        } else {
+            // spec returns NaN here *without* touching the slot — a valueOf
+            // side effect may have already replaced it
+            return Ok(Value::Num(f64::NAN));
+        }
     } else {
-        date_parts(0.0)
+        t
     };
+    let base = date_parts(t);
     let (mut y, mut mo, mut d, mut h, mut mi, mut s, mut msec) = (
         base.0 as f64,
         (base.1 - 1) as f64,
@@ -7500,38 +7602,34 @@ fn date_set(
     );
     for (k, v) in given.iter().enumerate() {
         match slots[k] {
-            0 => y = v.trunc(),
-            1 => mo = v.trunc(),
-            2 => d = v.trunc(),
-            3 => h = v.trunc(),
-            4 => mi = v.trunc(),
-            5 => s = v.trunc(),
-            _ => msec = v.trunc(),
+            0 => y = *v,
+            1 => mo = *v,
+            2 => d = *v,
+            3 => h = *v,
+            4 => mi = *v,
+            5 => s = *v,
+            _ => msec = *v,
         }
     }
-    let y_adj = y + (mo / 12.0).floor();
-    let mo_adj = mo.rem_euclid(12.0);
-    let day = days_from_civil(y_adj as i64, (mo_adj + 1.0) as u32, 1) + d as i64 - 1;
-    let ms = time_clip(
-        day as f64 * 86_400_000.0
-            + h * 3_600_000.0
-            + mi * 60_000.0
-            + s * 1000.0
-            + msec,
-    );
+    let ms = time_clip(make_date(make_day(y, mo, d), make_time(h, mi, s, msec)));
     Ok(date_store(i, this, ms))
 }
 
 fn date_set_time(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // slot check runs before ToNumber — TypeError on non-Date receivers
+    this_time_value(i, this)?;
     let v = i.to_num(&arg(args, 0))?;
     Ok(date_store(i, this, time_clip(v)))
 }
 
 /// legacy setYear: 0-99 → 1900+y (already full years otherwise)
 fn date_set_year(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec reads the slot (TypeError on non-Date) before ToNumber(year)
+    this_time_value(i, this)?;
     let mut y = i.to_num(&arg(args, 0))?;
-    if (0.0..=99.0).contains(&y) {
-        y += 1900.0;
+    let yi = y.trunc();
+    if !y.is_nan() && (0.0..=99.0).contains(&yi) {
+        y = 1900.0 + yi;
     }
     date_set(i, this, &[Value::Num(y)], &[0], true)
 }
@@ -7539,7 +7637,14 @@ fn date_set_year(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 /// spec Date.prototype.toJSON: ToPrimitive(number) → non-finite → null;
 /// else invoke this.toISOString()
 fn date_to_json(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let tv = i.to_primitive(this)?;
+    // O = ? ToObject(this) — undefined/null throw TypeError
+    if matches!(this, Value::Und | Value::Null) {
+        return Err(i.type_err("Cannot convert undefined or null to object"));
+    }
+    let tv = match this {
+        Value::Obj(o) => i.to_primitive_hint(this, o.clone(), "number")?,
+        v => v.clone(),
+    };
     if let Value::Num(n) = tv {
         if !n.is_finite() {
             return Ok(Value::Null);
@@ -7555,6 +7660,10 @@ fn date_to_json(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 /// spec Date.prototype[@@toPrimitive](hint): "default"→"string";
 /// OrdinaryToPrimitive with the resolved hint.
 fn date_to_primitive(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec: Type(this value) must be Object before the hint is examined
+    if !matches!(this, Value::Obj(_)) {
+        return Err(i.type_err("Date.prototype[Symbol.toPrimitive] called on non-object"));
+    }
     let hint = match arg(args, 0) {
         Value::Str(s) => s.to_string(),
         _ => String::new(),
@@ -7578,48 +7687,57 @@ fn date_to_primitive(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Err(i.type_err("Cannot convert object to primitive value"))
 }
 
+const WD_NAMES: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MO_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// the spec DateString year: padded to ≥4 digits; a `-` sign only when
+/// negative ("-0001", "-12345"; positive years are never signed).
+fn fmt_year(y: i64) -> String {
+    if y < 0 {
+        format!("-{:04}", y.unsigned_abs())
+    } else {
+        format!("{:04}", y)
+    }
+}
+
+/// ToDateString(tv) for a finite UTC time — shared by `Date()` / toString.
+fn date_str(ms: f64) -> String {
+    let (y, m, d, wd, h, mi, s, _) = date_parts(ms);
+    format!(
+        "{} {} {:02} {} {:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+        WD_NAMES[wd as usize],
+        MO_NAMES[(m - 1) as usize],
+        d,
+        fmt_year(y),
+        h,
+        mi,
+        s
+    )
+}
+
 fn date_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let ms = date_ms(i, this);
+    let ms = this_time_value(i, this)?;
     if !ms.is_finite() {
         return Ok(Value::Str(Rc::from("Invalid Date")));
     }
-    let (y, m, d, wd, h, mi, s, _) = date_parts(ms);
-    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MO: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    Ok(Value::Str(Rc::from(
-        format!(
-            "{} {} {:02} {} {:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
-            WD[wd as usize],
-            MO[(m - 1) as usize],
-            d,
-            y,
-            h,
-            mi,
-            s
-        )
-        .as_str(),
-    )))
+    Ok(Value::Str(Rc::from(date_str(ms))))
 }
 
 fn date_to_utc(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let ms = date_ms(i, this);
+    let ms = this_time_value(i, this)?;
     if !ms.is_finite() {
         return Ok(Value::Str(Rc::from("Invalid Date")));
     }
     let (y, m, d, wd, h, mi, s, _) = date_parts(ms);
-    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MO: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     Ok(Value::Str(Rc::from(
         format!(
             "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
-            WD[wd as usize],
+            WD_NAMES[wd as usize],
             d,
-            MO[(m - 1) as usize],
-            y,
+            MO_NAMES[(m - 1) as usize],
+            fmt_year(y),
             h,
             mi,
             s
@@ -7629,99 +7747,364 @@ fn date_to_utc(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 fn date_to_iso(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let ms = date_ms(i, this);
+    let ms = this_time_value(i, this)?;
     if !ms.is_finite() {
         return Err(i.range_err("Invalid time value"));
     }
     let (y, m, d, _, h, mi, s, msec) = date_parts(ms);
+    // spec: years outside 0000-9999 use the signed 6-digit expanded form
+    let ys = if (0..=9999).contains(&y) {
+        format!("{:04}", y)
+    } else if y < 0 {
+        format!("-{:06}", y.unsigned_abs())
+    } else {
+        format!("+{:06}", y)
+    };
     Ok(Value::Str(Rc::from(
         format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-            y, m, d, h, mi, s, msec
+            "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            ys, m, d, h, mi, s, msec
         )
         .as_str(),
     )))
 }
 
 fn date_to_datestr(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let ms = date_ms(i, this);
+    let ms = this_time_value(i, this)?;
     if !ms.is_finite() {
         return Ok(Value::Str(Rc::from("Invalid Date")));
     }
     let (y, m, d, wd, _, _, _, _) = date_parts(ms);
-    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MO: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     Ok(Value::Str(Rc::from(
         format!(
             "{} {} {:02} {}",
-            WD[wd as usize],
-            MO[(m - 1) as usize],
+            WD_NAMES[wd as usize],
+            MO_NAMES[(m - 1) as usize],
             d,
-            y
+            fmt_year(y)
         )
         .as_str(),
     )))
 }
 
 fn date_to_timestr(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let ms = date_ms(i, this);
+    let ms = this_time_value(i, this)?;
     if !ms.is_finite() {
         return Ok(Value::Str(Rc::from("Invalid Date")));
     }
     let (_, _, _, _, h, mi, s, _) = date_parts(ms);
     Ok(Value::Str(Rc::from(
-        format!("{:02}:{:02}:{:02}", h, mi, s).as_str(),
+        format!(
+            "{:02}:{:02}:{:02} GMT+0000 (Coordinated Universal Time)",
+            h, mi, s
+        )
+        .as_str(),
     )))
 }
 
-fn date_utc(_i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
-    let num = |k: usize, d: f64| match arg(a, k) {
-        Value::Num(n) => n,
-        _ => d,
+fn date_utc(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
+    // spec: ToNumber each supplied arg in order — year is required, the
+    // rest default (month → 0, date → 1, others → 0)
+    let y = i.to_num(&arg(a, 0))?;
+    let mut n = |k: usize, d: f64| -> Result<f64, Value> {
+        if k < a.len() {
+            i.to_num(&a[k])
+        } else {
+            Ok(d)
+        }
     };
-    let y = num(0, 0.0) as i64;
-    let y = if (0..=99).contains(&y) { 1900 + y } else { y };
-    let days = days_from_civil(y, num(1, 0.0) as u32 + 1, num(2, 1.0) as u32);
-    let ms = days as f64 * 86_400_000.0
-        + num(3, 0.0) * 3_600_000.0
-        + num(4, 0.0) * 60_000.0
-        + num(5, 0.0) * 1000.0
-        + num(6, 0.0);
-    Ok(Value::Num(ms))
+    let mo = n(1, 0.0)?;
+    let d = n(2, 1.0)?;
+    let h = n(3, 0.0)?;
+    let mi = n(4, 0.0)?;
+    let s = n(5, 0.0)?;
+    let msec = n(6, 0.0)?;
+    // 0 ≤ ToInteger(y) ≤ 99 → 1900 + ToInteger(y)
+    let yr = {
+        let yi = y.trunc();
+        if !y.is_nan() && (0.0..=99.0).contains(&yi) {
+            1900.0 + yi
+        } else {
+            y
+        }
+    };
+    Ok(Value::Num(time_clip(make_date(
+        make_day(yr, mo, d),
+        make_time(h, mi, s, msec),
+    ))))
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// "HH:mm[:ss[.fff]]" — strict 2-digit fields; hour 24 only with zero rest.
+fn parse_hms(t: &str) -> Option<(f64, f64, f64, f64)> {
+    let two_dig = |x: Option<&str>| -> Option<u32> {
+        match x {
+            Some(s) if s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit()) => {
+                s.parse().ok()
+            }
+            _ => None,
+        }
+    };
+    let mut it = t.split(':');
+    let h = two_dig(it.next())?;
+    let m = two_dig(it.next())?;
+    let (s, f) = match it.next() {
+        Some(ss) => {
+            let (sp, fp) = ss.split_once('.').unwrap_or((ss, ""));
+            let s = if sp.len() == 2 && sp.bytes().all(|b| b.is_ascii_digit()) {
+                sp.parse().ok()?
+            } else {
+                return None;
+            };
+            let f = if fp.is_empty() {
+                0.0
+            } else if fp.bytes().all(|b| b.is_ascii_digit()) {
+                (format!("0.{fp}").parse::<f64>().ok()? * 1000.0).trunc()
+            } else {
+                return None;
+            };
+            (s, f)
+        }
+        None => (0, 0.0),
+    };
+    if it.next().is_some() {
+        return None;
+    }
+    if h > 24 || m > 59 || s > 59 || (h == 24 && (m != 0 || s != 0 || f != 0.0)) {
+        return None;
+    }
+    Some((h as f64, m as f64, s as f64, f))
+}
+
+/// ISO zone suffix: "Z" or ±HH[:MM] / ±HHMM — the offset in ms.
+fn parse_zone(z: &str) -> Option<f64> {
+    if z.eq_ignore_ascii_case("z") {
+        return Some(0.0);
+    }
+    let (sign, r) = if let Some(r) = z.strip_prefix('+') {
+        (1.0, r)
+    } else if let Some(r) = z.strip_prefix('-') {
+        (-1.0, r)
+    } else {
+        return None;
+    };
+    let (hh, mm): (u32, u32) = if let Some((h, m)) = r.split_once(':') {
+        if h.len() != 2
+            || m.len() != 2
+            || !h.bytes().all(|b| b.is_ascii_digit())
+            || !m.bytes().all(|b| b.is_ascii_digit())
+        {
+            return None;
+        }
+        (h.parse().ok()?, m.parse().ok()?)
+    } else if r.len() == 4 && r.bytes().all(|b| b.is_ascii_digit()) {
+        (r[..2].parse().ok()?, r[2..].parse().ok()?)
+    } else if r.len() == 2 && r.bytes().all(|b| b.is_ascii_digit()) {
+        (r.parse().ok()?, 0)
+    } else {
+        return None;
+    };
+    if hh > 23 || mm > 59 {
+        return None;
+    }
+    Some(sign * (hh as f64 * 3_600_000.0 + mm as f64 * 60_000.0))
+}
+
+/// spec Date Time String Format:
+/// [±]YYYY[-MM[-DD]][T|space HH:mm[:ss[.sss]]][Z|±HH:mm]
+fn parse_iso_ms(s: &str) -> Option<f64> {
+    let (dstr, tstr) = match s.find(|c| c == 'T' || c == 't' || c == ' ') {
+        Some(idx) => (&s[..idx], Some(&s[idx + 1..])),
+        None => (s, None),
+    };
+    let (signed, neg, drest) = if let Some(r) = dstr.strip_prefix('+') {
+        (true, false, r)
+    } else if let Some(r) = dstr.strip_prefix('-') {
+        (true, true, r)
+    } else {
+        (false, false, dstr)
+    };
+    let segs: Vec<&str> = drest.split('-').collect();
+    if segs.len() > 3 || segs.iter().any(|x| x.is_empty()) {
+        return None;
+    }
+    let ystr = segs[0];
+    let ok_len = if signed { ystr.len() == 6 } else { ystr.len() == 4 };
+    if !ok_len || !ystr.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if neg && ystr.bytes().all(|b| b == b'0') {
+        return None; // "-000000" is not a valid year
+    }
+    let mut y: i64 = ystr.parse().ok()?;
+    if neg {
+        y = -y;
+    }
+    let seg2 = |x: Option<&&str>| -> Option<u32> {
+        match x {
+            Some(s) if s.len() == 2 && s.bytes().all(|b| b.is_ascii_digit()) => {
+                s.parse().ok()
+            }
+            Some(_) => None,
+            None => Some(0),
+        }
+    };
+    let m = match segs.get(1) {
+        None => 1,
+        x => seg2(x)?,
+    };
+    let d = match segs.get(2) {
+        None => 1,
+        x => seg2(x)?,
+    };
+    if tstr.is_some() && segs.len() != 3 {
+        return None;
+    }
+    if !(1..=12).contains(&m) || !(1..=days_in_month(y, m)).contains(&d) {
+        return None;
+    }
+    let mut ms = days_from_civil(y, m, d) as f64 * 86_400_000.0;
+    if let Some(t) = tstr {
+        let zi = t.find(|c| c == 'Z' || c == 'z' || c == '+' || c == '-');
+        let (tp, off) = match zi {
+            Some(zi) => (&t[..zi], parse_zone(&t[zi..])?),
+            None => (t, 0.0),
+        };
+        let (h, mi, s2, f) = parse_hms(tp)?;
+        ms += h * 3_600_000.0 + mi * 60_000.0 + s2 * 1_000.0 + f - off;
+    }
+    Some(ms)
+}
+
+/// English month name → 1-12 ("Jan", "January", "Sept", ...).
+fn month_of(t: &str) -> Option<u32> {
+    const NAMES: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let l = t.to_ascii_lowercase();
+    if l.len() < 3 || !l.bytes().all(|b| b.is_ascii_lowercase()) {
+        return None;
+    }
+    NAMES
+        .iter()
+        .position(|n| l.starts_with(*n))
+        .map(|p| p as u32 + 1)
+}
+
+/// the non-ISO forms engines accept — needed for toString/toUTCString
+/// round-trips ("Wed Jul 01 2020 ...", "Thu, 01 Jan 1970 ... GMT").
+fn parse_other_ms(s: &str) -> Option<f64> {
+    let s = s.split('(').next().unwrap_or("").trim();
+    let mut month: Option<u32> = None;
+    let mut day: Option<i64> = None;
+    let mut year: Option<i64> = None;
+    let mut tod = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut have_time = false;
+    let mut offset = 0.0f64;
+    let mut pre_ints: Vec<i64> = Vec::new();
+    let mut post_ints: Vec<i64> = Vec::new();
+    for t in s.split([',', ' ']).filter(|t| !t.is_empty()) {
+        if month.is_none() {
+            if let Some(m) = month_of(t) {
+                month = Some(m);
+                continue;
+            }
+        }
+        if t.contains('/') {
+            // MM/DD/YYYY (US order); a leading >31 value means YYYY/MM/DD
+            let p: Vec<&str> = t.split('/').collect();
+            if p.len() != 3 {
+                return None;
+            }
+            let (a, b, c): (i64, i64, i64) =
+                (p[0].parse().ok()?, p[1].parse().ok()?, p[2].parse().ok()?);
+            let (y2, m2, d2) = if a > 31 { (a, b, c) } else { (c, a, b) };
+            month = Some(m2 as u32);
+            day = Some(d2);
+            year = Some(y2);
+            continue;
+        }
+        if t.as_bytes()[0].is_ascii_digit() && t.contains(':') {
+            if have_time {
+                return None;
+            }
+            tod = parse_hms(t)?;
+            have_time = true;
+            continue;
+        }
+        let low = t.to_ascii_lowercase();
+        if low == "z" || low == "gmt" || low == "utc" || low == "ut" {
+            continue; // zero offset
+        }
+        if low.starts_with("gmt") || low.starts_with("utc") {
+            offset = parse_zone(&t[3..])?;
+            continue;
+        }
+        // a signed field after the year/time is a zone offset ("-0500");
+        // before them it's the (possibly negative) year
+        if (t.starts_with('+') || t.starts_with('-')) && (year.is_some() || have_time) {
+            if let Some(o) = parse_zone(t) {
+                offset = o;
+                continue;
+            }
+        }
+        if let Ok(v) = t.parse::<i64>() {
+            if month.is_none() {
+                pre_ints.push(v);
+            } else {
+                post_ints.push(v);
+            }
+            continue;
+        }
+        if t.bytes().all(|b| b.is_ascii_alphabetic()) {
+            continue; // weekday / timezone-name noise ("Thu", "PST", ...)
+        }
+        return None;
+    }
+    // ints before the month name fill the day slot first; ints after it
+    // fill day then year (covers "Jan 01 1970" and "01 Jan 1970" alike)
+    for v in pre_ints.iter().chain(post_ints.iter()) {
+        if (1..=31).contains(v) && day.is_none() {
+            day = Some(*v);
+        } else if year.is_none() {
+            year = Some(*v);
+        }
+    }
+    let (m, d, y) = (month?, day?, year?);
+    if !(1..=12).contains(&m) || !(1..=days_in_month(y, m) as i64).contains(&d) {
+        return None;
+    }
+    Some(
+        days_from_civil(y, m, d as u32) as f64 * 86_400_000.0
+            + tod.0 * 3_600_000.0
+            + tod.1 * 60_000.0
+            + tod.2 * 1_000.0
+            + tod.3
+            - offset,
+    )
 }
 
 fn date_parse(i: &mut Interp, _t: &Value, a: &[Value]) -> NResult {
-    let s = match arg(a, 0) {
-        Value::Str(s) => s.to_string(),
-        _ => return Ok(Value::Num(f64::NAN)),
-    };
-    // ISO-ish: YYYY-MM-DD[THH:MM[:SS[.mmm]]][Z]
+    let s = i.to_str(&arg(a, 0))?;
     let s = s.trim();
-    let (dpart, tpart) = s
-        .split_once(['T', ' '])
-        .map(|(d, t)| (d, Some(t)))
-        .unwrap_or((s, None));
-    let dsegs: Vec<i64> = dpart.split('-').filter_map(|x| x.parse().ok()).collect();
-    if dsegs.len() < 3 {
-        return Ok(Value::Num(f64::NAN));
-    }
-    let mut ms = days_from_civil(dsegs[0], dsegs[1] as u32, dsegs[2] as u32) as f64 * 86_400_000.0;
-    if let Some(t) = tpart {
-        let t = t.trim_end_matches('Z');
-        let tsegs: Vec<f64> = t.split(':').map(|x| x.parse().unwrap_or(0.0)).collect();
-        if !tsegs.is_empty() {
-            ms += tsegs[0] * 3_600_000.0;
-        }
-        if tsegs.len() > 1 {
-            ms += tsegs[1] * 60_000.0;
-        }
-        if tsegs.len() > 2 {
-            ms += tsegs[2] * 1000.0;
-        }
-    }
-    let _ = i;
+    let ms = parse_iso_ms(s)
+        .or_else(|| parse_other_ms(s))
+        .filter(|ms| ms.is_finite() && ms.abs() <= 8.64e15)
+        .unwrap_or(f64::NAN);
     Ok(Value::Num(ms))
 }
 
@@ -8295,7 +8678,13 @@ fn reflect_get(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 
 fn reflect_set(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let k = i.to_propkey(&arg(args, 1))?;
-    i.set_prop(&arg(args, 0), k, arg(args, 2))?;
+    let target = arg(args, 0);
+    let receiver = arg(args, 3);
+    let receiver = if matches!(receiver, Value::Und) { target.clone() } else { receiver };
+    match &target {
+        Value::Obj(o) => i.obj_set(o, k, arg(args, 2), &receiver)?,
+        _ => i.set_prop(&target, k, arg(args, 2))?,
+    }
     Ok(Value::Bool(true))
 }
 
@@ -8438,10 +8827,18 @@ fn to_uint32_num(n: f64) -> u32 {
     n.trunc().rem_euclid(4294967296.0) as u32
 }
 
-/// spec AdvanceStringIndex — chars are already whole code points here, so
-/// unicode and non-unicode both step by one.
-fn advance_string_index(_chars: &[char], index: usize, _unicode: bool) -> usize {
-    index + 1
+/// spec AdvanceStringIndex — a surrogate pair steps by 2 code units for
+/// unicode regexps, otherwise by 1.
+fn advance_string_index(chars: &[u16], index: usize, unicode: bool) -> usize {
+    if unicode
+        && index + 1 < chars.len()
+        && (0xD800..0xDC00).contains(&(chars[index] as u32))
+        && (0xDC00..0xE000).contains(&(chars[index + 1] as u32))
+    {
+        index + 2
+    } else {
+        index + 1
+    }
 }
 
 /// spec GetMethod: nullish → None, callable → Some, else TypeError.
@@ -8515,17 +8912,17 @@ fn set_strict(i: &mut Interp, ov: &Value, key: &str, v: Value) -> Result<(), Val
     i.set_prop_str(ov, key, v)
 }
 
-fn chars_str(chars: &[char], a: usize, b: usize) -> Value {
-    let s: String = chars[a..b].iter().collect();
+fn chars_str(chars: &[u16], a: usize, b: usize) -> Value {
+    let s = String::from_utf16_lossy(&chars[a..b]);
     Value::Str(Rc::from(s.as_str()))
 }
 
-fn chars_string(chars: &[char]) -> String {
-    chars.iter().collect()
+fn chars_string(chars: &[u16]) -> String {
+    String::from_utf16_lossy(chars)
 }
 
 /// exec result: array [m0, g1..gn] + index/input/groups/indices props.
-fn match_obj(i: &mut Interp, chars: &[char], re: &Regex, m: &RxMatch) -> Value {
+fn match_obj(i: &mut Interp, chars: &[u16], re: &Regex, m: &RxMatch) -> Value {
     let mut items = vec![chars_str(chars, m.start, m.end)];
     for g in 1..=re.n_groups {
         items.push(match m.caps.get(g).copied().flatten() {
@@ -8577,7 +8974,7 @@ fn match_obj(i: &mut Interp, chars: &[char], re: &Regex, m: &RxMatch) -> Value {
     Value::Obj(arr)
 }
 
-fn groups_obj(i: &mut Interp, chars: &[char], re: &Regex, m: &RxMatch) -> Value {
+fn groups_obj(i: &mut Interp, chars: &[u16], re: &Regex, m: &RxMatch) -> Value {
     // spec: the named-capture groups object has a null prototype
     let g = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
     for (name, idx) in &re.names {
@@ -8593,7 +8990,7 @@ fn groups_obj(i: &mut Interp, chars: &[char], re: &Regex, m: &RxMatch) -> Value 
 /// Annex-B `UpdateRegExpStatics`: refresh %RegExp%'s legacy slots after a
 /// successful built-in exec. Regexps allocated by a subclass newTarget
 /// (marked at construction) invalidate the slots instead.
-fn re_update_statics(i: &mut Interp, this: &Value, chars: &[char], m: &RxMatch) {
+fn re_update_statics(i: &mut Interp, this: &Value, chars: &[u16], m: &RxMatch) {
     let st = re_state(i);
     let legacy_off = matches!(this, Value::Obj(o)
         if o.borrow().props.contains_key(&PropKey::Sym(SYM_RE_NOLEGACY)));
@@ -8637,7 +9034,7 @@ fn regexp_run(
     i: &mut Interp,
     this: &Value,
     re: &Regex,
-    chars: &[char],
+    chars: &[u16],
 ) -> Result<Option<RxMatch>, Value> {
     let lv = i.get_prop_str(this, "lastIndex")?;
     let last_index = to_length_num(i.to_num(&lv)?);
@@ -8681,7 +9078,9 @@ fn regexp_builtin_exec(i: &mut Interp, r: &Value, s: &str) -> Result<Value, Valu
     let Some(re) = re_of(r) else {
         return Err(i.type_err("RegExp exec called on incompatible receiver"));
     };
-    let chars: Vec<char> = s.chars().collect();
+    // JS strings are UTF-16 — the matcher works on code units (with `u`/`v`
+    // consuming surrogate pairs atomically)
+    let chars: Vec<u16> = s.encode_utf16().collect();
     match regexp_run(i, r, &re, &chars)? {
         Some(m) => Ok(match_obj(i, &chars, &re, &m)),
         None => Ok(Value::Null),
@@ -8942,11 +9341,11 @@ fn re_get_flags(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     Ok(Value::Str(Rc::from(out.as_str())))
 }
 
-/// `get unicodeSets` — the `v` flag isn't implemented, so this is always
-/// false on real regexps (undefined on %RegExp.prototype%, TypeError else).
+/// `get unicodeSets` — reflects the `v` flag (undefined on
+/// %RegExp.prototype%, TypeError on other non-regexp receivers).
 fn re_get_v(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     match re_of(this) {
-        Some(_) => Ok(Value::Bool(false)),
+        Some(re) => Ok(Value::Bool(re.unicode_sets)),
         None => {
             if let Value::Obj(o) = this {
                 if Rc::ptr_eq(o, &i.p.regexp) {
@@ -9041,7 +9440,7 @@ fn re_sym_match(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     set_strict(i, rx, "lastIndex", Value::Num(0.0))?;
     let arr = i.new_arr(Vec::new());
     let a = Value::Obj(arr);
-    let chars: Vec<char> = s.chars().collect();
+    let chars: Vec<u16> = s.encode_utf16().collect();
     let mut n = 0usize;
     loop {
         let result = regexp_exec(i, rx, &s)?;
@@ -9156,7 +9555,7 @@ fn re_striter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let m0 = i.get_prop_str(&m, "0")?;
     let match_str = re_coerce_str(i, &m0)?;
     if match_str.is_empty() {
-        let chars: Vec<char> = s.chars().collect();
+        let chars: Vec<u16> = s.encode_utf16().collect();
         let lv = i.get_prop_str(&rx, "lastIndex")?;
         let this_index = to_length_num(i.to_num(&lv)?);
         let next = advance_string_index(&chars, this_index, unicode);
@@ -9198,8 +9597,8 @@ fn get_substitution(
     named: &Value,
     rep: &str,
 ) -> Result<String, Value> {
-    let chars: Vec<char> = s.chars().collect();
-    let tail_start = (position + matched.chars().count()).min(chars.len());
+    let chars: Vec<u16> = s.encode_utf16().collect();
+    let tail_start = (position + matched.encode_utf16().count()).min(chars.len());
     let mut out = String::new();
     let cs: Vec<char> = rep.chars().collect();
     let n_caps = captures.len();
@@ -9293,7 +9692,7 @@ fn re_sym_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(i.type_err("Symbol.replace called on non-object"));
     }
     let s = re_coerce_str(i, &arg(args, 0))?;
-    let length_s = s.chars().count();
+    let length_s = s.encode_utf16().count();
     let repl_arg = arg(args, 1);
     let functional = i.is_callable(&repl_arg);
     let rep_str = if functional {
@@ -9308,7 +9707,7 @@ fn re_sym_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if global {
         set_strict(i, rx, "lastIndex", Value::Num(0.0))?;
     }
-    let chars: Vec<char> = s.chars().collect();
+    let chars: Vec<u16> = s.encode_utf16().collect();
     // collect all exec results first (spec gathers them before splicing)
     let mut results: Vec<Value> = Vec::new();
     loop {
@@ -9340,7 +9739,7 @@ fn re_sym_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         let n_caps = res_len.saturating_sub(1);
         let matched_v = i.get_prop_str(result, "0")?;
         let matched = re_coerce_str(i, &matched_v)?;
-        let match_len = matched.chars().count();
+        let match_len = matched.encode_utf16().count();
         let idx_v = i.get_prop_str(result, "index")?;
         let pos_num = i.to_num(&idx_v)?.trunc();
         let position = if pos_num.is_nan() || pos_num <= 0.0 {
@@ -9420,7 +9819,7 @@ fn re_sym_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if lim == 0 {
         return Ok(a);
     }
-    let chars: Vec<char> = s.chars().collect();
+    let chars: Vec<u16> = s.encode_utf16().collect();
     let size = chars.len();
     let mut length_a = 0usize;
     if size == 0 {

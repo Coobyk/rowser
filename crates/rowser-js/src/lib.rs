@@ -1760,7 +1760,7 @@ mod tests {
             0.0
         );
         assert_eq!(num("typeof BigInt64Array === 'function' ? 1 : 0"), 1.0);
-        assert!(eval("new BigInt64Array(1)").is_err());
+        assert!(eval("new BigInt64Array(1)").is_ok());
         assert!(b("typeof queueMicrotask === 'function'"));
         assert_eq!(
             num("typeof URL.createObjectURL(new Blob()) === 'string' ? 1 : 0"),

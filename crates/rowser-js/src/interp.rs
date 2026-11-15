@@ -140,8 +140,22 @@ pub type ObjRef = Rc<RefCell<Obj>>;
 /// target's base and key is a separate phase from storing the value.
 enum LRef {
     Prop(Value, PropKey),
+    /// member base + unevaluated-key value — ToPropertyKey is deferred
+    /// to PutValue (ES2019+ assignment evaluation order)
+    PropV(Value, Value),
     /// `super.x` — home object and receiver captured at eval time
     Super(ObjRef, Value, PropKey),
+    SuperV(ObjRef, Value, Value),
+    /// identifier resolved to a specific env record (the reference's
+    /// [[Base]] survives mid-RHS mutation of the scope chain)
+    Env(EnvRef, Rc<str>),
+    /// identifier resolved through a `with` object env record — the
+    /// base is the env record, so PutValue re-checks HasProperty at
+    /// store time (strict: missing → ReferenceError)
+    WithObj(ObjRef, Rc<str>),
+    /// identifier found nowhere — strict PutValue throws, sloppy writes
+    /// a global property
+    Unres(Rc<str>),
 }
 
 /// A destructuring element whose member target has already resolved its
@@ -306,6 +320,9 @@ impl PropMap {
     #[inline]
     pub fn contains_str(&self, k: &str) -> bool {
         self.map.contains_key(k)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
     }
     /// iteration in insertion order
     pub fn iter(&self) -> impl Iterator<Item = (&PropKey, &Prop)> + '_ {
@@ -728,18 +745,19 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
             kind,
             track,
         } => {
-            if let Some(idx) = arr_index(key) {
-                // OOB (resizable shrink) and detached views shadow any
-                // proto-chain value with `undefined` — integer-indexed
-                // exotic behaviour.
+            // 10.4.5.5: canonical numeric strings answer solely from the
+            // element store — no props, no proto chain.
+            if let Some(ni) = canonical_numeric_index(key) {
                 let eff =
                     typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
-                if idx >= eff {
-                    return Some(Value::Und);
-                }
-                if let Some(bytes) = buffer_bytes(buf) {
-                    let bb = bytes.borrow();
-                    return Some(Value::Num(kind.read(&bb, *off + idx * kind.size())));
+                let idx = ni as usize;
+                if ni.fract() == 0.0 && ni >= 0.0 && idx < eff {
+                    if let Some(bytes) = buffer_bytes(buf) {
+                        let bb = bytes.borrow();
+                        return Some(Value::Num(
+                            kind.read(&bb, *off + idx * kind.size()),
+                        ));
+                    }
                 }
                 return Some(Value::Und);
             }
@@ -878,8 +896,10 @@ pub enum Completion {
     /// a statement that produced no value (decls, empty stmts) — the
     /// previous completion value is kept, per spec
     Empty,
-    Break(Option<String>),
-    Continue(Option<String>),
+    /// break/continue carry the accumulated completion value
+    /// (UpdateEmpty) — `None` = empty
+    Break(Option<String>, Option<Value>),
+    Continue(Option<String>, Option<Value>),
     Return(Value),
 }
 
@@ -896,6 +916,9 @@ pub type ERes = Result<Value, Value>;
 struct Hoisted {
     fns: Vec<Rc<FnDef>>,
     vars: Vec<Rc<str>>,
+    /// lexical (let/const/class) declarations at this level — instantiate
+    /// as uninitialized bindings at scope entry (the TDZ)
+    lets: Vec<Rc<str>>,
     /// Annex B block-level function names — hoisted `undefined` into the
     /// var environment in sloppy code (block-scoped binding lives in the
     /// block; see `exec_hoisted_block` + `Stmt::FnDecl` exec)
@@ -1256,35 +1279,83 @@ impl Interp {
     /// WithEnvironmentRecord.HasBinding — `name` binds on the with-object
     /// iff `HasProperty(obj, name)` and `obj[@@unscopables][name]` isn't
     /// truthy (raw lookups — spec traps/getters run in the `&mut` paths)
-    fn with_scope_has(&self, o: &ObjRef, name: &str) -> bool {
-        let key = PropKey::from_str(name);
-        if self.obj_get_raw_chain(o, &key).is_none() {
-            return false;
-        }
-        if let Some(Value::Obj(u)) = self.obj_get_raw_chain(o, &PropKey::Sym(SYM_UNSCOPABLES)) {
-            if let Some(v) = self.obj_get_raw_chain(&u, &key) {
-                if self.to_bool(&v) {
-                    return false;
+    /// HasProperty on the with-object — a proxy fires its `has` trap.
+    fn with_has_prop(&mut self, o: &ObjRef, name: &str) -> Result<bool, Value> {
+        let proxy = {
+            let b = o.borrow();
+            match &b.kind {
+                ObjKind::Proxy { target, handler } => {
+                    Some((target.clone(), handler.clone()))
                 }
+                _ => None,
+            }
+        };
+        if let Some((t, h)) = proxy {
+            return match self.proxy_trap(&h, "has")? {
+                Some(trap) => {
+                    let r = self.call(
+                        &trap,
+                        h,
+                        vec![t, Value::Str(Rc::from(name))],
+                    )?;
+                    Ok(self.to_bool(&r))
+                }
+                None => self.has_prop(&t, &PropKey::from_str(name)),
+            };
+        }
+        self.has_prop(&Value::Obj(o.clone()), &PropKey::from_str(name))
+    }
+
+    /// WithEnvironmentRecord.HasBinding — HasProperty(N), then
+    /// Get(bindings, @@unscopables) and Get(unscopables, N) — all through
+    /// the full MOP so proxies trap and getters fire.
+    fn with_has(&mut self, o: &ObjRef, name: &str) -> Result<bool, Value> {
+        if !self.with_has_prop(o, name)? {
+            return Ok(false);
+        }
+        let u = self.get_prop(
+            &Value::Obj(o.clone()),
+            &PropKey::Sym(SYM_UNSCOPABLES),
+        )?;
+        if let Value::Obj(uo) = &u {
+            let v = self.get_prop(
+                &Value::Obj(uo.clone()),
+                &PropKey::from_str(name),
+            )?;
+            if self.to_bool(&v) {
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
-    /// WithEnvironmentRecord.GetBindingValue — raw get off the with-object
-    fn with_scope_get(&self, o: &ObjRef, name: &str) -> Option<Value> {
-        self.obj_get_raw_chain(o, &PropKey::from_str(name))
+    /// WithEnvironmentRecord.GetBindingValue — HasProperty(N) then
+    /// Get(bindings, N), both observable.
+    fn with_get(&mut self, o: &ObjRef, name: &str) -> Result<Value, Value> {
+        if !self.with_has_prop(o, name)? {
+            // GetBindingValue: missing binding → ReferenceError in
+            // strict code, undefined otherwise (9.1.1.2.4 step 5)
+            if self.cur_strict {
+                return Err(self.ref_err(format!("{name} is not defined")));
+            }
+            return Ok(Value::Und);
+        }
+        self.get_prop(&Value::Obj(o.clone()), &PropKey::from_str(name))
     }
 
-    pub fn env_lookup_st(&self, env: &EnvRef, name: &str) -> Option<(Value, bool)> {
+    pub fn env_lookup_st(
+        &mut self,
+        env: &EnvRef,
+        name: &str,
+    ) -> Result<Option<(Value, bool)>, Value> {
         let mut cur: &EnvRef = env;
         loop {
             if let Some(o) = &cur.obj_env {
-                if self.with_scope_has(o, name) {
-                    return self.with_scope_get(o, name).map(|v| (v, false));
+                if self.with_has(o, name)? {
+                    return self.with_get(o, name).map(|v| Some((v, false)));
                 }
             } else if let Some(b) = cur.vars.borrow().get(name) {
-                return Some((b.val.clone(), b.uninit));
+                return Ok(Some((b.val.clone(), b.uninit)));
             }
             match &cur.parent {
                 Some(p) => cur = p,
@@ -1292,19 +1363,26 @@ impl Interp {
             }
         }
         // fall back to global object properties (globalThis.x = …)
-        self.obj_get_raw_str(&self.p.global, name)
-            .map(|v| (v, false))
+        Ok(self
+            .obj_get_raw_str(&self.p.global, name)
+            .map(|v| (v, false)))
     }
 
-    pub fn env_lookup(&self, env: &EnvRef, name: &str) -> Option<Value> {
-        self.env_lookup_st(env, name).map(|(v, _)| v)
+    pub fn env_lookup(
+        &mut self,
+        env: &EnvRef,
+        name: &str,
+    ) -> Result<Option<Value>, Value> {
+        Ok(self.env_lookup_st(env, name)?.map(|(v, _)| v))
     }
 
     pub fn env_assign(&mut self, env: &EnvRef, name: &str, v: Value) -> Result<(), Value> {
         let mut cur: &EnvRef = env;
         loop {
             if let Some(o) = &cur.obj_env {
-                if self.with_scope_has(o, name) {
+                // SetMutableBinding on an object env: plain HasProperty —
+                // @@unscopables is only consulted by HasBinding at resolve time
+                if self.has_prop(&Value::Obj(o.clone()), &PropKey::from_str(name))? {
                     let o = Value::Obj(o.clone());
                     return self.set_prop_str(&o, name, v);
                 }
@@ -1312,6 +1390,12 @@ impl Interp {
             {
                 let mut vars = cur.vars.borrow_mut();
                 if let Some(b) = vars.get_mut(name) {
+                    if b.uninit {
+                        drop(vars);
+                        return Err(self.ref_err(format!(
+                            "Cannot access '{name}' before initialization"
+                        )));
+                    }
                     if !b.mutable {
                         drop(vars);
                         return Err(
@@ -1319,7 +1403,6 @@ impl Interp {
                         );
                     }
                     b.val = v;
-                    b.uninit = false;
                     return Ok(());
                 }
             }
@@ -1709,6 +1792,14 @@ impl Interp {
     }
 
     /// PropKey → the JS value traps receive (`"a"` → Str, symbol → Sym)
+    /// human-readable key name for error messages
+    pub fn key_to_name(&self, k: &PropKey) -> String {
+        match k {
+            PropKey::S(s) => s.to_string(),
+            PropKey::Sym(id) => format!("Symbol({id})"),
+        }
+    }
+
     pub fn key_to_value(&self, k: &PropKey) -> Value {
         match k {
             PropKey::S(s) => {
@@ -1732,6 +1823,7 @@ impl Interp {
                     SYM_MATCHALL => "Symbol.matchAll",
                     SYM_IS_CONCAT_SPREADABLE => "Symbol.isConcatSpreadable",
                     SYM_SPECIES => "Symbol.species",
+                    SYM_UNSCOPABLES => "Symbol.unscopables",
                     _ => "",
                 };
                 Value::Sym(*id, Rc::from(d))
@@ -2023,16 +2115,20 @@ impl Interp {
                             let s = s.clone();
                             return self.call(&s, base.clone(), vec![v]).map(|_| ());
                         }
-                        return Ok(()); // non-setter found → sloppy no-op
+                        // non-setter accessor or data prop on the proto —
+                        // primitives can't create own props → [[Set]] fails
+                        return self.set_fail(&self.key_to_name(&key));
                     }
                     cur = c.borrow().proto.clone();
                 }
-                Ok(())
+                // no prop anywhere: CreateDataProperty on the primitive
+                // receiver fails
+                self.set_fail(&self.key_to_name(&key))
             }
         }
     }
 
-    fn obj_set(
+    pub fn obj_set(
         &mut self,
         o: &ObjRef,
         key: PropKey,
@@ -2071,7 +2167,19 @@ impl Interp {
                     track,
                 } => {
                     if let PropKey::S(s) = &key {
-                        if let Some(idx) = arr_index(s) {
+                        // 10.4.5.6: canonical numeric strings are
+                        // intercepted — TypedArraySetElement when
+                        // receiver === O, silent for invalid indices;
+                        // a valid index with a distinct receiver falls
+                        // through to OrdinarySet (shadows on receiver).
+                        if let Some(ni) = canonical_numeric_index(s) {
+                            let idx = ni as usize;
+                            let valid = ni.fract() == 0.0 && ni >= 0.0
+                                && typed_state(buf, *off, *len, *kind, *track)
+                                    .is_some_and(|eff| idx < eff);
+                            let same_recv = matches!(receiver,
+                                Value::Obj(ro) if Rc::ptr_eq(ro, o));
+                            if !(valid && !same_recv) {
                             let (buf, off, len, kind, track) =
                                 (buf.clone(), *off, *len, *kind, *track);
                             drop(b);
@@ -2080,8 +2188,9 @@ impl Interp {
                             // that resizes/detaches the buffer makes the
                             // write silently vanish instead of throwing.
                             let n = self.to_num(&v)?;
-                            if typed_state(&buf, off, len, kind, track)
-                                .is_some_and(|eff| idx < eff)
+                            if valid
+                                && typed_state(&buf, off, len, kind, track)
+                                    .is_some_and(|eff| idx < eff)
                             {
                                 if buf.borrow().immutable {
                                     return Err(self.type_err(
@@ -2097,26 +2206,27 @@ impl Interp {
                                 }
                             }
                             return Ok(());
+                            }
                         }
                         if matches!(
                             s.as_ref(),
                             "length" | "byteLength" | "byteOffset" | "buffer"
                         ) {
-                            return Ok(()); // accessor-only props: sloppy no-op
+                            return self.set_fail(&self.key_to_name(&key));
                         }
                     }
                 }
                 ObjKind::Bytes(_) => {
                     if let PropKey::S(s) = &key {
                         if s.as_ref() == "byteLength" {
-                            return Ok(());
+                            return self.set_fail(&self.key_to_name(&key));
                         }
                     }
                 }
                 ObjKind::View { .. } => {
                     if let PropKey::S(s) = &key {
                         if matches!(s.as_ref(), "byteLength" | "byteOffset" | "buffer") {
-                            return Ok(());
+                            return self.set_fail(&self.key_to_name(&key));
                         }
                     }
                 }
@@ -2162,6 +2272,83 @@ impl Interp {
         // walk chain looking for existing prop (setter or data)
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
+            // a TypedArray in the chain intercepts canonical numeric
+            // strings via its own [[Set]] (10.4.5.6) — the recursion
+            // parent.[[Set]](P, V, receiver) never reaches the tail
+            if let PropKey::S(sk) = &key {
+                let (ta_hit, write_elem) = {
+                    let b = c.borrow();
+                    if let ObjKind::Typed { buf, off, len, kind, track } =
+                        &b.kind
+                    {
+                        if let Some(ni) = canonical_numeric_index(sk) {
+                            let idx = ni as usize;
+                            let valid = ni.fract() == 0.0 && ni >= 0.0
+                                && typed_state(buf, *off, *len, *kind, *track)
+                                    .is_some_and(|eff| idx < eff);
+                            let same = matches!(receiver,
+                                Value::Obj(ro) if Rc::ptr_eq(ro, &c));
+                            (
+                                true,
+                                if valid && same {
+                                    Some((buf.clone(), *off, *len, *kind, *track, idx))
+                                } else {
+                                    None
+                                },
+                            )
+                        } else {
+                            (false, None)
+                        }
+                    } else {
+                        (false, None)
+                    }
+                };
+                if ta_hit {
+                    match write_elem {
+                        Some((buf, off, len, kind, track, idx)) => {
+                            let n = self.to_num(&v)?;
+                            if typed_state(&buf, off, len, kind, track)
+                                .is_some_and(|eff| idx < eff)
+                            {
+                                if let Some(bytes) = buffer_bytes(&buf) {
+                                    kind.write(
+                                        &mut bytes.borrow_mut(),
+                                        off + idx * kind.size(),
+                                        n,
+                                    );
+                                }
+                            }
+                            return Ok(());
+                        }
+                        // valid index + distinct receiver: the element
+                        // desc is writable → receiver shadows via its
+                        // own [[DefineOwnProperty]] (the tail handles it)
+                        None => {
+                            let ni = canonical_numeric_index(sk).unwrap();
+                            let idx = ni as usize;
+                            let valid = ni.fract() == 0.0 && ni >= 0.0;
+                            if !valid {
+                                return Ok(());
+                            }
+                            let eff_ok = {
+                                let b = c.borrow();
+                                if let ObjKind::Typed { buf, off, len, kind, track } =
+                                    &b.kind
+                                {
+                                    typed_state(buf, *off, *len, *kind, *track)
+                                        .is_some_and(|eff| idx < eff)
+                                } else {
+                                    false
+                                }
+                            };
+                            if !eff_ok {
+                                return Ok(());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             let (found_accessor, found_data, is_own) = {
                 let b = c.borrow();
                 match b.props.get(&key) {
@@ -2173,18 +2360,25 @@ impl Interp {
             if let Some(setter) = found_accessor {
                 return match setter {
                     Some(s) => self.call(&s, receiver.clone(), vec![v]).map(|_| ()),
-                    None => Ok(()),
+                    None => self.set_fail(&self.key_to_name(&key)),
                 };
             }
             if let Some(writable) = found_data {
                 if is_own {
+                    // OrdinarySet: a distinct receiver shadows via its own
+                    // [[DefineOwnProperty]] instead of touching `o`
+                    if let Value::Obj(ro) = receiver {
+                        if !Rc::ptr_eq(ro, o) {
+                            return self.set_on_receiver(receiver, key, v);
+                        }
+                    }
                     // update own prop
                     let mut b = c.borrow_mut();
                     if let ObjKind::Arr(items) = &mut b.kind {
                         let _ = items; // handled below via index path before props
                     }
                     if !writable {
-                        return Ok(()); // non-writable: sloppy no-op
+                        return self.set_fail(&self.key_to_name(&key));
                     }
                     if let ObjKind::Arr(items) = &mut b.kind {
                         if let PropKey::S(s) = &key {
@@ -2227,16 +2421,33 @@ impl Interp {
                     b.props.get_mut(&key).unwrap().val = v;
                     return Ok(());
                 }
-                // prop lives on a proto → shadow with own data prop
-                break;
+                // prop lives on a proto → writable: shadow with own
+                // data prop; non-writable: [[Set]] fails
+                if writable {
+                    break;
+                }
+                return self.set_fail(&self.key_to_name(&key));
             }
             let next = c.borrow().proto.clone();
             cur = next;
         }
-        // define own prop — non-extensible: sloppy silent no-op
+        // chain walk found nothing settable — OrdinarySet creates the
+        // own property on the *receiver* (a proxy traps; a distinct
+        // receiver like `super` or Reflect.set gets the shadow)
+        self.set_on_receiver(receiver, key, v)
+    }
+
+    /// the dense/props insertion half of a set — writes a data prop on
+    /// `o` itself (receiver == object, or an ordinary receiver)
+    fn obj_define_data(
+        &mut self,
+        o: &ObjRef,
+        key: PropKey,
+        v: Value,
+    ) -> Result<(), Value> {
         let mut b = o.borrow_mut();
         if !b.extensible {
-            return Ok(());
+            return self.set_fail(&self.key_to_name(&key));
         }
         let materialized = matches!(b.kind, ObjKind::Args { .. })
             && b.props.get(&key).is_some();
@@ -2314,6 +2525,146 @@ impl Interp {
         Ok(())
     }
 
+    /// [[GetOwnProperty]] on the receiver for OrdinarySet's
+    /// existingDescriptor check — a proxy receiver's
+    /// `getOwnPropertyDescriptor` trap fires. Returns
+    /// Some((is_accessor, writable)) or None.
+    fn recv_own_desc(
+        &mut self,
+        ro: &ObjRef,
+        key: &PropKey,
+    ) -> Result<Option<(bool, bool)>, Value> {
+        let proxy = {
+            let b = ro.borrow();
+            match &b.kind {
+                ObjKind::Proxy { target, handler } => {
+                    Some((target.clone(), handler.clone()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((t, h)) = proxy {
+            return match self.proxy_trap(&h, "getOwnPropertyDescriptor")? {
+                Some(trap) => {
+                    let kv = self.key_to_value(key);
+                    let r = self.call(&trap, h, vec![t, kv])?;
+                    match r {
+                        Value::Und => Ok(None),
+                        Value::Obj(_) => {
+                            let g = self.get_prop_str(&r, "get")?;
+                            let st = self.get_prop_str(&r, "set")?;
+                            let is_acc = !matches!(
+                                (g, st),
+                                (Value::Und, Value::Und)
+                            );
+                            let w = self.get_prop_str(&r, "writable")?;
+                            Ok(Some((is_acc, self.to_bool(&w))))
+                        }
+                        _ => Err(self.type_err(
+                            "proxy getOwnPropertyDescriptor trap must                              return object or undefined",
+                        )),
+                    }
+                }
+                // no trap → forward to the target
+                None => match t {
+                    Value::Obj(to) => self.recv_own_desc(&to, key),
+                    _ => Ok(None),
+                },
+            };
+        }
+        // ordinary: dense/virtual indices count as own writable props
+        {
+            let b = ro.borrow();
+            if let PropKey::S(sk) = key {
+                if let Some(i) = arr_index(sk) {
+                    let virt = match &b.kind {
+                        ObjKind::Arr(items) => i < items.len(),
+                        ObjKind::Args { items, .. } => i < items.len()
+                            && !b.holes.as_ref().is_some_and(|h| h.contains(&i)),
+                        ObjKind::Typed { len, .. } => i < *len,
+                        _ => false,
+                    };
+                    if virt {
+                        return Ok(Some((false, true)));
+                    }
+                }
+            }
+            Ok(b.props
+                .get(key)
+                .map(|p| (p.is_accessor(), p.writable)))
+        }
+    }
+
+    /// [[DefineOwnProperty]](P, Desc) on the receiver — a proxy fires its
+    /// `defineProperty` trap with a descriptor object.
+    fn recv_define(
+        &mut self,
+        ro: &ObjRef,
+        key: &PropKey,
+        v: Value,
+        full: bool,
+    ) -> Result<(), Value> {
+        let proxy = {
+            let b = ro.borrow();
+            match &b.kind {
+                ObjKind::Proxy { target, handler } => {
+                    Some((target.clone(), handler.clone()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((t, h)) = proxy {
+            match self.proxy_trap(&h, "defineProperty")? {
+                Some(trap) => {
+                    let d = self.new_obj();
+                    self.set_data(&d, "value", v.clone());
+                    if full {
+                        self.set_data(&d, "writable", Value::Bool(true));
+                        self.set_data(&d, "enumerable", Value::Bool(true));
+                        self.set_data(&d, "configurable", Value::Bool(true));
+                    }
+                    let kv = self.key_to_value(key);
+                    let r =
+                        self.call(&trap, h, vec![t, kv, Value::Obj(d)])?;
+                    if self.to_bool(&r) {
+                        Ok(())
+                    } else {
+                        self.set_fail(&self.key_to_name(key))
+                    }
+                }
+                None => match t {
+                    Value::Obj(to) => {
+                        self.recv_define(&to, key, v, full)
+                    }
+                    _ => self.set_fail(&self.key_to_name(key)),
+                },
+            }
+        } else {
+            self.obj_define_data(ro, key.clone(), v)
+        }
+    }
+
+    /// OrdinarySet tail — walk produced no settable prop: the own prop
+    /// materializes on `receiver` per spec (existingDescriptor → partial
+    /// define, missing → CreateDataProperty).
+    fn set_on_receiver(
+        &mut self,
+        receiver: &Value,
+        key: PropKey,
+        v: Value,
+    ) -> Result<(), Value> {
+        let Value::Obj(ro) = receiver else {
+            return self.set_fail(&self.key_to_name(&key));
+        };
+        match self.recv_own_desc(ro, &key)? {
+            Some((true, _)) | Some((_, false)) => {
+                self.set_fail(&self.key_to_name(&key))
+            }
+            Some(_) => self.recv_define(ro, &key, v, false),
+            None => self.recv_define(ro, &key, v, true),
+        }
+    }
+
     /// `set_prop` by borrowed string key — `obj.name = v` fast path.
     pub fn set_prop_str(&mut self, base: &Value, key: &str, v: Value) -> Result<(), Value> {
         match base {
@@ -2342,17 +2693,39 @@ impl Interp {
                             let s = s.clone();
                             return self.call(&s, base.clone(), vec![v]).map(|_| ());
                         }
-                        return Ok(()); // non-setter found → sloppy no-op
+                        // non-setter accessor or data prop on the proto —
+                        // primitives can't create own props → [[Set]] fails
+                        return self.set_fail(key);
                     }
                     cur = c.borrow().proto.clone();
                 }
-                Ok(())
+                self.set_fail(key)
             }
         }
     }
 
     /// `obj_set` by borrowed string key.
     fn obj_set_str(&mut self, o: &ObjRef, key: &str, v: Value, receiver: &Value) -> Result<(), Value> {
+        // proxy set trap fires before anything else
+        if let ObjKind::Proxy { target, handler } = &o.borrow().kind {
+            let (t, h, r) = (target.clone(), handler.clone(), receiver.clone());
+            return match self.proxy_trap(&h, "set")? {
+                Some(trap) => {
+                    let kv = Value::Str(Rc::from(key));
+                    let r2 = self.call(&trap, h, vec![t, kv, v, r])?;
+                    if self.to_bool(&r2) {
+                        Ok(())
+                    } else {
+                        Err(self.type_err("proxy set trap returned falsy"))
+                    }
+                }
+                // spec fallback: target.[[Set]](P, V, Receiver)
+                None => match t {
+                    Value::Obj(to) => self.obj_set_str(&to, key, v, &r),
+                    _ => Ok(()),
+                },
+            };
+        }
         // integer-indexed writes + read-only virtuals on binary views
         {
             let b = o.borrow();
@@ -2364,15 +2737,23 @@ impl Interp {
                     kind,
                     track,
                 } => {
-                    if let Some(idx) = arr_index(key) {
+                    if let Some(ni) = canonical_numeric_index(key) {
+                        let idx = ni as usize;
+                        let valid = ni.fract() == 0.0 && ni >= 0.0
+                            && typed_state(buf, *off, *len, *kind, *track)
+                                .is_some_and(|eff| idx < eff);
+                        let same_recv = matches!(receiver,
+                            Value::Obj(ro) if Rc::ptr_eq(ro, o));
+                        if !(valid && !same_recv) {
                         let (buf, off, len, kind, track) =
                             (buf.clone(), *off, *len, *kind, *track);
                         drop(b);
                         // ToNumber before the bounds check (spec
                         // IntegerIndexedElementSet).
                         let n = self.to_num(&v)?;
-                        if typed_state(&buf, off, len, kind, track)
-                            .is_some_and(|eff| idx < eff)
+                        if valid
+                            && typed_state(&buf, off, len, kind, track)
+                                .is_some_and(|eff| idx < eff)
                         {
                             if buf.borrow().immutable {
                                 return Err(self.type_err(
@@ -2388,19 +2769,20 @@ impl Interp {
                             }
                         }
                         return Ok(());
+                        }
                     }
                     if matches!(key, "length" | "byteLength" | "byteOffset" | "buffer") {
-                        return Ok(()); // accessor-only props: sloppy no-op
+                        return self.set_fail(key);
                     }
                 }
                 ObjKind::Bytes(_) => {
                     if key == "byteLength" {
-                        return Ok(());
+                        return self.set_fail(key);
                     }
                 }
                 ObjKind::View { .. } => {
                     if matches!(key, "byteLength" | "byteOffset" | "buffer") {
-                        return Ok(());
+                        return self.set_fail(key);
                     }
                 }
                 _ => {}
@@ -2437,6 +2819,77 @@ impl Interp {
         // walk chain looking for existing prop (setter or data)
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
+            // TypedArray chain interception (10.4.5.6) — see obj_set
+            {
+                let (ta_hit, write_elem) = {
+                    let b = c.borrow();
+                    if let ObjKind::Typed { buf, off, len, kind, track } =
+                        &b.kind
+                    {
+                        if let Some(ni) = canonical_numeric_index(key) {
+                            let idx = ni as usize;
+                            let valid = ni.fract() == 0.0 && ni >= 0.0
+                                && typed_state(buf, *off, *len, *kind, *track)
+                                    .is_some_and(|eff| idx < eff);
+                            let same = matches!(receiver,
+                                Value::Obj(ro) if Rc::ptr_eq(ro, &c));
+                            (
+                                true,
+                                if valid && same {
+                                    Some((buf.clone(), *off, *len, *kind, *track, idx))
+                                } else {
+                                    None
+                                },
+                            )
+                        } else {
+                            (false, None)
+                        }
+                    } else {
+                        (false, None)
+                    }
+                };
+                if ta_hit {
+                    match write_elem {
+                        Some((buf, off, len, kind, track, idx)) => {
+                            let n = self.to_num(&v)?;
+                            if typed_state(&buf, off, len, kind, track)
+                                .is_some_and(|eff| idx < eff)
+                            {
+                                if let Some(bytes) = buffer_bytes(&buf) {
+                                    kind.write(
+                                        &mut bytes.borrow_mut(),
+                                        off + idx * kind.size(),
+                                        n,
+                                    );
+                                }
+                            }
+                            return Ok(());
+                        }
+                        None => {
+                            let ni = canonical_numeric_index(key).unwrap();
+                            let idx = ni as usize;
+                            if !(ni.fract() == 0.0 && ni >= 0.0) {
+                                return Ok(());
+                            }
+                            let eff_ok = {
+                                let b = c.borrow();
+                                if let ObjKind::Typed { buf, off, len, kind, track } =
+                                    &b.kind
+                                {
+                                    typed_state(buf, *off, *len, *kind, *track)
+                                        .is_some_and(|eff| idx < eff)
+                                } else {
+                                    false
+                                }
+                            };
+                            if !eff_ok {
+                                return Ok(());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             let (found_accessor, found_data, is_own) = {
                 let b = c.borrow();
                 match b.props.get_str(key) {
@@ -2448,15 +2901,24 @@ impl Interp {
             if let Some(setter) = found_accessor {
                 return match setter {
                     Some(s) => self.call(&s, receiver.clone(), vec![v]).map(|_| ()),
-                    None => Ok(()),
+                    None => self.set_fail(key),
                 };
             }
             if let Some(writable) = found_data {
                 if is_own {
+                    if let Value::Obj(ro) = receiver {
+                        if !Rc::ptr_eq(ro, o) {
+                            return self.set_on_receiver(
+                                receiver,
+                                PropKey::from_str(key),
+                                v,
+                            );
+                        }
+                    }
                     // update own prop
                     let mut b = c.borrow_mut();
                     if !writable {
-                        return Ok(()); // non-writable: sloppy no-op
+                        return self.set_fail(key);
                     }
                     if let ObjKind::Arr(items) = &mut b.kind {
                         if key == "length" {
@@ -2495,94 +2957,19 @@ impl Interp {
                     b.props.get_str_mut(key).unwrap().val = v;
                     return Ok(());
                 }
-                // prop lives on a proto → shadow with own data prop
-                break;
+                // prop lives on a proto → writable: shadow with own
+                // data prop; non-writable: [[Set]] fails
+                if writable {
+                    break;
+                }
+                return self.set_fail(key);
             }
             let next = c.borrow().proto.clone();
             cur = next;
         }
-        // define own prop — non-extensible: sloppy silent no-op
-        let mut b = o.borrow_mut();
-        if !b.extensible {
-            return Ok(());
-        }
-        let materialized = matches!(b.kind, ObjKind::Args { .. })
-            && b.props.get_str(key).is_some();
-        if materialized {
-            if let Some(p) = b.props.get_str_mut(key) {
-                p.val = v.clone();
-            }
-        }
-        match &mut b.kind {
-            ObjKind::Args { items, env, map } => {
-                if let Some(i) = arr_index(key) {
-                    if materialized {
-                        if i < items.len() {
-                            items[i] = v.clone();
-                            if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
-                                let name = name.clone();
-                                if let Some(bnd) = e.vars.borrow_mut().get_mut(name.as_ref()) {
-                                    bnd.val = v;
-                                }
-                            }
-                        }
-                        return Ok(());
-                    }
-                    if i < items.len() {
-                        items[i] = v.clone();
-                        if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
-                            let name = name.clone();
-                            if let Some(bnd) =
-                                e.vars.borrow_mut().get_mut(name.as_ref())
-                            {
-                                bnd.val = v;
-                            }
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-            _ => {}
-        }
-        if let ObjKind::Arr(items) = &mut b.kind {
-            if let Some(i) = arr_index(key) {
-                if i >= items.len() && i <= 8_000_000 {
-                    items.resize(i + 1, Value::Und);
-                }
-                if i < items.len() {
-                    items[i] = v;
-                    if let Some(h) = &mut b.holes {
-                        h.remove(&i);
-                    }
-                }
-                return Ok(());
-            }
-            if key == "length" {
-                if let Value::Num(n) = v {
-                    let n = n.max(0.0).min(4294967295.0) as usize;
-                    if n < items.len() {
-                        items.truncate(n);
-                        if let Some(h) = &mut b.holes {
-                            h.retain(|&h| h < n);
-                        }
-                    }
-                    b.props.insert_str(
-                        "length",
-                        Prop {
-                            val: Value::Num(n as f64),
-                            writable: true,
-                            enumerable: false,
-                            configurable: false,
-                            get: None,
-                            set: None,
-                        },
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        b.props.insert_str(key, Prop::data(v));
-        Ok(())
+        // chain walk found nothing settable — the own prop is created
+        // on the receiver per OrdinarySet
+        self.set_on_receiver(receiver, PropKey::from_str(key), v)
     }
 
     /// `delete_prop` by borrowed string key.
@@ -2707,12 +3094,15 @@ impl Interp {
                         track,
                     } => {
                         if let PropKey::S(s) = key {
-                            if let Some(i) = arr_index(s) {
+                            if let Some(ni) = canonical_numeric_index(s) {
                                 // spec [[HasProperty]]: a canonical
-                                // integer index answers solely with
+                                // numeric index answers solely with
                                 // IsValidIntegerIndex — never props/proto.
-                                return Ok(typed_state(buf, *off, *len, *kind, *track)
-                                    .is_some_and(|eff| i < eff));
+                                let i = ni as usize;
+                                return Ok(ni.fract() == 0.0
+                                    && ni >= 0.0
+                                    && typed_state(buf, *off, *len, *kind, *track)
+                                        .is_some_and(|eff| i < eff));
                             }
                         }
                     }
@@ -2943,14 +3333,25 @@ impl Interp {
             }
             _ => {}
         }
+        // [[OwnPropertyKeys]] order: integer indices ascending, then
+        // string keys in insertion order (symbols are separate)
+        let mut ints: Vec<(usize, String)> = Vec::new();
+        let mut rest: Vec<String> = Vec::new();
         for (k, p) in b.props.iter() {
             if !p.enumerable {
                 continue;
             }
             if let PropKey::S(s) = k {
-                out.push(s.to_string());
+                if let Some(i) = js_int_index(s) {
+                    ints.push((i, s.to_string()));
+                } else {
+                    rest.push(s.to_string());
+                }
             }
         }
+        ints.sort_by_key(|(i, _)| *i);
+        out.extend(ints.into_iter().map(|(_, s)| s));
+        out.extend(rest);
         out
     }
 
@@ -3795,6 +4196,8 @@ impl Interp {
     /// exprs get NamedEvaluation (`(0, function(){})` does not).
     fn is_anon_fn_def(e: &Expr) -> bool {
         match e {
+            // spec IsAnonymousFunctionDefinition looks through parens
+            Expr::Paren(inner) => Self::is_anon_fn_def(inner),
             Expr::Fn(d) => d.name.is_none(),
             Expr::Class(c) => c.name.is_none(),
             _ => false,
@@ -3842,12 +4245,45 @@ impl Interp {
                 return Err(self.syntax_err("'super' keyword unexpected here"));
             };
             let this = fscope.thisv.borrow().clone();
-            let k = self.member_key(prop, env)?;
-            return Ok(LRef::Super(home, this, k));
+            if let Expr::Str(s) = &**prop {
+                return Ok(LRef::Super(home, this, PropKey::from_str(s)));
+            }
+            let pv = self.eval_expr(prop, env)?;
+            return Ok(LRef::SuperV(home, this, pv));
         }
         let ov = self.eval_expr(obj, env)?;
-        let k = self.member_key(prop, env)?;
-        Ok(LRef::Prop(ov, k))
+        if let Expr::Str(s) = &**prop {
+            return Ok(LRef::Prop(ov, PropKey::from_str(s)));
+        }
+        let pv = self.eval_expr(prop, env)?;
+        Ok(LRef::PropV(ov, pv))
+    }
+
+    /// Resolve an identifier reference — the binding location is
+    /// captured now (an object-env base becomes a property reference on
+    /// the object itself) so PutValue writes through the initially
+    /// created reference per spec
+    fn eval_lref_ident(
+        &mut self,
+        env: &EnvRef,
+        name: &str,
+    ) -> Result<LRef, Value> {
+        let mut cur: &EnvRef = env;
+        loop {
+            if let Some(o) = &cur.obj_env {
+                if self.with_has(o, name)? {
+                    return Ok(LRef::WithObj(o.clone(), self.intern(name)));
+                }
+            }
+            if cur.vars.borrow().contains_key(name) {
+                return Ok(LRef::Env(cur.clone(), self.intern(name)));
+            }
+            match &cur.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        Ok(LRef::Unres(self.intern(name)))
     }
 
     fn member_key(&mut self, prop: &Expr, env: &EnvRef) -> Result<PropKey, Value> {
@@ -3858,15 +4294,99 @@ impl Interp {
         self.to_propkey(&pv)
     }
 
+    /// A [[Set]] that spec-returns false: silent in sloppy, TypeError in strict.
+    fn set_fail(&mut self, key: &str) -> Result<(), Value> {
+        if self.cur_strict {
+            Err(self.type_err(format!(
+                "Cannot assign to read only property '{key}'"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
     fn put_lref(&mut self, lr: LRef, v: Value) -> Result<(), Value> {
         match lr {
             LRef::Prop(b, k) => self.set_prop(&b, k, v),
+            LRef::PropV(b, kv) => {
+                let k = self.to_propkey(&kv)?;
+                self.set_prop(&b, k, v)
+            }
             LRef::Super(home, this, k) => {
                 let parent = home.borrow().proto.clone();
                 let Some(parent) = parent else {
-                    return Ok(());
+                    return Err(self.type_err(
+                        "Cannot set property of null (via super)"
+                    ));
                 };
                 self.obj_set(&parent, k, v, &this)
+            }
+            LRef::SuperV(home, this, kv) => {
+                let parent = home.borrow().proto.clone();
+                let Some(parent) = parent else {
+                    return Err(self.type_err(
+                        "Cannot set property of null (via super)"
+                    ));
+                };
+                let k = self.to_propkey(&kv)?;
+                self.obj_set(&parent, k, v, &this)
+            }
+            LRef::Env(sc, name) => {
+                let mut vars = sc.vars.borrow_mut();
+                match vars.get_mut(name.as_ref()) {
+                    Some(b) => {
+                        if b.uninit {
+                            drop(vars);
+                            return Err(self.ref_err(format!(
+                                "Cannot access '{name}' before initialization"
+                            )));
+                        }
+                        if !b.mutable {
+                            drop(vars);
+                            return Err(self.type_err(format!(
+                                "Assignment to constant variable '{name}'"
+                            )));
+                        }
+                        b.val = v;
+                        Ok(())
+                    }
+                    None => {
+                        vars.insert(
+                            name,
+                            Binding {
+                                val: v, mutable: true, uninit: false,
+                                deletable: false, lexical: false,
+                            },
+                        );
+                        Ok(())
+                    }
+                }
+            }
+            LRef::WithObj(o, name) => {
+                // SetMutableBinding on the object env record:
+                // stillExists = HasProperty (traps fire), strict throws
+                // ReferenceError when it went missing
+                if !self.with_has_prop(&o, &name)? && self.cur_strict {
+                    return Err(
+                        self.ref_err(format!("{name} is not defined"))
+                    );
+                }
+                self.set_prop(&Value::Obj(o), PropKey::S(name), v)
+            }
+            LRef::Unres(name) => {
+                if self.cur_strict {
+                    return Err(self.ref_err(format!("{name} is not defined")));
+                }
+                // unresolved sloppy write creates a global property
+                self.global.vars.borrow_mut().insert(
+                    name.clone(),
+                    Binding {
+                        val: v.clone(), mutable: true, uninit: false,
+                        deletable: false, lexical: false,
+                    },
+                );
+                self.declare_global_prop(&name, v);
+                Ok(())
             }
         }
     }
@@ -4005,7 +4525,7 @@ impl Interp {
                                     }
                                 }
                                 let arr = Value::Obj(self.new_arr(rest));
-                                self.pat_bind(scope, p, arr, mode)?;
+                                self.pat_bind_prepped(scope, pp, arr, mode)?;
                             }
                         }
                     }
@@ -4014,9 +4534,12 @@ impl Interp {
                 if !done && !it_err {
                     // pattern finished while the iterator is still open —
                     // IteratorClose (normal completion). On abrupt the
-                    // close error is swallowed per spec.
+                    // close error is swallowed per spec — EXCEPT a
+                    // suspended `return()` (gen-abort): that completion
+                    // is a return, not a throw, so a close error wins.
                     match (&res, crate::builtins::iter_lazy_close(self, &mut it)) {
                         (Ok(()), Err(ce)) => return Err(ce),
+                        (Err(e), Err(ce)) if is_gen_abort(e) => return Err(ce),
                         _ => {}
                     }
                 }
@@ -4031,9 +4554,19 @@ impl Interp {
                 for e in elems {
                     if let ast::PropKey::Str(s) = &e.key {
                         if s.as_str() == REST_PAT_KEY {
+                            // the rest target's lref evaluates before
+                            // CopyDataProperties runs
+                            let pp_rest = self.prep_pat(scope, &e.val)?;
                             // `{...rest}` — CopyDataProperties over own
                             // enumerable keys, string AND symbol, minus
-                            // the keys already consumed by the pattern
+                            // the keys already consumed by the pattern.
+                            // a primitive source is boxed (its own
+                            // enumerable props still copy)
+                            let v = if matches!(v, Value::Obj(_)) {
+                                v.clone()
+                            } else {
+                                self.to_object(&v)?
+                            };
                             let rest = self.new_obj();
                             if let Value::Obj(src) = &v {
                                 let mut taken: HashSet<String> = elems
@@ -4092,7 +4625,7 @@ impl Interp {
                                     }
                                 }
                             }
-                            self.pat_bind(scope, &e.val, Value::Obj(rest), mode)?;
+                            self.pat_bind_prepped(scope, pp_rest, Value::Obj(rest), mode)?;
                             continue;
                         }
                     }
@@ -4287,6 +4820,20 @@ impl Interp {
     /// binding) instead of the var boundary. Annex-B nested fn names are
     /// initialized `undefined` at the var boundary in sloppy code.
     fn apply_hoisted_mode(&mut self, h: &Hoisted, scope: &EnvRef, block_scope: bool) {
+        // lexical declarations instantiate as uninitialized bindings at
+        // scope entry — reads/writes before their decl throws (TDZ)
+        if !h.lets.is_empty() {
+            let mut vars = scope.vars.borrow_mut();
+            for name in &h.lets {
+                vars.entry(name.clone()).or_insert(Binding {
+                    val: Value::Und,
+                    mutable: true,
+                    uninit: true,
+                    deletable: false,
+                    lexical: true,
+                });
+            }
+        }
         for name in &h.vars {
             self.declare_var_rc(scope, name, Value::Und);
         }
@@ -4411,6 +4958,14 @@ impl Interp {
             match self.exec_stmt(s, env)? {
                 Completion::Normal(v) => last = Some(v),
                 Completion::Empty => {}
+                // UpdateEmpty: an abrupt with empty [[value]] picks up
+                // the block's accumulated normal completion
+                Completion::Break(l, v) => {
+                    return Ok(Completion::Break(l, v.or(last)));
+                }
+                Completion::Continue(l, v) => {
+                    return Ok(Completion::Continue(l, v.or(last)));
+                }
                 other => return Ok(other),
             }
         }
@@ -4486,7 +5041,7 @@ impl Interp {
                     // Annex B.3.3: executing a block-level fn decl syncs the
                     // block-scoped value into the var-environment binding
                     if !self.cur_strict {
-                        if let Some(fv) = self.env_lookup(env, name) {
+                        if let Some(fv) = self.env_lookup(env, name)? {
                             self.declare_var(env, name, fv);
                         }
                     }
@@ -4522,17 +5077,23 @@ impl Interp {
                     match self.exec_stmt(body, env)? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
-                        Completion::Break(l) => {
+                        Completion::Break(l, v) => {
                             if l.is_some() {
-                                return Ok(Completion::Break(l));
+                                return Ok(Completion::Break(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                             break;
                         }
-                        Completion::Continue(l) => {
+                        Completion::Continue(l, v) => {
                             if l.is_none() || l.as_deref() == my_label.as_deref() {
+                                if let Some(v) = v {
+                                    last = v;
+                                }
                                 continue;
                             }
-                            return Ok(Completion::Continue(l));
+                            return Ok(Completion::Continue(l, v));
                         }
                         r => return Ok(r),
                     }
@@ -4546,15 +5107,21 @@ impl Interp {
                     match self.exec_stmt(body, env)? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
-                        Completion::Break(l) => {
+                        Completion::Break(l, v) => {
                             if l.is_some() {
-                                return Ok(Completion::Break(l));
+                                return Ok(Completion::Break(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                             break;
                         }
-                        Completion::Continue(l) => {
+                        Completion::Continue(l, v) => {
                             if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
-                                return Ok(Completion::Continue(l));
+                                return Ok(Completion::Continue(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                         }
                         r => return Ok(r),
@@ -4632,15 +5199,21 @@ impl Interp {
                     match self.exec_stmt(body, &env_i)? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
-                        Completion::Break(l) => {
+                        Completion::Break(l, v) => {
                             if l.is_some() {
-                                return Ok(Completion::Break(l));
+                                return Ok(Completion::Break(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                             break;
                         }
-                        Completion::Continue(l) => {
+                        Completion::Continue(l, v) => {
                             if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
-                                return Ok(Completion::Continue(l));
+                                return Ok(Completion::Continue(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                         }
                         r => return Ok(r),
@@ -4745,15 +5318,21 @@ impl Interp {
                     match r? {
                         Completion::Normal(v) => last = v,
                         Completion::Empty => {}
-                        Completion::Break(l) => {
+                        Completion::Break(l, v) => {
                             if l.is_some() {
-                                return Ok(Completion::Break(l));
+                                return Ok(Completion::Break(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                             return Ok(Completion::Normal(last));
                         }
-                        Completion::Continue(l) => {
+                        Completion::Continue(l, v) => {
                             if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
-                                return Ok(Completion::Continue(l));
+                                return Ok(Completion::Continue(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                         }
                         r => return Ok(r),
@@ -4838,17 +5417,23 @@ impl Interp {
                     match r {
                         Ok(Completion::Normal(v)) => last = v,
                         Ok(Completion::Empty) => {}
-                        Ok(Completion::Break(l)) => {
+                        Ok(Completion::Break(l, v)) => {
                             let _ = crate::builtins::iter_lazy_close(self, &mut lz);
                             if l.is_some() {
-                                return Ok(Completion::Break(l));
+                                return Ok(Completion::Break(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                             return Ok(Completion::Normal(last));
                         }
-                        Ok(Completion::Continue(l)) => {
+                        Ok(Completion::Continue(l, v)) => {
                             if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
                                 let _ = crate::builtins::iter_lazy_close(self, &mut lz);
-                                return Ok(Completion::Continue(l));
+                                return Ok(Completion::Continue(l, v));
+                            }
+                            if let Some(v) = v {
+                                last = v;
                             }
                         }
                         Ok(r) => {
@@ -4873,8 +5458,20 @@ impl Interp {
                     let mut fns: Vec<&Rc<FnDef>> = Vec::new();
                     let mut block_fns: Vec<&str> = Vec::new();
                     let mut vars: Vec<&str> = Vec::new();
+                    let mut lets: Vec<&str> = Vec::new();
                     for c in cases {
-                        collect_hoisted(&c.body, &mut fns, &mut block_fns, &mut vars);
+                        collect_hoisted(&c.body, &mut fns, &mut block_fns, &mut vars, &mut lets);
+                    }
+                    // case-body lexicals share the switch's one block scope
+                    for n in lets {
+                        let k = self.intern(n);
+                        scope.vars.borrow_mut().insert(
+                            k,
+                            Binding {
+                                val: Value::Und, mutable: true,
+                                uninit: true, deletable: false, lexical: true,
+                            },
+                        );
                     }
                     for n in vars {
                         self.declare_var(&scope, n, Value::Und);
@@ -4919,8 +5516,13 @@ impl Interp {
                             match self.exec_stmt(st, &scope)? {
                                 Completion::Normal(v) => last = v,
                                 Completion::Empty => {}
-                                Completion::Break(None) => break 'cases,
-                                other @ Completion::Break(_) => return Ok(other),
+                                Completion::Break(None, v) => {
+                                    if let Some(v) = v {
+                                        last = v;
+                                    }
+                                    break 'cases;
+                                }
+                                other @ Completion::Break(_, _) => return Ok(other),
                                 other => return Ok(other),
                             }
                         }
@@ -4935,7 +5537,18 @@ impl Interp {
                     _ => unreachable!(),
                 };
                 let sc = Scope::with_obj(env.clone(), o);
-                self.exec_stmt(body, &sc)
+                // UpdateEmpty(C, undefined): an empty completion
+                // materializes as `undefined`
+                match self.exec_stmt(body, &sc)? {
+                    Completion::Empty => Ok(Completion::Normal(Value::Und)),
+                    Completion::Break(l, None) => {
+                        Ok(Completion::Break(l, Some(Value::Und)))
+                    }
+                    Completion::Continue(l, None) => {
+                        Ok(Completion::Continue(l, Some(Value::Und)))
+                    }
+                    other => Ok(other),
+                }
             }
             Stmt::Try {
                 block,
@@ -4993,7 +5606,9 @@ impl Interp {
                     self.pending_label = None;
                 }
                 match res {
-                    Ok(Completion::Break(Some(n))) if n == *label => Ok(Completion::Empty),
+                    Ok(Completion::Break(Some(n), v)) if n == *label => {
+                        Ok(Completion::Normal(v.unwrap_or(Value::Und)))
+                    }
                     other => other,
                 }
             }
@@ -5004,8 +5619,8 @@ impl Interp {
                 };
                 Ok(Completion::Return(v))
             }
-            Stmt::Break(l) => Ok(Completion::Break(l.clone())),
-            Stmt::Continue(l) => Ok(Completion::Continue(l.clone())),
+            Stmt::Break(l) => Ok(Completion::Break(l.clone(), None)),
+            Stmt::Continue(l) => Ok(Completion::Continue(l.clone(), None)),
             Stmt::Import(rec) => {
                 self.modules.push(format!(
                     "import {} from {:?}",
@@ -5311,6 +5926,7 @@ impl Interp {
     // -- expressions ---------------------------------------------------------------
     pub fn eval_expr(&mut self, e: &Expr, env: &EnvRef) -> ERes {
         match e {
+            Expr::Paren(inner) => return self.eval_expr(inner, env),
             Expr::Num(n) => Ok(Value::Num(*n)),
             Expr::BigInt(n) => Ok(self.bigint_obj(*n)),
             // interned: string literals become refcount bumps, not allocs
@@ -5323,7 +5939,7 @@ impl Interp {
                     let v = fs.new_target.borrow().clone();
                     return Ok(v);
                 }
-                match self.env_lookup_st(env, name) {
+                match self.env_lookup_st(env, name)? {
                     Some((_, true)) => Err(self.ref_err(format!(
                         "cannot access '{name}' before initialization"
                     ))),
@@ -5362,7 +5978,7 @@ impl Interp {
                     match el {
                         ArrElem::Expr(ex) => items.push(self.eval_expr(ex, env)?),
                         ArrElem::Hole => items.push(Value::Und),
-                        ArrElem::Spread(ex) => {
+                        ArrElem::Spread(ex) | ArrElem::SpreadTrail(ex) => {
                             let v = self.eval_expr(ex, env)?;
                             items.extend(self.iter_values(&v)?);
                         }
@@ -5370,11 +5986,14 @@ impl Interp {
                 }
                 Ok(Value::Obj(self.new_arr(items)))
             }
+            Expr::ObjDup(_) => {
+                Err(self.syntax_err("duplicate __proto__ property"))
+            }
             Expr::Object(props) => {
                 let o = self.new_obj();
                 for p in props {
                     match &p.val {
-                        PropVal::Spread(ex) => {
+                        PropVal::Spread(ex) | PropVal::SpreadTrail(ex) => {
                             let sv = self.eval_expr(ex, env)?;
                             if let Value::Obj(src) = &sv {
                                 for k in self.own_keys(&sv) {
@@ -5452,7 +6071,7 @@ impl Interp {
                                         ent.set = Some(f);
                                     }
                                 }
-                                PropVal::Spread(_) => unreachable!(),
+                                PropVal::Spread(_) | PropVal::SpreadTrail(_) => unreachable!(),
                             }
                         }
                     }
@@ -5679,9 +6298,13 @@ impl Interp {
                                     return Err(e);
                                 }
                                 GenIn::Return(_) => {
-                                    let _ = crate::builtins::iter_lazy_close(
+                                    // IteratorClose on the delegated
+                                    // iterator — a throw from its return()
+                                    // (or a non-object result) propagates
+                                    // as the generator's own error
+                                    crate::builtins::iter_lazy_close(
                                         self, &mut inner,
-                                    );
+                                    )?;
                                     return Err(gen_abort_v());
                                 }
                             }
@@ -5813,7 +6436,7 @@ impl Interp {
             UnaryOp::Typeof => {
                 // `typeof undefinedIdent` must not throw
                 if let Expr::Ident(n) = expr {
-                    match self.env_lookup_st(env, n) {
+                    match self.env_lookup_st(env, n)? {
                         Some((_, true)) => {
                             return Err(self.ref_err(format!(
                                 "cannot access '{n}' before initialization"
@@ -5860,7 +6483,7 @@ impl Interp {
                     let mut cur = Some(env);
                     while let Some(sc) = cur {
                         if let Some(o) = &sc.obj_env {
-                            if self.with_scope_has(o, n) {
+                            if self.with_has(o, n)? {
                                 let ov = Value::Obj(o.clone());
                                 let b = self.delete_prop(&ov, &PropKey::S(k))?;
                                 return Ok(Value::Bool(b));
@@ -6036,11 +6659,22 @@ impl Interp {
         })
     }
 
+    fn unparen(e: &Expr) -> &Expr {
+        match e {
+            Expr::Paren(inner) => Self::unparen(inner),
+            _ => e,
+        }
+    }
+
     fn eval_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr, env: &EnvRef) -> ERes {
         if op == AssignOp::Assign {
+            // a parenthesized LHS is not an IdentifierRef — the
+            // NamedEvaluation name check inspects the raw target
+            let raw_target = target;
+            let target = Self::unparen(target);
             // destructuring targets arrive as Array/Object literal exprs
             match target {
-                Expr::Array(_) | Expr::Object(_) => {
+                Expr::Array(_) | Expr::Object(_) | Expr::ObjDup(_) => {
                     let v = self.eval_expr(value, env)?;
                     if let Some(pat) = expr_to_pattern(target) {
                         self.assign_pattern(env, &pat, v.clone())?;
@@ -6050,13 +6684,26 @@ impl Interp {
                     return Ok(v);
                 }
                 _ => {
+                    // LHS reference evaluates before the RHS
+                    let lr = match target {
+                        Expr::Member { .. } => Some(self.eval_lref(target, env)?),
+                        Expr::Ident(n) => {
+                            Some(self.eval_lref_ident(env, n)?)
+                        }
+                        _ => None,
+                    };
                     let v = self.eval_expr(value, env)?;
-                    if let Expr::Ident(n) = target {
+                    if let Expr::Ident(n) = raw_target {
                         if Self::is_anon_fn_def(value) {
                             self.maybe_name(&v, n);
                         }
                     }
-                    self.assign_target(env, target, v.clone())?;
+                    match lr {
+                        Some(lr) => self.put_lref(lr, v.clone())?,
+                        None => {
+                            self.assign_target(env, target, v.clone())?;
+                        }
+                    }
                     return Ok(v);
                 }
             }
@@ -6116,6 +6763,9 @@ impl Interp {
     fn assign_target(&mut self, env: &EnvRef, target: &Expr, v: Value) -> Result<Value, Value> {
         match target {
             Expr::Ident(name) => {
+                if name == "$new_target" {
+                    return Err(self.syntax_err("invalid assignment target"));
+                }
                 self.env_assign(env, name, v.clone())?;
                 Ok(v)
             }
@@ -6124,7 +6774,8 @@ impl Interp {
                 self.put_lref(lr, v.clone())?;
                 Ok(v)
             }
-            Expr::Array(_) | Expr::Object(_) => {
+            Expr::Paren(inner) => self.assign_target(env, inner, v),
+            Expr::Array(_) | Expr::Object(_) | Expr::ObjDup(_) => {
                 if let Some(pat) = expr_to_pattern(target) {
                     self.assign_pattern(env, &pat, v.clone())?;
                     Ok(v)
@@ -6295,6 +6946,21 @@ impl Interp {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// Canonical integer-index key for [[OwnPropertyKeys]] ordering —
+/// array indices are ToString(ToUint32) keys below 2^32-1.
+fn js_int_index(s: &str) -> Option<usize> {
+    if s.is_empty() || s.len() > 10 {
+        return None;
+    }
+    if !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        return None;
+    }
+    s.parse::<usize>().ok().filter(|i| *i < 4294967295)
+}
+
 pub fn arr_index(s: &str) -> Option<usize> {
     if s.is_empty() || s.len() > 10 {
         return None;
@@ -6306,6 +6972,21 @@ pub fn arr_index(s: &str) -> Option<usize> {
         return None;
     }
     s.parse::<usize>().ok().filter(|i| *i < (1 << 30))
+}
+
+/// CanonicalNumericIndexString — any string that round-trips through
+/// ToNumber/ToString ("NaN", "-0", "1.5", "20", ...) — the key class
+/// TypedArray exotic methods intercept, wider than `arr_index`.
+pub fn canonical_numeric_index(s: &str) -> Option<f64> {
+    if s == "-0" {
+        return Some(-0.0);
+    }
+    let n: f64 = s.parse().ok()?;
+    if js_num_str(n) == s {
+        Some(n)
+    } else {
+        None
+    }
 }
 
 pub fn to_i32(n: f64) -> i32 {
@@ -6413,8 +7094,9 @@ fn collect_hoisted<'a>(
     fns: &mut Vec<&'a Rc<FnDef>>,
     block_fns: &mut Vec<&'a str>,
     vars: &mut Vec<&'a str>,
+    lets: &mut Vec<&'a str>,
 ) {
-    collect_hoisted_at(stmts, fns, block_fns, vars, true)
+    collect_hoisted_at(stmts, fns, block_fns, vars, lets, true)
 }
 
 fn collect_hoisted_at<'a>(
@@ -6422,10 +7104,11 @@ fn collect_hoisted_at<'a>(
     fns: &mut Vec<&'a Rc<FnDef>>,
     block_fns: &mut Vec<&'a str>,
     vars: &mut Vec<&'a str>,
+    lets: &mut Vec<&'a str>,
     top: bool,
 ) {
     for s in stmts {
-        collect_stmt(s, fns, block_fns, vars, top);
+        collect_stmt(s, fns, block_fns, vars, lets, top);
     }
 }
 
@@ -6434,10 +7117,12 @@ fn collect_hoisted_owned(stmts: &[Stmt]) -> Hoisted {
     let mut fns: Vec<&Rc<FnDef>> = Vec::new();
     let mut block_fns: Vec<&str> = Vec::new();
     let mut vars: Vec<&str> = Vec::new();
-    collect_hoisted(stmts, &mut fns, &mut block_fns, &mut vars);
+    let mut lets: Vec<&str> = Vec::new();
+    collect_hoisted(stmts, &mut fns, &mut block_fns, &mut vars, &mut lets);
     Hoisted {
         fns: fns.into_iter().cloned().collect(),
         vars: vars.into_iter().map(|s| Rc::<str>::from(s)).collect(),
+        lets: lets.into_iter().map(|s| Rc::<str>::from(s)).collect(),
         block_fns: block_fns.into_iter().map(|s| Rc::<str>::from(s)).collect(),
         uses_arguments: false,
     }
@@ -6521,6 +7206,7 @@ fn pat_uses_arguments(p: &Pattern) -> bool {
 
 fn expr_uses_arguments(e: &Expr) -> bool {
     match e {
+        Expr::Paren(inner) => return expr_uses_arguments(inner),
         Expr::Ident(n) => n == "arguments",
         Expr::Num(_)
         | Expr::BigInt(_)
@@ -6534,15 +7220,15 @@ fn expr_uses_arguments(e: &Expr) -> bool {
             .iter()
             .any(|p| matches!(p, TemplPart::Expr(e) if expr_uses_arguments(e))),
         Expr::Array(elems) => elems.iter().any(|el| match el {
-            ArrElem::Expr(e) | ArrElem::Spread(e) => expr_uses_arguments(e),
+            ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => expr_uses_arguments(e),
             ArrElem::Hole => false,
         }),
-        Expr::Object(props) => props.iter().any(|p| {
+        Expr::Object(props) | Expr::ObjDup(props) => props.iter().any(|p| {
             if matches!(&p.key, ast::PropKey::Computed(ex) if expr_uses_arguments(ex)) {
                 return true;
             }
             match &p.val {
-                PropVal::Expr(e) | PropVal::Spread(e) => expr_uses_arguments(e),
+                PropVal::Expr(e) | PropVal::Spread(e) | PropVal::SpreadTrail(e) => expr_uses_arguments(e),
                 PropVal::Method(d) | PropVal::Get(d) | PropVal::Set(d) => {
                     fndef_uses_arguments(d)
                 }
@@ -6699,6 +7385,7 @@ fn collect_stmt<'a>(
     fns: &mut Vec<&'a Rc<FnDef>>,
     block_fns: &mut Vec<&'a str>,
     vars: &mut Vec<&'a str>,
+    lets: &mut Vec<&'a str>,
     top: bool,
 ) {
     let nested = |f: &'a Rc<FnDef>, block_fns: &mut Vec<&'a str>| {
@@ -6719,17 +7406,30 @@ fn collect_stmt<'a>(
                 for (p, _) in decls {
                     collect_pattern_names(p, vars);
                 }
+            } else if top {
+                // lexical decls instantiate uninit at THIS scope —
+                // decls inside nested scopes hoist on their own entry
+                for (p, _) in decls {
+                    collect_pattern_names(p, lets);
+                }
             }
         }
-        Stmt::Block(ss) => collect_hoisted_at(ss, fns, block_fns, vars, false),
+        Stmt::ClassDecl(c) => {
+            if top {
+                if let Some(n) = c.name.as_deref() {
+                    lets.push(n);
+                }
+            }
+        }
+        Stmt::Block(ss) => collect_hoisted_at(ss, fns, block_fns, vars, lets, false),
         Stmt::If { t, e, .. } => {
-            collect_stmt(t, fns, block_fns, vars, false);
+            collect_stmt(t, fns, block_fns, vars, lets, false);
             if let Some(e) = e {
-                collect_stmt(e, fns, block_fns, vars, false);
+                collect_stmt(e, fns, block_fns, vars, lets, false);
             }
         }
         Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
-                collect_stmt(body, fns, block_fns, vars, false)
+                collect_stmt(body, fns, block_fns, vars, lets, false)
             }
         Stmt::For { init, body, .. } => {
             if let Some(ForInit::Var(VarKind::Var, decls)) = init {
@@ -6737,17 +7437,17 @@ fn collect_stmt<'a>(
                     collect_pattern_names(p, vars);
                 }
             }
-            collect_stmt(body, fns, block_fns, vars, false);
+            collect_stmt(body, fns, block_fns, vars, lets, false);
         }
         Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
             if let ForTarget::Var(VarKind::Var, p) = left {
                 collect_pattern_names(p, vars);
             }
-            collect_stmt(body, fns, block_fns, vars, false);
+            collect_stmt(body, fns, block_fns, vars, lets, false);
         }
         Stmt::Switch { cases, .. } => {
             for c in cases {
-                collect_hoisted(&c.body, fns, block_fns, vars);
+                collect_hoisted(&c.body, fns, block_fns, vars, lets);
             }
         }
         Stmt::Try {
@@ -6756,16 +7456,16 @@ fn collect_stmt<'a>(
             finally,
             ..
         } => {
-            collect_hoisted_at(block, fns, block_fns, vars, false);
+            collect_hoisted_at(block, fns, block_fns, vars, lets, false);
             if let Some(h) = handler {
-                collect_hoisted_at(h, fns, block_fns, vars, false);
+                collect_hoisted_at(h, fns, block_fns, vars, lets, false);
             }
             if let Some(f) = finally {
-                collect_hoisted_at(f, fns, block_fns, vars, false);
+                collect_hoisted_at(f, fns, block_fns, vars, lets, false);
             }
         }
-        Stmt::Labeled(_, inner) => collect_stmt(inner, fns, block_fns, vars, false),
-        Stmt::With { body, .. } => collect_stmt(body, fns, block_fns, vars, false),
+        Stmt::Labeled(_, inner) => collect_stmt(inner, fns, block_fns, vars, lets, false),
+        Stmt::With { body, .. } => collect_stmt(body, fns, block_fns, vars, lets, false),
         _ => {}
     }
 }
@@ -6795,7 +7495,8 @@ fn collect_pattern_names<'a>(p: &'a Pattern, out: &mut Vec<&'a str>) {
 /// (for `[a,b] = x` / `{x, y} = o`).
 fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
     match e {
-        Expr::Ident(n) => Some(Pattern::Ident(n.clone())),
+        Expr::Paren(inner) => expr_to_pattern(inner),
+        Expr::Ident(n) if n != "$new_target" => Some(Pattern::Ident(n.clone())),
         Expr::Array(elems) => {
             let mut out = Vec::new();
             for el in elems {
@@ -6812,17 +7513,24 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                         _ => out.push(ArrayPatElem::Elem(expr_to_pattern(ex)?)),
                     },
                     ArrElem::Hole => out.push(ArrayPatElem::Hole),
+                    ArrElem::SpreadTrail(_) => return None,
                     ArrElem::Spread(ex) => {
+                        // rest must be the final element — a mid-list
+                        // spread is not a valid assignment pattern
+                        if !std::ptr::eq(el, elems.last().unwrap()) {
+                            return None;
+                        }
                         out.push(ArrayPatElem::Rest(expr_to_pattern(ex)?));
                     }
                 }
             }
             Some(Pattern::Array(out))
         }
-        Expr::Object(props) => {
+        Expr::Object(props) | Expr::ObjDup(props) => {
             let mut out = Vec::new();
             for p in props {
                 match &p.val {
+                    PropVal::SpreadTrail(_) => return None,
                     PropVal::Spread(ex) => {
                         out.push(ObjPatElem {
                             key: ast::PropKey::Str(REST_PAT_KEY.into()),
@@ -6839,7 +7547,8 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                             } => (expr_to_pattern(target)?, Some((**value).clone())),
                             Expr::Ident(n) => (Pattern::Ident(n.clone()), None),
                             // `{a: [x, y]} = o` / `{a: {b}} = o` / `{a: x.y} = o`
-                            Expr::Array(_) | Expr::Object(_) | Expr::Member { .. } => {
+                            Expr::Array(_) | Expr::Object(_) | Expr::ObjDup(_)
+                            | Expr::Member { .. } => {
                                 (expr_to_pattern(ex)?, None)
                             }
                             _ => return None,

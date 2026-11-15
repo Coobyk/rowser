@@ -22,6 +22,10 @@ pub enum Expr {
     Template(Vec<TemplPart>),
     Array(Vec<ArrElem>),
     Object(Vec<ObjProp>),
+    /// object literal containing a duplicate `__proto__` data prop —
+    /// the early error only applies if it is NOT reinterpreted as a
+    /// destructuring assignment target, so validation is deferred
+    ObjDup(Vec<ObjProp>),
     Fn(Rc<FnDef>),
     Class(Rc<ClassDef>),
     Unary {
@@ -65,6 +69,9 @@ pub enum Expr {
         computed: bool,
         optional: bool,
     },
+    /// `(expr)` — preserves that the source parenthesized it (cover-
+    /// parenthesized targets don't get NamedEvaluation)
+    Paren(Box<Expr>),
     New {
         callee: Box<Expr>,
         args: Vec<Arg>,
@@ -82,6 +89,9 @@ pub enum TemplPart {
 pub enum ArrElem {
     Expr(Expr),
     Spread(Expr),
+    /// `...expr,` — a trailing comma is legal in a literal but makes
+    /// the node unusable as a destructuring pattern
+    SpreadTrail(Expr),
     Hole,
 }
 
@@ -115,6 +125,8 @@ pub enum PropVal {
     Set(Rc<FnDef>),
     /// `...expr`
     Spread(Expr),
+    /// `...expr,` — see ArrElem::SpreadTrail
+    SpreadTrail(Expr),
 }
 
 #[derive(Debug)]
