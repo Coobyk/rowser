@@ -684,14 +684,23 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
         }
         ObjKind::Args { items, env, map } => {
             if let Some(i) = arr_index(key) {
-                if i >= items.len() || b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
-                    return None;
-                }
-                // mapped index → the parameter binding is the source of truth
+                // a materialized prop only shadows the value once unmapped;
+                // a still-mapped index keeps reading the parameter binding
                 if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
                     if let Some(b) = e.vars.borrow().get(name.as_ref()) {
                         return Some(b.val.clone());
                     }
+                }
+                if let Some(p) = b.props.get_str(key) {
+                    // accessor props fall through to the normal props path
+                    // so the getter actually runs
+                    if !p.is_accessor() {
+                        return Some(p.val.clone());
+                    }
+                    return None;
+                }
+                if i >= items.len() || b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+                    return None;
                 }
                 return Some(items[i].clone());
             }
@@ -1512,8 +1521,13 @@ impl Interp {
             Err(i.type_err("'caller' and 'arguments' are restricted"))
         }
         let strict = def.strict || crate::parser::stmts_strict(&def.body);
+        // spec: a non-simple parameter list (defaults, destructuring,
+        // rest) yields an UNMAPPED arguments object even when sloppy
+        let simple_params =
+            def.params.iter().all(|p| matches!(p, Param::Ident(_)));
+        let mapped = !strict && simple_params;
         let mut map: Vec<Option<Rc<str>>> = Vec::new();
-        if !strict {
+        if mapped {
             // spec: index i maps to the parameter name when i < param
             // count, the param is a bare identifier, and the name hasn't
             // already been claimed by an earlier parameter
@@ -1546,7 +1560,7 @@ impl Interp {
         o.borrow_mut()
             .props
             .insert(PropKey::from_str("length"), Prop::builtin(Value::Num(args.len() as f64)));
-        if strict {
+        if !mapped {
             // unmapped: throwing caller/callee accessors (own props,
             // non-configurable)
             let thrower = self.native("ThrowTypeError", throw_type_err);
@@ -1787,6 +1801,19 @@ impl Interp {
                     _ => unreachable!(),
                 };
                 let obj = Rc::new(RefCell::new(Obj::new(Some(proto), ObjKind::Ord)));
+                // wrappers carry the primitive so valueOf/toString and
+                // ToPrimitive work on them (5 >>> 0 on a boxed this)
+                obj.borrow_mut().props.insert(
+                    PropKey::from_str("$value"),
+                    Prop {
+                        val: v.clone(),
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                        get: None,
+                        set: None,
+                    },
+                );
                 // String wrappers expose length + indexed characters
                 if let Value::Str(s) = v {
                     let len = s.chars().count();
@@ -2081,6 +2108,42 @@ impl Interp {
                 _ => {}
             }
         }
+        // arguments-object virtual index props are own props — they
+        // shadow proto accessors entirely (10.6-11-b-1)
+        {
+            let mut b = o.borrow_mut();
+            let args_i = if let PropKey::S(sk) = &key {
+                arr_index(sk)
+            } else {
+                None
+            };
+            let args_hole = args_i
+                .is_some_and(|i| b.holes.as_ref().is_some_and(|h| h.contains(&i)));
+            // materialized slots take the normal walk so their attrs apply
+            let args_mat = b.props.get(&key).is_some();
+            if let ObjKind::Args { items, env, map } = &mut b.kind {
+                if let PropKey::S(sk) = &key {
+                    if let Some(i) = args_i {
+                        if i < items.len() && !args_hole && !args_mat {
+                            items[i] = v.clone();
+                            if let (Some(e), Some(Some(name))) =
+                                (&*env, map.get(i))
+                            {
+                                let name = name.clone();
+                                if let Some(bnd) = e
+                                    .vars
+                                    .borrow_mut()
+                                    .get_mut(name.as_ref())
+                                {
+                                    bnd.val = v;
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
         // walk chain looking for existing prop (setter or data)
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
@@ -2123,6 +2186,29 @@ impl Interp {
                             }
                         }
                     }
+                    // materialized but still-mapped arguments index:
+                    // keep items + the parameter binding in sync
+                    if let ObjKind::Args { items, env, map } = &mut b.kind {
+                        if let PropKey::S(sk) = &key {
+                            if let Some(i) = arr_index(sk) {
+                                if i < items.len() {
+                                    items[i] = v.clone();
+                                    if let (Some(e), Some(Some(name))) =
+                                        (&*env, map.get(i))
+                                    {
+                                        let name = name.clone();
+                                        if let Some(bnd) = e
+                                            .vars
+                                            .borrow_mut()
+                                            .get_mut(name.as_ref())
+                                        {
+                                            bnd.val = v.clone();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     b.props.get_mut(&key).unwrap().val = v;
                     return Ok(());
                 }
@@ -2137,10 +2223,19 @@ impl Interp {
         if !b.extensible {
             return Ok(());
         }
+        let materialized = matches!(b.kind, ObjKind::Args { .. })
+            && b.props.get(&key).is_some();
+        if materialized {
+            if let Some(p) = b.props.get_mut(&key) {
+                p.val = v.clone();
+            }
+        }
         match &mut b.kind {
             ObjKind::Args { items, env, map } => {
                 if let PropKey::S(s) = &key {
                     if let Some(i) = arr_index(s) {
+                        // materialized prop: updated above; when still
+                        // mapped the parameter binding stays in sync
                         if i < items.len() {
                             items[i] = v.clone();
                             // mapped index → write through to the param binding
@@ -2296,6 +2391,34 @@ impl Interp {
                 _ => {}
             }
         }
+        // arguments-object virtual index props are own props — they
+        // shadow proto accessors entirely (10.6-11-b-1); materialized
+        // slots go through the normal props walk (attrs apply)
+        {
+            let mut b = o.borrow_mut();
+            let mat = b.props.get_str(key).is_some();
+            let args_i = arr_index(key);
+            let args_hole = args_i
+                .is_some_and(|i| b.holes.as_ref().is_some_and(|h| h.contains(&i)));
+            if let ObjKind::Args { items, env, map } = &mut b.kind {
+                if let Some(i) = args_i {
+                    if i < items.len() && !args_hole && !mat {
+                        items[i] = v.clone();
+                        if let (Some(e), Some(Some(name))) =
+                            (&*env, map.get(i))
+                        {
+                            let name = name.clone();
+                            if let Some(bnd) =
+                                e.vars.borrow_mut().get_mut(name.as_ref())
+                            {
+                                bnd.val = v;
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
         // walk chain looking for existing prop (setter or data)
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
@@ -2333,6 +2456,27 @@ impl Interp {
                             }
                         }
                     }
+                    // materialized but still-mapped arguments index:
+                    // the parameter binding stays the source of truth
+                    if let ObjKind::Args { items, env, map } = &mut b.kind {
+                        if let Some(i) = arr_index(key) {
+                            if i < items.len() {
+                                items[i] = v.clone();
+                                if let (Some(e), Some(Some(name))) =
+                                    (&*env, map.get(i))
+                                {
+                                    let name = name.clone();
+                                    if let Some(bnd) = e
+                                        .vars
+                                        .borrow_mut()
+                                        .get_mut(name.as_ref())
+                                    {
+                                        bnd.val = v.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
                     b.props.get_str_mut(key).unwrap().val = v;
                     return Ok(());
                 }
@@ -2347,9 +2491,28 @@ impl Interp {
         if !b.extensible {
             return Ok(());
         }
+        let materialized = matches!(b.kind, ObjKind::Args { .. })
+            && b.props.get_str(key).is_some();
+        if materialized {
+            if let Some(p) = b.props.get_str_mut(key) {
+                p.val = v.clone();
+            }
+        }
         match &mut b.kind {
             ObjKind::Args { items, env, map } => {
                 if let Some(i) = arr_index(key) {
+                    if materialized {
+                        if i < items.len() {
+                            items[i] = v.clone();
+                            if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
+                                let name = name.clone();
+                                if let Some(bnd) = e.vars.borrow_mut().get_mut(name.as_ref()) {
+                                    bnd.val = v;
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
                     if i < items.len() {
                         items[i] = v.clone();
                         if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
@@ -2413,9 +2576,12 @@ impl Interp {
             return true;
         };
         let mut b = o.borrow_mut();
-        if let ObjKind::Args { items, map, .. } = &mut b.kind {
-            if let Some(i) = arr_index(key) {
-                if i < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+        if let Some(i) = arr_index(key) {
+            let hole = b.holes.as_ref().is_some_and(|h| h.contains(&i));
+            let materialized = b.props.get_str(key).is_some();
+            if let ObjKind::Args { items, map, .. } = &mut b.kind {
+                // materialized props fall through to the configurable check
+                if i < items.len() && !hole && !materialized {
                     // delete: unmap the param link, mark the slot gone —
                     // `length` is a separate data prop and stays
                     if let Some(m) = map.get_mut(i) {
@@ -2470,6 +2636,16 @@ impl Interp {
             return false;
         }
         b.props.remove_str(key);
+        // a materialized arguments index deleted from props also severs
+        // the parameter link and leaves the slot a hole
+        if let ObjKind::Args { map, .. } = &mut b.kind {
+            if let Some(i) = arr_index(key) {
+                if let Some(m) = map.get_mut(i) {
+                    *m = None;
+                }
+                b.holes.get_or_insert_default().insert(i);
+            }
+        }
         true
     }
 
@@ -2566,10 +2742,12 @@ impl Interp {
             };
         }
         let mut b = o.borrow_mut();
-        if let ObjKind::Args { items, map, .. } = &mut b.kind {
-            if let PropKey::S(s) = key {
-                if let Some(i) = arr_index(s) {
-                    if i < items.len() && !b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
+        if let PropKey::S(s) = key {
+            if let Some(i) = arr_index(s) {
+                let hole = b.holes.as_ref().is_some_and(|h| h.contains(&i));
+                let materialized = b.props.get(&key).is_some();
+                if let ObjKind::Args { items, map, .. } = &mut b.kind {
+                    if i < items.len() && !hole && !materialized {
                         if let Some(m) = map.get_mut(i) {
                             *m = None;
                         }
@@ -2622,6 +2800,16 @@ impl Interp {
             return Ok(false);
         }
         b.props.remove(key);
+        if let ObjKind::Args { map, .. } = &mut b.kind {
+            if let PropKey::S(s) = key {
+                if let Some(i) = arr_index(s) {
+                    if let Some(m) = map.get_mut(i) {
+                        *m = None;
+                    }
+                    b.holes.get_or_insert_default().insert(i);
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -2673,6 +2861,9 @@ impl Interp {
                                 continue;
                             }
                             let k = i.to_string();
+                            if b.props.get_str(&k).is_some() {
+                                continue;
+                            }
                             if seen.insert(k.clone()) {
                                 out.push(k);
                             }
@@ -2726,7 +2917,13 @@ impl Interp {
                     if b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
                         continue;
                     }
-                    out.push(i.to_string());
+                    let k = i.to_string();
+                    // materialized indices flow through the props loop so
+                    // their stored enumerable flag is honoured
+                    if b.props.get_str(&k).is_some() {
+                        continue;
+                    }
+                    out.push(k);
                 }
             }
             _ => {}
@@ -2834,7 +3031,9 @@ impl Interp {
             Value::Bool(b) => b.to_string(),
             Value::Num(n) => js_num_str(*n),
             Value::Str(s) => s.to_string(),
-            Value::Sym(_, d) => format!("Symbol({d})"),
+            Value::Sym(..) => {
+                return Err(self.type_err("Cannot convert a Symbol value to a string"))
+            }
             Value::Obj(o) => {
                 if let ObjKind::Arr(items) = &o.borrow().kind {
                     let mut parts = Vec::new();
@@ -3422,6 +3621,20 @@ impl Interp {
                 *scope.thisv.borrow_mut() = this;
                 *scope.new_target.borrow_mut() = nt;
                 *scope.ctor_fn.borrow_mut() = f.clone();
+                let h = self.hoisted_fn(&def);
+                // `arguments` is visible inside parameter initializers —
+                // bind it before defaults evaluate
+                if h.uses_arguments {
+                    let arr = self.new_args_obj(&args, &scope, &def, f);
+                    let k = self.intern("arguments");
+                    scope.vars.borrow_mut().insert(
+                        k,
+                        Binding {
+                            val: Value::Obj(arr),
+                            mutable: true, uninit: false, deletable: false, lexical: false,
+                        },
+                    );
+                }
                 self.bind_params(&scope, &def.params, &args)?;
                 // a non-simple parameter environment rejects
                 // `eval("var arguments")`/`eval("var eval")` — non-arrows
@@ -3434,18 +3647,6 @@ impl Interp {
                         }))
                 {
                     scope.param_env.set(true);
-                }
-                let h = self.hoisted_fn(&def);
-                if h.uses_arguments {
-                    let arr = self.new_args_obj(&args, &scope, &def, f);
-                    let k = self.intern("arguments");
-                    scope.vars.borrow_mut().insert(
-                        k,
-                        Binding {
-                            val: Value::Obj(arr),
-                            mutable: true, uninit: false, deletable: false, lexical: false,
-                        },
-                    );
                 }
                 let body_scope: EnvRef = if def
                     .params
@@ -3623,8 +3824,11 @@ impl Interp {
         match pat {
             Pattern::Ident(name) => match mode {
                 BindMode::Assign => self.env_assign(scope, name, v)?,
+                // var initializers assign through the scope chain —
+                // catch params and `with` objects intercept; the binding
+                // itself was already created at the var boundary by hoisting
                 BindMode::Decl(VarKind::Var) => {
-                    self.declare_var(scope, name, v)
+                    self.env_assign(scope, name, v)?
                 }
                 BindMode::Decl(kind) => {
                     self.declare(scope, name, v, kind != VarKind::Const)
@@ -4107,7 +4311,10 @@ impl Interp {
                     }
                     match pat {
                         Pattern::Ident(name) => match kind {
-                            VarKind::Var => self.declare_var(env, name, v.clone()),
+                            // `var x;` (no init) leaves the hoisted binding
+                            // untouched — only initializers assign
+                            VarKind::Var if init.is_none() => {}
+                            VarKind::Var => self.env_assign(env, name, v.clone())?,
                             _ => self.declare(env, name, v.clone(), *kind != VarKind::Const),
                         },
                         other => self.bind_pattern(env, other, v.clone(), *kind, true)?,
@@ -4350,6 +4557,9 @@ impl Interp {
                 };
                 let mut last = Value::Und;
                 let mut prev_iter: Option<EnvRef> = None;
+                // existence re-check needs an object — primitives (string
+                // indices) box here; null/undefined yield empty `keys`
+                let rv_obj = self.to_object(&rv).unwrap_or(Value::Und);
                 for k in keys {
                     let mut iter_scope: Option<EnvRef> = None;
                     let scope: &EnvRef = if per_iter {
@@ -4377,6 +4587,11 @@ impl Interp {
                     } else {
                         scope
                     };
+                    // spec: keys deleted since enumeration are skipped;
+                    // keys added during iteration are never visited
+                    if !self.has_prop(&rv_obj, &PropKey::from_str(k.as_str()))? {
+                        continue;
+                    }
                     self.bind_for_target(scope, left, Value::Str(Rc::from(k.as_str())))?;
                     let r = self.exec_stmt(body, scope);
                     if per_iter {
@@ -5466,12 +5681,19 @@ impl Interp {
             UnaryOp::Delete => match expr {
                 Expr::Member { obj, prop, .. } => {
                     let ov = self.eval_expr(obj, env)?;
-                    if let Expr::Str(s) = &**prop {
-                        return Ok(Value::Bool(self.delete_prop_str(&ov, s)));
+                    let ok = if let Expr::Str(s) = &**prop {
+                        self.delete_prop_str(&ov, s)
+                    } else {
+                        let pv = self.eval_expr(prop, env)?;
+                        let key = self.to_propkey(&pv)?;
+                        self.delete_prop(&ov, &key)?
+                    };
+                    if !ok && self.cur_strict {
+                        return Err(self.type_err(
+                            "Cannot delete property (non-configurable)",
+                        ));
                     }
-                    let pv = self.eval_expr(prop, env)?;
-                    let key = self.to_propkey(&pv)?;
-                    Ok(Value::Bool(self.delete_prop(&ov, &key)?))
+                    Ok(Value::Bool(ok))
                 }
                 Expr::This => Ok(Value::Bool(true)),
                 Expr::Ident(n) => {

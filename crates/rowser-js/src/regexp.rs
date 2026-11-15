@@ -120,13 +120,14 @@ impl Regex {
             n_groups: 0,
             names: Vec::new(),
             total_groups: count_capture_groups(source),
+            unicode: seen.contains('u'),
         };
         let root = p.alt()?;
         if p.i < p.s.len() {
             return Err(format!("unexpected '{}'", p.s[p.i]));
         }
         let names = p.names.clone();
-        let root = resolve_names(root, &names)?;
+        let root = resolve_names(root, &names, p.unicode)?;
         let canonical: String = "dgimsuy".chars().filter(|c| seen.contains(*c)).collect();
         Ok(Rc::new(Regex {
             source: source.to_string(),
@@ -224,6 +225,9 @@ struct ReParser {
     /// total capture groups in the whole pattern (prescan) — needed to tell
     /// `\1` backreferences from legacy octal escapes
     total_groups: usize,
+    /// `u` flag — Annex-B extensions (quantifiable assertions, lone `]`/`}`/`{`)
+    /// are disabled and stray syntax is a hard error
+    unicode: bool,
 }
 
 impl ReParser {
@@ -303,9 +307,23 @@ impl ReParser {
             },
             _ => return Ok(atom),
         };
+        // Assertions can't be quantified in the base grammar. Annex B adds
+        // one exception for non-unicode patterns: lookaheads may carry a
+        // quantifier. Lookbehinds and anchors are never quantifiable.
+        match &atom {
+            Node::Anchor(_) => {
+                return Err("quantifier on assertion".into());
+            }
+            Node::Look { behind, .. } => {
+                if *behind || self.unicode {
+                    return Err("quantifier on assertion".into());
+                }
+            }
+            _ => {}
+        }
         let lazy = self.eat('?');
-        // tolerate a stray possessive `+` (not JS syntax, harmless to accept)
-        self.eat('+');
+        // a second `*`/`+`/`?`/`{` after the quantifier falls back through
+        // `atom` → "nothing to repeat" (or a lone-`{` literal under Annex B)
         Ok(Node::Rep {
             inner: Box::new(atom),
             min,
@@ -363,7 +381,13 @@ impl ReParser {
             '$' => Ok(Node::Anchor(Anchor::End)),
             '\\' => self.escape(),
             ')' | '|' => Err(format!("unexpected '{c}'")),
-            // stray quantifier chars are treated as literals (Annex-B leniency)
+            // `*`, `+`, `?` in atom position are stray quantifiers — a hard
+            // error in every mode ("nothing to repeat")
+            '*' | '+' | '?' => Err("nothing to repeat".into()),
+            // lone `]`, `}`, `{` are literals only under Annex-B leniency;
+            // with the `u` flag they are a SyntaxError
+            ']' | '}' | '{' if self.unicode => Err(format!("unexpected '{c}'")),
+            // stray `]`/`}`/`{` are treated as literals (Annex-B leniency)
             c => Ok(Node::Ch(c)),
         }
     }
@@ -445,16 +469,11 @@ impl ReParser {
                     }
                 }
                 _ => {
-                    // unknown (?x — be lenient: treat `(?` as a capture of `?`
-                    self.i -= 1;
-                    self.n_groups += 1;
-                    let idx = self.n_groups;
-                    let n = self.alt()?;
-                    self.expect(')')?;
-                    Ok(Node::Group {
-                        idx,
-                        inner: Box::new(n),
-                    })
+                    // `(?x` — only `?:` `?=` `?!` `?<name>` `?<=` `?<!` exist
+                    Err(format!(
+                        "invalid group specifier '(?{}'",
+                        self.peek().unwrap_or(' ')
+                    ))
                 }
             }
         } else {
@@ -487,17 +506,47 @@ impl ReParser {
             'f' => Node::Ch('\u{c}'),
             'v' => Node::Ch('\u{b}'),
             '0' => {
+                if self.unicode && self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                    return Err("octal escapes are not allowed in unicode mode".into());
+                }
                 // \0 or legacy octal
                 Node::Ch(self.octal_after(0))
             }
-            'x' => Node::Ch(self.hex(2).unwrap_or('x')),
-            'u' => Node::Ch(self.uesc()),
+            'x' => {
+                let save = self.i;
+                match self.hex(2) {
+                    Some(ch) => Node::Ch(ch),
+                    None if self.unicode => {
+                        return Err("invalid \\x escape".into());
+                    }
+                    None => {
+                        self.i = save;
+                        Node::Ch('x')
+                    }
+                }
+            }
+            'u' => {
+                let save = self.i;
+                match self.uesc_opt() {
+                    Some(ch) => Node::Ch(ch),
+                    None if self.unicode => {
+                        return Err("invalid \\u escape".into());
+                    }
+                    None => {
+                        self.i = save;
+                        Node::Ch('u')
+                    }
+                }
+            }
             'c' => {
                 // control letter \cA → \x01
                 match self.peek() {
                     Some(l) if l.is_ascii_alphabetic() => {
                         self.i += 1;
                         Node::Ch((l as u8 % 32) as char)
+                    }
+                    _ if self.unicode => {
+                        return Err("invalid \\c escape".into());
                     }
                     _ => Node::Ch('c'),
                 }
@@ -513,6 +562,8 @@ impl ReParser {
                         }
                     }
                     Node::BackrefName(name)
+                } else if self.unicode {
+                    return Err("invalid \\k escape".into());
                 } else {
                     Node::Ch('k')
                 }
@@ -531,19 +582,23 @@ impl ReParser {
                 let n: u32 = digits.parse().unwrap_or(0);
                 if (n as usize) <= self.total_groups {
                     Node::Backref(n)
+                } else if self.unicode {
+                    // no such capture group → SyntaxError in unicode mode
+                    return Err(format!("invalid backreference \\{digits}"));
                 } else {
                     // legacy octal / literal digits — read back the extra
-                    // digits and take up to 3 octal digits, or identity for 8/9
+                    // digits and take the Annex-B octal prefix: `0`-`3` get
+                    // up to 3 digits, `4`-`7` only 2 (`FourToSeven OctalDigit`)
                     let first = digits.chars().next().unwrap();
                     if first == '8' || first == '9' {
                         self.i -= digits.len() - 1;
                         Node::Ch(first)
                     } else {
-                        // octal: first 1-3 octal digits
+                        let cap = if first <= '3' { 3 } else { 2 };
                         let od: String = digits
                             .chars()
                             .take_while(|d| ('0'..='7').contains(d))
-                            .take(3)
+                            .take(cap)
                             .collect();
                         self.i -= digits.len() - od.len();
                         let v = u32::from_str_radix(&od, 8).unwrap_or(0);
@@ -551,7 +606,14 @@ impl ReParser {
                     }
                 }
             }
-            other => Node::Ch(other), // identity escape: \. \/ \\ \- \* \$ ...
+            other => {
+                // identity escapes in unicode mode are limited to
+                // SyntaxCharacter + `/` — anything else is a SyntaxError
+                if self.unicode && !"^$\\.*+?()[]{}|/".contains(other) {
+                    return Err(format!("invalid escape '\\{other}'"));
+                }
+                Node::Ch(other)
+            }
         })
     }
 
@@ -571,20 +633,67 @@ impl ReParser {
             'r' => ClassItem::Ch('\r'),
             'f' => ClassItem::Ch('\u{c}'),
             'v' => ClassItem::Ch('\u{b}'),
-            '0' => ClassItem::Ch(self.octal_after(0)),
-            'x' => ClassItem::Ch(self.hex(2).unwrap_or('x')),
-            'u' => ClassItem::Ch(self.uesc()),
+            '0' => {
+                if self.unicode && self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                    return Err("octal escapes are not allowed in unicode mode".into());
+                }
+                ClassItem::Ch(self.octal_after(0))
+            }
+            'x' => {
+                let save = self.i;
+                match self.hex(2) {
+                    Some(ch) => ClassItem::Ch(ch),
+                    None if self.unicode => {
+                        return Err("invalid \\x escape".into());
+                    }
+                    None => {
+                        self.i = save;
+                        ClassItem::Ch('x')
+                    }
+                }
+            }
+            'u' => {
+                let save = self.i;
+                match self.uesc_opt() {
+                    Some(ch) => ClassItem::Ch(ch),
+                    None if self.unicode => {
+                        return Err("invalid \\u escape".into());
+                    }
+                    None => {
+                        self.i = save;
+                        ClassItem::Ch('u')
+                    }
+                }
+            }
             'c' => match self.peek() {
                 Some(l) if l.is_ascii_alphabetic() => {
+                    self.i += 1;
+                    ClassItem::Ch((l as u8 % 32) as char)
+                }
+                _ if self.unicode => {
+                    return Err("invalid \\c escape".into());
+                }
+                // Annex B: inside a class, `\c_` / `\c<digit>` are control
+                // chars formed from the second char's codepoint % 32
+                Some(l) if l == '_' || l.is_ascii_digit() => {
                     self.i += 1;
                     ClassItem::Ch((l as u8 % 32) as char)
                 }
                 _ => ClassItem::Ch('c'),
             },
             '1'..='9' => {
-                // legacy octal inside class
+                if self.unicode {
+                    return Err(format!("invalid class escape \\{c}"));
+                }
+                if c >= '8' {
+                    // `[\8]` `[\9]` — NonOctalDecimalEscape → literal digit
+                    return Ok(ClassItem::Ch(c));
+                }
+                // legacy octal inside class — `0`-`3` take up to 3 digits,
+                // `4`-`7` only 2 (spec LegacyOctalEscapeSequence)
+                let cap = if c <= '3' { 3 } else { 2 };
                 let mut v = c.to_digit(10).unwrap();
-                for _ in 0..2 {
+                for _ in 1..cap {
                     match self.peek().and_then(|d| d.to_digit(8)) {
                         Some(d) => {
                             v = v * 8 + d;
@@ -595,7 +704,18 @@ impl ReParser {
                 }
                 ClassItem::Ch(char::from_u32(v).unwrap_or('\0'))
             }
-            other => ClassItem::Ch(other),
+            'k' if self.unicode => {
+                // \k<name> is valid inside classes for named backrefs? —
+                // spec: \k is only an atom escape; inside a class it's an
+                // invalid escape in unicode mode
+                return Err("invalid class escape \\k".into());
+            }
+            other => {
+                if self.unicode && !"^$\\.*+?()[]{}|/-".contains(other) {
+                    return Err(format!("invalid class escape '\\{other}'"));
+                }
+                ClassItem::Ch(other)
+            }
         })
     }
 
@@ -624,18 +744,23 @@ impl ReParser {
         char::from_u32(v)
     }
 
-    /// `\uNNNN` or `\u{NNNNN}`
-    fn uesc(&mut self) -> char {
+    /// `\uNNNN` or `\u{NNNNN}` — Option variant for strict unicode parsing:
+    /// out-of-range code points and malformed sequences are `None`.
+    fn uesc_opt(&mut self) -> Option<char> {
         if self.eat('{') {
             let mut v: u32 = 0;
+            let mut any = false;
             while let Some(d) = self.peek().and_then(|c| c.to_digit(16)) {
+                any = true;
                 v = v.saturating_mul(16).saturating_add(d);
                 self.i += 1;
             }
-            self.eat('}');
-            char::from_u32(v).unwrap_or('\u{fffd}')
+            if !self.eat('}') || !any {
+                return None;
+            }
+            char::from_u32(v)
         } else {
-            self.hex(4).unwrap_or('u')
+            self.hex(4)
         }
     }
 
@@ -668,9 +793,18 @@ impl ReParser {
                 let b = self.class_atom()?;
                 match (a, b) {
                     (ClassItem::Ch(lo), ClassItem::Ch(hi)) => {
+                        if self.unicode && hi < lo {
+                            return Err("range out of order in character class".into());
+                        }
                         items.push(ClassItem::Range(lo, hi));
                     }
                     (a, b) => {
+                        if self.unicode {
+                            // `[\d-z]` — invalid range with the `u` flag
+                            return Err(
+                                "invalid character class range".into()
+                            );
+                        }
                         // `[\d-z]` — not a real range; keep '-' literal
                         items.push(a);
                         items.push(ClassItem::Ch('-'));
@@ -732,22 +866,37 @@ fn count_capture_groups(src: &str) -> usize {
     n
 }
 
-/// Resolve `\k<name>` backreferences to numeric group indices.
-fn resolve_names(n: Node, names: &[(String, usize)]) -> Result<Node, String> {
+/// Resolve `\k<name>` backreferences to numeric group indices. Annex-B
+/// leniency: in non-unicode patterns with NO named groups at all, `\k<name>`
+/// is just literal text (`k`, `<`, name chars, `>`).
+fn resolve_names(
+    n: Node,
+    names: &[(String, usize)],
+    unicode: bool,
+) -> Result<Node, String> {
     Ok(match n {
         Node::BackrefName(name) => match names.iter().find(|(nm, _)| *nm == name) {
             Some((_, idx)) => Node::Backref(*idx as u32),
-            None => return Err(format!("unknown group name '{name}'")),
+            None => {
+                if !unicode && names.is_empty() {
+                    let mut items = vec![Node::Ch('k'), Node::Ch('<')];
+                    items.extend(name.chars().map(Node::Ch));
+                    items.push(Node::Ch('>'));
+                    Node::Seq(items)
+                } else {
+                    return Err(format!("unknown group name '{name}'"));
+                }
+            }
         },
         Node::Seq(items) => Node::Seq(
             items
                 .into_iter()
-                .map(|x| resolve_names(x, names))
+                .map(|x| resolve_names(x, names, unicode))
                 .collect::<Result<_, _>>()?,
         ),
         Node::Alt(arms) => Node::Alt(
             arms.into_iter()
-                .map(|x| resolve_names(x, names))
+                .map(|x| resolve_names(x, names, unicode))
                 .collect::<Result<_, _>>()?,
         ),
         Node::Rep {
@@ -756,17 +905,17 @@ fn resolve_names(n: Node, names: &[(String, usize)]) -> Result<Node, String> {
             max,
             lazy,
         } => Node::Rep {
-            inner: Box::new(resolve_names(*inner, names)?),
+            inner: Box::new(resolve_names(*inner, names, unicode)?),
             min,
             max,
             lazy,
         },
         Node::Group { idx, inner } => Node::Group {
             idx,
-            inner: Box::new(resolve_names(*inner, names)?),
+            inner: Box::new(resolve_names(*inner, names, unicode)?),
         },
         Node::Look { inner, neg, behind } => Node::Look {
-            inner: Box::new(resolve_names(*inner, names)?),
+            inner: Box::new(resolve_names(*inner, names, unicode)?),
             neg,
             behind,
         },

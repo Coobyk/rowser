@@ -70,12 +70,11 @@ fn meta2(src: &str, m: &mut Meta) {
 }
 
 const SKIP_FEATURES: &[&str] = &[
-    "TypedArray",
     "SharedArrayBuffer", "Atomics", "FinalizationRegistry", "WeakRef",
     "Intl", "Temporal", "Float16Array", "import.meta", "dynamic-import",
     "import-attributes", "explicit-resource-management",
     "Decorators", "RegExp.escape", "regexp-duplicate-named-groups",
-    "resizable-arraybuffer", "tail-call-optimization", "async-functions",
+    "tail-call-optimization", "async-functions",
     "async-iteration", "regexp-v-flag",
     "set-methods", "promise-with-resolvers", "array-grouping",
     "regexp-modifiers", "json-parse-with-source", "source-phase-imports",
@@ -88,6 +87,7 @@ const SKIP_FEATURES: &[&str] = &[
     "class-static-block", "class-methods-private",
     "class-static-methods-private", "class-accessor-methods-private",
     "class-static-accessor-methods-private",
+    "caller",
     // $262.createRealm / Error.isError — APIs we don't expose
     "cross-realm", "Error.isError", "host-gc-required",
     "CanBlockIsFalse", "SharedArrayBuffer",

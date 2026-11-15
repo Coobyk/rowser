@@ -433,7 +433,9 @@ impl Parser {
                 Ok(Stmt::Throw(e))
             }
             Tok::Kw(Kw::Return) => {
-                if self.nonarrow_fn_depth == 0 {
+                // arrow bodies are FunctionBody — `return` is legal
+                // inside any function including arrows (fn_depth)
+                if self.fn_depth == 0 {
                     return Err(self.err("`return` outside function"));
                 }
                 self.next();

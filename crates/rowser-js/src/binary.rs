@@ -3,7 +3,9 @@
 //! web-platform stubs (Worker, Image, Blob, FormData, XMLHttpRequest,
 //! crypto) — all std-only, installed by `builtins::install`.
 
-use crate::builtins::{clamp_index, make_iter, merge_sort, promise_resolve_static, to_elems};
+use crate::builtins::{
+    clamp_index, make_iter, make_iter_in, merge_sort, promise_resolve_static, to_elems,
+};
 use crate::interp::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -134,42 +136,60 @@ fn install_typed_arrays(i: &mut Interp) {
     // %TypedArray%.prototype — all methods live here; per-class protos
     // chain to it.
     let shared = plain(Some(i.p.obj.clone()));
-    for (n, f) in [
-        ("set", m_ta_set as NativeFn),
-        ("subarray", m_ta_subarray),
-        ("slice", m_ta_slice),
-        ("fill", m_ta_fill),
-        ("copyWithin", m_ta_copy_within),
-        ("reverse", m_ta_reverse),
-        ("sort", m_ta_sort),
-        ("indexOf", m_ta_index_of),
-        ("lastIndexOf", m_ta_last_index_of),
-        ("includes", m_ta_includes),
-        ("join", m_ta_join),
-        ("toString", m_ta_to_string),
-        ("toLocaleString", m_ta_to_string),
-        ("at", m_ta_at),
-        ("map", m_ta_map),
-        ("filter", m_ta_filter),
-        ("forEach", m_ta_for_each),
-        ("reduce", m_ta_reduce),
-        ("reduceRight", m_ta_reduce_right),
-        ("find", m_ta_find),
-        ("findIndex", m_ta_find_index),
-        ("findLast", m_ta_find_last),
-        ("findLastIndex", m_ta_find_last_index),
-        ("some", m_ta_some),
-        ("every", m_ta_every),
-        ("keys", m_ta_keys),
-        ("values", m_ta_values),
-        ("entries", m_ta_entries),
-        ("toReversed", m_ta_to_reversed),
-        ("toSorted", m_ta_to_sorted),
-        ("with", m_ta_with),
+    for (n, f, arity) in [
+        ("set", m_ta_set as NativeFn, 1.0),
+        ("subarray", m_ta_subarray, 2.0),
+        ("slice", m_ta_slice, 2.0),
+        ("fill", m_ta_fill, 1.0),
+        ("copyWithin", m_ta_copy_within, 2.0),
+        ("reverse", m_ta_reverse, 0.0),
+        ("sort", m_ta_sort, 1.0),
+        ("indexOf", m_ta_index_of, 1.0),
+        ("lastIndexOf", m_ta_last_index_of, 1.0),
+        ("includes", m_ta_includes, 1.0),
+        ("join", m_ta_join, 1.0),
+        ("toLocaleString", m_ta_to_locale_string, 0.0),
+        ("at", m_ta_at, 1.0),
+        ("map", m_ta_map, 1.0),
+        ("filter", m_ta_filter, 1.0),
+        ("forEach", m_ta_for_each, 1.0),
+        ("reduce", m_ta_reduce, 1.0),
+        ("reduceRight", m_ta_reduce_right, 1.0),
+        ("find", m_ta_find, 1.0),
+        ("findIndex", m_ta_find_index, 1.0),
+        ("findLast", m_ta_find_last, 1.0),
+        ("findLastIndex", m_ta_find_last_index, 1.0),
+        ("some", m_ta_some, 1.0),
+        ("every", m_ta_every, 1.0),
+        ("keys", m_ta_keys, 0.0),
+        ("values", m_ta_values, 0.0),
+        ("entries", m_ta_entries, 0.0),
+        ("toReversed", m_ta_to_reversed, 0.0),
+        ("toSorted", m_ta_to_sorted, 1.0),
+        ("with", m_ta_with, 2.0),
     ] {
-        met(i, &shared, n, f);
+        let v = i.native(n, f);
+        if let Value::Obj(fo) = &v {
+            i.set_attr(fo, "length", Value::Num(arity), false, true);
+        }
+        i.set_builtin(&shared, n, v);
     }
-    // Symbol.iterator = values
+    // %TypedArray%.prototype.toString === Array.prototype.toString
+    if let Some(ts) = i.obj_get_raw(&i.p.array.clone(), &PropKey::from_str("toString")) {
+        i.set_builtin(&shared, "toString", ts);
+    }
+    acc(i, &shared, "length", Some(ta_get_len), None);
+    acc(i, &shared, "byteLength", Some(ta_get_byte_len), None);
+    acc(i, &shared, "byteOffset", Some(ta_get_byte_off), None);
+    acc(i, &shared, "buffer", Some(ta_get_buffer), None);
+    // @@toStringTag — accessor producing the receiver's TypedArrayName
+    // (spec: undefined for non-TA receivers).
+    let tag_get = i.native("get [Symbol.toStringTag]", ta_get_tag);
+    shared.borrow_mut().props.insert(
+        PropKey::Sym(SYM_TOSTRINGTAG),
+        Prop::accessor(Some(tag_get), None),
+    );
+    // Symbol.iterator === values
     let values_fn = i
         .obj_get_raw(&shared, &PropKey::from_str("values"))
         .unwrap_or(Value::Und);
@@ -178,62 +198,286 @@ fn install_typed_arrays(i: &mut Interp) {
         .props
         .insert(PropKey::Sym(SYM_ITERATOR), Prop::builtin(values_fn));
 
+    // %TypedArray% — the abstract intrinsic constructor. Concrete
+    // ctors chain to it (`Object.getPrototypeOf(Int8Array)`), so the
+    // shared @@species getter and statics resolve by inheritance.
+    let ta_intr = Rc::new(RefCell::new(Obj::new(
+        Some(i.p.func.clone()),
+        ObjKind::Func(Func::Native {
+            name: Rc::from("TypedArray"),
+            f: ta_intr_ctor,
+        }),
+    )));
+    i.set_attr(&ta_intr, "length", Value::Num(0.0), false, true);
+    i.set_attr(
+        &ta_intr,
+        "name",
+        Value::Str(Rc::from("TypedArray")),
+        false,
+        true,
+    );
+    // .prototype — {writable:false, enumerable:false, configurable:false}
+    ta_intr.borrow_mut().props.insert(
+        PropKey::from_str("prototype"),
+        Prop {
+            val: Value::Obj(shared.clone()),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            get: None,
+            set: None,
+        },
+    );
+    i.set_builtin(&shared, "constructor", Value::Obj(ta_intr.clone()));
+    {
+        let of = i.native("of", ta_static_of);
+        i.set_builtin(&ta_intr, "of", of);
+        let from = i.native("from", ta_static_from);
+        if let Value::Obj(fo) = &from {
+            i.set_attr(fo, "length", Value::Num(1.0), false, true);
+        }
+        i.set_builtin(&ta_intr, "from", from);
+        let sp = i.native("get [Symbol.species]", ta_get_species);
+        ta_intr.borrow_mut().props.insert(
+            PropKey::Sym(SYM_SPECIES),
+            Prop::accessor(Some(sp), None),
+        );
+    }
+
     for ((name, kind), cf) in TA_CLASSES.iter().zip(TA_CTORS.iter()) {
         let proto = plain(Some(shared.clone()));
-        i.set_builtin(&proto, "BYTES_PER_ELEMENT", Value::Num(kind.size() as f64));
-        proto.borrow_mut().props.insert(
-            PropKey::Sym(SYM_TOSTRINGTAG),
-            Prop::builtin(Value::Str(Rc::from(*name))),
-        );
-        let ctor = mk_ctor(i, name, *cf, &proto);
+        let ctor = i.native(name, *cf);
         if let Value::Obj(co) = &ctor {
-            i.set_builtin(co, "BYTES_PER_ELEMENT", Value::Num(kind.size() as f64));
-            i.set_builtin(co, "of", i.native("of", ta_static_of));
-            i.set_builtin(co, "from", i.native("from", ta_static_from));
+            co.borrow_mut().proto = Some(ta_intr.clone());
+            co.borrow_mut().props.insert(
+                PropKey::from_str("prototype"),
+                Prop {
+                    val: Value::Obj(proto.clone()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    get: None,
+                    set: None,
+                },
+            );
+            i.set_attr(
+                co,
+                "BYTES_PER_ELEMENT",
+                Value::Num(kind.size() as f64),
+                false,
+                false,
+            );
         }
+        i.set_attr(
+            &proto,
+            "BYTES_PER_ELEMENT",
+            Value::Num(kind.size() as f64),
+            false,
+            false,
+        );
+        i.set_builtin(&proto, "constructor", ctor.clone());
         gdef(i, name, ctor);
     }
     // tolerant stubs — exist so `typeof BigInt64Array === "function"`
     for name in ["BigInt64Array", "BigUint64Array"] {
         let proto = plain(Some(shared.clone()));
-        let ctor = mk_ctor(i, name, big_ta_ctor, &proto);
+        let ctor = i.native(name, big_ta_ctor);
         if let Value::Obj(co) = &ctor {
-            i.set_builtin(co, "BYTES_PER_ELEMENT", Value::Num(8.0));
+            co.borrow_mut().proto = Some(ta_intr.clone());
+            co.borrow_mut().props.insert(
+                PropKey::from_str("prototype"),
+                Prop {
+                    val: Value::Obj(proto.clone()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    get: None,
+                    set: None,
+                },
+            );
+            i.set_attr(co, "BYTES_PER_ELEMENT", Value::Num(8.0), false, false);
+            i.set_builtin(&proto, "constructor", ctor.clone());
         }
         gdef(i, name, ctor);
     }
 }
 
-/// (buffer-obj, byte offset, element count, kind) for a TypedArray value.
-fn ta_parts(v: &Value) -> Option<(ObjRef, usize, usize, TAK)> {
+/// %TypedArray% itself is an abstract constructor — always throws.
+fn ta_intr_ctor(i: &mut Interp, _t: &Value, _a: &[Value]) -> NR {
+    Err(i.type_err("The TypedArray constructor is abstract"))
+}
+
+/// `get %TypedArray%[Symbol.species]` — returns `this`.
+fn ta_get_species(_i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    Ok(this.clone())
+}
+
+/// `get %TypedArray%.prototype[Symbol.toStringTag]` — receiver's
+/// TypedArrayName, or undefined for non-TypedArray receivers.
+fn ta_get_tag(_i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    Ok(match ta_parts(this) {
+        Some(t) => Value::Str(Rc::from(t.kind.type_name())),
+        None => Value::Und,
+    })
+}
+
+fn ta_get_len(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let t = ta_parts(this).ok_or_else(|| {
+        i.type_err("Method called on incompatible receiver (expected TypedArray)")
+    })?;
+    // detached / out-of-bounds views report length 0
+    Ok(Value::Num(t.eff().unwrap_or(0) as f64))
+}
+
+fn ta_get_byte_len(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let t = ta_parts(this).ok_or_else(|| {
+        i.type_err("Method called on incompatible receiver (expected TypedArray)")
+    })?;
+    Ok(Value::Num(
+        t.eff().map(|n| n * t.kind.size()).unwrap_or(0) as f64
+    ))
+}
+
+fn ta_get_byte_off(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let t = ta_parts(this).ok_or_else(|| {
+        i.type_err("Method called on incompatible receiver (expected TypedArray)")
+    })?;
+    Ok(Value::Num(if t.eff().is_some() {
+        t.off as f64
+    } else {
+        0.0
+    }))
+}
+
+fn ta_get_buffer(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let t = ta_parts(this).ok_or_else(|| {
+        i.type_err("Method called on incompatible receiver (expected TypedArray)")
+    })?;
+    Ok(Value::Obj(t.buf))
+}
+
+/// `ObjKind::Typed` internals pulled into a single value.
+#[derive(Clone)]
+struct Tap {
+    buf: ObjRef,
+    off: usize,
+    len: usize,
+    kind: TAK,
+    track: bool,
+}
+
+impl Tap {
+    /// Live element capacity — `None` when the view is detached or
+    /// out-of-bounds (resizable buffer shrunk past the view's range).
+    fn eff(&self) -> Option<usize> {
+        typed_state(&self.buf, self.off, self.len, self.kind, self.track)
+    }
+    /// spec IntegerIndexedElementGet — `None` reads as `undefined`.
+    fn get(&self, k: usize) -> Option<f64> {
+        if !self.eff().is_some_and(|n| k < n) {
+            return None;
+        }
+        let b = buffer_bytes(&self.buf)?;
+        let bb = b.borrow();
+        Some(self.kind.read(&bb, self.off + k * self.kind.size()))
+    }
+    /// spec IntegerIndexedElementSet's tail — in-bounds writes hit the
+    /// immutable check (TypeError); detached / out-of-bounds writes are
+    /// silently dropped.
+    fn set_num(&self, i: &mut Interp, k: usize, v: f64) -> Result<(), Value> {
+        if self.eff().is_some_and(|n| k < n) {
+            if self.buf.borrow().immutable {
+                return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+            }
+            if let Some(b) = buffer_bytes(&self.buf) {
+                self.kind
+                    .write(&mut b.borrow_mut(), self.off + k * self.kind.size(), v);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `ObjKind::Typed` internals for a TypedArray value.
+fn ta_parts(v: &Value) -> Option<Tap> {
     if let Value::Obj(o) = v {
         if let ObjKind::Typed {
             buf,
             off,
             len,
             kind,
+            track,
         } = &o.borrow().kind
         {
-            return Some((buf.clone(), *off, *len, *kind));
+            return Some(Tap {
+                buf: buf.clone(),
+                off: *off,
+                len: *len,
+                kind: *kind,
+                track: *track,
+            });
         }
     }
     None
 }
 
-/// All elements of a TypedArray as f64s.
+/// All live elements of a TypedArray as f64s (empty when detached/OOB).
 fn ta_f64s(v: &Value) -> Vec<f64> {
-    let Some((buf, off, len, kind)) = ta_parts(v) else {
+    let Some(t) = ta_parts(v) else {
         return Vec::new();
     };
-    let Some(bytes) = buffer_bytes(&buf) else {
+    let Some(n) = t.eff() else {
         return Vec::new();
     };
-    let b = bytes.borrow();
-    let sz = kind.size();
-    (0..len).map(|k| kind.read(&b, off + k * sz)).collect()
+    (0..n).filter_map(|k| t.get(k)).collect()
 }
 
-fn mk_typed(proto: Option<ObjRef>, buf: ObjRef, off: usize, len: usize, kind: TAK) -> ObjRef {
+/// integer-index `k` as a PropKey — for Get/Set on TAs and array-likes.
+fn ta_elem_key(k: usize) -> PropKey {
+    PropKey::from_str(&k.to_string())
+}
+
+/// live element read via the integer-indexed exotic [[Get]] path.
+fn ta_elem(i: &mut Interp, this: &Value, k: usize) -> Result<Value, Value> {
+    i.get_prop(this, &ta_elem_key(k))
+}
+
+/// ? ToIntegerOrInfinity — NaN → 0, fraction truncated, ±∞ preserved.
+fn ta_to_int(i: &mut Interp, v: &Value) -> Result<f64, Value> {
+    let n = i.to_num(v)?;
+    Ok(if n.is_nan() { 0.0 } else { n.trunc() })
+}
+
+/// SameValueZero for element comparisons (includes).
+fn ta_same_value_zero(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Num(x), Value::Num(y)) => x == y || (x.is_nan() && y.is_nan()),
+        _ => ta_strict_eq(a, b),
+    }
+}
+
+/// strict equality for element comparisons (indexOf / lastIndexOf).
+fn ta_strict_eq(a: &Value, b: &Value) -> bool {
+    use Value::*;
+    match (a, b) {
+        (Und, Und) | (Null, Null) => true,
+        (Bool(x), Bool(y)) => x == y,
+        (Num(x), Num(y)) => x == y,
+        (Str(x), Str(y)) => x == y,
+        (Sym(x, _), Sym(y, _)) => x == y,
+        (Obj(x), Obj(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+fn mk_typed(
+    proto: Option<ObjRef>,
+    buf: ObjRef,
+    off: usize,
+    len: usize,
+    kind: TAK,
+    track: bool,
+) -> ObjRef {
     Rc::new(RefCell::new(Obj::new(
         proto,
         ObjKind::Typed {
@@ -241,6 +485,7 @@ fn mk_typed(proto: Option<ObjRef>, buf: ObjRef, off: usize, len: usize, kind: TA
             off,
             len,
             kind,
+            track,
         },
     )))
 }
@@ -265,55 +510,141 @@ fn mk_buf_of(i: &Interp, elems: &[f64], kind: TAK) -> (ObjRef, usize) {
     (buf, elems.len())
 }
 
-/// Build a fresh typed array holding `elems` of `kind` (its own buffer).
-fn ta_from_f64s(i: &mut Interp, proto: Option<ObjRef>, elems: Vec<f64>, kind: TAK) -> Value {
-    let (buf, n) = mk_buf_of(i, &elems, kind);
-    Value::Obj(mk_typed(proto, buf, 0, n, kind))
+/// `new <matching intrinsic ctor>(len)` — spec TypedArrayCreateSameType
+/// (toReversed / toSorted / with) and the default species path.
+fn ta_fresh_typed(i: &mut Interp, kind: TAK, len: usize) -> NR {
+    let g = i.global.clone();
+    let cv = i.env_lookup(&g, kind.type_name()).unwrap_or(Value::Und);
+    i.construct(&cv, vec![Value::Num(len as f64)], None)
 }
 
-/// Element count from `new XxxArray(arg0)` when arg0 is an array-like
-/// (non-view) object — via `.length` + indexed reads.
+/// spec SpeciesConstructor — `this.constructor[@@species]`;
+/// `Ok(None)` selects the default constructor for the TA's own kind.
+fn ta_species_ctor(i: &mut Interp, this: &Value) -> Result<Option<Value>, Value> {
+    let c = i.get_prop_str(this, "constructor")?;
+    if matches!(c, Value::Und) {
+        return Ok(None);
+    }
+    let s = i.get_prop(&c, &PropKey::Sym(SYM_SPECIES))?;
+    match s {
+        Value::Und | Value::Null => Ok(None),
+        s if i.is_constructor(&s) => Ok(Some(s)),
+        _ => Err(i.type_err("constructor[Symbol.species] is not a constructor")),
+    }
+}
+
+/// spec TypedArraySpeciesCreate + the TypedArrayCreateFromConstructor
+/// validation: construct `ctor(args)` (default = intrinsic of `kind`),
+/// require a valid TypedArray result. `min_len` enforces the
+/// single-number-argument length check used by slice/map/filter.
+fn ta_species_result(
+    i: &mut Interp,
+    this: &Value,
+    kind: TAK,
+    args: Vec<Value>,
+    min_len: Option<usize>,
+) -> NR {
+    let result = match ta_species_ctor(i, this)? {
+        Some(c) => i.construct(&c, args, None)?,
+        None => {
+            let g = i.global.clone();
+            let cv = i.env_lookup(&g, kind.type_name()).unwrap_or(Value::Und);
+            i.construct(&cv, args, None)?
+        }
+    };
+    let Some(t) = ta_parts(&result) else {
+        return Err(i.type_err("species constructor did not return a TypedArray"));
+    };
+    let Some(eff) = t.eff() else {
+        return Err(i.type_err(
+            "species constructor returned a detached or out-of-bounds TypedArray",
+        ));
+    };
+    if let Some(n) = min_len {
+        if eff < n {
+            return Err(i.type_err(
+                "species constructor returned a TypedArray that is too short",
+            ));
+        }
+    }
+    Ok(result)
+}
+
+/// `new XxxArray(...)` — concrete element-kind constructor.
 fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
+    if i.new_target_native.is_none() {
+        return Err(i.type_err("TypedArray constructor cannot be invoked without 'new'"));
+    }
     let sz = kind.size();
     let src = arg(args, 0);
-    // (buffer obj, byte offset, elem count)
-    let (buf, off, len): (ObjRef, usize, usize) = match &src {
+    // (buffer obj, byte offset, elem count, length-tracking)
+    let (buf, off, len, track): (ObjRef, usize, usize, bool) = match &src {
         Value::Obj(o) => {
             let kind_of_src = o.borrow().kind.clone();
             match kind_of_src {
                 ObjKind::Bytes(b) => {
+                    if o.borrow().detached {
+                        return Err(i.type_err("Cannot construct a TypedArray on a detached ArrayBuffer"));
+                    }
+                    let resizable = o.borrow().rab_max.is_some();
                     let blen = b.borrow().len();
                     let off = match arg(args, 1) {
                         Value::Und => 0,
-                        v => i.to_num(&v)?.max(0.0) as usize,
+                        v => {
+                            let n = i.to_num(&v)?.trunc();
+                            if n < 0.0 || !n.is_finite() {
+                                return Err(
+                                    i.range_err("start offset of typed array is out of range")
+                                );
+                            }
+                            n as usize
+                        }
                     };
                     if off % sz != 0 || off > blen {
                         return Err(i.range_err("start offset of typed array is out of bounds"));
                     }
-                    let len = match arg(args, 2) {
+                    let (len, track) = match arg(args, 2) {
                         Value::Und => {
-                            if (blen - off) % sz != 0 {
-                                return Err(
-                                    i.range_err("byte length of typed array is not aligned")
-                                );
+                            if resizable {
+                                // length-tracking view — no alignment
+                                // constraint on the initial byte size
+                                ((blen - off) / sz, true)
+                            } else {
+                                if (blen - off) % sz != 0 {
+                                    return Err(
+                                        i.range_err("byte length of typed array is not aligned")
+                                    );
+                                }
+                                ((blen - off) / sz, false)
                             }
-                            (blen - off) / sz
                         }
                         v => {
-                            let n = i.to_num(&v)?.max(0.0) as usize;
+                            let n = i.to_num(&v)?.trunc();
+                            if n < 0.0 || !n.is_finite() {
+                                return Err(
+                                    i.range_err("length of typed array is out of range")
+                                );
+                            }
+                            let n = n as usize;
                             if off + n.saturating_mul(sz) > blen {
                                 return Err(i.range_err("length of typed array out of bounds"));
                             }
-                            n
+                            (n, false)
                         }
                     };
-                    (o.clone(), off, len)
+                    (o.clone(), off, len, track)
                 }
-                ObjKind::Typed { .. } | ObjKind::View { .. } => {
-                    // copy elements into a fresh buffer
+                ObjKind::Typed {
+                    buf: sbuf, ..
+                } => {
+                    // InitializeTypedArrayFromTypedArray — detached
+                    // source throws; an OOB source contributes 0 elems.
+                    if sbuf.borrow().detached {
+                        return Err(i.type_err("source TypedArray is detached"));
+                    }
                     let elems = ta_f64s(&src);
                     let (buf, n) = mk_buf_of(i, &elems, kind);
-                    (buf, 0, n)
+                    (buf, 0, n, false)
                 }
                 _ => {
                     // array-like / iterable
@@ -327,21 +658,21 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
                         elems.push(i.to_num(&it)?);
                     }
                     let (buf, n) = mk_buf_of(i, &elems, kind);
-                    (buf, 0, n)
+                    (buf, 0, n, false)
                 }
             }
         }
-        Value::Und | Value::Null => (mk_buffer(i, Vec::new()), 0, 0),
+        Value::Und | Value::Null => (mk_buffer(i, Vec::new()), 0, 0, false),
         other => {
             let n = i.to_num(other)?;
             if n.is_nan() {
-                (mk_buffer(i, Vec::new()), 0, 0)
+                (mk_buffer(i, Vec::new()), 0, 0, false)
             } else {
                 if !n.is_finite() || n < 0.0 || n > 268435456.0 {
                     return Err(i.range_err("Invalid typed array length"));
                 }
                 let n = n as usize;
-                (mk_buffer(i, vec![0u8; n * sz]), 0, n)
+                (mk_buffer(i, vec![0u8; n * sz]), 0, n, false)
             }
         }
     };
@@ -354,68 +685,105 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
         off,
         len,
         kind,
+        track,
     };
     Ok(Value::Obj(o))
 }
 
-fn ta_static_of(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
-    // `this` is the ctor obj; find its proto to type the result
-    // (fall back to Uint8Array when this isn't a class).
-    // The ctor fn is `this` for statics.
-    let proto = _t_proto_of_ctor(i, _t);
-    let kind = ta_kind_of_proto(i, &proto).unwrap_or(TAK::U8);
-    let mut elems = Vec::with_capacity(args.len());
-    for a in args {
-        elems.push(i.to_num(a)?);
+/// `%TypedArray%.of` — `new this(len)` then per-index Set.
+fn ta_static_of(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
+    if !i.is_constructor(t) {
+        return Err(i.type_err("of called on a non-constructor"));
     }
-    Ok(ta_from_f64s(i, proto, elems, kind))
+    let obj = i.construct(t, vec![Value::Num(args.len() as f64)], None)?;
+    if ta_parts(&obj).is_none() {
+        return Err(i.type_err("of result is not a TypedArray"));
+    }
+    for (k, v) in args.iter().enumerate() {
+        i.set_prop(&obj, ta_elem_key(k), v.clone())?;
+    }
+    Ok(obj)
 }
 
-/// If `v` is one of the TA ctor objects, its `.prototype` obj.
-fn _t_proto_of_ctor(i: &mut Interp, v: &Value) -> Option<ObjRef> {
-    if let Value::Obj(o) = v {
-        if let Some(Value::Obj(p)) = i.obj_get_raw(o, &PropKey::from_str("prototype")) {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// which TA class a proto belongs to (its own Symbol.toStringTag).
-fn ta_kind_of_proto(i: &mut Interp, proto: &Option<ObjRef>) -> Option<TAK> {
-    let p = proto.as_ref()?;
-    for (name, kind) in TA_CLASSES {
-        if let Some(Value::Str(s)) = i.obj_get_raw(p, &PropKey::Sym(SYM_TOSTRINGTAG)) {
-            if s.as_ref() == name {
-                return Some(kind);
-            }
-        }
-    }
-    None
-}
-
+/// `%TypedArray%.from` — iterable and array-like forms, with map fn.
 fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
-    let proto = _t_proto_of_ctor(i, t);
-    let kind = ta_kind_of_proto(i, &proto).unwrap_or(TAK::U8);
-    let items = if i.has_prop(&arg(args, 0), &PropKey::Sym(SYM_ITERATOR))? {
-        i.iter_values(&arg(args, 0))?
-    } else {
-        to_elems(i, &arg(args, 0))?
-    };
-    let mapf = arg(args, 1);
-    let mut elems = Vec::with_capacity(items.len());
-    for (k, it) in items.iter().enumerate() {
-        let v = if i.is_callable(&mapf) {
-            i.call(&mapf, Value::Und, vec![it.clone(), Value::Num(k as f64)])?
-        } else {
-            it.clone()
-        };
-        elems.push(i.to_num(&v)?);
+    if !i.is_constructor(t) {
+        return Err(i.type_err("from called on a non-constructor"));
     }
-    Ok(ta_from_f64s(i, proto, elems, kind))
+    let src = arg(args, 0);
+    let mapf = arg(args, 1);
+    let this_arg = arg(args, 2);
+    if !matches!(mapf, Value::Und) && !i.is_callable(&mapf) {
+        return Err(i.type_err("TypedArray.from mapper is not callable"));
+    }
+    let use_map = i.is_callable(&mapf);
+    let iterm = i.get_prop(&src, &PropKey::Sym(SYM_ITERATOR))?;
+    if !matches!(iterm, Value::Und | Value::Null) {
+        // iterable source — drain via the next() protocol
+        if !i.is_callable(&iterm) {
+            return Err(i.type_err("value is not iterable"));
+        }
+        let iter = i.call(&iterm, src.clone(), Vec::new())?;
+        let mut items = Vec::new();
+        loop {
+            if items.len() > 200_000 {
+                return Err(i.range_err("iteration limit exceeded"));
+            }
+            let next = i.get_prop_str(&iter, "next")?;
+            if !i.is_callable(&next) {
+                return Err(i.type_err("iterator.next is not a function"));
+            }
+            let r = i.call(&next, iter.clone(), Vec::new())?;
+            if !matches!(r, Value::Obj(_)) {
+                return Err(i.type_err("iterator result is not an object"));
+            }
+            let done = i.get_prop_str(&r, "done")?;
+            if i.to_bool(&done) {
+                break;
+            }
+            items.push(i.get_prop_str(&r, "value")?);
+        }
+        let obj = i.construct(t, vec![Value::Num(items.len() as f64)], None)?;
+        if ta_parts(&obj).is_none() {
+            return Err(i.type_err("from result is not a TypedArray"));
+        }
+        for (k, it) in items.into_iter().enumerate() {
+            let v = if use_map {
+                i.call(&mapf, this_arg.clone(), vec![it, Value::Num(k as f64)])?
+            } else {
+                it
+            };
+            i.set_prop(&obj, ta_elem_key(k), v)?;
+        }
+        return Ok(obj);
+    }
+    // array-like source — length read, construct, then per-index
+    // Get → map → Set (all errors propagate in order)
+    let lv = i.get_prop_str(&src, "length")?;
+    let n = i.to_num(&lv)?;
+    let len = if n.is_nan() || n <= 0.0 {
+        0
+    } else {
+        n.min(9_007_199_254_740_991.0) as usize
+    };
+    let obj = i.construct(t, vec![Value::Num(len as f64)], None)?;
+    if ta_parts(&obj).is_none() {
+        return Err(i.type_err("from result is not a TypedArray"));
+    }
+    for k in 0..len {
+        let kv = i.get_prop(&src, &ta_elem_key(k))?;
+        let v = if use_map {
+            i.call(&mapf, this_arg.clone(), vec![kv, Value::Num(k as f64)])?
+        } else {
+            kv
+        };
+        i.set_prop(&obj, ta_elem_key(k), v)?;
+    }
+    Ok(obj)
 }
 
-/// the proto for results of methods on `this` typed array (its own proto).
+/// the proto for results of methods on `this` (its own proto) — used
+/// by the non-TypedArray installers below (Blob, media stubs).
 fn this_proto(this: &Value) -> Option<ObjRef> {
     if let Value::Obj(o) = this {
         return o.borrow().proto.clone();
@@ -423,156 +791,220 @@ fn this_proto(this: &Value) -> Option<ObjRef> {
     None
 }
 
-fn need_ta(i: &mut Interp, this: &Value) -> Result<(ObjRef, usize, usize, TAK), Value> {
-    ta_parts(this)
-        .ok_or_else(|| i.type_err("Method called on incompatible receiver (expected TypedArray)"))
+/// spec ValidateTypedArray — receiver must be a TypedArray with a
+/// non-detached, in-bounds buffer.
+fn need_ta(i: &mut Interp, this: &Value) -> Result<Tap, Value> {
+    let t = ta_parts(this).ok_or_else(|| {
+        i.type_err("Method called on incompatible receiver (expected TypedArray)")
+    })?;
+    if t.eff().is_none() {
+        return Err(i.type_err("Cannot perform operation on a detached or out-of-bounds TypedArray"));
+    }
+    Ok(t)
 }
 
 fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (buf, off, len, kind) = need_ta(i, this)?;
-    let to = i.to_num(&arg(args, 1)).unwrap_or(0.0);
-    if to < 0.0 || to as usize > len {
+    // spec ValidateTypedArray precedes the offset coercion.
+    let t = need_ta(i, this)?;
+    let tof = ta_to_int(i, &arg(args, 1))?;
+    if tof < 0.0 || tof == f64::INFINITY {
         return Err(i.range_err("offset is out of bounds"));
     }
-    let to = to as usize;
+    let to = tof as usize;
+    // target detached / out-of-bounds validated after offset coercion
+    let Some(tlen) = t.eff() else {
+        return Err(
+            i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray")
+        );
+    };
     let src = arg(args, 0);
+    if let Some(s) = ta_parts(&src) {
+        // TypedArray source — internal-slot reads, buffer snapshot
+        // (handles shared-buffer aliasing).
+        if s.buf.borrow().detached {
+            return Err(i.type_err("source TypedArray is detached"));
+        }
+        // an out-of-bounds source contributes zero elements (spec:
+        // TypedArrayLength of an OOB record is 0)
+        let slen = s.eff().unwrap_or(0);
+        if to.saturating_add(slen) > tlen {
+            return Err(i.range_err("source array is too long"));
+        }
+        let elems = ta_f64s(&src);
+        if !elems.is_empty() && t.buf.borrow().immutable {
+            return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+        }
+        if let Some(bytes) = buffer_bytes(&t.buf) {
+            let mut bb = bytes.borrow_mut();
+            let sz = t.kind.size();
+            for (k, v) in elems.iter().enumerate() {
+                t.kind.write(&mut bb, t.off + (to + k) * sz, *v);
+            }
+        }
+        return Ok(Value::Und);
+    }
+    // array-like / primitive source — spec per-element Get → ToNumber →
+    // write (live-bounded: source getters may resize the target)
     if matches!(src, Value::Und | Value::Null) {
         return Err(i.type_err("set source must be an object"));
     }
-    // materialize source first (may alias our own buffer)
-    let elems: Vec<f64> = match &src {
-        Value::Obj(o) => match &o.borrow().kind {
-            ObjKind::Typed { .. } => ta_f64s(&src),
-            ObjKind::Arr(_) => {
-                let items = to_elems(i, &src)?;
-                let mut out = Vec::with_capacity(items.len());
-                for it in items {
-                    out.push(i.to_num(&it)?);
-                }
-                out
-            }
-            _ => {
-                let items = to_elems(i, &src)?;
-                let mut out = Vec::with_capacity(items.len());
-                for it in items {
-                    out.push(i.to_num(&it)?);
-                }
-                out
-            }
-        },
-        _ => return Err(i.type_err("set source must be an object")),
+    let lv = i.get_prop_str(&src, "length")?;
+    let n = i.to_num(&lv)?;
+    let slen = if n.is_nan() || n <= 0.0 {
+        0
+    } else {
+        n.min(9_007_199_254_740_991.0) as usize
     };
-    if to + elems.len() > len {
+    if to.saturating_add(slen) > tlen {
         return Err(i.range_err("source array is too long"));
     }
-    if let Some(bytes) = buffer_bytes(&buf) {
-        let mut bb = bytes.borrow_mut();
-        let sz = kind.size();
-        for (k, v) in elems.iter().enumerate() {
-            kind.write(&mut bb, off + (to + k) * sz, *v);
-        }
+    for k in 0..slen {
+        // ? Get — an abrupt completion leaves earlier writes in place.
+        let v = i.get_prop(&src, &ta_elem_key(k))?;
+        // spec Set propagates ToNumber first — conversion side effects
+        // (detach/resize) make the write itself silently vanish.
+        let nv = i.to_num(&v)?;
+        t.set_num(i, to + k, nv)?;
     }
     Ok(Value::Und)
 }
 
 fn m_ta_subarray(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (buf, off, len, kind) = need_ta(i, this)?;
-    let begin = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let begin = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
     let end = match arg(args, 1) {
         Value::Und => len,
-        v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
+        v => clamp_index(ta_to_int(i, &v)?, len),
     };
     let nlen = end.saturating_sub(begin);
-    let noff = off + begin * kind.size();
-    Ok(Value::Obj(mk_typed(
-        this_proto(this),
-        buf,
-        noff,
-        nlen,
-        kind,
-    )))
+    let noff = t.off + begin * t.kind.size();
+    // species ctor gets (buffer, byteOffset[, length]); the two-arg
+    // form preserves length-tracking when `this` tracks and `end`
+    // was not given.
+    let argv = if t.track && matches!(arg(args, 1), Value::Und) {
+        vec![Value::Obj(t.buf.clone()), Value::Num(noff as f64)]
+    } else {
+        vec![
+            Value::Obj(t.buf.clone()),
+            Value::Num(noff as f64),
+            Value::Num(nlen as f64),
+        ]
+    };
+    ta_species_result(i, this, t.kind, argv, None)
 }
 
 fn m_ta_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, len, kind) = need_ta(i, this)?;
-    let all = ta_f64s(this);
-    let begin = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let begin = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
     let end = match arg(args, 1) {
         Value::Und => len,
-        v => clamp_index(i.to_num(&v).unwrap_or(0.0), len),
+        v => clamp_index(ta_to_int(i, &v)?, len),
     };
-    let out = if begin < end {
-        all[begin..end].to_vec()
-    } else {
-        Vec::new()
-    };
-    Ok(ta_from_f64s(i, this_proto(this), out, kind))
+    let count = end.saturating_sub(begin);
+    let a = ta_species_result(
+        i,
+        this,
+        t.kind,
+        vec![Value::Num(count as f64)],
+        Some(count),
+    )?;
+    if count > 0 {
+        if t.buf.borrow().detached {
+            return Err(i.type_err("Cannot perform slice on a detached ArrayBuffer"));
+        }
+        // snapshot the source range first — a custom species result
+        // may alias this buffer (same-typed results get a byte copy
+        // per spec; per-element copy is observably identical)
+        let mut vals = Vec::with_capacity(count);
+        for k in 0..count {
+            vals.push(ta_elem(i, this, begin + k)?);
+        }
+        for (k, v) in vals.into_iter().enumerate() {
+            i.set_prop(&a, ta_elem_key(k), v)?;
+        }
+    }
+    Ok(a)
 }
 
 fn m_ta_fill(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (buf, off, len, kind) = need_ta(i, this)?;
-    let v = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), len);
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let v = i.to_num(&arg(args, 0))?;
+    let start = clamp_index(ta_to_int(i, &arg(args, 1))?, len);
     let end = match arg(args, 2) {
         Value::Und => len,
-        x => clamp_index(i.to_num(&x).unwrap_or(0.0), len),
+        x => clamp_index(ta_to_int(i, &x)?, len),
     };
-    if let Some(bytes) = buffer_bytes(&buf) {
-        let mut bb = bytes.borrow_mut();
-        let sz = kind.size();
-        for k in start..end {
-            kind.write(&mut bb, off + k * sz, v);
-        }
+    // coercion may have detached the buffer
+    if t.buf.borrow().detached {
+        return Err(i.type_err("Cannot perform fill on a detached ArrayBuffer"));
+    }
+    for k in start..end {
+        t.set_num(i, k, v)?;
     }
     Ok(this.clone())
 }
 
 fn m_ta_copy_within(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (buf, off, len, kind) = need_ta(i, this)?;
-    let target = clamp_index(i.to_num(&arg(args, 0)).unwrap_or(0.0), len);
-    let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), len);
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let target = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
+    let start = clamp_index(ta_to_int(i, &arg(args, 1))?, len);
     let end = match arg(args, 2) {
         Value::Und => len,
-        x => clamp_index(i.to_num(&x).unwrap_or(0.0), len),
+        x => clamp_index(ta_to_int(i, &x)?, len),
     };
-    let count = (end - start).min(len - target);
-    let tmp = ta_f64s(this);
-    if let Some(bytes) = buffer_bytes(&buf) {
-        let mut bb = bytes.borrow_mut();
-        let sz = kind.size();
+    let count = end.saturating_sub(start).min(len - target);
+    if count > 0 {
+        if t.buf.borrow().detached {
+            return Err(
+                i.type_err("Cannot perform copyWithin on a detached ArrayBuffer")
+            );
+        }
+        // byte-copy via an element snapshot; out-of-range source
+        // positions (shrunk buffer) read as 0
+        let tmp: Vec<f64> = (0..count)
+            .map(|k| t.get(start + k).unwrap_or(0.0))
+            .collect();
         for k in 0..count {
-            kind.write(&mut bb, off + (target + k) * sz, tmp[start + k]);
+            t.set_num(i, target + k, tmp[k])?;
         }
     }
     Ok(this.clone())
 }
 
 fn m_ta_reverse(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (buf, off, len, kind) = need_ta(i, this)?;
+    let t = need_ta(i, this)?;
     let _ = args;
+    let len = t.eff().unwrap_or(0);
     let tmp = ta_f64s(this);
-    if let Some(bytes) = buffer_bytes(&buf) {
-        let mut bb = bytes.borrow_mut();
-        let sz = kind.size();
-        for k in 0..len {
-            kind.write(&mut bb, off + k * sz, tmp[len - 1 - k]);
-        }
+    for k in 0..len {
+        t.set_num(i, k, tmp[len - 1 - k])?;
     }
     Ok(this.clone())
 }
 
-fn m_ta_sort(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (buf, off, _len, kind) = need_ta(i, this)?;
-    let cmp = arg(args, 0);
-    let mut items: Vec<Value> = ta_f64s(this).into_iter().map(Value::Num).collect();
-    if i.is_callable(&cmp) {
+/// shared element capture + sort + write-back for sort/toSorted.
+fn ta_sort_elems(
+    i: &mut Interp,
+    this: &Value,
+    len: usize,
+    cmp: &Value,
+) -> Result<Vec<Value>, Value> {
+    let mut items = Vec::with_capacity(len);
+    for k in 0..len {
+        items.push(ta_elem(i, this, k)?);
+    }
+    if i.is_callable(cmp) {
         let mut err: Option<Value> = None;
         let mut work = items.clone();
         merge_sort(&mut items, &mut work, &mut |a, b| {
             if err.is_some() {
                 return std::cmp::Ordering::Equal;
             }
-            match i.call(&cmp, Value::Und, vec![a.clone(), b.clone()]) {
+            match i.call(cmp, Value::Und, vec![a.clone(), b.clone()]) {
                 Ok(v) => match i.to_num(&v) {
                     Ok(n) if n < 0.0 => std::cmp::Ordering::Less,
                     Ok(n) if n > 0.0 => std::cmp::Ordering::Greater,
@@ -592,41 +1024,65 @@ fn m_ta_sort(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             return Err(e);
         }
     } else {
-        // numeric compare; NaN sorts last
-        items.sort_by(|a, b| match (a, b) {
-            (Value::Num(x), Value::Num(y)) => {
-                if x.is_nan() && y.is_nan() {
-                    std::cmp::Ordering::Equal
-                } else if x.is_nan() {
-                    std::cmp::Ordering::Greater
-                } else if y.is_nan() {
-                    std::cmp::Ordering::Less
-                } else {
-                    x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-                }
+        // default numeric compare; NaN (incl. undefined elements) last
+        items.sort_by(|a, b| {
+            let (x, y) = match (a, b) {
+                (Value::Num(x), Value::Num(y)) => (*x, *y),
+                (Value::Num(_), _) => return std::cmp::Ordering::Less,
+                (_, Value::Num(_)) => return std::cmp::Ordering::Greater,
+                _ => (f64::NAN, f64::NAN),
+            };
+            if x.is_nan() && y.is_nan() {
+                std::cmp::Ordering::Equal
+            } else if x.is_nan() {
+                std::cmp::Ordering::Greater
+            } else if y.is_nan() {
+                std::cmp::Ordering::Less
+            } else {
+                x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
             }
-            _ => std::cmp::Ordering::Equal,
         });
     }
-    if let Some(bytes) = buffer_bytes(&buf) {
-        let mut bb = bytes.borrow_mut();
-        let sz = kind.size();
-        for (k, v) in items.iter().enumerate() {
-            if let Value::Num(n) = v {
-                kind.write(&mut bb, off + k * sz, *n);
-            }
-        }
+    Ok(items)
+}
+
+fn m_ta_sort(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let cmp = arg(args, 0);
+    if !matches!(cmp, Value::Und) && !i.is_callable(&cmp) {
+        return Err(i.type_err("comparefn must be a function or undefined"));
+    }
+    let items = ta_sort_elems(i, this, len, &cmp)?;
+    // write-back via Set — live bounds; immutable throws TypeError
+    for (k, v) in items.into_iter().enumerate() {
+        i.set_prop(this, ta_elem_key(k), v)?;
     }
     Ok(this.clone())
 }
 
 fn m_ta_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, len, _) = need_ta(i, this)?;
-    let needle = i.to_num(&arg(args, 0))?;
-    let start = clamp_index(i.to_num(&arg(args, 1)).unwrap_or(0.0), len);
-    let elems = ta_f64s(this);
-    for (k, v) in elems.iter().enumerate().skip(start) {
-        if *v == needle {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    if len == 0 {
+        return Ok(Value::Num(-1.0));
+    }
+    let needle = arg(args, 0);
+    let n = match arg(args, 1) {
+        Value::Und => 0.0,
+        v => ta_to_int(i, &v)?,
+    };
+    if n == f64::INFINITY {
+        return Ok(Value::Num(-1.0));
+    }
+    let start = if n < 0.0 {
+        len.saturating_sub((-n) as usize)
+    } else {
+        (n as usize).min(len)
+    };
+    for k in start..len {
+        let v = ta_elem(i, this, k)?;
+        if ta_strict_eq(&v, &needle) {
             return Ok(Value::Num(k as f64));
         }
     }
@@ -634,23 +1090,30 @@ fn m_ta_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, len, _) = need_ta(i, this)?;
-    let needle = i.to_num(&arg(args, 0))?;
-    let elems = ta_f64s(this);
-    let mut start = match arg(args, 1) {
-        Value::Und => len,
-        v => {
-            let n = i.to_num(&v).unwrap_or(0.0);
-            if n < 0.0 {
-                len.saturating_sub((-n) as usize)
-            } else {
-                (n as usize).min(len)
-            }
-        }
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    if len == 0 {
+        return Ok(Value::Num(-1.0));
+    }
+    let needle = arg(args, 0);
+    let n = match arg(args, 1) {
+        Value::Und => len as f64 - 1.0,
+        v => ta_to_int(i, &v)?,
     };
-    start = start.min(len);
-    for k in (0..start).rev() {
-        if elems[k] == needle {
+    if n == f64::NEG_INFINITY {
+        return Ok(Value::Num(-1.0));
+    }
+    let k: i64 = if n >= 0.0 {
+        n.min(len as f64 - 1.0) as i64
+    } else {
+        len as i64 + n as i64
+    };
+    if k < 0 {
+        return Ok(Value::Num(-1.0));
+    }
+    for k in (0..=k as usize).rev() {
+        let v = ta_elem(i, this, k)?;
+        if ta_strict_eq(&v, &needle) {
             return Ok(Value::Num(k as f64));
         }
     }
@@ -658,10 +1121,27 @@ fn m_ta_last_index_of(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let needle = i.to_num(&arg(args, 0))?;
-    for v in ta_f64s(this) {
-        if v == needle || (v.is_nan() && needle.is_nan()) {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    if len == 0 {
+        return Ok(Value::Bool(false));
+    }
+    let needle = arg(args, 0);
+    let n = match arg(args, 1) {
+        Value::Und => 0.0,
+        v => ta_to_int(i, &v)?,
+    };
+    if n == f64::INFINITY {
+        return Ok(Value::Bool(false));
+    }
+    let start = if n < 0.0 {
+        len.saturating_sub((-n) as usize)
+    } else {
+        (n as usize).min(len)
+    };
+    for k in start..len {
+        let v = ta_elem(i, this, k)?;
+        if ta_same_value_zero(&v, &needle) {
             return Ok(Value::Bool(true));
         }
     }
@@ -669,88 +1149,152 @@ fn m_ta_includes(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_join(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
     let sep = match arg(args, 0) {
         Value::Und => ",".to_string(),
-        v => i.to_str(&v)?,
+        v => {
+            if let Value::Sym(..) = v {
+                return Err(i.type_err("Cannot convert a Symbol value to a string"));
+            }
+            i.to_str(&v)?
+        }
     };
-    let parts: Vec<String> = ta_f64s(this).iter().map(|n| js_num_str(*n)).collect();
+    let mut parts = Vec::with_capacity(len);
+    for k in 0..len {
+        let v = ta_elem(i, this, k)?;
+        parts.push(match v {
+            Value::Und | Value::Null => String::new(),
+            v => i.to_str(&v)?,
+        });
+    }
     Ok(Value::Str(Rc::from(parts.join(&sep).as_str())))
 }
 
-fn m_ta_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    m_ta_join(i, this, &[])
+fn m_ta_to_locale_string(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let _ = args;
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let mut parts = Vec::with_capacity(len);
+    for k in 0..len {
+        let v = ta_elem(i, this, k)?;
+        let s = match v {
+            Value::Und | Value::Null => String::new(),
+            v => {
+                let m = i.get_prop_str(&v, "toLocaleString")?;
+                if !i.is_callable(&m) {
+                    return Err(i.type_err("element.toLocaleString is not callable"));
+                }
+                let r = i.call(&m, v.clone(), Vec::new())?;
+                i.to_str(&r)?
+            }
+        };
+        parts.push(s);
+    }
+    Ok(Value::Str(Rc::from(parts.join(",").as_str())))
 }
 
 fn m_ta_at(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, len, _) = need_ta(i, this)?;
-    let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let n = ta_to_int(i, &arg(args, 0))?;
     let idx = if n < 0.0 {
         len as i64 + n as i64
     } else {
-        n as i64
+        n.min(i64::MAX as f64) as i64
     };
     if idx < 0 || idx >= len as i64 {
         return Ok(Value::Und);
     }
-    let elems = ta_f64s(this);
-    Ok(Value::Num(elems[idx as usize]))
+    ta_elem(i, this, idx as usize)
+}
+
+/// spec callback-preamble for map/filter/forEach/find*/some/every:
+/// callable check happens before any iteration (throws even for
+/// empty receivers).
+fn ta_cb(i: &mut Interp, args: &[Value]) -> Result<(Value, Value), Value> {
+    let cb = arg(args, 0);
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not a function"));
+    }
+    Ok((cb, arg(args, 1)))
 }
 
 fn m_ta_map(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, len, kind) = need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    let elems = ta_f64s(this);
-    let mut out = Vec::with_capacity(len);
-    for (k, v) in elems.iter().enumerate() {
-        let r = i.call(
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    let a = ta_species_result(
+        i,
+        this,
+        t.kind,
+        vec![Value::Num(len as f64)],
+        Some(len),
+    )?;
+    for k in 0..len {
+        let kv = ta_elem(i, this, k)?;
+        let rv = i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(*v), Value::Num(k as f64), this.clone()],
+            vec![kv, Value::Num(k as f64), this.clone()],
         )?;
-        out.push(i.to_num(&r)?);
+        i.set_prop(&a, ta_elem_key(k), rv)?;
     }
-    Ok(ta_from_f64s(i, this_proto(this), out, kind))
+    Ok(a)
 }
 
 fn m_ta_filter(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, _, kind) = need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    let elems = ta_f64s(this);
-    let mut out = Vec::new();
-    for (k, v) in elems.iter().enumerate() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    // callbacks run before the species create (spec order)
+    let mut kept = Vec::new();
+    for k in 0..len {
+        let kv = ta_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(*v), Value::Num(k as f64), this.clone()],
+            vec![kv.clone(), Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
-            out.push(*v);
+            kept.push(kv);
         }
     }
-    Ok(ta_from_f64s(i, this_proto(this), out, kind))
+    let a = ta_species_result(
+        i,
+        this,
+        t.kind,
+        vec![Value::Num(kept.len() as f64)],
+        Some(kept.len()),
+    )?;
+    for (k, kv) in kept.into_iter().enumerate() {
+        i.set_prop(&a, ta_elem_key(k), kv)?;
+    }
+    Ok(a)
 }
 
 fn m_ta_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    for (k, v) in ta_f64s(this).iter().enumerate() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    for k in 0..len {
+        let kv = ta_elem(i, this, k)?;
         i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(*v), Value::Num(k as f64), this.clone()],
+            vec![kv, Value::Num(k as f64), this.clone()],
         )?;
     }
     Ok(Value::Und)
 }
 
 fn m_ta_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, len, _) = need_ta(i, this)?;
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
     let cb = arg(args, 0);
-    let elems = ta_f64s(this);
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not a function"));
+    }
     let mut k = 0;
     let mut acc = match args.get(1) {
         Some(v) => v.clone(),
@@ -759,14 +1303,15 @@ fn m_ta_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
                 return Err(i.type_err("Reduce of empty array with no initial value"));
             }
             k = 1;
-            Value::Num(elems[0])
+            ta_elem(i, this, 0)?
         }
     };
-    for v in elems.iter().skip(k) {
+    while k < len {
+        let kv = ta_elem(i, this, k)?;
         acc = i.call(
             &cb,
             Value::Und,
-            vec![acc, Value::Num(*v), Value::Num((k) as f64), this.clone()],
+            vec![acc, kv, Value::Num(k as f64), this.clone()],
         )?;
         k += 1;
     }
@@ -774,9 +1319,12 @@ fn m_ta_reduce(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, len, _) = need_ta(i, this)?;
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
     let cb = arg(args, 0);
-    let elems = ta_f64s(this);
+    if !i.is_callable(&cb) {
+        return Err(i.type_err("callback is not a function"));
+    }
     let mut k = len;
     let mut acc = match args.get(1) {
         Some(v) => v.clone(),
@@ -785,51 +1333,49 @@ fn m_ta_reduce_right(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
                 return Err(i.type_err("Reduce of empty array with no initial value"));
             }
             k = len - 1;
-            Value::Num(elems[len - 1])
+            ta_elem(i, this, len - 1)?
         }
     };
     while k > 0 {
         k -= 1;
+        let kv = ta_elem(i, this, k)?;
         acc = i.call(
             &cb,
             Value::Und,
-            vec![
-                acc,
-                Value::Num(elems[k]),
-                Value::Num(k as f64),
-                this.clone(),
-            ],
+            vec![acc, kv, Value::Num(k as f64), this.clone()],
         )?;
     }
     Ok(acc)
 }
 
 fn m_ta_find(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    for (k, v) in ta_f64s(this).iter().enumerate() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    for k in 0..len {
+        let kv = ta_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(*v), Value::Num(k as f64), this.clone()],
+            vec![kv.clone(), Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(Value::Num(*v));
+            return Ok(kv);
         }
     }
     Ok(Value::Und)
 }
 
 fn m_ta_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    for (k, v) in ta_f64s(this).iter().enumerate() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    for k in 0..len {
+        let kv = ta_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(*v), Value::Num(k as f64), this.clone()],
+            vec![kv, Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
             return Ok(Value::Num(k as f64));
@@ -839,33 +1385,33 @@ fn m_ta_find_index(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_find_last(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    let elems = ta_f64s(this);
-    for k in (0..elems.len()).rev() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    for k in (0..len).rev() {
+        let kv = ta_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(elems[k]), Value::Num(k as f64), this.clone()],
+            vec![kv.clone(), Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
-            return Ok(Value::Num(elems[k]));
+            return Ok(kv);
         }
     }
     Ok(Value::Und)
 }
 
 fn m_ta_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    let elems = ta_f64s(this);
-    for k in (0..elems.len()).rev() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    for k in (0..len).rev() {
+        let kv = ta_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(elems[k]), Value::Num(k as f64), this.clone()],
+            vec![kv, Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
             return Ok(Value::Num(k as f64));
@@ -875,14 +1421,15 @@ fn m_ta_find_last_index(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_some(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    for (k, v) in ta_f64s(this).iter().enumerate() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    for k in 0..len {
+        let kv = ta_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(*v), Value::Num(k as f64), this.clone()],
+            vec![kv, Value::Num(k as f64), this.clone()],
         )?;
         if i.to_bool(&r) {
             return Ok(Value::Bool(true));
@@ -892,14 +1439,15 @@ fn m_ta_some(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_every(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let cb = arg(args, 0);
-    let this_arg = arg(args, 1);
-    for (k, v) in ta_f64s(this).iter().enumerate() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let (cb, this_arg) = ta_cb(i, args)?;
+    for k in 0..len {
+        let kv = ta_elem(i, this, k)?;
         let r = i.call(
             &cb,
             this_arg.clone(),
-            vec![Value::Num(*v), Value::Num(k as f64), this.clone()],
+            vec![kv, Value::Num(k as f64), this.clone()],
         )?;
         if !i.to_bool(&r) {
             return Ok(Value::Bool(false));
@@ -909,58 +1457,91 @@ fn m_ta_every(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    let (_, _, len, _) = need_ta(i, this)?;
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
     let ks: Vec<Value> = (0..len).map(|k| Value::Num(k as f64)).collect();
-    Ok(make_iter(i, ks))
+    Ok(make_iter_in(ks, i.p.array_iter.clone()))
 }
 
 fn m_ta_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let vs: Vec<Value> = ta_f64s(this).into_iter().map(Value::Num).collect();
-    Ok(make_iter(i, vs))
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let mut vs = Vec::with_capacity(len);
+    for k in 0..len {
+        vs.push(ta_elem(i, this, k)?);
+    }
+    Ok(make_iter_in(vs, i.p.array_iter.clone()))
 }
 
 fn m_ta_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
-    need_ta(i, this)?;
-    let mut out = Vec::new();
-    for (k, v) in ta_f64s(this).iter().enumerate() {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let mut out = Vec::with_capacity(len);
+    for k in 0..len {
+        let v = ta_elem(i, this, k)?;
         out.push(Value::Obj(
-            i.new_arr(vec![Value::Num(k as f64), Value::Num(*v)]),
+            i.new_arr(vec![Value::Num(k as f64), v]),
         ));
     }
-    Ok(make_iter(i, out))
+    Ok(make_iter_in(out, i.p.array_iter.clone()))
 }
 
 fn m_ta_to_reversed(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, _, kind) = need_ta(i, this)?;
     let _ = args;
-    let mut elems = ta_f64s(this);
-    elems.reverse();
-    Ok(ta_from_f64s(i, this_proto(this), elems, kind))
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let a = ta_fresh_typed(i, t.kind, len)?;
+    for k in 0..len {
+        let v = ta_elem(i, this, len - 1 - k)?;
+        i.set_prop(&a, ta_elem_key(k), v)?;
+    }
+    Ok(a)
 }
 
 fn m_ta_to_sorted(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, _, kind) = need_ta(i, this)?;
-    let elems = ta_f64s(this);
-    let copy = ta_from_f64s(i, this_proto(this), elems, kind);
-    m_ta_sort(i, &copy, args)
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let cmp = arg(args, 0);
+    if !matches!(cmp, Value::Und) && !i.is_callable(&cmp) {
+        return Err(i.type_err("comparefn must be a function or undefined"));
+    }
+    let items = ta_sort_elems(i, this, len, &cmp)?;
+    let a = ta_fresh_typed(i, t.kind, len)?;
+    for (k, v) in items.into_iter().enumerate() {
+        i.set_prop(&a, ta_elem_key(k), v)?;
+    }
+    Ok(a)
 }
 
 fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let (_, _, len, kind) = need_ta(i, this)?;
-    let n = i.to_num(&arg(args, 0)).unwrap_or(0.0);
-    let idx = if n < 0.0 {
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
+    let n = ta_to_int(i, &arg(args, 0))?;
+    let actual = if n < 0.0 {
         len as i64 + n as i64
     } else {
-        n as i64
+        n.min(i64::MAX as f64) as i64
     };
-    if idx < 0 || idx >= len as i64 {
+    // value conversion runs before the index validity check (a
+    // valueOf may resize the buffer and invalidate the index)
+    let v = i.to_num(&arg(args, 1))?;
+    let Some(eff) = t.eff() else {
+        return Err(i.range_err("Invalid index"));
+    };
+    if actual < 0 || actual >= eff as i64 {
         return Err(i.range_err("Invalid index"));
     }
-    let v = i.to_num(&arg(args, 1))?;
-    let mut elems = ta_f64s(this);
-    elems[idx as usize] = v;
-    Ok(ta_from_f64s(i, this_proto(this), elems, kind))
+    let actual = actual as usize;
+    let a = ta_fresh_typed(i, t.kind, len)?;
+    for k in 0..len {
+        let kv = if k == actual {
+            Value::Num(v)
+        } else {
+            ta_elem(i, this, k)?
+        };
+        i.set_prop(&a, ta_elem_key(k), kv)?;
+    }
+    Ok(a)
 }
 
 // ===========================================================================
@@ -970,8 +1551,16 @@ fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 fn install_array_buffer(i: &mut Interp) {
     let p = i.p.arraybuffer.clone();
     met(i, &p, "slice", m_ab_slice);
-    met(i, &p, "resize", m_ab_noop);
-    met(i, &p, "transfer", |_i, this, _a| Ok(this.clone()));
+    met(i, &p, "sliceToImmutable", m_ab_slice_to_immutable);
+    met(i, &p, "resize", m_ab_resize);
+    met(i, &p, "transfer", m_ab_transfer);
+    met(i, &p, "transferToFixedLength", m_ab_transfer);
+    met(i, &p, "transferToImmutable", m_ab_transfer_immutable);
+    acc(i, &p, "byteLength", Some(ab_get_byte_len), None);
+    acc(i, &p, "detached", Some(ab_get_detached), None);
+    acc(i, &p, "maxByteLength", Some(ab_get_max_byte_len), None);
+    acc(i, &p, "resizable", Some(ab_get_resizable), None);
+    acc(i, &p, "immutable", Some(ab_get_immutable), None);
     p.borrow_mut().props.insert(
         PropKey::Sym(SYM_TOSTRINGTAG),
         Prop::builtin(Value::Str(Rc::from("ArrayBuffer"))),
@@ -997,6 +1586,24 @@ fn ab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Value::Obj(o) => o.clone(),
         _ => plain(Some(i.p.arraybuffer.clone())),
     };
+    // host limit: engine max byte length (spec allows up to 2^53-1)
+    if !n.is_finite() || n < 0.0 || n > 4294967296.0 {
+        return Err(i.range_err("Invalid array buffer length"));
+    }
+    if let Value::Obj(opts) = arg(args, 1) {
+        if let Ok(v) = i.get_prop(&Value::Obj(opts.clone()), &PropKey::from_str("maxByteLength")) {
+            if !matches!(v, Value::Und) {
+                let m = i.to_num(&v)?;
+                if !m.is_finite() || m < 0.0 || m > 4294967296.0 {
+                    return Err(i.range_err("maxByteLength is out of range"));
+                }
+                if (m as usize) < n as usize {
+                    return Err(i.range_err("maxByteLength is smaller than byteLength"));
+                }
+                o.borrow_mut().rab_max = Some(m as usize);
+            }
+        }
+    }
     o.borrow_mut().kind = ObjKind::Bytes(Rc::new(RefCell::new(vec![0u8; n as usize])));
     Ok(Value::Obj(o))
 }
@@ -1009,6 +1616,9 @@ fn m_ab_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let Value::Obj(o) = this else {
         return Err(i.type_err("slice called on non-ArrayBuffer"));
     };
+    if o.borrow().detached {
+        return Err(i.type_err("Cannot perform slice on a detached ArrayBuffer"));
+    }
     let data = if let Some(b) = buffer_bytes(o) {
         b.borrow().clone()
     } else {
@@ -1026,6 +1636,116 @@ fn m_ab_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Vec::new()
     };
     Ok(Value::Obj(mk_buffer(i, out)))
+}
+
+fn need_ab(i: &mut Interp, this: &Value) -> Result<(ObjRef, Rc<RefCell<Vec<u8>>>), Value> {
+    let Value::Obj(o) = this else {
+        return Err(i.type_err("Method called on incompatible receiver (expected ArrayBuffer)"));
+    };
+    let Some(b) = buffer_bytes(o) else {
+        return Err(i.type_err("Method called on incompatible receiver (expected ArrayBuffer)"));
+    };
+    Ok((o.clone(), b))
+}
+
+fn ab_get_byte_len(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (o, b) = need_ab(i, this)?;
+    Ok(Value::Num(if o.borrow().detached {
+        0.0
+    } else {
+        b.borrow().len() as f64
+    }))
+}
+
+fn ab_get_detached(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (o, _) = need_ab(i, this)?;
+    let d = o.borrow().detached;
+    Ok(Value::Bool(d))
+}
+
+fn ab_get_max_byte_len(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (o, b) = need_ab(i, this)?;
+    let v = if o.borrow().detached {
+        0.0
+    } else if let Some(m) = o.borrow().rab_max {
+        m as f64
+    } else {
+        b.borrow().len() as f64
+    };
+    Ok(Value::Num(v))
+}
+
+fn ab_get_resizable(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (o, _) = need_ab(i, this)?;
+    let r = o.borrow().rab_max.is_some();
+    Ok(Value::Bool(r))
+}
+
+fn ab_get_immutable(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (o, _) = need_ab(i, this)?;
+    let im = o.borrow().immutable;
+    Ok(Value::Bool(im))
+}
+
+fn m_ab_resize(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let (o, b) = need_ab(i, this)?;
+    if o.borrow().detached {
+        return Err(i.type_err("Cannot resize a detached ArrayBuffer"));
+    }
+    let Some(max) = o.borrow().rab_max else {
+        return Err(i.type_err("ArrayBuffer is not resizable"));
+    };
+    let n = i.to_num(&arg(args, 0))?;
+    if !n.is_finite() || n < 0.0 || n as usize > max {
+        return Err(i.range_err("new length is out of bounds"));
+    }
+    b.borrow_mut().resize(n as usize, 0);
+    Ok(Value::Und)
+}
+
+fn ab_transfer_into(i: &mut Interp, this: &Value, args: &[Value], immutable: bool) -> NR {
+    let (o, b) = need_ab(i, this)?;
+    if o.borrow().detached {
+        return Err(i.type_err("Cannot transfer a detached ArrayBuffer"));
+    }
+    if o.borrow().immutable {
+        return Err(i.type_err("Cannot transfer an immutable ArrayBuffer"));
+    }
+    let old_len = b.borrow().len();
+    let new_len = match arg(args, 0) {
+        Value::Und => old_len,
+        v => {
+            let n = i.to_num(&v)?;
+            if !n.is_finite() || n < 0.0 || n > 268435456.0 {
+                return Err(i.range_err("new length is out of bounds"));
+            }
+            n as usize
+        }
+    };
+    let data = std::mem::take(&mut *b.borrow_mut());
+    o.borrow_mut().detached = true;
+    let mut data = data;
+    data.resize(new_len, 0);
+    data.truncate(new_len);
+    let nb = mk_buffer(i, data);
+    nb.borrow_mut().immutable = immutable;
+    Ok(Value::Obj(nb))
+}
+
+fn m_ab_transfer(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    ab_transfer_into(i, this, args, false)
+}
+
+fn m_ab_transfer_immutable(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    ab_transfer_into(i, this, args, true)
+}
+
+fn m_ab_slice_to_immutable(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let v = m_ab_slice(i, this, args)?;
+    if let Value::Obj(o) = &v {
+        o.borrow_mut().immutable = true;
+    }
+    Ok(v)
 }
 
 fn ab_is_view(_i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
@@ -1064,6 +1784,9 @@ fn install_data_view(i: &mut Interp) {
     ] {
         met(i, &p, n, f);
     }
+    acc(i, &p, "buffer", Some(dv_get_buffer), None);
+    acc(i, &p, "byteLength", Some(dv_get_byte_len), None);
+    acc(i, &p, "byteOffset", Some(dv_get_byte_off), None);
     let ctor = mk_ctor(i, "DataView", dv_ctor, &p);
     gdef(i, "DataView", ctor);
 }
@@ -1078,6 +1801,36 @@ fn dv_parts(v: &Value) -> Option<(Rc<RefCell<Vec<u8>>>, usize, usize)> {
         }
     }
     None
+}
+
+fn need_view(i: &mut Interp, this: &Value) -> Result<(ObjRef, usize, usize), Value> {
+    if let Value::Obj(o) = this {
+        if let ObjKind::View { buf, off, len } = &o.borrow().kind {
+            return Ok((buf.clone(), *off, *len));
+        }
+    }
+    Err(i.type_err("Method called on incompatible receiver (expected DataView)"))
+}
+
+fn dv_get_buffer(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (buf, _, _) = need_view(i, this)?;
+    Ok(Value::Obj(buf))
+}
+
+fn dv_get_byte_len(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (buf, _, len) = need_view(i, this)?;
+    if buf.borrow().detached {
+        return Err(i.type_err("Cannot read byteLength of a detached DataView"));
+    }
+    Ok(Value::Num(len as f64))
+}
+
+fn dv_get_byte_off(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let (buf, off, _) = need_view(i, this)?;
+    if buf.borrow().detached {
+        return Err(i.type_err("Cannot read byteOffset of a detached DataView"));
+    }
+    Ok(Value::Num(off as f64))
 }
 
 fn dv_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
@@ -1127,6 +1880,13 @@ fn dv_bounds(
     args: &[Value],
     sz: usize,
 ) -> Result<(Rc<RefCell<Vec<u8>>>, usize), Value> {
+    if let Value::Obj(o) = this {
+        if let ObjKind::View { buf, .. } = &o.borrow().kind {
+            if buf.borrow().detached {
+                return Err(i.type_err("Cannot perform operation on a detached ArrayBuffer"));
+            }
+        }
+    }
     let Some((b, off, len)) = dv_parts(this) else {
         return Err(i.type_err("Method called on incompatible receiver (expected DataView)"));
     };
@@ -1135,6 +1895,17 @@ fn dv_bounds(
         return Err(i.range_err("Offset is outside the bounds of the DataView"));
     }
     Ok((b, off + at as usize))
+}
+
+fn dv_check_write(i: &mut Interp, this: &Value) -> Result<(), Value> {
+    if let Value::Obj(o) = this {
+        if let ObjKind::View { buf, .. } = &o.borrow().kind {
+            if buf.borrow().immutable {
+                return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn dv_le(i: &mut Interp, args: &[Value], n: usize) -> bool {
@@ -1224,12 +1995,14 @@ fn dv_get_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Num(v))
 }
 fn dv_set_u8(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    dv_check_write(i, this)?;
     let (b, at) = dv_bounds(i, this, args, 1)?;
     let v = i.to_num(&arg(args, 1))?;
     b.borrow_mut()[at] = to_u32(v) as u8;
     Ok(Value::Und)
 }
 fn dv_set_u16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    dv_check_write(i, this)?;
     let (b, at) = dv_bounds(i, this, args, 2)?;
     let v = i.to_num(&arg(args, 1))?;
     let s = if dv_le(i, args, 2) {
@@ -1241,6 +2014,7 @@ fn dv_set_u16(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Und)
 }
 fn dv_set_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    dv_check_write(i, this)?;
     let (b, at) = dv_bounds(i, this, args, 4)?;
     let v = i.to_num(&arg(args, 1))?;
     let s = if dv_le(i, args, 2) {
@@ -1252,6 +2026,7 @@ fn dv_set_u32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Und)
 }
 fn dv_set_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    dv_check_write(i, this)?;
     let (b, at) = dv_bounds(i, this, args, 4)?;
     let v = i.to_num(&arg(args, 1))? as f32;
     let s = if dv_le(i, args, 2) {
@@ -1263,6 +2038,7 @@ fn dv_set_f32(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     Ok(Value::Und)
 }
 fn dv_set_f64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    dv_check_write(i, this)?;
     let (b, at) = dv_bounds(i, this, args, 8)?;
     let v = i.to_num(&arg(args, 1))?;
     let s = if dv_le(i, args, 2) {
@@ -1319,6 +2095,7 @@ fn te_encode(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
         0,
         n,
         TAK::U8,
+        false,
     )))
 }
 
@@ -1326,16 +2103,18 @@ fn te_encode_into(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
     let s = i.to_str(&arg(args, 0))?;
     let mut read = 0usize; // utf-16 code units consumed
     let mut written = 0usize;
-    if let Some((buf, off, len, _)) = ta_parts(&arg(args, 1)) {
-        if let Some(bytes) = buffer_bytes(&buf) {
+    if let Some(tp) = ta_parts(&arg(args, 1)) {
+        let cap = tp.eff().unwrap_or(0) * tp.kind.size();
+        if let Some(bytes) = buffer_bytes(&tp.buf) {
             let mut bb = bytes.borrow_mut();
             for c in s.chars() {
                 let mut tmp = [0u8; 4];
                 let enc = c.encode_utf8(&mut tmp);
-                if written + enc.len() > len {
+                if written + enc.len() > cap {
                     break;
                 }
-                bb[off + written..off + written + enc.len()].copy_from_slice(enc.as_bytes());
+                bb[tp.off + written..tp.off + written + enc.len()]
+                    .copy_from_slice(enc.as_bytes());
                 written += enc.len();
                 read += c.len_utf16();
             }
@@ -1376,11 +2155,13 @@ fn view_bytes(v: &Value) -> Option<Vec<u8>> {
             off,
             len,
             kind,
+            track,
         } => {
             let b = buffer_bytes(buf)?;
             let bb = b.borrow();
             let start = (*off).min(bb.len());
-            let end = (*off + *len * kind.size()).min(bb.len());
+            let eff = typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
+            let end = (*off + eff * kind.size()).min(bb.len());
             Some(bb[start..end].to_vec())
         }
         ObjKind::View { buf, off, len } => {
@@ -2979,11 +3760,11 @@ fn crypto_fill(i: &mut Interp, n: usize) -> Vec<u8> {
 fn crypto_get_random_values(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
     let v = arg(args, 0);
     match ta_parts(&v) {
-        Some((buf, off, len, kind)) => {
-            let n = len * kind.size();
+        Some(tp) => {
+            let n = tp.eff().unwrap_or(0) * tp.kind.size();
             let rnd = crypto_fill(i, n);
-            if let Some(b) = buffer_bytes(&buf) {
-                b.borrow_mut()[off..off + n].copy_from_slice(&rnd);
+            if let Some(b) = buffer_bytes(&tp.buf) {
+                b.borrow_mut()[tp.off..tp.off + n].copy_from_slice(&rnd);
             }
             Ok(v)
         }

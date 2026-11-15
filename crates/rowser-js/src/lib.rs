@@ -1211,8 +1211,9 @@ mod tests {
         assert!(eval("var r = /x/q;").is_err());
         assert!(eval("new RegExp('a', 'zz')").is_err());
         assert!(eval("new RegExp('(')").is_err());
-        // unknown named backref
-        assert!(eval("new RegExp('\\\\k<nope>')").is_err());
+        // unknown named backref (unicode mode — non-unicode \k is the
+        // Annex-B identity escape and legal)
+        assert!(eval("new RegExp('\\\\k<nope>', 'u')").is_err());
     }
 
     #[test]
