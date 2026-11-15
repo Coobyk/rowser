@@ -95,6 +95,9 @@ struct Parser {
     method_depth: usize,
     /// inside FormalParameters — YieldExpression is an early error here
     param_depth: usize,
+    /// inside an async fn's params/body — `await` is reserved ([Await]
+    /// context): binding names and identifier uses are early errors
+    await_decl: usize,
     /// recursion guard for deeply nested source
     depth: usize,
 }
@@ -115,6 +118,7 @@ impl Parser {
             ctor_depth: 0,
             method_depth: 0,
             param_depth: 0,
+            await_decl: 0,
             depth: 0,
         }
     }
@@ -388,15 +392,17 @@ impl Parser {
             Tok::Kw(Kw::Function) => {
                 self.next();
                 let g = self.eat_punct("*");
-                let f = self.fn_tail(true, g)?;
+                let f = self.fn_tail(true, g, false)?;
                 Ok(Stmt::FnDecl(Rc::new(f)))
             }
-            Tok::Kw(Kw::Async) if matches!(self.peek2().tok, Tok::Kw(Kw::Function)) => {
+            Tok::Kw(Kw::Async)
+                if matches!(self.peek2().tok, Tok::Kw(Kw::Function))
+                    && !self.peek2().newline_before =>
+            {
                 self.next();
                 self.next();
                 let g = self.eat_punct("*");
-                let mut f = self.fn_tail(true, g)?;
-                f.is_async = true;
+                let f = self.fn_tail(true, g, true)?;
                 Ok(Stmt::FnDecl(Rc::new(f)))
             }
             Tok::Kw(Kw::Class) => {
@@ -506,6 +512,20 @@ impl Parser {
                 Ok(Stmt::Export(rec))
             }
             Tok::Ident(name) if matches!(self.peek2().tok, Tok::Punct(":")) => {
+                if name == "yield" && (self.yield_decl > 0 || self.strict) {
+                    return Err(self.err("`yield` is not a valid label here"));
+                }
+                self.next();
+                self.next();
+                let inner = self.stmt_body(true)?;
+                Ok(Stmt::Labeled(name, inner))
+            }
+            Tok::Kw(k)
+                if is_contextual_ident_kw(&k)
+                    && matches!(self.peek2().tok, Tok::Punct(":"))
+                    && !(k == Kw::Yield && (self.yield_decl > 0 || self.strict)) =>
+            {
+                let name = k.name().to_string();
                 self.next();
                 self.next();
                 let inner = self.stmt_body(true)?;
@@ -523,11 +543,22 @@ impl Parser {
         if self.peek().newline_before {
             return Ok(None);
         }
-        if let Tok::Ident(s) = self.peek().tok.clone() {
-            self.next();
-            Ok(Some(s))
-        } else {
-            Ok(None)
+        match self.peek().tok.clone() {
+            Tok::Ident(s) => {
+                self.next();
+                Ok(Some(s))
+            }
+            Tok::Kw(Kw::Yield)
+                if !self.strict && self.yield_decl == 0 && !self.peek().escaped =>
+            {
+                self.next();
+                Ok(Some("yield".to_string()))
+            }
+            Tok::Kw(Kw::Await) if !self.peek().escaped => {
+                self.next();
+                Ok(Some("await".to_string()))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -892,6 +923,10 @@ impl Parser {
         if matches!(self.peek().tok, Tok::Kw(Kw::Async))
             && !self.peek().escaped
             && matches!(self.peek2().tok, Tok::Kw(Kw::Of))
+            && !matches!(
+                self.toks[(self.pos + 2).min(self.toks.len() - 1)].tok,
+                Tok::Punct("=>")
+            )
         {
             return Err(self.err("`for (async of` is a reserved form"));
         }
@@ -1136,7 +1171,7 @@ impl Parser {
             if self.at_kw(Kw::Function) {
                 self.next();
                 let g = self.eat_punct("*");
-                let f = self.fn_tail(false, g)?;
+                let f = self.fn_tail(false, g, false)?;
                 ExportRec::Default(Expr::Fn(Rc::new(f)))
             } else if self.at_kw(Kw::Class) {
                 self.next();
@@ -1207,7 +1242,7 @@ impl Parser {
     /// `fn` after the `function` keyword: `name (params) { body }`.
     /// `name_required`: decls need names, expressions don't.
     /// `gen`: a `*` generator marker was already consumed.
-    fn fn_tail(&mut self, name_required: bool, gen: bool) -> Result<FnDef, Error> {
+    fn fn_tail(&mut self, name_required: bool, gen: bool, is_async: bool) -> Result<FnDef, Error> {
         let name = {
             // the name's [Yield] context: declarations inherit the
             // enclosing generator; the nested fn always uses its own
@@ -1240,6 +1275,7 @@ impl Parser {
             self.strict,
             self.ctor_depth,
             self.method_depth,
+            self.await_decl,
         );
         // a nested function always gets its own [Yield] context from its
         // own `*` marker — only arrows inherit the enclosing one
@@ -1247,6 +1283,7 @@ impl Parser {
         self.yield_decl = gen as usize;
         self.ctor_depth = 0;
         self.method_depth = 0;
+        self.await_decl = is_async as usize;
         let res = (|| {
             self.expect_punct("(")?;
             let params = self.params()?;
@@ -1270,6 +1307,17 @@ impl Parser {
                     }
                 }
             }
+            // a strict body retroactively makes `eval`/`arguments` names
+            // early errors (the name parsed before the directive)
+            if self.strict {
+                if let Some(n) = &name {
+                    if matches!(n.as_str(), "eval" | "arguments") {
+                        return Err(self.err(format!(
+                            "`{n}` is not a valid function name in strict mode"
+                        )));
+                    }
+                }
+            }
             self.check_params(&params, false)?;
             let body = self.fn_body(false)?;
             Ok((params, body))
@@ -1280,6 +1328,7 @@ impl Parser {
             self.strict,
             self.ctor_depth,
             self.method_depth,
+            self.await_decl,
         ) = old_ctx;
         let (params, body) = res?;
         Ok(FnDef {
@@ -1288,7 +1337,7 @@ impl Parser {
             body,
             is_arrow: false,
             arrow_expr: None,
-            is_async: false,
+            is_async,
             is_gen: gen,
                     strict: self.strict,
         })
@@ -1357,6 +1406,10 @@ impl Parser {
         // `yield` is reserved in any [Yield] context even in sloppy mode
         if name == "yield" && self.yield_decl > 0 {
             return Err(self.err("`yield` is not a valid binding in a generator"));
+        }
+        // `await` in an async fn's [Await] context — params/body names
+        if name == "await" && self.await_decl > 0 {
+            return Err(self.err("`await` is not a valid binding in an async function"));
         }
         // `let` is never a valid lexical-decl binding name (sloppy `var let`
         // stays legal — gated on the declaration kind, not strictness)
@@ -1644,8 +1697,16 @@ impl Parser {
         if is_async {
             self.next();
         }
-        // case 1: `ident => ...`
-        if let Tok::Ident(name) = self.peek().tok.clone() {
+        // case 1: `ident => ...` (contextual keywords are valid param
+        // names too: `async of => {}`, `async yield => {}`)
+        let single = match self.peek().tok.clone() {
+            Tok::Ident(name) => Some(name),
+            Tok::Kw(k) if is_contextual_ident_kw(&k) => {
+                Some(k.name().to_string())
+            }
+            _ => None,
+        };
+        if let Some(name) = single {
             if matches!(self.peek2().tok, Tok::Punct("=>")) {
                 self.next();
                 self.next();
@@ -2142,16 +2203,18 @@ impl Parser {
             Tok::Kw(Kw::Function) => {
                 self.next();
                 let g = self.eat_punct("*");
-                let f = self.fn_tail(false, g)?;
+                let f = self.fn_tail(false, g, false)?;
                 Ok(Expr::Fn(Rc::new(f)))
             }
-            Tok::Kw(Kw::Async) if matches!(self.peek2().tok, Tok::Kw(Kw::Function)) => {
+            Tok::Kw(Kw::Async)
+                if matches!(self.peek2().tok, Tok::Kw(Kw::Function))
+                    && !self.peek2().newline_before =>
+            {
                 // `async function [name](...) {}` in expression position
                 self.next();
                 self.next();
                 let g = self.eat_punct("*");
-                let mut f = self.fn_tail(false, g)?;
-                f.is_async = true;
+                let f = self.fn_tail(false, g, true)?;
                 Ok(Expr::Fn(Rc::new(f)))
             }
             Tok::Kw(Kw::Import) => {
@@ -2175,6 +2238,11 @@ impl Parser {
                 Ok(Expr::Class(Rc::new(c)))
             }
             Tok::Ident(name) => {
+                // an (escaped) `yield` resolves to the same StringValue —
+                // [Yield] contexts ban it as an IdentifierReference
+                if name == "yield" && (self.yield_decl > 0 || self.strict) {
+                    return Err(self.err("`yield` is not a valid identifier here"));
+                }
                 self.next();
                 Ok(Expr::Ident(name))
             }

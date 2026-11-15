@@ -1444,6 +1444,18 @@ impl Interp {
             .map(|v| (v, false)))
     }
 
+    /// `set_prop` on the global object must update a var-declared env
+    /// binding too (script `var x` and `globalThis.x` are one slot).
+    /// Called by the set paths after the prop write succeeds.
+    pub fn sync_global_binding(&mut self, name: &str, v: &Value) {
+        let mut b = self.global.vars.borrow_mut();
+        if let Some(bind) = b.get_mut(name) {
+            if !bind.lexical {
+                bind.val = v.clone();
+            }
+        }
+    }
+
     pub fn env_lookup(
         &mut self,
         env: &EnvRef,
@@ -1459,8 +1471,16 @@ impl Interp {
                 // SetMutableBinding on an object env: plain HasProperty —
                 // @@unscopables is only consulted by HasBinding at resolve time
                 if self.has_prop(&Value::Obj(o.clone()), &PropKey::from_str(name))? {
+                    let is_glob = Rc::ptr_eq(o, &self.p.global);
                     let o = Value::Obj(o.clone());
-                    return self.set_prop_str(&o, name, v);
+                    self.set_prop_str(&o, name, v.clone())?;
+                    // writes through `with (globalThis)` stay in sync with
+                    // the env binding (compound assigns take this path —
+                    // eval_lref_ident uses set_prop directly)
+                    if is_glob {
+                        self.sync_global_binding(name, &v);
+                    }
+                    return Ok(());
                 }
             }
             {
@@ -1478,10 +1498,12 @@ impl Interp {
                             self.type_err(format!("Assignment to constant variable '{name}'"))
                         );
                     }
+                    let lexical = b.lexical;
                     b.val = v.clone();
-                    // global bindings mirror the global object's props —
-                    // `this.x`/`window.x` must see the assignment
-                    if Rc::ptr_eq(cur, &self.global) {
+                    // global `var` bindings mirror the global object's
+                    // props — `this.x`/`window.x` must see the assignment.
+                    // `let`/`const` bindings never become object props.
+                    if !lexical && Rc::ptr_eq(cur, &self.global) {
                         let g = self.p.global.clone();
                         let pk = PropKey::S(self.intern(name));
                         let mut gb = g.borrow_mut();
@@ -1545,7 +1567,22 @@ impl Interp {
                     }
                     if let Value::Num(n) = b.val {
                         let new = n + delta;
+                        let lexical = b.lexical;
                         b.val = Value::Num(new);
+                        // global `var` bindings mirror the global-object
+                        // prop — a stale prop would shadow the binding for
+                        // `with (globalThis)` lookups
+                        if !lexical && Rc::ptr_eq(cur, &self.global) {
+                            let g = self.p.global.clone();
+                            let pk = PropKey::S(self.intern(name));
+                            let mut gb = g.borrow_mut();
+                            match gb.props.get_mut(&pk) {
+                                Some(p) => p.val = Value::Num(new),
+                                None => {
+                                    gb.props.insert(pk, Prop::data(Value::Num(new)));
+                                }
+                            }
+                        }
                         return Some(Ok((n, new)));
                     }
                     return None;
@@ -2211,7 +2248,17 @@ impl Interp {
                     }
                 )))
             }
-            Value::Obj(o) => self.obj_set(o, key, v, base),
+            Value::Obj(o) => {
+                self.obj_set(o, key.clone(), v.clone(), base)?;
+                // a write to the global object updates a var-declared
+                // global binding — `var x` and `globalThis.x` are one slot
+                if Rc::ptr_eq(o, &self.p.global) {
+                    if let PropKey::S(s) = &key {
+                        self.sync_global_binding(s, &v);
+                    }
+                }
+                Ok(())
+            }
             _ => {
                 // primitive — check proto chain for setter, else silently ignore
                 let proto = match base {
@@ -2590,13 +2637,18 @@ impl Interp {
                 p.val = v.clone();
             }
         }
+        let args_hole = matches!(b.kind, ObjKind::Args { .. })
+            && matches!(&key, PropKey::S(s) if arr_index(s)
+                .is_some_and(|i| b.holes.as_ref().is_some_and(|h| h.contains(&i))));
         match &mut b.kind {
             ObjKind::Args { items, env, map } => {
                 if let PropKey::S(s) = &key {
                     if let Some(i) = arr_index(s) {
+                        // a deleted (holed) index isn't an element — the
+                        // write must materialize an ordinary prop instead
                         // materialized prop: updated above; when still
                         // mapped the parameter binding stays in sync
-                        if i < items.len() {
+                        if i < items.len() && !args_hole {
                             items[i] = v.clone();
                             // mapped index → write through to the param binding
                             if let (Some(e), Some(Some(name))) = (env, map.get(i)) {
@@ -4084,17 +4136,39 @@ impl Interp {
                     self.depth += 1;
                     let r = self.eval_expr(&e, &body_scope);
                     self.depth -= 1;
-                    return r;
+                    return if def.is_async {
+                        Ok(self.async_wrap(r))
+                    } else {
+                        r
+                    };
                 }
                 self.depth += 1;
                 let r = self.exec_block(&def.body, &body_scope);
                 self.depth -= 1;
-                match r {
+                let r = match r {
                     Ok(Completion::Return(v)) => Ok(v),
                     Ok(_) => Ok(Value::Und),
                     Err(e) => Err(e),
+                };
+                if def.is_async {
+                    return Ok(self.async_wrap(r));
                 }
+                r
         }
+    }
+
+    /// AsyncFunction [[Call]] result: a Promise fulfilled with the return
+    /// value / rejected with the thrown error. Promises settle
+    /// synchronously in this engine.
+    fn async_wrap(&mut self, r: ERes) -> Value {
+        let state = match r {
+            Ok(v) => PromiseState::Fulfilled(Box::new(v)),
+            Err(e) => PromiseState::Rejected(Box::new(e)),
+        };
+        Value::Obj(Rc::new(RefCell::new(Obj::new(
+            Some(self.p.promise.clone()),
+            ObjKind::Promise(state),
+        ))))
     }
 
     fn call_dispatch_end(&mut self, o: &ObjRef, this: Value, args: Vec<Value>) -> ERes {
@@ -4604,7 +4678,21 @@ impl Interp {
                                 "Assignment to constant variable '{name}'"
                             )));
                         }
-                        b.val = v;
+                        let lexical = b.lexical;
+                        b.val = v.clone();
+                        drop(vars);
+                        // global `var` bindings mirror the global-object prop
+                        if !lexical && Rc::ptr_eq(&sc, &self.global) {
+                            let g = self.p.global.clone();
+                            let pk = PropKey::S(name.clone());
+                            let mut gb = g.borrow_mut();
+                            match gb.props.get_mut(&pk) {
+                                Some(p) => p.val = v,
+                                None => {
+                                    gb.props.insert(pk, Prop::data(v));
+                                }
+                            }
+                        }
                         Ok(())
                     }
                     None => {
@@ -5210,7 +5298,9 @@ impl Interp {
         } else if !def.is_arrow {
             let proto = self.new_obj();
             self.set_builtin(&proto, "constructor", Value::Obj(o.clone()));
-            self.set_builtin(&o, "prototype", Value::Obj(proto));
+            // `.prototype` on ordinary fns: {writable, !enumerable,
+            // !configurable}
+            self.set_attr(&o, "prototype", Value::Obj(proto), true, false);
         }
         Value::Obj(o)
     }
@@ -5264,6 +5354,15 @@ impl Interp {
             Stmt::Expr(e) => Ok(Completion::Normal(self.eval_expr(e, env)?)),
             Stmt::VarDecl { kind, decls } => {
                 for (pat, init) in decls {
+                    // spec 14.3.2.4 step 2: ResolveBinding runs BEFORE the
+                    // initializer — a `with (obj)` binding pins the object's
+                    // property while it still exists (e.g. `var x = delete
+                    // obj.x` still writes back to `obj.x`)
+                    let early_lr = if let (Pattern::Ident(n), Some(_)) = (pat, init) {
+                        Some(self.eval_lref_ident(env, n)?)
+                    } else {
+                        None
+                    };
                     let v = match init {
                         Some(e) => self.eval_expr(e, env)?,
                         None => Value::Und,
@@ -5278,7 +5377,10 @@ impl Interp {
                             // `var x;` (no init) leaves the hoisted binding
                             // untouched — only initializers assign
                             VarKind::Var if init.is_none() => {}
-                            VarKind::Var => self.env_assign(env, name, v.clone())?,
+                            VarKind::Var => match early_lr.unwrap() {
+                                LRef::Env(sc, n2) => self.env_assign(&sc, &n2, v.clone())?,
+                                lr => self.put_lref(lr, v.clone())?,
+                            },
                             _ => self.declare(env, name, v.clone(), *kind != VarKind::Const),
                         },
                         other => self.bind_pattern(env, other, v.clone(), *kind, true)?,
@@ -5531,12 +5633,10 @@ impl Interp {
                         }
                         r => return Ok(r),
                     }
-                    if let Some(u) = update {
-                        self.eval_expr(u, &env_i)?;
-                    }
                     if per_iter {
-                        // next iteration's env copies the (post-update)
-                        // for-head bindings
+                        // CreatePerIterationEnvironment runs BEFORE the
+                        // update: next iteration's env copies the current
+                        // head bindings, then `update` evaluates inside it
                         let s = Scope::new(Some(env.clone()), false);
                         {
                             let pv = env_i.vars.borrow();
@@ -5557,6 +5657,9 @@ impl Interp {
                             }
                         }
                         env_i = s;
+                    }
+                    if let Some(u) = update {
+                        self.eval_expr(u, &env_i)?;
                     }
                 }
                 Ok(Completion::Normal(last))
@@ -7275,11 +7378,12 @@ impl Interp {
             for name in &names {
                 let mut cur = env.parent.clone();
                 while let Some(sc) = cur {
-                    let hit = sc
-                        .vars
-                        .borrow()
-                        .get(name.as_ref())
-                        .is_some_and(|b| b.lexical);
+                    let vars = sc.vars.borrow();
+                    let hit = vars.get(name.as_ref()).is_some_and(|b| b.lexical)
+                        // a parameter environment's bindings are its formals —
+                        // `var <param>` inside eval is a SyntaxError too
+                        || (sc.param_env.get() && vars.contains_key(name.as_ref()));
+                    drop(vars);
                     if hit {
                         return Err(self.syntax_err(format!(
                             "Identifier `{name}` has already been declared"
