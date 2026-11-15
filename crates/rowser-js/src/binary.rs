@@ -153,31 +153,31 @@ const TA_CLASSES: [(&str, TAK); 9] = [
 ];
 
 fn u8_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::U8)
+    ta_ctor(i, t, a, TAK::U8, false)
 }
 fn u8c_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::U8C)
+    ta_ctor(i, t, a, TAK::U8C, false)
 }
 fn i8_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::I8)
+    ta_ctor(i, t, a, TAK::I8, false)
 }
 fn u16_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::U16)
+    ta_ctor(i, t, a, TAK::U16, false)
 }
 fn i16_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::I16)
+    ta_ctor(i, t, a, TAK::I16, false)
 }
 fn u32_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::U32)
+    ta_ctor(i, t, a, TAK::U32, false)
 }
 fn i32_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::I32)
+    ta_ctor(i, t, a, TAK::I32, false)
 }
 fn f32_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::F32)
+    ta_ctor(i, t, a, TAK::F32, false)
 }
 fn f64_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
-    ta_ctor(i, t, a, TAK::F64)
+    ta_ctor(i, t, a, TAK::F64, false)
 }
 /// BigInt64Array / BigUint64Array — the engine has no real bigint
 /// representation, so these behave as 8-byte float arrays (bigint
@@ -185,7 +185,10 @@ fn f64_ctor(i: &mut Interp, t: &Value, a: &[Value]) -> NR {
 /// hidden `__name` slot records the real TypedArrayName since both
 /// share TAK::F64 — `ta_intrinsic_name` resolves it.
 fn big_ta_ctor(i: &mut Interp, t: &Value, a: &[Value], name: &'static str) -> NR {
-    let r = ta_ctor(i, t, a, TAK::F64)?;
+    // `ctor_big` = true — spec [[ContentType]] comes from the invoked
+    // constructor, not the receiver's prototype chain (a custom
+    // newTarget.prototype can replace that chain entirely).
+    let r = ta_ctor(i, t, a, TAK::F64, true)?;
     if let Value::Obj(o) = &r {
         hid(i, o, "__name", Value::Str(Rc::from(name)));
     }
@@ -877,35 +880,52 @@ fn ta_species_result(
             "species constructor returned a detached or out-of-bounds TypedArray",
         ));
     };
-    // the single-Number-argument check only applies to fixed-length
-    // results — tracking views carry "auto" for [[ArrayLength]].
+    // spec TypedArrayCreate: a single-Number argument list requires the
+    // result's TypedArrayLength — the live computed length for tracking
+    // views — to be at least the requested count.
     if let Some(n) = min_len {
-        if !t.track && eff < n {
+        if eff < n {
             return Err(i.type_err(
                 "species constructor returned a TypedArray that is too short",
             ));
         }
     }
+    // spec TypedArraySpeciesCreate step: the result's [[ContentType]]
+    // must match the exemplar's — bigint and number TypedArrays are
+    // never interchangeable.
+    if ta_is_big(&result) != ta_is_big(this) {
+        return Err(i.type_err(
+            "species constructor returned a TypedArray with a different content type",
+        ));
+    }
     Ok(result)
 }
 
 /// `new XxxArray(...)` — concrete element-kind constructor.
-fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
-    if i.new_target_native.is_none() {
+/// `ctor_big` is spec [[ContentType]]: `true` only for the BigInt
+/// TypedArray constructors (it cannot be derived from the receiver's
+/// proto — a custom newTarget.prototype can replace that chain).
+fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bool) -> NR {
+    // `new_target_native` stays set while a native ctor body runs — a
+    // bare `Uint8Array(...)` inside a getter/species fn must still
+    // throw. Requiring `this` to be the freshly allocated Ordinary
+    // object distinguishes a real [[Construct]] from a plain call.
+    let fresh_this = matches!(this, Value::Obj(o)
+        if matches!(o.borrow().kind, ObjKind::Ord) && o.borrow().props.is_empty());
+    if !(i.new_target_native.is_some() && fresh_this) {
         return Err(i.type_err("TypedArray constructor cannot be invoked without 'new'"));
     }
     // spec OrdinaryCreateFromConstructor happens before argument
     // processing — `construct` resolved the proto without invoking
-    // getters, so replay the observable Get(newTarget,"prototype"):
-    // a getter may detach or resize a source buffer.
-    if let Some(nt) = i.new_target_native.clone() {
-        let _ = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
-    }
+    // getters, so replay the observable Get(newTarget,"prototype")
+    // (and adopt an object result): a getter may detach or resize a
+    // source buffer.
+    apply_new_target_proto(i, this)?;
     let sz = kind.size();
     let src = arg(args, 0);
-    // spec [[ContentType]] of the array being constructed — resolved
-    // through the proto chain before the instance slot exists
-    let target_big = ta_is_big(this);
+    // spec [[ContentType]] — from the invoked constructor, not the
+    // receiver's proto chain (see `ctor_big`).
+    let target_big = ctor_big;
     // (buffer obj, byte offset, elem count, length-tracking)
     let (buf, off, len, track): (ObjRef, usize, usize, bool) = match &src {
         Value::Obj(o) => {
@@ -981,7 +1001,38 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
                     // method is a TypeError.
                     let iterm = i.get_prop(&src, &PropKey::Sym(SYM_ITERATOR))?;
                     let items = if matches!(iterm, Value::Und | Value::Null) {
-                        to_elems(i, &src)?
+                        // engine-internal array/iterator kinds may carry
+                        // elements without a `length` prop — reuse the
+                        // shared drain for those.
+                        let internal = matches!(&src, Value::Obj(o) if matches!(
+                            o.borrow().kind,
+                            ObjKind::Arr(_) | ObjKind::Iter { .. } | ObjKind::IterLazy(_)
+                        ));
+                        if internal {
+                            to_elems(i, &src)?
+                        } else {
+                            // spec InitializeTypedArrayFromArrayLike:
+                            // LengthOfArrayLike feeds AllocateTypedArrayBuffer —
+                            // a length beyond the host element cap is a
+                            // RangeError before any element is read. `to_elems`
+                            // would silently clamp, so the generic length is
+                            // read and bounded here instead.
+                            let len =
+                                i.get_prop(&src, &PropKey::from_str("length"))?;
+                            let n = i.to_num(&len)?;
+                            if n.is_nan() || n <= 0.0 {
+                                Vec::new()
+                            } else if !n.is_finite() || n > 8_000_000.0 {
+                                return Err(i.range_err("Invalid typed array length"));
+                            } else {
+                                let n = n.trunc() as usize;
+                                let mut items = Vec::with_capacity(n.min(1_000_000));
+                                for k in 0..n {
+                                    items.push(i.get_prop(&src, &ta_elem_key(k))?);
+                                }
+                                items
+                            }
+                        }
                     } else {
                         if !i.is_callable(&iterm) {
                             return Err(i.type_err("value is not iterable"));
@@ -1001,9 +1052,10 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK) -> NR {
         other => {
             // spec InitializeTypedArrayFromLength — ToIndex semantics:
             // NaN → +0, fractions truncate, negatives / ±∞ / ≥ 2^53 are
-            // RangeErrors.
+            // RangeErrors. The host limit applies to the BYTE count —
+            // `n * sz` must not overflow or exceed the data-block cap.
             let n = to_index(i, other)?;
-            if n > 268435456 {
+            if n > AB_HOST_MAX / sz {
                 return Err(i.range_err("Invalid typed array length"));
             }
             (mk_buffer(i, vec![0u8; n * sz]), 0, n, false)
@@ -1138,6 +1190,22 @@ fn this_proto(this: &Value) -> Option<ObjRef> {
     None
 }
 
+/// spec GetPrototypeFromConstructor — the observable
+/// `Get(newTarget, "prototype")` replayed inside native constructors.
+/// `Interp::construct` resolved the proto without invoking getters, so
+/// the Get is performed here at its spec position: an Object result
+/// becomes the receiver's [[Prototype]]; a non-object keeps the
+/// already-chosen fallback (the callee's own `.prototype`).
+fn apply_new_target_proto(i: &mut Interp, this: &Value) -> Result<(), Value> {
+    if let Some(nt) = i.new_target_native.clone() {
+        let pv = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
+        if let (Value::Obj(np), Value::Obj(o)) = (&pv, this) {
+            o.borrow_mut().proto = Some(np.clone());
+        }
+    }
+    Ok(())
+}
+
 /// spec ValidateTypedArray — receiver must be a TypedArray with a
 /// non-detached, in-bounds buffer.
 fn need_ta(i: &mut Interp, this: &Value) -> Result<Tap, Value> {
@@ -1182,8 +1250,8 @@ fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let target_big = ta_is_big(this);
     if let Some(s) = ta_parts(&src) {
         // TypedArray source — spec SetTypedArrayFromTypedArray:
-        // ValidateTypedArray(target), ValidateTypedArray(source),
-        // lengths, range checks, content-type check, then copy.
+        // out-of-bounds checks on both records, the ContentType check,
+        // the length range check, then the copy.
         let Some(tlen) = t.eff() else {
             return Err(
                 i.type_err("Cannot perform set on a detached or out-of-bounds TypedArray")
@@ -1192,11 +1260,14 @@ fn m_ta_set(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         let Some(slen) = s.eff() else {
             return Err(i.type_err("source TypedArray is detached or out of bounds"));
         };
-        if to.saturating_add(slen) > tlen {
-            return Err(i.range_err("source array is too long"));
-        }
+        // spec: the ContentType check precedes the length range check —
+        // a mixed bigint/number set is a TypeError even when the source
+        // would also be too long.
         if ta_is_big(&src) != target_big {
             return Err(i.type_err("Cannot mix BigInt and non-BigInt TypedArrays"));
+        }
+        if to.saturating_add(slen) > tlen {
+            return Err(i.range_err("source array is too long"));
         }
         let elems = ta_f64s(&src);
         if let Some(bytes) = buffer_bytes(&t.buf) {
@@ -1249,9 +1320,12 @@ fn m_ta_subarray(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     let t = ta_parts(this).ok_or_else(|| {
         i.type_err("Method called on incompatible receiver (expected TypedArray)")
     })?;
-    // srcLength = O.[[ArrayLength]]: live length for tracking views, the
-    // stored length for fixed views (even when currently out of bounds).
-    let len = if t.track { t.eff().unwrap_or(0) } else { t.len };
+    // srcLength = TypedArrayLength(record): live length for tracking
+    // views, the stored length for in-bounds fixed views, and 0 when the
+    // view is detached or out of bounds (a shrunk resizable buffer can
+    // put a fixed view out of bounds without throwing here — the
+    // species construction below surfaces any RangeError).
+    let len = t.eff().unwrap_or(0);
     let begin = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
     let end = match arg(args, 1) {
         Value::Und => len,
@@ -1290,12 +1364,14 @@ fn m_ta_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         vec![Value::Num(count as f64)],
         Some(count),
     )?;
+    // spec re-validates the source after species construction — a
+    // detached or shrunk-out-of-bounds view throws even when count is 0.
+    if t.eff().is_none() {
+        return Err(
+            i.type_err("Cannot perform slice on a detached or out-of-bounds ArrayBuffer")
+        );
+    }
     if count > 0 {
-        if t.eff().is_none() {
-            return Err(
-                i.type_err("Cannot perform slice on a detached or out-of-bounds ArrayBuffer")
-            );
-        }
         // spec: same element kind → byte-level copy (requires the same
         // [[ContentType]] too — bigint-kind storage shares TAK::F64
         // with Float64Array). Source bytes past the live (possibly
@@ -2025,12 +2101,13 @@ fn m_ta_to_reversed(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ta_to_sorted(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let t = need_ta(i, this)?;
-    let len = t.eff().unwrap_or(0);
+    // spec: comparefn callability is checked before ValidateTypedArray
     let cmp = arg(args, 0);
     if !matches!(cmp, Value::Und) && !i.is_callable(&cmp) {
         return Err(i.type_err("comparefn must be a function or undefined"));
     }
+    let t = need_ta(i, this)?;
+    let len = t.eff().unwrap_or(0);
     let items = ta_sort_elems(i, this, len, &cmp)?;
     let a = ta_fresh_typed(i, this, t.kind, len)?;
     for (k, v) in items.into_iter().enumerate() {
@@ -2127,14 +2204,14 @@ fn install_array_buffer(i: &mut Interp) {
 const AB_HOST_MAX: usize = 268435456;
 
 fn ab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    if i.new_target_native.is_none() {
+    // `new_target_native` stays set while a native ctor body runs — a
+    // bare `ArrayBuffer(...)` nested inside another constructor's
+    // observable work must still throw. The freshly allocated Ordinary
+    // `this` is what marks a real [[Construct]].
+    let fresh_this = matches!(this, Value::Obj(o)
+        if matches!(o.borrow().kind, ObjKind::Ord) && o.borrow().props.is_empty());
+    if !(i.new_target_native.is_some() && fresh_this) {
         return Err(i.type_err("Constructor ArrayBuffer requires 'new'"));
-    }
-    // spec OrdinaryCreateFromConstructor precedes argument coercion —
-    // replay the observable Get(newTarget, "prototype") since
-    // `construct` resolved the proto without invoking getters.
-    if let Some(nt) = i.new_target_native.clone() {
-        let _ = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
     }
     // spec: byteLength is ToIndex'd — NaN → +0, negatives and
     // out-of-range values are RangeErrors.
@@ -2142,9 +2219,6 @@ fn ab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Value::Und => 0,
         v => to_index(i, &v)?,
     };
-    if n > AB_HOST_MAX {
-        return Err(i.range_err("Invalid array buffer length"));
-    }
     // options.maxByteLength — Get runs in order after the length
     // coercion; only an Object `options` is consulted per spec.
     let max = match arg(args, 1) {
@@ -2154,18 +2228,28 @@ fn ab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             if matches!(v, Value::Und) {
                 None
             } else {
-                let m = to_index(i, &v)?;
-                if m > AB_HOST_MAX {
-                    return Err(i.range_err("maxByteLength is out of range"));
-                }
-                if m < n {
-                    return Err(i.range_err("maxByteLength is smaller than byteLength"));
-                }
-                Some(m)
+                Some(to_index(i, &v)?)
             }
         }
         _ => None,
     };
+    // spec AllocateArrayBuffer step 3: byteLength > maxByteLength is a
+    // RangeError *before* OrdinaryCreateFromConstructor — i.e. before
+    // any observable Get(newTarget, "prototype").
+    if max.is_some_and(|m| n > m) {
+        return Err(i.range_err("maxByteLength is smaller than byteLength"));
+    }
+    // spec step 4: OrdinaryCreateFromConstructor — `construct` resolved
+    // the proto without invoking getters, so replay the observable
+    // Get(newTarget, "prototype") at its spec position (an Object
+    // result becomes the receiver's proto).
+    apply_new_target_proto(i, this)?;
+    // spec step 5: CreateByteDataBlock — the host allocation limit is a
+    // RangeError that only fires once object creation (with its proto
+    // access) succeeded.
+    if n > AB_HOST_MAX || max.is_some_and(|m| m > AB_HOST_MAX) {
+        return Err(i.range_err("Invalid array buffer length"));
+    }
     let o = match this {
         Value::Obj(o) => o.clone(),
         _ => plain(Some(i.p.arraybuffer.clone())),
@@ -2406,22 +2490,15 @@ fn ab_is_view(_i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
 /// `new SharedArrayBuffer(length[, options])` — byte storage marked
 /// `__shared` so %ArrayBuffer.prototype% members reject it.
 fn sab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    if i.new_target_native.is_none() {
+    let fresh_this = matches!(this, Value::Obj(o)
+        if matches!(o.borrow().kind, ObjKind::Ord) && o.borrow().props.is_empty());
+    if !(i.new_target_native.is_some() && fresh_this) {
         return Err(i.type_err("Constructor SharedArrayBuffer requires 'new'"));
-    }
-    // spec OrdinaryCreateFromConstructor precedes argument coercion —
-    // replay the observable Get(newTarget, "prototype") since
-    // `construct` resolved the proto without invoking getters.
-    if let Some(nt) = i.new_target_native.clone() {
-        let _ = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
     }
     let n = match arg(args, 0) {
         Value::Und => 0,
         v => to_index(i, &v)?,
     };
-    if n > AB_HOST_MAX {
-        return Err(i.range_err("Invalid array buffer length"));
-    }
     // growable SharedArrayBuffers — options.maxByteLength
     let max = match arg(args, 1) {
         Value::Obj(opts) => {
@@ -2430,18 +2507,26 @@ fn sab_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
             if matches!(v, Value::Und) {
                 None
             } else {
-                let m = to_index(i, &v)?;
-                if m > AB_HOST_MAX {
-                    return Err(i.range_err("maxByteLength is out of range"));
-                }
-                if m < n {
-                    return Err(i.range_err("maxByteLength is smaller than byteLength"));
-                }
-                Some(m)
+                Some(to_index(i, &v)?)
             }
         }
         _ => None,
     };
+    // spec AllocateSharedArrayBuffer: byteLength > maxByteLength is a
+    // RangeError before OrdinaryCreateFromConstructor.
+    if max.is_some_and(|m| n > m) {
+        return Err(i.range_err("maxByteLength is smaller than byteLength"));
+    }
+    // OrdinaryCreateFromConstructor — `construct` resolved the proto
+    // without invoking getters, so replay the observable
+    // Get(newTarget, "prototype") at its spec position (an Object
+    // result becomes the receiver's proto).
+    apply_new_target_proto(i, this)?;
+    // CreateSharedByteDataBlock — host allocation limit (RangeError)
+    // fires only after the proto access above succeeded.
+    if n > AB_HOST_MAX || max.is_some_and(|m| m > AB_HOST_MAX) {
+        return Err(i.range_err("Invalid array buffer length"));
+    }
     let o = match this {
         Value::Obj(o) => o.clone(),
         _ => plain(global_ctor_proto(i, "SharedArrayBuffer")),
@@ -2642,7 +2727,9 @@ fn dv_get_byte_off(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
 }
 
 fn dv_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    if i.new_target_native.is_none() {
+    let fresh_this = matches!(this, Value::Obj(o)
+        if matches!(o.borrow().kind, ObjKind::Ord) && o.borrow().props.is_empty());
+    if !(i.new_target_native.is_some() && fresh_this) {
         return Err(i.type_err("Constructor DataView requires 'new'"));
     }
     let Value::Obj(bo) = &arg(args, 0) else {
@@ -2652,7 +2739,9 @@ fn dv_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         return Err(i.type_err("First argument to DataView constructor must be an ArrayBuffer"));
     };
     // spec order: ToIndex(offset) → detached → offset bounds →
-    // (explicit byteLength only) ToIndex(length) → detached → bounds
+    // (explicit byteLength only) ToIndex(length) → bounds vs the
+    // already-captured buffer length → proto access → detached →
+    // bounds re-checks.
     let off = match arg(args, 1) {
         Value::Und => 0,
         v => to_index(i, &v)?,
@@ -2670,10 +2759,9 @@ fn dv_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         Value::Und => blen - off,
         v => {
             let l = to_index(i, &v)?;
-            if bo.borrow().detached {
-                return Err(i.type_err("Cannot construct a DataView on a detached ArrayBuffer"));
-            }
-            let blen = b.borrow().len();
+            // spec: the bounds check uses bufferByteLength as captured
+            // before the coercion — a detaching valueOf surfaces via the
+            // post-proto-access check below instead.
             if l > blen - off {
                 return Err(i.range_err("Invalid DataView length"));
             }
@@ -2682,11 +2770,10 @@ fn dv_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
     };
     // spec OrdinaryCreateFromConstructor — `construct` resolved the
     // prototype without invoking getters, so replay the observable
-    // Get(newTarget, "prototype") here: a getter may detach/resize
-    // the buffer, after which the detached + bounds checks rerun.
-    if let Some(nt) = i.new_target_native.clone() {
-        let _ = i.get_prop(&nt, &PropKey::from_str("prototype"))?;
-    }
+    // Get(newTarget, "prototype") here (an Object result becomes the
+    // receiver's proto): a getter may detach/resize the buffer, after
+    // which the detached + bounds checks rerun.
+    apply_new_target_proto(i, this)?;
     if bo.borrow().detached {
         return Err(i.type_err("Cannot construct a DataView on a detached ArrayBuffer"));
     }

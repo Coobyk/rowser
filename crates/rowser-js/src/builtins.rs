@@ -1141,6 +1141,87 @@ fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
             let cell = cell.clone();
             return gen_resume(i, &cell, GenIn::Next(arg(_a, 0)));
         }
+        if matches!(o.borrow().kind, ObjKind::IterLive { .. }) {
+            // pull fields out and mark busy — getters/next can reenter
+            let (target, idx, mode) = {
+                let mut b = o.borrow_mut();
+                match std::mem::replace(&mut b.kind, ObjKind::IterBusy) {
+                    ObjKind::IterLive { obj, idx, mode } => (obj, idx, mode),
+                    _ => unreachable!(),
+                }
+            };
+            let step = (|| -> Result<Option<Value>, Value> {
+                let tv = || Value::Obj(target.clone());
+                match mode {
+                    0 | 1 | 2 => {
+                        // array-like (incl. arguments): length re-read per
+                        // step (LengthOfArrayLike is live)
+                        let lv = i.get_prop(&tv(), &PropKey::from_str("length"))?;
+                        let len = i.to_num(&lv)?.max(0.0) as usize;
+                        if idx >= len {
+                            return Ok(None);
+                        }
+                        let kk = i.intern(&idx.to_string());
+                        let item = i.get_prop(&tv(), &PropKey::S(kk))?;
+                        Ok(Some(match mode {
+                            1 => Value::Num(idx as f64),
+                            _ if mode == 2 => Value::Obj(i.new_arr(vec![
+                                Value::Num(idx as f64),
+                                item,
+                            ])),
+                            _ => item,
+                        }))
+                    }
+                    3 | 4 => {
+                        let items = match &target.borrow().kind {
+                            ObjKind::Map(m) => m.clone(),
+                            _ => Vec::new(),
+                        };
+                        match items.get(idx) {
+                            None => Ok(None),
+                            Some((k, v)) => Ok(Some(if mode == 3 {
+                                Value::Obj(i.new_arr(vec![k.clone(), v.clone()]))
+                            } else {
+                                v.clone()
+                            })),
+                        }
+                    }
+                    _ => {
+                        let items = match &target.borrow().kind {
+                            ObjKind::Set(m) => m.clone(),
+                            _ => Vec::new(),
+                        };
+                        match items.get(idx) {
+                            None => Ok(None),
+                            Some(v) => Ok(Some(if mode == 6 {
+                                Value::Obj(i.new_arr(vec![v.clone(), v.clone()]))
+                            } else {
+                                v.clone()
+                            })),
+                        }
+                    }
+                }
+            })();
+            {
+                let mut b = o.borrow_mut();
+                if matches!(b.kind, ObjKind::IterBusy) {
+                    b.kind = ObjKind::IterLive {
+                        obj: target,
+                        idx: if matches!(step, Ok(Some(_))) {
+                            idx + 1
+                        } else {
+                            usize::MAX
+                        },
+                        mode,
+                    };
+                }
+            }
+            return match step {
+                Ok(Some(v)) => iter_result(i, v, false),
+                Ok(None) => iter_result(i, Value::Und, true),
+                Err(e) => Err(e),
+            };
+        }
         if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
             let mut lz = take_lazy(o).expect("checked IterLazy above");
             let r = iter_lazy_step(i, &mut lz);
@@ -1416,21 +1497,27 @@ fn iter_src_step(i: &mut Interp, src: &mut IterSrc) -> Result<Option<Value>, Val
             Ok(Some(i.get_prop(&r, &PropKey::from_str("value"))?))
         }
         IterSrc::Arr { arr, idx } => {
-            let b = arr.borrow();
-            let ObjKind::Arr(items) = &b.kind else {
-                return Ok(None);
-            };
-            let len = arr_declared_len(arr);
-            if *idx >= len {
-                return Ok(None);
+            // element getters + defineProperty'd accessors are observable —
+            // read via get_prop, not the raw Vec
+            {
+                let b = arr.borrow();
+                if let ObjKind::Arr(items) = &b.kind {
+                    if *idx >= items.len() {
+                        // declared length may exceed items — check it
+                        let dl = arr_declared_len(arr);
+                        drop(b);
+                        if *idx >= dl {
+                            return Ok(None);
+                        }
+                    }
+                } else {
+                    drop(b);
+                }
             }
-            let v = if b.holes.as_ref().is_some_and(|h| h.contains(idx)) {
-                Value::Und
-            } else {
-                items.get(*idx).cloned().unwrap_or(Value::Und)
-            };
+            let kk = i.intern(&idx.to_string());
             *idx += 1;
-            Ok(Some(v))
+            let v = i.get_prop(&Value::Obj(arr.clone()), &PropKey::S(kk))?;
+            return Ok(Some(v));
         }
     }
 }
@@ -3917,12 +4004,51 @@ fn define_prop_from_desc(
                 }
             }
         }
+        // accessor def on an array element slot: it becomes an own
+        // accessor property — hole the element first so the props entry
+        // shadows it, then the generic path defines the descriptor
+        let acc_idx = if is_acc {
+            match &key {
+                PropKey::S(s) => arr_index(s),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(idx) = acc_idx {
+            if matches!(&b.kind, ObjKind::Arr(it) if idx < it.len()) {
+                b.holes.get_or_insert_with(Default::default).insert(idx);
+            } else if matches!(&b.kind, ObjKind::Arr(_)) {
+                // ArrayDefineOwnProperty: an index past the end grows
+                // length to idx+1 — `defineProperty([],"0",{get})` must
+                // still lengthen so `for..of` visits the slot
+                let need = idx + 1;
+                let cur = match b.props.get(&PropKey::from_str("length")) {
+                    Some(p) => match &p.val {
+                        Value::Num(n) => *n as usize,
+                        _ => 0,
+                    },
+                    None => 0,
+                };
+                if need > cur {
+                    b.props.insert(
+                        PropKey::from_str("length"),
+                        Prop {
+                            val: Value::Num(need as f64),
+                            writable: true,
+                            enumerable: false,
+                            configurable: false,
+                            get: None,
+                            set: None,
+                        },
+                    );
+                }
+            }
+        }
+        if acc_idx.is_none() {
         if let ObjKind::Arr(items) = &mut b.kind {
             if let PropKey::S(s) = &key {
                 if let Some(idx) = arr_index(s) {
-                    if is_acc {
-                        return Err(i.type_err("Invalid property descriptor"));
-                    }
                     if idx < items.len() {
                         if has_val {
                             items[idx] = vv;
@@ -3960,6 +4086,7 @@ fn define_prop_from_desc(
                     return Ok(());
                 }
             }
+        }
         }
     }
 
@@ -5388,6 +5515,9 @@ fn arr_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn arr_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    if let Value::Obj(o) = this {
+        return Ok(make_live_iter(o.clone(), i.p.array_iter.clone(), 1));
+    }
     let items = to_elems(i, this)?;
     Ok(make_iter_in(
         (0..items.len()).map(|k| Value::Num(k as f64)).collect(),
@@ -5396,17 +5526,32 @@ fn arr_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 fn arr_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    if let Value::Obj(o) = this {
+        return Ok(make_live_iter(o.clone(), i.p.array_iter.clone(), 0));
+    }
     let items = to_elems(i, this)?;
     Ok(make_iter_in(items, i.p.array_iter.clone()))
 }
 
 fn arr_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
+    if let Value::Obj(o) = this {
+        return Ok(make_live_iter(o.clone(), i.p.array_iter.clone(), 2));
+    }
     let items = to_elems(i, this)?;
     let mut out = Vec::new();
     for (k, v) in items.into_iter().enumerate() {
         out.push(Value::Obj(i.new_arr(vec![Value::Num(k as f64), v])));
     }
     Ok(make_iter_in(out, i.p.array_iter.clone()))
+}
+
+/// live-view iterator object — reads `obj` per step so mid-iteration
+/// mutation (mapped arguments, array holes, map/set delete+add) shows
+fn make_live_iter(o: ObjRef, proto: ObjRef, mode: u8) -> Value {
+    Value::Obj(Rc::new(RefCell::new(Obj::new(
+        Some(proto),
+        ObjKind::IterLive { obj: o, idx: 0, mode },
+    ))))
 }
 
 // ===========================================================================
@@ -8235,9 +8380,8 @@ fn map_keys(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 
 fn map_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
-        if let ObjKind::Map(items) = &o.borrow().kind {
-            let vs: Vec<Value> = items.iter().map(|(_, v)| v.clone()).collect();
-            return Ok(make_iter_in(vs, i.p.map_iter.clone()));
+        if matches!(&o.borrow().kind, ObjKind::Map(_)) {
+            return Ok(make_live_iter(o.clone(), i.p.map_iter.clone(), 4));
         }
     }
     Ok(make_iter_in(vec![], i.p.map_iter.clone()))
@@ -8245,13 +8389,8 @@ fn map_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 
 fn map_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
-        if let ObjKind::Map(items) = &o.borrow().kind {
-            let items = items.clone();
-            let mut out = Vec::new();
-            for (k, v) in items {
-                out.push(Value::Obj(i.new_arr(vec![k, v])));
-            }
-            return Ok(make_iter_in(out, i.p.map_iter.clone()));
+        if matches!(&o.borrow().kind, ObjKind::Map(_)) {
+            return Ok(make_live_iter(o.clone(), i.p.map_iter.clone(), 3));
         }
     }
     Ok(make_iter_in(vec![], i.p.map_iter.clone()))
@@ -8355,8 +8494,8 @@ fn set_for_each(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn set_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
-        if let ObjKind::Set(items) = &o.borrow().kind {
-            return Ok(make_iter_in(items.clone(), i.p.set_iter.clone()));
+        if matches!(&o.borrow().kind, ObjKind::Set(_)) {
+            return Ok(make_live_iter(o.clone(), i.p.set_iter.clone(), 5));
         }
     }
     Ok(make_iter_in(vec![], i.p.set_iter.clone()))
@@ -8364,13 +8503,8 @@ fn set_values(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 
 fn set_entries(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     if let Value::Obj(o) = this {
-        if let ObjKind::Set(items) = &o.borrow().kind {
-            let items = items.clone();
-            let mut out = Vec::new();
-            for v in items {
-                out.push(Value::Obj(i.new_arr(vec![v.clone(), v])));
-            }
-            return Ok(make_iter_in(out, i.p.set_iter.clone()));
+        if matches!(&o.borrow().kind, ObjKind::Set(_)) {
+            return Ok(make_live_iter(o.clone(), i.p.set_iter.clone(), 6));
         }
     }
     Ok(make_iter_in(vec![], i.p.set_iter.clone()))

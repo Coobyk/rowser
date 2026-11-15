@@ -9,6 +9,13 @@ fn main() {
         .stack_size(256 << 20)
         .spawn(move || {
             let mut ctx = rowser_js::Context::new();
+            let secs: u64 = std::env::var("RJS_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10);
+            if secs > 0 {
+                ctx.interp.arm_deadline(std::time::Duration::from_secs(secs));
+            }
             let t = std::time::Instant::now();
             match ctx.eval(&src) {
                 Ok(v) => println!(

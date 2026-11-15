@@ -418,6 +418,12 @@ pub enum ObjKind {
         items: Vec<Value>,
         idx: usize,
     },
+    /// LIVE-view iterator (Array/Map/Set keys/values/entries + arguments):
+    /// `len`/elements/entries are read through `obj` fresh per step so
+    /// mid-iteration mutation is observable (spec iterator semantics).
+    /// mode: 0=values 1=keys 2=entries(array) 3=entries(map) 4=values(map)
+    ///       5=values(set) 6=entries(set)
+    IterLive { obj: ObjRef, idx: usize, mode: u8 },
     /// lazy protocol iterator — Iterator helpers, `Iterator.from` wraps,
     /// zip/concat. Steps the source's own `next` per pull.
     IterLazy(IterLazy),
@@ -710,7 +716,9 @@ fn view_own_prop_str(o: &ObjRef, key: &str) -> Option<Value> {
                 if b.holes.as_ref().is_some_and(|h| h.contains(&i)) {
                     return None; // hole → not an own prop
                 }
-                return Some(items.get(i).cloned().unwrap_or(Value::Und));
+                // out-of-range: NOT an own prop — a shadowing props entry
+                // (accessor define) or the proto chain handles it
+                return items.get(i).cloned();
             }
             None
         }
@@ -3272,13 +3280,14 @@ impl Interp {
         while let Some(c) = cur {
             {
                 let b = c.borrow();
+                // spec for-in order per level: integer-index keys ascending
+                // numerically FIRST, then string keys in insertion order
+                let mut ints: Vec<(u64, String)> = Vec::new();
+                let mut strs: Vec<String> = Vec::new();
                 match &b.kind {
                     ObjKind::Arr(items) => {
                         for i in 0..items.len() {
-                            let k = i.to_string();
-                            if seen.insert(k.clone()) {
-                                out.push(k);
-                            }
+                            ints.push((i as u64, i.to_string()));
                         }
                     }
                     ObjKind::Typed {
@@ -3291,10 +3300,7 @@ impl Interp {
                         let eff =
                             typed_state(buf, *off, *len, *kind, *track).unwrap_or(0);
                         for i in 0..eff {
-                            let k = i.to_string();
-                            if seen.insert(k.clone()) {
-                                out.push(k);
-                            }
+                            ints.push((i as u64, i.to_string()));
                         }
                     }
                     ObjKind::Args { items, .. } => {
@@ -3306,22 +3312,44 @@ impl Interp {
                             if b.props.get_str(&k).is_some() {
                                 continue;
                             }
-                            if seen.insert(k.clone()) {
-                                out.push(k);
-                            }
+                            ints.push((i as u64, k));
                         }
                     }
                     _ => {}
                 }
+                let mut nonenum: Vec<String> = Vec::new();
                 for (k, p) in b.props.iter() {
-                    if !p.enumerable {
-                        continue;
-                    }
                     if let PropKey::S(s) = k {
-                        if seen.insert(s.to_string()) {
-                            out.push(s.to_string());
+                        if !p.enumerable {
+                            // shadowed or not, a non-enum own prop still
+                            // blocks the same name from enumerating higher
+                            // up the proto chain
+                            nonenum.push(s.to_string());
+                            continue;
+                        }
+                        // canonical numeric strings (incl. "-0", "1.5", big
+                        // ints) order as ordinary string keys — only true
+                        // array indices join the integer run
+                        if let Some(i) = js_int_index(s) {
+                            ints.push((i as u64, s.to_string()));
+                        } else {
+                            strs.push(s.to_string());
                         }
                     }
+                }
+                ints.sort_by_key(|(n, _)| *n);
+                for (_, k) in ints {
+                    if seen.insert(k.clone()) {
+                        out.push(k);
+                    }
+                }
+                for s in strs {
+                    if seen.insert(s.clone()) {
+                        out.push(s);
+                    }
+                }
+                for s in nonenum {
+                    seen.insert(s);
                 }
             }
             cur = c.borrow().proto.clone();
@@ -3634,6 +3662,7 @@ impl Interp {
                     }
                     ObjKind::Bound { .. } => "[Function bound]".into(),
                     ObjKind::Und => "undefined".into(),
+                    ObjKind::IterLive { .. } => "Iterator {}".into(),
                     ObjKind::Args { items, .. } => {
                         let inner: Vec<String> = items
                             .iter()
@@ -5306,7 +5335,34 @@ impl Interp {
             }
             Stmt::ForIn { left, right, body } => {
                 let my_label = self.pending_label.take();
-                let rv = self.eval_expr(right, env)?;
+                // ForIn/OfHeadEvaluation: a `let`/`const` target creates a
+                // declarative env holding the bound names UNINITIALIZED
+                // before the head expression evaluates — reading them there
+                // throws ReferenceError (TDZ)
+                let tdz_scope;
+                let head_env: &EnvRef = match left {
+                    ForTarget::Var(kind, pat) if *kind != VarKind::Var => {
+                        let s = Scope::new(Some(env.clone()), false);
+                        let mut names = Vec::new();
+                        collect_pattern_names(pat, &mut names);
+                        {
+                            let mut vars = s.vars.borrow_mut();
+                            for n in names {
+                                vars.entry(self.intern(n)).or_insert(Binding {
+                                    val: Value::Und,
+                                    mutable: true,
+                                    uninit: true,
+                                    deletable: false,
+                                    lexical: true,
+                                });
+                            }
+                        }
+                        tdz_scope = s;
+                        &tdz_scope
+                    }
+                    _ => env,
+                };
+                let rv = self.eval_expr(right, head_env)?;
                 let keys = self.enum_keys(&rv);
                 // `let`/`const` loop targets need a per-iteration scope
                 // (CreatePerIterationEnvironment), seeded from the previous
@@ -5398,7 +5454,34 @@ impl Interp {
             }
             Stmt::ForOf { left, right, body } => {
                 let my_label = self.pending_label.take();
-                let rv = self.eval_expr(right, env)?;
+                // ForIn/OfHeadEvaluation: a `let`/`const` target creates a
+                // declarative env holding the bound names UNINITIALIZED
+                // before the head expression evaluates — reading them there
+                // throws ReferenceError (TDZ)
+                let tdz_scope;
+                let head_env: &EnvRef = match left {
+                    ForTarget::Var(kind, pat) if *kind != VarKind::Var => {
+                        let s = Scope::new(Some(env.clone()), false);
+                        let mut names = Vec::new();
+                        collect_pattern_names(pat, &mut names);
+                        {
+                            let mut vars = s.vars.borrow_mut();
+                            for n in names {
+                                vars.entry(self.intern(n)).or_insert(Binding {
+                                    val: Value::Und,
+                                    mutable: true,
+                                    uninit: true,
+                                    deletable: false,
+                                    lexical: true,
+                                });
+                            }
+                        }
+                        tdz_scope = s;
+                        &tdz_scope
+                    }
+                    _ => env,
+                };
+                let rv = self.eval_expr(right, head_env)?;
                 // spec: lazy protocol iteration — `next()` per step,
                 // IteratorClose on every abrupt completion
                 let mut lz = crate::builtins::for_of_iter(self, &rv)?;
@@ -5430,11 +5513,9 @@ impl Interp {
                     let it = match crate::builtins::iter_lazy_step(self, &mut lz) {
                         Ok(Some(v)) => v,
                         Ok(None) => break,
-                        Err(e) => {
-                            // IfAbruptCloseIterator — close errors swallowed
-                            let _ = crate::builtins::iter_lazy_close(self, &mut lz);
-                            return Err(e);
-                        }
+                        // `? IteratorStepValue` — the iterator threw itself;
+                        // NO IteratorClose runs on step/result-attr errors
+                        Err(e) => return Err(e),
                     };
                     let mut iter_scope: Option<EnvRef> = None;
                     let scope: &EnvRef = if per_iter {
@@ -5474,7 +5555,8 @@ impl Interp {
                         Ok(Completion::Normal(v)) => last = v,
                         Ok(Completion::Empty) => {}
                         Ok(Completion::Break(l, v)) => {
-                            let _ = crate::builtins::iter_lazy_close(self, &mut lz);
+                            // non-throw abrupt: a close error REPLACES it
+                            crate::builtins::iter_lazy_close(self, &mut lz)?;
                             if l.is_some() {
                                 return Ok(Completion::Break(l, v));
                             }
@@ -5485,7 +5567,7 @@ impl Interp {
                         }
                         Ok(Completion::Continue(l, v)) => {
                             if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
-                                let _ = crate::builtins::iter_lazy_close(self, &mut lz);
+                                crate::builtins::iter_lazy_close(self, &mut lz)?;
                                 return Ok(Completion::Continue(l, v));
                             }
                             if let Some(v) = v {
@@ -5736,8 +5818,11 @@ impl Interp {
                     }
                 },
                 other => {
-                    // destructuring target — redeclare each iteration in scope
-                    self.bind_pattern_iter(scope, other, v, *kind)
+                    // destructuring target — the full pat_bind path gives
+                    // lazy protocol pulls, IteratorClose and default-init
+                    // name inference; the per-iteration scope makes each
+                    // `declare` a fresh binding
+                    self.pat_bind(scope, other, v, BindMode::Decl(*kind))
                 }
             },
             ForTarget::Expr(e) => self.assign_target(scope, e, v).map(|_| ()),

@@ -2004,14 +2004,16 @@ fn canon_nonu(cp: u32) -> u32 {
 }
 
 /// Unicode simple case folding (CaseFolding status C/S) — toLowercase
-/// covers nearly everything; the exceptions are chars whose simple fold
-/// differs from their lowercase (Greek letter variants, `ſ`, `ς`, `µ`)
+/// covers nearly everything; the explicit entries are the folds that
+/// differ from toLowercase: `ſ`/`ς`/`µ`-style variant letters, the Greek
+/// lunate sigmas and symbol forms, the Cyrillic small variants, Cherokee
+/// smalls (which fold to capitals), and the Unicode-15.1 additions
+/// (`ΐ`→`ΐ`, `ΰ`→`ΰ`, `ﬅ`→`ﬆ`).
 fn scf_cp(cp: u32) -> u32 {
     match cp {
-        0x00B5 => 0x03BC, // µ → μ
         0x017F => 0x0073, // ſ → s
-        0x03BE => 0x03BA, // Ͼ → κ
-        0x03BF => 0x03C3, // Ͽ → σ
+        0x0345 => 0x03B9, // ͅ combining ypogegrammeni → ι
+        0x037B..=0x037D => 0x03C3, // ͻ/ͼ/ͽ lunate sigmas → σ
         0x03C2 => 0x03C3, // ς → σ
         0x03D0 => 0x03B2, // ϐ → β
         0x03D1 => 0x03B8, // ϑ → θ
@@ -2019,8 +2021,28 @@ fn scf_cp(cp: u32) -> u32 {
         0x03D6 => 0x03C0, // ϖ → π
         0x03F0 => 0x03BA, // ϰ → κ
         0x03F1 => 0x03C1, // ϱ → ρ
+        0x03F2 => 0x03F9, // ϲ → Ϲ
+        0x03F3 => 0x037F, // ϳ → Ϳ
         0x03F5 => 0x03B5, // ϵ → ε
+        // Cyrillic small variants → base letters
+        0x1C80 => 0x0432,
+        0x1C81 => 0x0434,
+        0x1C82 => 0x043E,
+        0x1C83 => 0x0441,
+        0x1C84 | 0x1C85 => 0x0442,
+        0x1C86 => 0x044A,
+        0x1C87 => 0x0463,
+        0x1C88 => 0xA64A,
         0x1E9B => 0x1E61, // ẛ → ṡ
+        0x1FBE => 0x03B9, // ι prosgegrammeni → ι
+        0x214E => 0x2132, // ⅎ → Ⅎ
+        0xA7F8 => 0x0126, // ꟸ → Ħ
+        0xA7F9 => 0x0153, // ꟹ → œ
+        0xAB70..=0xABBF => cp - 0x97D0, // Cherokee smalls ꭰ–ꮿ → 13A0–13EF
+        0x13F8..=0x13FD => cp - 8,      // Cherokee smalls ᏸ–ᏽ → 13F0–13F5
+        0x1FD3 => 0x0390, // ΐ → ΐ
+        0x1FE3 => 0x03B0, // ΰ → ΰ
+        0xFB05 => 0xFB06, // ﬅ → ﬆ
         _ => {
             let Some(c) = char::from_u32(cp) else {
                 return cp;
@@ -2083,12 +2105,7 @@ fn class_match(items: &[ClassItem], cp: u32, icase: bool, umatch: bool) -> bool 
         ClassItem::Ch(w) => ch_eq_cp(cp, *w, icase, umatch),
         ClassItem::Range(lo, hi) => {
             (*lo..=*hi).contains(&cp)
-                || (icase && {
-                    // spec canonicalizes the range's character set too —
-                    // `[a-z]`/i holds A-Z after folding
-                    let (l2, h2) = (canon_cp(*lo, umatch), canon_cp(*hi, umatch));
-                    l2 <= h2 && (l2..=h2).contains(&canon_cp(cp, umatch))
-                })
+                || (icase && range_icase_match(*lo, *hi, cp, umatch))
         }
         // `\w`/`\d`/`\s` sets are canonicalized too — under `i` the input
         // char folds into the set (u-mode `ſ`→`s` makes it a word char)
@@ -2097,4 +2114,145 @@ fn class_match(items: &[ClassItem], cp: u32, icase: bool, umatch: bool) -> bool 
             pre_match(*p, q)
         }
     })
+}
+
+/// `i`-flag class-range test: the spec canonicalizes every char in
+/// `[lo,hi]`, so `cp` matches iff some `c` in the range has
+/// `canon(c) == canon(cp)` — i.e. a canonical *pre-image* of the folded
+/// input lies in the range. (Folding the two endpoints and testing the
+/// folded char between them is wrong: `[W-z]` folds to `[W,Z]+[a-z]+`
+/// punctuation, dropping `_`/`` ` `` while picking up `A`–`F` through
+/// their lowercase pre-images.)
+fn range_icase_match(lo: u32, hi: u32, cp: u32, umatch: bool) -> bool {
+    let q = canon_cp(cp, umatch);
+    let inside = |v: u32| lo <= v && v <= hi;
+    // `q` itself, when it is a canonical fixpoint (a char can always
+    // pre-image itself)
+    if canon_cp(q, umatch) == q && inside(q) {
+        return true;
+    }
+    // `q`'s case-variant — `u` folds toward lowercase so the pre-image
+    // is the uppercase form; non-`u` folds toward uppercase so it is
+    // the lowercase form
+    if let Some(v) = case_variant(q, umatch) {
+        if canon_cp(v, umatch) == q && inside(v) {
+            return true;
+        }
+    }
+    // chars with asymmetric/special folds that land on `q`
+    if fold_preimages(q, umatch).iter().any(|&v| inside(v)) {
+        return true;
+    }
+    // Cherokee (u-mode): the smalls fold *up* to capitals, so pre-images
+    // of capital fold-targets sit in the AB70–ABBF / 13F8–13FD blocks
+    if umatch {
+        let v = match q {
+            0x13A0..=0x13EF => q + 0x97D0,
+            0x13F0..=0x13F5 => q + 8,
+            0x13FD => 0x13F5,
+            _ => return false,
+        };
+        inside(v)
+    } else {
+        false
+    }
+}
+
+/// the single-char case-variant of `q` used as a canonical pre-image:
+/// `toUppercase` for `u`-mode folding, `toLowercase` for non-`u`
+fn case_variant(q: u32, umatch: bool) -> Option<u32> {
+    let c = char::from_u32(q)?;
+    let v = if umatch {
+        let mut it = c.to_uppercase();
+        let v = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        v
+    } else {
+        let mut it = c.to_lowercase();
+        let v = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        v
+    };
+    Some(v as u32)
+}
+
+/// Chars `c` outside `q`'s own case pair that canonicalize to `q` —
+/// asymmetric folds the case-variant path cannot reach (e.g. `ſ`→`s`,
+/// `ς`→`Σ`, `µ`→`Μ`, `ẛ`→`Ṡ`, the Greek symbol forms).
+fn fold_preimages(q: u32, umatch: bool) -> &'static [u32] {
+    if umatch {
+        // c with scf(c) == q (simple-fold pre-images)
+        match q {
+            0x006B => &[0x212A],
+            0x0073 => &[0x017F],
+            0x00DF => &[0x1E9E],
+            0x00E5 => &[0x212B],
+            0x0126 => &[0xA7F8],
+            0x0153 => &[0xA7F9],
+            0x01C6 => &[0x01C5],
+            0x01C9 => &[0x01C8],
+            0x01CC => &[0x01CB],
+            0x01F3 => &[0x01F2],
+            0x037F => &[0x03F3],
+            0x0390 => &[0x1FD3],
+            0x03B0 => &[0x1FE3],
+            0x03B2 => &[0x03D0],
+            0x03B5 => &[0x03F5],
+            0x03B8 => &[0x03D1],
+            0x03B9 => &[0x0345, 0x1FBE],
+            0x03BA => &[0x03F0],
+            0x03BC => &[0x00B5],
+            0x03C0 => &[0x03D6],
+            0x03C1 => &[0x03F1],
+            0x03C3 => &[0x03C2, 0x037B, 0x037C, 0x037D],
+            0x03C6 => &[0x03D5],
+            0x03C9 => &[0x2126],
+            0x03F9 => &[0x03F2],
+            0x0432 => &[0x1C80],
+            0x0434 => &[0x1C81],
+            0x043E => &[0x1C82],
+            0x0441 => &[0x1C83],
+            0x0442 => &[0x1C84, 0x1C85],
+            0x044A => &[0x1C86],
+            0x0463 => &[0x1C87],
+            0x1E61 => &[0x1E9B],
+            0x2132 => &[0x214E],
+            0xA64A => &[0x1C88],
+            0xFB06 => &[0xFB05],
+            _ => &[],
+        }
+    } else {
+        // c ≥ 0x80 with toUppercase(c) == q (non-u canon pre-images) —
+        // folds to ASCII are excluded by the ≥128 rule in canon_nonu
+        match q {
+            0x01C4 => &[0x01C5],
+            0x01C7 => &[0x01C8],
+            0x01CA => &[0x01CB],
+            0x01F1 => &[0x01F2],
+            0x0392 => &[0x03D0],
+            0x0395 => &[0x03F5],
+            0x0398 => &[0x03D1],
+            0x0399 => &[0x0345, 0x1FBE],
+            0x039A => &[0x03F0],
+            0x039C => &[0x00B5],
+            0x03A0 => &[0x03D6],
+            0x03A1 => &[0x03F1],
+            0x03A3 => &[0x03C2],
+            0x03A6 => &[0x03D5],
+            0x0432 => &[0x1C80],
+            0x0434 => &[0x1C81],
+            0x043E => &[0x1C82],
+            0x0441 => &[0x1C83],
+            0x0442 => &[0x1C84, 0x1C85],
+            0x044A => &[0x1C86],
+            0x0463 => &[0x1C87],
+            0x1E60 => &[0x1E9B],
+            0xA64A => &[0x1C88],
+            _ => &[],
+        }
+    }
 }

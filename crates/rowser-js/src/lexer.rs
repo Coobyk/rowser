@@ -305,6 +305,28 @@ impl Lexer {
                 // while IdentifierName positions (member names, prop
                 // keys, labels) accept them per spec
                 match keyword(&name) {
+                    // escaped CONTEXTUAL keywords are ordinary identifiers
+                    // (`as\u0079nc`, `l\u0065t`, `yi\u0065ld`) — only true
+                    // ReservedWords keep their Kw token to be rejected
+                    // contextually by the parser
+                    Some(kw)
+                        if self.tok_escaped
+                            && matches!(
+                                kw,
+                                Kw::Let
+                                    | Kw::Static
+                                    | Kw::Async
+                                    | Kw::Await
+                                    | Kw::Yield
+                                    | Kw::Of
+                                    | Kw::As
+                                    | Kw::From
+                                    | Kw::Get
+                                    | Kw::Set
+                            ) =>
+                    {
+                        Tok::Ident(name)
+                    }
                     Some(kw) => Tok::Kw(kw),
                     None => Tok::Ident(name),
                 }
@@ -747,8 +769,36 @@ impl Lexer {
                                 self.hex_digits(4)
                                     .ok_or_else(|| self.err("bad \\u escape"))?
                             };
-                            let Some(ch) = char::from_u32(cp) else {
-                                return Err(self.err("bad \\u escape"));
+                            // surrogate escapes pair into an astral char;
+                            // lone surrogates are WTF-16 code units we
+                            // can't store in a UTF-8 string → U+FFFD
+                            let ch = if (0xd800..=0xdbff).contains(&cp) {
+                                let (si, scol) = (self.i, self.col);
+                                let mut paired = None;
+                                if self.peek() == Some('\\')
+                                    && self.peek2() == Some('u')
+                                {
+                                    self.bump();
+                                    self.bump();
+                                    if let Some(lo) = self.hex_digits(4) {
+                                        if (0xdc00..=0xdfff).contains(&lo) {
+                                            paired = Some(
+                                                0x10000
+                                                    + ((cp - 0xd800) << 10)
+                                                    + (lo - 0xdc00),
+                                            );
+                                        }
+                                    }
+                                    if paired.is_none() {
+                                        self.i = si;
+                                        self.col = scol;
+                                    }
+                                }
+                                paired
+                                    .and_then(char::from_u32)
+                                    .unwrap_or('\u{fffd}')
+                            } else {
+                                char::from_u32(cp).unwrap_or('\u{fffd}')
                             };
                             s.push(ch);
                         }

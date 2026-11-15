@@ -70,6 +70,9 @@ struct Parser {
     /// parsing for-head init expressions so `for (x in y)` and the common
     /// minified `for (a in b&&c, d)` forms parse correctly
     no_in: bool,
+    /// depth >0 while parsing the binding list of a let/const (lexical)
+    /// declaration — `let` can't be bound there even in sloppy mode
+    lex_decl: u32,
     /// strict-mode context (directive prologue, class body, inherited)
     strict: bool,
     /// >0 while inside `(` — the contents may reinterpret as a
@@ -102,6 +105,7 @@ impl Parser {
             toks,
             pos: 0,
             no_in: false,
+            lex_decl: 0,
             strict: false,
             paren_depth: 0,
             fn_depth: 0,
@@ -548,25 +552,35 @@ impl Parser {
             _ => return Err(self.err("expected var/let/const")),
         };
         self.next();
-        let mut decls = Vec::new();
-        loop {
-            let pat = self.binding_pattern()?;
-            let init = if self.eat_punct("=") {
-                Some(self.assign_expr()?)
-            } else {
-                None
-            };
-            if init.is_none() && !matches!(pat, Pattern::Ident(_)) {
-                return Err(self.err("destructuring requires an initializer"));
-            }
-            if init.is_none() && kind == VarKind::Const {
-                return Err(self.err("const declaration requires an initializer"));
-            }
-            decls.push((pat, init));
-            if !self.eat_punct(",") {
-                break;
-            }
+        if kind != VarKind::Var {
+            self.lex_decl += 1;
         }
+        let mut decls = Vec::new();
+        let r = (|| {
+            loop {
+                let pat = self.binding_pattern()?;
+                let init = if self.eat_punct("=") {
+                    Some(self.assign_expr()?)
+                } else {
+                    None
+                };
+                if init.is_none() && !matches!(pat, Pattern::Ident(_)) {
+                    return Err(self.err("destructuring requires an initializer"));
+                }
+                if init.is_none() && kind == VarKind::Const {
+                    return Err(self.err("const declaration requires an initializer"));
+                }
+                decls.push((pat, init));
+                if !self.eat_punct(",") {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        if kind != VarKind::Var {
+            self.lex_decl -= 1;
+        }
+        r?;
         Ok((kind, decls))
     }
 
@@ -725,6 +739,24 @@ impl Parser {
                     "function declaration not allowed in statement position",
                 ));
             }
+            // `for (...) label: function f(){}` — a fn decl reachable
+            // through labels is still in a single-statement position:
+            // Annex B labelled fns are only legal at function/script/block
+            // top level
+            Stmt::Labeled(_, inner) if !fn_ok => {
+                let mut cur: &Stmt = inner;
+                loop {
+                    match cur {
+                        Stmt::Labeled(_, i) => cur = i,
+                        Stmt::FnDecl(_) => {
+                            return Err(self.err(
+                                "labelled function declaration not allowed                                  in statement position",
+                            ));
+                        }
+                        _ => break,
+                    }
+                }
+            }
             _ => {}
         }
         Ok(Box::new(body))
@@ -755,10 +787,19 @@ impl Parser {
                 _ => VarKind::Let,
             };
             self.next();
-            let pat = self.binding_pattern()?;
+            if kind != VarKind::Var {
+                self.lex_decl += 1;
+            }
+            let pat = self.binding_pattern();
+            if kind != VarKind::Var {
+                self.lex_decl -= 1;
+            }
+            let pat = pat?;
             if self.at_kw(Kw::Of) {
                 self.next();
-                let right = self.expression()?;
+                // ForOfHead: `of` binds an AssignmentExpression — a
+                // top-level `,` is a syntax error
+                let right = self.assign_expr()?;
                 self.expect_punct(")")?;
                 let body = self.loop_body()?;
                 return Ok(Stmt::ForOf {
@@ -843,11 +884,20 @@ impl Parser {
         // parse the head expression with `in` disabled so `for (x in y)`
         // and `for (a in b&&c, d)` see the keyword as the for-in marker
         self.no_in = true;
+        // `for (async of` is reserved — `async` LHS directly followed by
+        // `of` is an early error (escaped `as\u0079nc` lexes to Ident and
+        // stays legal)
+        if matches!(self.peek().tok, Tok::Kw(Kw::Async))
+            && !self.peek().escaped
+            && matches!(self.peek2().tok, Tok::Kw(Kw::Of))
+        {
+            return Err(self.err("`for (async of` is a reserved form"));
+        }
         let first = self.expression()?;
         self.no_in = false;
         if self.at_kw(Kw::Of) {
             self.next();
-            let right = self.expression()?;
+            let right = self.assign_expr()?;
             self.expect_punct(")")?;
             let body = self.loop_body()?;
             return Ok(Stmt::ForOf {
@@ -1274,6 +1324,13 @@ impl Parser {
         // `yield` is reserved in any [Yield] context even in sloppy mode
         if name == "yield" && self.yield_decl > 0 {
             return Err(self.err("`yield` is not a valid binding in a generator"));
+        }
+        // `let` is never a valid lexical-decl binding name (sloppy `var let`
+        // stays legal — gated on the declaration kind, not strictness)
+        if name == "let" && self.lex_decl > 0 {
+            return Err(
+                self.err("`let` is not a valid binding in a lexical declaration")
+            );
         }
         if !self.strict {
             return Ok(());
@@ -2123,7 +2180,11 @@ impl Parser {
                 // destructuring patterns — ObjectLiteral-only early
                 // errors (duplicate __proto__) don't apply to a cover
                 self.paren_depth += 1;
+                // `in` inside brackets is an ordinary operator — the
+                // for-head's no_in only scopes the top level
+                let no_in = std::mem::replace(&mut self.no_in, false);
                 let e = self.expression();
+                self.no_in = no_in;
                 self.paren_depth -= 1;
                 let e = e?;
                 self.expect_punct(")")?;
@@ -2131,6 +2192,7 @@ impl Parser {
             }
             Tok::Punct("[") => {
                 self.next();
+                let no_in = std::mem::replace(&mut self.no_in, false);
                 let mut elems = Vec::new();
                 while !self.at_punct("]") {
                     if self.at_punct(",") {
@@ -2157,10 +2219,12 @@ impl Parser {
                     }
                 }
                 self.expect_punct("]")?;
+                self.no_in = no_in;
                 Ok(Expr::Array(elems))
             }
             Tok::Punct("{") => {
                 self.next();
+                let no_in = std::mem::replace(&mut self.no_in, false);
                 let mut props = Vec::new();
                 // spec: two `__proto__: v` DATA properties → early error
                 // (getters/setters/methods/computed don't count)
@@ -2371,6 +2435,7 @@ impl Parser {
                     }
                 }
                 self.expect_punct("}")?;
+                self.no_in = no_in;
                 Ok(if dup_proto {
                     Expr::ObjDup(props)
                 } else {

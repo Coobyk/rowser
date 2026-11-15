@@ -173,7 +173,13 @@ fn main() {
         // a panic in one test must not kill the run — count it as a fail
         let res = std::panic::catch_unwind(|| {
             let mut ctx = rowser_js::Context::new();
-            ctx.interp.arm_deadline(std::time::Duration::from_secs(15));
+            let secs: u64 = std::env::var("T262_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15);
+            if secs > 0 {
+                ctx.interp.arm_deadline(std::time::Duration::from_secs(secs));
+            }
             ctx.eval(&body)
         })
         .unwrap_or_else(|_| {

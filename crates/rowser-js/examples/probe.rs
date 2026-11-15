@@ -12,6 +12,13 @@ var out=Mi(ctx,0,null,0,0,0);
 out.s
 "#;
     let mut c = rowser_js::Context::new();
+    let secs: u64 = std::env::var("RJS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    if secs > 0 {
+        c.interp.arm_deadline(std::time::Duration::from_secs(secs));
+    }
     match c.eval(src) {
         Ok(v) => println!("=> {}", c.interp.to_str(&v).unwrap_or_default()),
         Err(e) => println!("=> ERR {e}"),
