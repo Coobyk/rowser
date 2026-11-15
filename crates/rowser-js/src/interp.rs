@@ -1402,7 +1402,20 @@ impl Interp {
                             self.type_err(format!("Assignment to constant variable '{name}'"))
                         );
                     }
-                    b.val = v;
+                    b.val = v.clone();
+                    // global bindings mirror the global object's props —
+                    // `this.x`/`window.x` must see the assignment
+                    if Rc::ptr_eq(cur, &self.global) {
+                        let g = self.p.global.clone();
+                        let pk = PropKey::S(self.intern(name));
+                        let mut gb = g.borrow_mut();
+                        match gb.props.get_mut(&pk) {
+                            Some(p) => p.val = v,
+                            None => {
+                                gb.props.insert(pk, Prop::data(v));
+                            }
+                        }
+                    }
                     return Ok(());
                 }
             }
@@ -1501,11 +1514,18 @@ impl Interp {
     /// `var` — walks to nearest function scope.
     pub fn declare_var(&mut self, env: &EnvRef, name: &str, v: Value) {
         let k = self.intern(name);
-        self.declare_var_rc(env, &k, v);
+        self.declare_var_rc(env, &k, v, false);
+    }
+
+    /// `declare_var` for hoisted FUNCTION decls — a configurable existing
+    /// global prop is fully redefined, not just value-updated
+    pub fn declare_var_fn(&mut self, env: &EnvRef, name: &str, v: Value) {
+        let k = self.intern(name);
+        self.declare_var_rc(env, &k, v, true);
     }
 
     /// `declare_var` with a pre-interned key (hoist cache reuse).
-    fn declare_var_rc(&mut self, env: &EnvRef, name: &Rc<str>, v: Value) {
+    fn declare_var_rc(&mut self, env: &EnvRef, name: &Rc<str>, v: Value, is_fn: bool) {
         let mut cur = env.clone();
         loop {
             if cur.var_boundary.get() || cur.parent.is_none() {
@@ -1544,12 +1564,29 @@ impl Interp {
                 // surface)
             }
             // script var/fn globals are non-configurable; eval-declared ones
-            // are configurable per CreateGlobalVarBinding(D=true)
-            let mut p = Prop::data(v);
-            p.configurable = deletable;
-            g.borrow_mut()
-                .props
-                .insert(PropKey::S(name.clone()), p);
+            // are configurable per CreateGlobalVarBinding(D=true). An
+            // existing global prop keeps its descriptor — the binding
+            // update only writes the value (CreateGlobalVarBinding step 7).
+            let mut gb = g.borrow_mut();
+            match gb.props.get_mut(&PropKey::S(name.clone())) {
+                // hoist passes Und — an existing global prop keeps its
+                // value until the initializer assigns it
+                Some(_) if matches!(v, Value::Und) => {}
+                Some(p) if is_fn && p.configurable => {
+                    // CreateGlobalFunctionBinding: configurable existing
+                    // props are fully REDEFINED with default attrs
+                    *p = Prop::data(v);
+                    p.configurable = deletable;
+                }
+                // non-configurable (or var decl): only the value updates —
+                // existing descriptor attributes are preserved
+                Some(p) => p.val = v,
+                None => {
+                    let mut p = Prop::data(v);
+                    p.configurable = deletable;
+                    gb.props.insert(PropKey::S(name.clone()), p);
+                }
+            }
         }
     }
 
@@ -3767,11 +3804,11 @@ impl Interp {
                         },
                     );
                 }
-                self.bind_params(&scope, &def.params, &args)?;
                 // a non-simple parameter environment rejects
                 // `eval("var arguments")`/`eval("var eval")` — non-arrows
                 // always have the implicit binding; arrows only when a
-                // parameter is literally named arguments/eval
+                // parameter is literally named arguments/eval. Set BEFORE
+                // defaults evaluate: eval() in an initializer must see it.
                 if def.params.iter().any(|p| matches!(p, Param::Default(..)))
                     && (!def.is_arrow
                         || def.params.iter().any(|p| {
@@ -3780,6 +3817,7 @@ impl Interp {
                 {
                     scope.param_env.set(true);
                 }
+                self.bind_params(&scope, &def.params, &args)?;
                 // non-simple formals get a separate var environment —
                 // body `var` decls must not leak into the param scope
                 let body_scope: EnvRef = if def
@@ -4051,11 +4089,11 @@ impl Interp {
                         },
                     );
                 }
-                self.bind_params(&scope, &def.params, &args)?;
                 // a non-simple parameter environment rejects
                 // `eval("var arguments")`/`eval("var eval")` — non-arrows
                 // always have the implicit binding; arrows only when a
-                // parameter is literally named arguments/eval
+                // parameter is literally named arguments/eval. Set BEFORE
+                // defaults evaluate: eval() in an initializer must see it.
                 if def.params.iter().any(|p| matches!(p, Param::Default(..)))
                     && (!def.is_arrow
                         || def.params.iter().any(|p| {
@@ -4064,6 +4102,7 @@ impl Interp {
                 {
                     scope.param_env.set(true);
                 }
+                self.bind_params(&scope, &def.params, &args)?;
                 let body_scope: EnvRef = if def
                     .params
                     .iter()
@@ -4793,14 +4832,21 @@ impl Interp {
         }
         for (name, is_fn) in names {
             let key = PropKey::S(name.clone());
-            let existing = g.borrow().props.get(&key).map(|p| p.configurable);
+            let existing = g
+                .borrow()
+                .props
+                .get(&key)
+                .map(|p| (p.configurable, p.writable, p.enumerable, p.is_accessor()));
             match existing {
                 None if !ext => {
                     return Err(self.type_err(format!(
                         "Cannot define global variable `{name}`: object is not extensible"
                     )))
                 }
-                Some(false) if is_fn => {
+                // CanDeclareGlobalFunction: a non-configurable existing
+                // prop still allows the fn decl when it is a writable +
+                // enumerable DATA property
+                Some((false, w, e, acc)) if is_fn && !(w && e && !acc) => {
                     return Err(self.type_err(format!(
                         "Cannot define global function `{name}`: property is non-configurable"
                     )))
@@ -4835,11 +4881,11 @@ impl Interp {
             }
         }
         for name in &h.vars {
-            self.declare_var_rc(scope, name, Value::Und);
+            self.declare_var_rc(scope, name, Value::Und, false);
         }
         if !self.cur_strict {
             for name in &h.block_fns {
-                self.declare_var_rc(scope, name, Value::Und);
+                self.declare_var_rc(scope, name, Value::Und, false);
             }
         }
         for f in &h.fns {
@@ -4848,7 +4894,7 @@ impl Interp {
                 if block_scope {
                     self.declare(scope, &name, fv, true);
                 } else {
-                    self.declare_var(scope, &name, fv);
+                    self.declare_var_fn(scope, &name, fv);
                 }
             }
         }
@@ -5026,12 +5072,22 @@ impl Interp {
                 if let Some(name) = &f.name {
                     let k = self.intern(name);
                     // instantiated = an own binding holding the fn object —
-                    // the Annex-B `undefined` placeholder doesn't count
+                    // the Annex-B `undefined` placeholder doesn't count.
+                    // Top-level decls hoist to the var boundary, block-level
+                    // ones to the block scope — check both so neither is
+                    // re-declared into a shadowing ad-hoc binding.
+                    let mut ve = env.clone();
+                    while !ve.var_boundary.get() && ve.parent.is_some() {
+                        let next = ve.parent.clone().unwrap();
+                        ve = next;
+                    }
                     let has_own = env
                         .vars
                         .borrow()
                         .get(k.as_ref())
-                        .is_some_and(|b| matches!(b.val, Value::Obj(_)));
+                        .is_some_and(|b| matches!(b.val, Value::Obj(_)))
+                        || ve.vars.borrow().get(k.as_ref())
+                            .is_some_and(|b| matches!(b.val, Value::Obj(_)));
                     if !has_own {
                         // single-statement position (`if (c) function f(){}`,
                         // labels): the fn binds into the ad-hoc branch scope
@@ -5479,7 +5535,7 @@ impl Interp {
                     if !self.cur_strict {
                         for n in block_fns {
                             let k = self.intern(n);
-                            self.declare_var_rc(&scope, &k, Value::Und);
+                            self.declare_var_rc(&scope, &k, Value::Und, false);
                         }
                     }
                     for f in fns {
@@ -6434,7 +6490,9 @@ impl Interp {
                 Ok(Value::Num(!(to_i32(self.to_num(&v)?)) as f64))
             }
             UnaryOp::Typeof => {
-                // `typeof undefinedIdent` must not throw
+                // `typeof undefinedIdent` must not throw — `typeof (x)`
+                // keeps the reference through parens
+                let expr = Self::unparen(expr);
                 if let Expr::Ident(n) = expr {
                     match self.env_lookup_st(env, n)? {
                         Some((_, true)) => {
@@ -6458,7 +6516,7 @@ impl Interp {
                 Ok(Value::Und)
             }
             UnaryOp::Await => self.eval_expr(expr, env),
-            UnaryOp::Delete => match expr {
+            UnaryOp::Delete => match Self::unparen(expr) {
                 Expr::Member { obj, prop, .. } => {
                     let ov = self.eval_expr(obj, env)?;
                     let ok = if let Expr::Str(s) = &**prop {
@@ -6802,7 +6860,10 @@ impl Interp {
         {
             let mut cur = Some(&env);
             while let Some(s) = cur {
-                if s.is_fn {
+                // the global scope is is_fn=true (var boundary) but is NOT
+                // function code — `eval("new.target")` at top level must
+                // still be a SyntaxError
+                if s.is_fn && s.parent.is_some() {
                     in_fn = true;
                 }
                 if s.home.borrow().is_some() {
@@ -6822,7 +6883,10 @@ impl Interp {
             // not leak into the caller's var env)
             let lex = Scope::new(Some(env), false);
             let eenv = if strict_eval {
-                let v = Scope::new(Some(lex), true);
+                // strict eval's separate VAR env — a var boundary, but NOT
+                // a function scope (this/new.target/super must still walk
+                // through to the caller's function env)
+                let v = Scope::new(Some(lex), false);
                 v.var_boundary.set(true);
                 v
             } else {
@@ -6844,7 +6908,11 @@ impl Interp {
         // EvalDeclarationInstantiation: a `var`/fn name that collides with
         // a lexical (let/const/class/catch) binding anywhere in the chain
         // above the eval's own env is a SyntaxError
-        {
+        // EvalDeclarationInstantiation step 5: the lexical-collision rule
+        // applies only when the eval is NOT strict — strict eval code gets
+        // its own variable env, so `var x` colliding with a caller's
+        // `let x` is legal
+        if !self.cur_strict {
             let h = self.hoisted_slice(stmts);
             let mut names: Vec<Rc<str>> = h.vars.clone();
             for f in &h.fns {
@@ -6895,8 +6963,22 @@ impl Interp {
                 }
             }
             self.hoist_body(stmts, env)?;
+            // FunctionDeclaration instantiation already happened at hoist —
+            // per spec its Evaluation is a no-op, so executing it must NOT
+            // re-bind (a `delete f` between hoist and exec removes the
+            // binding for good)
+            let hf = self.hoisted_slice(stmts);
             let mut last = Value::Und;
             for s in stmts {
+                if let Stmt::FnDecl(f) = s {
+                    let hoisted = hf
+                        .fns
+                        .iter()
+                        .any(|hf| hf.name.as_deref() == f.name.as_deref());
+                    if hoisted {
+                        continue;
+                    }
+                }
                 match self.exec_stmt(s, env) {
                     Ok(Completion::Normal(v)) | Ok(Completion::Return(v)) => last = v,
                     Ok(_) => {}

@@ -28,14 +28,15 @@ pub fn parse_eval(
     let mut p = Parser::new(toks);
     p.strict = strict;
     if in_fn {
-        p.fn_depth = 1;
+        // new.target only — `return` is a SyntaxError in ALL eval code,
+        // even inside a function (early error on StatementList)
         p.nonarrow_fn_depth = 1;
     }
     if in_method {
         p.method_depth = 1;
     }
     let stmts = p.program()?;
-    validate_strict(&stmts, strict)?;
+    validate_strict_ctx(&stmts, strict, in_fn, in_method)?;
     Ok(stmts)
 }
 
@@ -2239,8 +2240,8 @@ impl Parser {
                         && !self.peek2().newline_before
                     {
                         self.next();
-                        let key = self.prop_key(true)?;
                         let member_gen = self.eat_punct("*");
+                        let key = self.prop_key(true)?;
                         self.expect_punct("(")?;
                         let params = self.params()?;
                         self.expect_punct(")")?;
@@ -2634,10 +2635,17 @@ fn body_strict(stmts: &[Stmt], inherited: bool) -> bool {
 }
 
 fn validate(stmts: &[Stmt]) -> Result<(), Error> {
-    validate_strict(stmts, false)
+    validate_strict_ctx(stmts, false, false, false)
 }
 
-fn validate_strict(stmts: &[Stmt], strict: bool) -> Result<(), Error> {
+/// Script/Eval validation — `in_fn`/`in_method` seed the early-error
+/// context so `new.target`/`super.prop` pass inside direct eval.
+fn validate_strict_ctx(
+    stmts: &[Stmt],
+    strict: bool,
+    in_fn: bool,
+    in_method: bool,
+) -> Result<(), Error> {
     // Script goal: module declarations are illegal at top level
     for s in stmts {
         match s {
@@ -2659,8 +2667,8 @@ fn validate_strict(stmts: &[Stmt], strict: bool) -> Result<(), Error> {
         labels: Vec::new(),
         in_iter: 0,
         in_switch: 0,
-        in_fn: 0,
-        in_method: 0,
+        in_fn: in_fn as usize,
+        in_method: in_method as usize,
         in_ctor: 0,
         strict: strict || body_strict(stmts, false),
     };
