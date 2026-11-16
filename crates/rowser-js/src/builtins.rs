@@ -1,5 +1,6 @@
 //! Minimal standard global environment.
 
+use crate::ast::{self, ArrayPatElem, Param, Pattern};
 use crate::interp::*;
 use crate::regexp::{Regex, RxMatch};
 use std::cell::RefCell;
@@ -1409,6 +1410,49 @@ fn install_protos(i: &mut Interp) {
         str_tag(&i.p.map_iter.clone(), "Map Iterator");
         str_tag(&i.p.set_iter.clone(), "Set Iterator");
         str_tag(&i.p.string_iter.clone(), "String Iterator");
+        // %AsyncIteratorPrototype% — proto of every async iterator:
+        // `{ [Symbol.asyncIterator]() { return this } }`
+        {
+            let ap = i.p.async_iter.clone();
+            let f = native(i, "[Symbol.asyncIterator]", iter_self);
+            ap.borrow_mut()
+                .props
+                .insert(PropKey::Sym(SYM_ASYNCITERATOR), Prop::builtin(f));
+        }
+        // %AsyncFromSyncIteratorPrototype% — wraps a sync iterator so
+        // next/return/throw produce promise-wrapped results
+        {
+            let ap = i.p.afx_iter.clone();
+            method(i, &ap, "next", afx_next);
+            method(i, &ap, "return", afx_return);
+            method(i, &ap, "throw", afx_throw);
+        }
+        // %AsyncGeneratorPrototype% — next/return/throw queue requests;
+        // @@asyncIterator returns `this` via %AsyncIteratorPrototype%
+        {
+            let ap = i.p.async_gen.clone();
+            method_len(i, &ap, "next", agen_next, 1.0);
+            method_len(i, &ap, "return", agen_return, 1.0);
+            method_len(i, &ap, "throw", agen_throw, 1.0);
+            // spec: constructor = %AsyncGeneratorFunction.prototype%
+            // (not the ctor) — non-writable, configurable
+            let afp = i.p.async_gen_func.clone();
+            i.set_attr(&ap, "constructor", Value::Obj(afp), false, true);
+            str_tag(&ap, "AsyncGenerator");
+        }
+        // %AsyncGeneratorFunction.prototype% — proto of `async function*`
+        // fns; its `.prototype` slot is %AsyncGeneratorPrototype%
+        {
+            let gf = i.p.async_gen_func.clone();
+            i.set_attr(
+                &gf,
+                "prototype",
+                Value::Obj(i.p.async_gen.clone()),
+                false,
+                true,
+            );
+            str_tag(&gf, "AsyncGeneratorFunction");
+        }
         // Iterator.prototype[@@toStringTag] — accessor: get → "Iterator",
         // set → CreateDataProperty on the receiver
         {
@@ -1646,6 +1690,7 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
     match res {
         corosensei::CoroutineResult::Yield(v) => {
             c.coro = Some(coro);
+            let _ = std::mem::take(&mut i.await_yield);
             if std::mem::take(&mut i.yieldstar_raw) {
                 // yield* passthrough — the inner result object IS the
                 // outer generator's next() result (done may be absent)
@@ -1738,6 +1783,10 @@ pub fn async_resume(
         corosensei::CoroutineResult::Yield(v) => {
             c.coro = Some(coro);
             drop(c);
+            // consume the await marker — async fns treat every suspend
+            // as an await regardless, but the flag must not leak into
+            // the next async-gen drive on this shared Interp
+            let _ = std::mem::take(&mut i.await_yield);
             // spec Await: PromiseResolve(%Promise%, v) — a live
             // `Promise.resolve` read (user-observable override fires)
             let resolved = match i.get_prop_str(&Value::Obj(i.p.promise_ctor.clone()), "resolve")
@@ -2882,6 +2931,790 @@ fn iter_from(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     Ok(make_lazy_in(lz, i.p.wrap_iter.clone()))
 }
 
+/// %AsyncFromSyncIterator% — wraps a sync iterator so for-await sees
+/// promise results. `[[Iterated]]` rides in `$syncit`.
+pub fn wrap_async_from_sync(i: &mut Interp, sync_it: Value) -> Value {
+    // spec IteratorRecord: [[NextMethod]] is captured NOW, at
+    // GetIterator time — later `get` traps must not fire per step
+    let next = i
+        .get_prop_str(&sync_it, "next")
+        .unwrap_or(Value::Und);
+    let o = Rc::new(RefCell::new(Obj::new(
+        Some(i.p.afx_iter.clone()),
+        ObjKind::Ord,
+    )));
+    i.set_builtin(&o, "$syncit", sync_it);
+    i.set_builtin(&o, "$syncnext", next);
+    Value::Obj(o)
+}
+
+/// this.[[Iterated]] for an AsyncFromSyncIterator method — the sync
+/// iterator object plus its captured [[NextMethod]]
+fn afx_sync_it(i: &mut Interp, this: &Value) -> Result<(Value, Value), Value> {
+    match this {
+        Value::Obj(o) => {
+            let b = o.borrow();
+            let it = b.props.get_str("$syncit").map(|p| p.val.clone());
+            let nm = b.props.get_str("$syncnext").map(|p| p.val.clone());
+            match (it, nm) {
+                (Some(it), Some(nm)) => Ok((it, nm)),
+                _ => Err(i.type_err("not an AsyncFromSyncIterator")),
+            }
+        }
+        _ => Err(i.type_err("not an AsyncFromSyncIterator")),
+    }
+}
+
+/// spec AsyncFromSyncIteratorContinuation: IteratorComplete and
+/// IteratorValue are read eagerly (abrupt → reject the capability),
+/// the VALUE then goes through PromiseResolve(%Promise%, ·) — the
+/// observable `constructor` lookup on promise values — and the
+/// continuation reaction re-wraps the unwrapped value into a fresh
+/// IterResultObject. The reaction is a JOB, which `for await` tick
+/// counts depend on. `it` is the sync iterator for IteratorClose.
+fn afx_step(i: &mut Interp, res: Result<Value, Value>, it: &Value) -> Value {
+    let outer = new_promise_pub(i);
+    let (ores, orej) = resolving_fns(i, &outer);
+    let dv = res.and_then(|r| {
+        let done = i.get_prop_str(&r, "done")?;
+        let value = i.get_prop_str(&r, "value")?;
+        Ok((value, i.to_bool(&done)))
+    });
+    match dv {
+        Err(e) => {
+            let _ = i.call(&orej, Value::Und, vec![e]);
+        }
+        Ok((value, done)) => {
+            let ctor = Value::Obj(i.p.promise_ctor.clone());
+            match promise_resolve_static(i, &ctor, &[value]) {
+                Ok(Value::Obj(po)) => {
+                    let onf = afx_wrap(i, ores.clone(), done);
+                    // spec: the close-on-rejection reaction exists only
+                    // when done == false — it runs IteratorClose then
+                    // propagates the original reason
+                    let onr = if done {
+                        afx_passthru(i, orej)
+                    } else {
+                        afx_close_rej(i, it.clone(), orej)
+                    };
+                    perform_promise_then(i, &po, onf, onr);
+                }
+                Ok(v) => {
+                    // PromiseResolve returned a non-promise — wrap directly
+                    let o = i.new_obj();
+                    i.set_data(&o, "value", v);
+                    i.set_data(&o, "done", Value::Bool(done));
+                    let _ = i.call(&ores, Value::Und, vec![Value::Obj(o)]);
+                }
+                Err(e) => {
+                    // PromiseResolve abrupt → IteratorClose(throw) —
+                    // a throwing `constructor` getter still closes the
+                    // sync iterator — then the original error rejects
+                    let e = afx_close_throw(i, it, e);
+                    let _ = i.call(&orej, Value::Und, vec![e]);
+                }
+            }
+        }
+    }
+    Value::Obj(outer)
+}
+
+/// IteratorClose(syncIt, ThrowCompletion(e)) — calls `return` for its
+/// side effects; per spec the original throw completion propagates
+/// (close-internal errors are discarded)
+fn afx_close_throw(i: &mut Interp, it: &Value, e: Value) -> Value {
+    if let Ok(ret) = i.get_prop_str(it, "return") {
+        if i.is_callable(&ret) {
+            let _ = i.call(&ret, it.clone(), vec![]);
+        }
+    }
+    e
+}
+
+/// close-on-rejection reaction `{it, rej}` — IteratorClose(throw)
+/// then reject the capability with the original reason
+fn afx_close_rej(i: &mut Interp, it: Value, rej: Value) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(&h, "$it", it);
+    i.set_builtin(&h, "$rej", rej);
+    bound_native(i, "", afx_close_rej_step, Value::Obj(h), 1.0)
+}
+
+fn afx_close_rej_step(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Err(i.type_err("afx close-reject called on non-object"));
+    };
+    let (it, rej) = {
+        let b = h.borrow();
+        (
+            b.props.get_str("$it").map(|p| p.val.clone()),
+            b.props.get_str("$rej").map(|p| p.val.clone()),
+        )
+    };
+    let Some(it) = it else {
+        return Err(i.type_err("afx close-reject: missing iterator"));
+    };
+    let e = afx_close_throw(i, &it, arg(args, 0));
+    match rej {
+        Some(rej) => i.call(&rej, Value::Und, vec![e]),
+        None => Ok(Value::Und),
+    }
+}
+
+/// reject a fresh promise immediately (IfAbruptRejectPromise on the
+/// sync-side steps — no extra reaction job)
+fn afx_reject(i: &mut Interp, e: Value) -> Value {
+    let outer = new_promise_pub(i);
+    let (_res, rej) = resolving_fns(i, &outer);
+    let _ = i.call(&rej, Value::Und, vec![e]);
+    Value::Obj(outer)
+}
+
+/// continuation reaction: re-wraps the unwrapped value into a fresh
+/// `{value, done}` iter-result and forwards it through the resolving fn
+fn afx_wrap(i: &mut Interp, f: Value, done: bool) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(&h, "$f", f);
+    i.set_builtin(&h, "$done", Value::Bool(done));
+    bound_native(i, "", afx_call_wrap, Value::Obj(h), 1.0)
+}
+
+fn afx_call_wrap(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Err(i.type_err("afx wrap receiver"));
+    };
+    let (f, done) = {
+        let b = h.borrow();
+        (
+            b.props.get_str("$f").map(|p| p.val.clone()),
+            b.props.get_str("$done").map(|p| p.val.clone()),
+        )
+    };
+    let Some(f) = f else {
+        return Err(i.type_err("afx wrap: missing fn"));
+    };
+    let o = i.new_obj();
+    i.set_data(&o, "value", arg(args, 0));
+    i.set_data(&o, "done", done.unwrap_or(Value::Bool(true)));
+    i.call(&f, Value::Und, vec![Value::Obj(o)])
+}
+
+/// a native closure `{f}` that just calls `f(arg0)` — forwards a
+/// settlement through the resolving fn so thenables adopt
+fn afx_passthru(i: &mut Interp, f: Value) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(&h, "$f", f);
+    bound_native(i, "", afx_call_f, Value::Obj(h), 1.0)
+}
+
+fn afx_call_f(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Err(i.type_err("afx passthrough receiver"));
+    };
+    let Some(f) = h.borrow().props.get_str("$f").map(|p| p.val.clone()) else {
+        return Err(i.type_err("afx passthrough: missing fn"));
+    };
+    i.call(&f, Value::Und, vec![arg(args, 0)])
+}
+
+fn afx_next(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let (it, next_m) = afx_sync_it(i, this)?;
+    // abrupt steps (call, non-object) reject the promise; the
+    // [[NextMethod]] came from the record — no fresh Get per step.
+    // Spec: the arg list forwards verbatim — next() with no value
+    // calls sync next() with ZERO arguments (arguments.length checked)
+    let v: Vec<Value> = args.to_vec();
+    let r = (|i: &mut Interp| -> Result<Value, Value> {
+        let r = i.call(&next_m, it.clone(), v)?;
+        if !matches!(r, Value::Obj(_)) {
+            return Err(i.type_err("iterator result is not an object"));
+        }
+        Ok(r)
+    })(i);
+    Ok(afx_step(i, r, &it))
+}
+
+fn afx_return(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let (it, _nm) = afx_sync_it(i, this)?;
+    let ret = match i.get_prop_str(&it, "return") {
+        Ok(m) => m,
+        Err(e) => return Ok(afx_reject(i, e)),
+    };
+    if matches!(ret, Value::Und | Value::Null) {
+        // no sync `return` — spec resolves the capability directly
+        // with {value: arg, done: true}, no continuation job
+        let outer = new_promise_pub(i);
+        let (res, _rej) = resolving_fns(i, &outer);
+        let o = i.new_obj();
+        i.set_data(&o, "value", arg(args, 0));
+        i.set_data(&o, "done", Value::Bool(true));
+        let _ = i.call(&res, Value::Und, vec![Value::Obj(o)]);
+        return Ok(Value::Obj(outer));
+    }
+    if !i.is_callable(&ret) {
+        let e = i.type_err("iterator return is not a function");
+        return Ok(afx_reject(i, e));
+    }
+    let v: Vec<Value> = args.to_vec();
+    let r = (|i: &mut Interp| -> Result<Value, Value> {
+        let r = i.call(&ret, it.clone(), v)?;
+        if !matches!(r, Value::Obj(_)) {
+            return Err(i.type_err("iterator return must return an object"));
+        }
+        Ok(r)
+    })(i);
+    Ok(afx_step(i, r, &it))
+}
+
+fn afx_throw(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let (it, _nm) = afx_sync_it(i, this)?;
+    let thr = match i.get_prop_str(&it, "throw") {
+        Ok(m) => m,
+        Err(e) => return Ok(afx_reject(i, e)),
+    };
+    if matches!(thr, Value::Und | Value::Null) {
+        // no sync `throw` — spec honours `return` via IteratorClose
+        // with a NORMAL completion: getter/call errors DO reject with
+        // themselves, a non-object result → TypeError; on success the
+        // capability still rejects with a NEWLY created TypeError
+        match i.get_prop_str(&it, "return") {
+            Err(e) => return Ok(afx_reject(i, e)),
+            Ok(ret) if i.is_callable(&ret) => match i.call(&ret, it.clone(), vec![]) {
+                Err(e) => return Ok(afx_reject(i, e)),
+                Ok(v) if !matches!(v, Value::Obj(_)) => {
+                    let e = i.type_err("iterator return result is not an object");
+                    return Ok(afx_reject(i, e));
+                }
+                Ok(_) => {}
+            },
+            Ok(ret) if !matches!(ret, Value::Und | Value::Null) => {
+                let e = i.type_err("iterator return is not a function");
+                return Ok(afx_reject(i, e));
+            }
+            Ok(_) => {}
+        }
+        let e = i.type_err("sync iterator has no throw method");
+        return Ok(afx_reject(i, e));
+    }
+    if !i.is_callable(&thr) {
+        let e = i.type_err("iterator throw is not a function");
+        return Ok(afx_reject(i, e));
+    }
+    let v: Vec<Value> = args.to_vec();
+    let r = (|i: &mut Interp| -> Result<Value, Value> {
+        let r = i.call(&thr, it.clone(), v)?;
+        if !matches!(r, Value::Obj(_)) {
+            return Err(i.type_err("iterator throw must return an object"));
+        }
+        Ok(r)
+    })(i);
+    Ok(afx_step(i, r, &it))
+}
+
+// -- %AsyncGeneratorPrototype%: next/return/throw queue requests onto
+// the [[AsyncGeneratorQueue]] and drive the body when it is parked --
+
+fn agen_cell_of(i: &mut Interp, this: &Value) -> Result<Rc<RefCell<AGenCell>>, Value> {
+    let Value::Obj(o) = this else {
+        return Err(i.type_err("Method called on incompatible receiver"));
+    };
+    match &o.borrow().kind {
+        ObjKind::AGen(c) => Ok(c.clone()),
+        _ => Err(i.type_err("Method called on incompatible receiver")),
+    }
+}
+
+/// AsyncGeneratorEnqueue — capability + queue + ResumeNext
+fn agen_enqueue(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>, completion: GenIn) -> Value {
+    let p = new_promise_pub(i);
+    cell.borrow_mut().queue.push_back(AgenReq {
+        completion,
+        promise: p.clone(),
+    });
+    agen_resume_next(i, cell);
+    Value::Obj(p)
+}
+
+fn agen_next(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    // spec: an invalid `this` rejects the capability, not a sync throw
+    let cell = match agen_cell_of(i, this) {
+        Ok(c) => c,
+        Err(e) => return Ok(afx_reject(i, e)),
+    };
+    Ok(agen_enqueue(i, &cell, GenIn::Next(arg(args, 0))))
+}
+
+fn agen_return(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let cell = match agen_cell_of(i, this) {
+        Ok(c) => c,
+        Err(e) => return Ok(afx_reject(i, e)),
+    };
+    Ok(agen_enqueue(i, &cell, GenIn::Return(arg(args, 0))))
+}
+
+fn agen_throw(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let cell = match agen_cell_of(i, this) {
+        Ok(c) => c,
+        Err(e) => return Ok(afx_reject(i, e)),
+    };
+    Ok(agen_enqueue(i, &cell, GenIn::Throw(arg(args, 0))))
+}
+
+/// spec AsyncGeneratorResolve — the capability resolves DIRECTLY
+/// with CreateIterResultObject(value, done): the value reached here
+/// was already unwrapped upstream (AwaitingReturn, the yield-unwrap
+/// job) so no extra PromiseResolve tick is observable
+fn agen_settle_req(i: &mut Interp, req: AgenReq, v: Value, done: bool) {
+    let (res, _rej) = resolving_fns(i, &req.promise);
+    let o = i.new_obj();
+    i.set_data(&o, "value", v);
+    i.set_data(&o, "done", Value::Bool(done));
+    let _ = i.call(&res, Value::Und, vec![Value::Obj(o)]);
+}
+
+/// the yield-unwrap fulfill closure `{cell, req}` — spec
+/// AsyncGeneratorUnwrapYieldResumption: settles the popped head
+/// request {value, done:false} then resumes the generator (the next
+/// queued request drives the body)
+fn agen_yield_unwrap_fn(i: &mut Interp, cell: Rc<RefCell<AGenCell>>, req: AgenReq) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(
+        &h,
+        "$cell",
+        Value::Obj(Rc::new(RefCell::new(Obj::new(None, ObjKind::AGen(cell))))),
+    );
+    i.set_builtin(&h, "$req", Value::Obj(req.promise));
+    bound_native(i, "", agen_yield_unwrap_step, Value::Obj(h), 1.0)
+}
+
+fn agen_yield_unwrap_step(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Err(i.type_err("yield-unwrap step called on non-object"));
+    };
+    let (cell, promise) = {
+        let b = h.borrow();
+        let cell = match b.props.get_str("$cell").map(|p| p.val.clone()) {
+            Some(Value::Obj(o)) => match &o.borrow().kind {
+                ObjKind::AGen(c) => c.clone(),
+                _ => return Err(i.type_err("yield-unwrap: bad cell")),
+            },
+            _ => return Err(i.type_err("yield-unwrap: bad cell")),
+        };
+        let promise = match b.props.get_str("$req").map(|p| p.val.clone()) {
+            Some(Value::Obj(o)) => o,
+            _ => return Err(i.type_err("yield-unwrap: bad req")),
+        };
+        (cell, promise)
+    };
+    // settle the head request {value, done:false} then ResumeNext —
+    // the next queued request's completion drives the body
+    let (res, _rej) = resolving_fns(i, &promise);
+    let o = i.new_obj();
+    i.set_data(&o, "value", arg(args, 0));
+    i.set_data(&o, "done", Value::Bool(false));
+    let _ = i.call(&res, Value::Und, vec![Value::Obj(o)]);
+    cell.borrow_mut().awaiting = false;
+    agen_resume_next(i, &cell);
+    Ok(Value::Und)
+}
+
+/// rejected-yield reaction: reject the head request, then complete
+/// the generator (state → completed, queue drains)
+fn agen_yield_rej_fn(i: &mut Interp, cell: Rc<RefCell<AGenCell>>, rej: Value) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(
+        &h,
+        "$cell",
+        Value::Obj(Rc::new(RefCell::new(Obj::new(None, ObjKind::AGen(cell))))),
+    );
+    i.set_builtin(&h, "$rej", rej);
+    bound_native(i, "", agen_yield_rej_step, Value::Obj(h), 1.0)
+}
+
+fn agen_yield_rej_step(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Err(i.type_err("yield-reject step called on non-object"));
+    };
+    let (cell, rej) = {
+        let b = h.borrow();
+        let cell = match b.props.get_str("$cell").map(|p| p.val.clone()) {
+            Some(Value::Obj(o)) => match &o.borrow().kind {
+                ObjKind::AGen(c) => c.clone(),
+                _ => return Err(i.type_err("yield-reject: bad cell")),
+            },
+            _ => return Err(i.type_err("yield-reject: bad cell")),
+        };
+        let rej = b.props.get_str("$rej").map(|p| p.val.clone());
+        (cell, rej)
+    };
+    if let Some(rej) = rej {
+        let _ = i.call(&rej, Value::Und, vec![arg(args, 0)]);
+    }
+    agen_complete_reject(i, &cell);
+    Ok(Value::Und)
+}
+
+/// complete the generator after a rejected yield — the parked
+/// coroutine is abandoned; queued requests resolve done-immediately
+fn agen_complete_reject(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>) {
+    {
+        let mut c = cell.borrow_mut();
+        c.done = true;
+        c.awaiting = false;
+        c.awaiting_return = false;
+        c.coro = None;
+        c.pending = None;
+    }
+    agen_drain(i, cell);
+}
+
+/// spec AsyncGeneratorResumeNext — drive the head request's completion
+/// into a parked coroutine; a return() value is awaited FIRST
+/// (AwaitingReturn) before the body sees the abrupt completion
+fn agen_resume_next(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>) {
+    let head = {
+        let c = cell.borrow();
+        if c.running || c.awaiting || c.awaiting_return || c.queue.is_empty() {
+            return;
+        }
+        c.queue[0].completion.clone()
+    };
+    match head {
+        GenIn::Return(v) => {
+            // spec AwaitingReturn: PromiseResolve the return value,
+            // THEN inject the (possibly unwrapped) return into the body
+            cell.borrow_mut().awaiting_return = true;
+            let ctor = Value::Obj(i.p.promise_ctor.clone());
+            match promise_resolve_static(i, &ctor, &[v]) {
+                Ok(Value::Obj(po)) => {
+                    let onf = agen_await_return_fn(i, cell.clone(), true);
+                    let onr = agen_await_return_fn(i, cell.clone(), false);
+                    perform_promise_then(i, &po, onf, onr);
+                }
+                Ok(v) => {
+                    cell.borrow_mut().awaiting_return = false;
+                    agen_drive(i, cell, GenIn::Return(v));
+                }
+                Err(e) => {
+                    cell.borrow_mut().awaiting_return = false;
+                    agen_drive(i, cell, GenIn::Throw(e));
+                }
+            }
+        }
+        input => agen_drive(i, cell, input),
+    }
+}
+
+/// resume closures for the AwaitingReturn promise — fulfilled value
+/// becomes the injected return value; a rejection becomes a throw
+fn agen_await_return_fn(i: &mut Interp, cell: Rc<RefCell<AGenCell>>, ok: bool) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(
+        &h,
+        "$cell",
+        Value::Obj(Rc::new(RefCell::new(Obj::new(None, ObjKind::AGen(cell))))),
+    );
+    i.set_builtin(&h, "$ok", Value::Bool(ok));
+    bound_native(i, "", agen_await_return_step, Value::Obj(h), 1.0)
+}
+
+fn agen_await_return_step(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Err(i.type_err("await-return step called on non-object"));
+    };
+    let (cell, ok) = {
+        let b = h.borrow();
+        let cell = match b.props.get_str("$cell").map(|p| p.val.clone()) {
+            Some(Value::Obj(o)) => match &o.borrow().kind {
+                ObjKind::AGen(c) => c.clone(),
+                _ => return Err(i.type_err("await-return: bad cell")),
+            },
+            _ => return Err(i.type_err("await-return: bad cell")),
+        };
+        let ok = matches!(
+            b.props.get_str("$ok").map(|p| p.val.clone()),
+            Some(Value::Bool(true))
+        );
+        (cell, ok)
+    };
+    cell.borrow_mut().awaiting_return = false;
+    let input = if ok {
+        GenIn::Return(arg(args, 0))
+    } else {
+        GenIn::Throw(arg(args, 0))
+    };
+    agen_drive(i, &cell, input);
+    Ok(Value::Und)
+}
+
+/// resume closures for an `await` inside the body — the fulfillment
+/// value resumes with Next, the rejection reason with Throw; neither
+/// consumes a queue request
+fn agen_await_fn(i: &mut Interp, cell: Rc<RefCell<AGenCell>>, ok: bool) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(
+        &h,
+        "$cell",
+        Value::Obj(Rc::new(RefCell::new(Obj::new(None, ObjKind::AGen(cell))))),
+    );
+    i.set_builtin(&h, "$ok", Value::Bool(ok));
+    bound_native(i, "", agen_await_step, Value::Obj(h), 1.0)
+}
+
+fn agen_await_step(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Err(i.type_err("agen await step called on non-object"));
+    };
+    let (cell, ok) = {
+        let b = h.borrow();
+        let cell = match b.props.get_str("$cell").map(|p| p.val.clone()) {
+            Some(Value::Obj(o)) => match &o.borrow().kind {
+                ObjKind::AGen(c) => c.clone(),
+                _ => return Err(i.type_err("agen await: bad cell")),
+            },
+            _ => return Err(i.type_err("agen await: bad cell")),
+        };
+        let ok = matches!(
+            b.props.get_str("$ok").map(|p| p.val.clone()),
+            Some(Value::Bool(true))
+        );
+        (cell, ok)
+    };
+    let input = if ok {
+        GenIn::Next(arg(args, 0))
+    } else {
+        GenIn::Throw(arg(args, 0))
+    };
+    agen_drive(i, &cell, input);
+    Ok(Value::Und)
+}
+
+/// the driver — mirrors gen_resume/async_resume. `input` is either a
+/// request completion (queue head) or an await settlement.
+fn agen_drive(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>, input: GenIn) {
+    let mut coro = {
+        let mut c = cell.borrow_mut();
+        if c.running {
+            return;
+        }
+        c.running = true;
+        c.awaiting = false;
+        c.coro.take()
+    };
+    let mut coro = match coro {
+        Some(c) => c,
+        None => {
+            let Some((def, scope)) = cell.borrow_mut().pending.take() else {
+                // never started and no body — the generator is
+                // completed; an injected completion (abrupt
+                // AwaitingReturn, throw()) still settles the queue head
+                let mut c = cell.borrow_mut();
+                c.running = false;
+                c.done = true;
+                drop(c);
+                match input {
+                    GenIn::Throw(e) => {
+                        if let Some(req) = cell.borrow_mut().queue.pop_front() {
+                            let (_r, rej) = resolving_fns(i, &req.promise);
+                            let _ = i.call(&rej, Value::Und, vec![e]);
+                        }
+                    }
+                    GenIn::Return(v) => {
+                        if let Some(req) = cell.borrow_mut().queue.pop_front() {
+                            agen_settle_req(i, req, v, true);
+                        }
+                    }
+                    GenIn::Next(_) => {}
+                }
+                agen_drain(i, cell);
+                return;
+            };
+            let ip = i as *mut Interp;
+            let stack =
+                corosensei::stack::DefaultStack::new(8 * 1024 * 1024).expect("async gen stack");
+            corosensei::Coroutine::with_stack(
+                stack,
+                move |y: &corosensei::Yielder<GenIn, Value>, first: GenIn| -> GenRet {
+                    // return()/throw() before the body starts completes
+                    // WITHOUT running the body (same as gen_resume)
+                    match first {
+                        GenIn::Return(v) => return Ok(v),
+                        GenIn::Throw(e) => return Err(e),
+                        GenIn::Next(_) => {}
+                    }
+                    let i = unsafe { &mut *ip };
+                    i.gen_yielders.push(y as *const _);
+                    let saved_strict = std::mem::replace(
+                        &mut i.cur_strict,
+                        def.strict || crate::parser::stmts_strict(&def.body),
+                    );
+                    let saved_agen = std::mem::replace(&mut i.cur_agen, true);
+                    let r = i.exec_block(&def.body, &scope);
+                    i.cur_agen = saved_agen;
+                    i.cur_strict = saved_strict;
+                    i.gen_yielders.pop();
+                    match r {
+                        Ok(Completion::Return(v)) => Ok(v),
+                        Ok(_) => Ok(Value::Und),
+                        Err(e) => Err(e),
+                    }
+                },
+            )
+        }
+    };
+    // the value carried by an injected Return — used if the body aborts
+    // without producing its own completion
+    let ret_v = match &input {
+        GenIn::Return(v) => Some(v.clone()),
+        _ => None,
+    };
+    let (ocap, ohit) = (i.gen_cap, i.gen_cap_hit);
+    i.gen_cap = i.steps.saturating_add(crate::interp::GEN_STEP_BUDGET);
+    i.gen_cap_hit = false;
+    i.depth += 1;
+    let res = coro.resume(input);
+    i.depth -= 1;
+    i.gen_cap = ocap;
+    i.gen_cap_hit = ohit;
+    match res {
+        corosensei::CoroutineResult::Yield(v) => {
+            let was_await = std::mem::take(&mut i.await_yield);
+            let mut c = cell.borrow_mut();
+            c.running = false;
+            c.coro = Some(coro);
+            if was_await {
+                // parked in `await` — head request stays queued; the
+                // PromiseResolve reaction resumes the body
+                c.awaiting = true;
+                drop(c);
+                let ctor = Value::Obj(i.p.promise_ctor.clone());
+                match promise_resolve_static(i, &ctor, &[v]) {
+                    Ok(Value::Obj(po)) => {
+                        let onf = agen_await_fn(i, cell.clone(), true);
+                        let onr = agen_await_fn(i, cell.clone(), false);
+                        perform_promise_then(i, &po, onf, onr);
+                    }
+                    Ok(v) => {
+                        // non-promise resolution — resume synchronously
+                        agen_drive(i, cell, GenIn::Next(v));
+                    }
+                    Err(e) => {
+                        agen_drive(i, cell, GenIn::Throw(e));
+                    }
+                }
+                return;
+            }
+            // a `yield` (or yield* passthrough) — the yielded value goes
+            // through PromiseResolve; the head request settles in the
+            // UNWRAP JOB (spec AsyncGeneratorUnwrapYieldResumption), not
+            // here — while it is pending the state is suspendedYield and
+            // ResumeNext must not inject the next request early
+            let req = c.queue.pop_front();
+            drop(c);
+            let (v, raw) = if std::mem::take(&mut i.yieldstar_raw) {
+                // yield* passthrough — the suspended value is the inner
+                // result's `value` already (read in-body so getter
+                // throws propagate as body exceptions)
+                (v, true)
+            } else {
+                (v, false)
+            };
+            match req {
+                Some(req) => {
+                    if raw {
+                        // yield* passthrough: spec AsyncGeneratorYield in
+                        // the delegation does NOT Await the inner value —
+                        // settle the request directly, no PromiseResolve
+                        agen_settle_req(i, req, v, false);
+                        agen_resume_next(i, cell);
+                        return;
+                    }
+                    cell.borrow_mut().awaiting = true;
+                    let ctor = Value::Obj(i.p.promise_ctor.clone());
+                    match promise_resolve_static(i, &ctor, &[v]) {
+                        Ok(Value::Obj(po)) => {
+                            let onf = agen_yield_unwrap_fn(i, cell.clone(), req.clone());
+                            let (_r, rej) = resolving_fns(i, &req.promise);
+                            let onr = agen_yield_rej_fn(i, cell.clone(), rej);
+                            perform_promise_then(i, &po, onf, onr);
+                        }
+                        Ok(v) => {
+                            // degenerate non-promise resolution — settle
+                            // and resume inline
+                            cell.borrow_mut().awaiting = false;
+                            agen_settle_req(i, req, v, false);
+                            agen_resume_next(i, cell);
+                        }
+                        Err(e) => {
+                            let (_r, rej) = resolving_fns(i, &req.promise);
+                            let _ = i.call(&rej, Value::Und, vec![e]);
+                            agen_complete_reject(i, cell);
+                        }
+                    }
+                }
+                None => {
+                    // yield with no pending request — just stay parked
+                    cell.borrow_mut().awaiting = false;
+                    agen_resume_next(i, cell);
+                }
+            }
+        }
+        corosensei::CoroutineResult::Return(r) => {
+            let mut c = cell.borrow_mut();
+            c.running = false;
+            c.done = true;
+            let req = c.queue.pop_front();
+            drop(c);
+            if let Some(req) = req {
+                match r {
+                    Ok(v) => agen_settle_req(i, req, v, true),
+                    Err(e) if is_gen_abort(&e) => {
+                        // injected return() — resolve head with the
+                        // carried value (awaited like any completion)
+                        let v = i
+                            .gen_ret_override
+                            .take()
+                            .or(ret_v)
+                            .unwrap_or(Value::Und);
+                        agen_settle_req(i, req, v, true);
+                    }
+                    Err(e) => {
+                        let (_res, rej) = resolving_fns(i, &req.promise);
+                        let _ = i.call(&rej, Value::Und, vec![e]);
+                    }
+                }
+            }
+            agen_drain(i, cell);
+        }
+    }
+}
+
+/// state Completed — every queued request resolves done-immediately.
+/// Return requests carry their value through (spec: {value, done:true}).
+fn agen_drain(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>) {
+    loop {
+        let req = cell.borrow_mut().queue.pop_front();
+        let Some(req) = req else { return };
+        let completion = req.completion.clone();
+        match completion {
+            GenIn::Return(v) => agen_settle_req(i, req, v, true),
+            // spec: a throw completion on a completed generator rejects
+            // with the thrown value (not a done-result)
+            GenIn::Throw(v) => {
+                let (_res, rej) = resolving_fns(i, &req.promise);
+                let _ = i.call(&rej, Value::Und, vec![v]);
+            }
+            _ => {
+                let (res, _rej) = resolving_fns(i, &req.promise);
+                let o = i.new_obj();
+                i.set_data(&o, "value", Value::Und);
+                i.set_data(&o, "done", Value::Bool(true));
+                let _ = i.call(&res, Value::Und, vec![Value::Obj(o)]);
+            }
+        }
+    }
+}
+
 /// `Iterator.concat(...iters)` — lazy chain over each argument's iterator
 fn iter_concat(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     // spec: at call time each arg must be an Object and its @@iterator is
@@ -3786,6 +4619,43 @@ fn install_globals(i: &mut Interp) {
             true,
         );
         str_tag(&i.p.async_func.clone(), "AsyncFunction");
+        // %AsyncGeneratorFunction% — reached via
+        // `Object.getPrototypeOf(async function*(){}).constructor`;
+        // [[Prototype]] = %Function%, `.prototype` =
+        // %AsyncGeneratorFunction.prototype%, [[Construct]]-able
+        let agfc = Rc::new(RefCell::new(Obj::new(
+            match &ctor {
+                Value::Obj(o) => Some(o.clone()),
+                _ => unreachable!(),
+            },
+            ObjKind::Func(Func::Native {
+                name: Rc::from("AsyncGeneratorFunction"),
+                f: async_gen_function_ctor,
+                ctor: true,
+            }),
+        )));
+        i.set_attr(
+            &agfc,
+            "name",
+            Value::Str(Rc::from("AsyncGeneratorFunction")),
+            false,
+            true,
+        );
+        i.set_attr(&agfc, "length", Value::Num(1.0), false, true);
+        i.set_attr(
+            &agfc,
+            "prototype",
+            Value::Obj(i.p.async_gen_func.clone()),
+            false,
+            false,
+        );
+        i.set_attr(
+            &i.p.async_gen_func.clone(),
+            "constructor",
+            Value::Obj(agfc),
+            false,
+            true,
+        );
     }
 
     // -- Symbol --
@@ -11782,6 +12652,34 @@ fn gen_function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     Ok(v)
 }
 
+/// like `ast::param_contains_await` but ALSO flags `await` used as a
+/// binding name — for the dynamic-ctor check, where both are illegal
+fn param_has_await(p: &Param) -> bool {
+    match p {
+        Param::Ident(n) => n.as_str() == "await",
+        Param::Rest(p) => pat_has_await(p),
+        Param::Pattern(p) => pat_has_await(p),
+        Param::Default(p, e) => pat_has_await(p) || ast::expr_contains_await(e),
+    }
+}
+
+fn pat_has_await(p: &Pattern) -> bool {
+    match p {
+        Pattern::Ident(n) => n.as_str() == "await",
+        Pattern::Target(e) => ast::expr_contains_await(e),
+        Pattern::Array(elems) => elems.iter().any(|el| match el {
+            ArrayPatElem::Hole => false,
+            ArrayPatElem::Elem(p) | ArrayPatElem::Rest(p) => pat_has_await(p),
+            ArrayPatElem::Default(p, e) => pat_has_await(p) || ast::expr_contains_await(e),
+        }),
+        Pattern::Object(elems) => elems.iter().any(|el| {
+            matches!(&el.key, ast::PropKey::Computed(e) if ast::expr_contains_await(e))
+                || pat_has_await(&el.val)
+                || el.default.as_ref().is_some_and(ast::expr_contains_await)
+        }),
+    }
+}
+
 /// `%AsyncFunction%` ctor — `CreateDynamicFunction` for `async function`:
 /// same shape as `gen_function_ctor`; the fn's [[Prototype]] comes from
 /// newTarget.prototype, falling back to %AsyncFunction.prototype%.
@@ -11801,6 +12699,66 @@ fn async_function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         Ok(v) => v,
         Err(e) => return Err(i.syntax_err(format!("{e}"))),
     };
+    // spec: FormalParameters[~Yield, ~Await] — an `await` expression
+    // in the parameters is a SyntaxError (Contains AwaitExpression)
+    if let Value::Obj(o) = &v {
+        let has = match &o.borrow().kind {
+            ObjKind::Func(Func::User { def, .. }) => def.params.iter().any(param_has_await),
+            _ => false,
+        };
+        if has {
+            return Err(i.syntax_err("await is not valid in parameters"));
+        }
+    }
+    if let Value::Obj(o) = &v {
+        let mut b = o.borrow_mut();
+        b.props.remove_str("caller");
+        b.props.remove_str("arguments");
+        if let ObjKind::Func(Func::User { dynamic, .. }) = &mut b.kind {
+            *dynamic = true;
+        }
+    }
+    let nt = i.new_target_native.clone().unwrap_or(Value::Und);
+    if let Value::Obj(nto) = &nt {
+        if let Ok(Value::Obj(p)) = i.get_prop(&nt, &PropKey::from_str("prototype")) {
+            let _ = nto;
+            if let Value::Obj(o) = &v {
+                o.borrow_mut().proto = Some(p);
+            }
+        }
+    }
+    Ok(v)
+}
+
+/// `%AsyncGeneratorFunction%` ctor — `CreateDynamicFunction` for
+/// `async function*`; same shape as `gen_function_ctor`
+fn async_gen_function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let (params, body) = match args.split_last() {
+        None => (String::new(), String::new()),
+        Some((b, ps)) => {
+            let mut names = Vec::with_capacity(ps.len());
+            for p in ps {
+                names.push(i.to_str(p)?);
+            }
+            (names.join(","), i.to_str(b)?)
+        }
+    };
+    let src = format!("(async function* anonymous({params}\n) {{\n{body}\n}})");
+    let v = match i.run(&src) {
+        Ok(v) => v,
+        Err(e) => return Err(i.syntax_err(format!("{e}"))),
+    };
+    // spec: FormalParameters[~Yield, ~Await] — an `await` expression
+    // in the parameters is a SyntaxError (Contains AwaitExpression)
+    if let Value::Obj(o) = &v {
+        let has = match &o.borrow().kind {
+            ObjKind::Func(Func::User { def, .. }) => def.params.iter().any(param_has_await),
+            _ => false,
+        };
+        if has {
+            return Err(i.syntax_err("await is not valid in parameters"));
+        }
+    }
     if let Value::Obj(o) = &v {
         let mut b = o.borrow_mut();
         b.props.remove_str("caller");
@@ -16853,8 +17811,19 @@ fn match_obj(i: &mut Interp, chars: &[u16], re: &Regex, m: &RxMatch) -> Value {
             Value::Und
         } else {
             let g = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
-            for (name, idx) in &re.names {
-                i.set_data(&g, name, mk_pair(&m.caps, *idx));
+            for (name, idxs) in re_unique_names(re) {
+                // duplicate-named groups: first non-undefined capture
+                // among the indices in source order
+                let v = idxs
+                    .iter()
+                    .find_map(|&gi| match m.caps.get(gi).copied().flatten() {
+                        Some((a, b)) => Some(Value::Obj(
+                            i.new_arr(vec![Value::Num(a as f64), Value::Num(b as f64)]),
+                        )),
+                        None => None,
+                    })
+                    .unwrap_or(Value::Und);
+                i.set_data(&g, &name, v);
             }
             Value::Obj(g)
         };
@@ -16864,15 +17833,37 @@ fn match_obj(i: &mut Interp, chars: &[u16], re: &Regex, m: &RxMatch) -> Value {
     Value::Obj(arr)
 }
 
-fn groups_obj(i: &mut Interp, chars: &[u16], re: &Regex, m: &RxMatch) -> Value {
-    // spec: the named-capture groups object has a null prototype
-    let g = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
+/// unique group names in first-occurrence order, each with the list of
+/// group indices that carry it (len>1 only for ES2025 duplicate names
+/// across alternatives)
+fn re_unique_names(re: &Regex) -> Vec<(String, Vec<usize>)> {
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
     for (name, idx) in &re.names {
-        let v = match m.caps.get(*idx).copied().flatten() {
-            Some((a, b)) => chars_str(chars, a, b),
-            None => Value::Und,
-        };
-        i.set_data(&g, name, v);
+        match out.iter_mut().find(|(n, _)| n == name) {
+            Some((_, v)) => v.push(*idx),
+            None => out.push((name.clone(), vec![*idx])),
+        }
+    }
+    out
+}
+
+fn groups_obj(i: &mut Interp, chars: &[u16], re: &Regex, m: &RxMatch) -> Value {
+    // spec: the named-capture groups object has a null prototype and
+    // one entry per unique name (first-occurrence order); a duplicate
+    // name takes the first non-undefined capture in source order
+    let g = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
+    for (name, idxs) in re_unique_names(re) {
+        let v = idxs
+            .iter()
+            .find_map(|&idx| {
+                m.caps
+                    .get(idx)
+                    .copied()
+                    .flatten()
+                    .map(|(a, b)| chars_str(chars, a, b))
+            })
+            .unwrap_or(Value::Und);
+        i.set_data(&g, &name, v);
     }
     Value::Obj(g)
 }

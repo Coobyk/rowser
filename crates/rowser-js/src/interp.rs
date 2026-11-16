@@ -597,6 +597,10 @@ pub enum ObjKind {
     /// suspended generator — the body runs on a coroutine stack and
     /// `yield` parks it mid-execution
     Gen(Rc<RefCell<GenCell>>),
+    /// async generator — same coroutine machinery, but requests queue
+    /// and complete through promises; `await` parks the body without
+    /// consuming a request (spec [[AsyncGeneratorQueue]])
+    AGen(Rc<RefCell<AGenCell>>),
     /// `arguments` object — indexed slots like an array; `map` links
     /// index i to a parameter binding in `env` (sloppy simple-param
     /// functions only — `env`/`map` empty for strict/unmapped)
@@ -629,6 +633,32 @@ pub struct GenCell {
     pub pending: Option<(Rc<FnDef>, EnvRef)>,
     pub running: bool,
     /// completed — next() → {value: undefined, done: true}
+    pub done: bool,
+}
+
+/// one queued next()/return()/throw() request — the head stays queued
+/// until its completion actually settles the promise
+#[derive(Clone)]
+pub struct AgenReq {
+    pub completion: GenIn,
+    pub promise: ObjRef,
+}
+
+/// spec [[AsyncGeneratorState]] machine: requests queue while the body
+/// is Executing / AwaitingReturn; a parked `yield` consumes the head's
+/// completion; a parked `await` drives none.
+pub struct AGenCell {
+    pub coro: Option<GenCoro>,
+    pub pending: Option<(Rc<FnDef>, EnvRef)>,
+    pub queue: std::collections::VecDeque<AgenReq>,
+    /// a resume is synchronously in flight
+    pub running: bool,
+    /// parked inside `await` — queued requests must not drive
+    pub awaiting: bool,
+    /// a return() request's value promise is in flight (spec
+    /// AwaitingReturn) — likewise blocks request-driven resumes
+    pub awaiting_return: bool,
+    /// completed — remaining queue resolves {value: undefined, done: true}
     pub done: bool,
 }
 
@@ -1205,6 +1235,16 @@ pub struct Protos {
     /// %AsyncFunction.prototype% — proto of async *functions*;
     /// non-callable, no `.prototype` slot of its own
     pub async_func: ObjRef,
+    /// %AsyncIteratorPrototype% — `{ [@@asyncIterator]() { return this } }`
+    pub async_iter: ObjRef,
+    /// %AsyncFromSyncIteratorPrototype% — proto of sync→async wraps
+    pub afx_iter: ObjRef,
+    /// %AsyncGenerator% — proto of objects `async function*` calls
+    /// return; itself inherits %AsyncIteratorPrototype%
+    pub async_gen: ObjRef,
+    /// %AsyncGeneratorFunction.prototype% — proto of async gen
+    /// *functions*; its `.prototype` slot is %AsyncGenerator%
+    pub async_gen_func: ObjRef,
     /// %IteratorHelperPrototype% — proto of lazy map/filter/take/… results
     pub iter_helper: ObjRef,
     /// %WrapForValidIteratorPrototype% — proto of `Iterator.from` wraps
@@ -1323,6 +1363,13 @@ pub struct Interp {
     /// `yield*` saw `inner.return()` produce a done result — overrides the
     /// value `gen_resume` reports for the injected return-completion
     pub(crate) gen_ret_override: Option<Value>,
+    /// the coroutine suspended via `await_value` (not `yield`) — the
+    /// async-gen driver reads this to distinguish an await operand from
+    /// a yielded value
+    pub(crate) await_yield: bool,
+    /// currently inside an async-generator coroutine body — `$yieldstar`
+    /// delegates through the async protocol when set
+    pub(crate) cur_agen: bool,
     /// NewTarget while a native constructor body runs — `Some(f)` when
     /// `f` was `new`-ed without an explicit newTarget; `None` for calls.
     /// Lets natives implement "NewTarget === active function" checks
@@ -1413,6 +1460,7 @@ impl Interp {
             }
         }
         let iterator = mk(Some(obj.clone()));
+        let async_iter = mk(Some(obj.clone()));
         Interp {
             global: Scope::new(None, true),
             p: Protos {
@@ -1445,9 +1493,13 @@ impl Interp {
                 generator: mk(Some(iterator.clone())),
                 gen_func: mk(Some(func.clone())),
                 async_func: mk(Some(func.clone())),
+                afx_iter: mk(Some(async_iter.clone())),
+                async_gen: mk(Some(async_iter.clone())),
+                async_gen_func: mk(Some(func.clone())),
                 iter_helper: mk(Some(iterator.clone())),
                 wrap_iter: mk(Some(iterator.clone())),
                 iterator,
+                async_iter,
                 regexp: mk(Some(obj.clone())),
                 arraybuffer: mk(Some(obj.clone())),
                 global: mk(Some(obj.clone())),
@@ -1492,6 +1544,8 @@ impl Interp {
             gen_yielders: Vec::new(),
             gen_cap: u64::MAX,
             yieldstar_raw: false,
+            await_yield: false,
+            cur_agen: false,
             gen_ret_override: None,
             gen_cap_hit: false,
             new_target_native: None,
@@ -5324,6 +5378,7 @@ impl Interp {
                     }
                     ObjKind::Proxy { target, .. } => self.inspect(&target, depth),
                     ObjKind::Gen(_) => "[object Generator]".to_string(),
+                    ObjKind::AGen(_) => "[object AsyncGenerator]".to_string(),
                     ObjKind::Err => {
                         let b = o.borrow();
                         let name = b
@@ -5486,7 +5541,11 @@ impl Interp {
         if ban {
             self.eval_args_ban += 1;
         }
+        // `cur_agen` is an execution-context flag — a callee's body runs
+        // in its OWN context; the async-gen coroutine re-arms it itself
+        let saved_agen = std::mem::replace(&mut self.cur_agen, false);
         let r = self.call_user_body_inner(f, o, def, env, home, this, args);
+        self.cur_agen = saved_agen;
         if ban {
             self.eval_args_ban -= 1;
         }
@@ -5544,10 +5603,11 @@ impl Interp {
             {
                 scope.param_env.set(true);
             }
-            if def.is_async {
+            if def.is_async && !def.is_gen {
                 // AsyncFunctionStart: parameter-initializer errors reject
                 // the returned promise — they never propagate to the
-                // caller synchronously
+                // caller synchronously. Async GENERATORS propagate like
+                // sync generators — binding errors throw at call time
                 if let Err(e) = self.bind_params(&scope, &def.params, &args) {
                     let p = crate::builtins::new_promise_pub(self);
                     let _ = crate::builtins::settle_pub(self, &p, false, e);
@@ -5576,6 +5636,28 @@ impl Interp {
                 scope.clone()
             };
             self.apply_hoisted(&h, &body_scope);
+            if def.is_gen && def.is_async {
+                // async generator — requests queue on the AGenCell and
+                // drive the coroutine through promise reactions;
+                // instances inherit the fn's `prototype` (proto
+                // %AsyncGeneratorPrototype%)
+                let gproto = match self.obj_get_raw(&o, &PropKey::from_str("prototype")) {
+                    Some(Value::Obj(p)) => p,
+                    _ => self.p.async_gen.clone(),
+                };
+                return Ok(Value::Obj(Rc::new(RefCell::new(Obj::new(
+                    Some(gproto),
+                    ObjKind::AGen(Rc::new(RefCell::new(AGenCell {
+                        coro: None,
+                        pending: Some((def.clone(), body_scope)),
+                        queue: std::collections::VecDeque::new(),
+                        running: false,
+                        awaiting: false,
+                        awaiting_return: false,
+                        done: false,
+                    }))),
+                )))));
+            }
             if def.is_gen {
                 // lazy generator: the body runs on a coroutine stack
                 // allocated at first resume; `yield` suspends back to
@@ -5819,9 +5901,13 @@ impl Interp {
                 }
                 let eff_strict = def.strict || parser::stmts_strict(&def.body);
                 let saved_strict = std::mem::replace(&mut self.cur_strict, eff_strict);
+                // `cur_agen` is an execution-context flag — a
+                // constructor's body gets its own context
+                let saved_agen = std::mem::replace(&mut self.cur_agen, false);
                 self.call_stack.push(f.clone());
                 let r = self.construct_user_body(f, o, def, env, home, ctor, new_target, args);
                 self.call_stack.pop();
+                self.cur_agen = saved_agen;
                 self.cur_strict = saved_strict;
                 r
             }
@@ -6912,7 +6998,19 @@ impl Interp {
         // function gets own caller/arguments props (strict or not); the
         // throws come from %Function.prototype%'s inherited poisoned
         // accessors (spec: FunctionInitialize post-ES2017 semantics)
-        if def.is_gen && home.is_none() {
+        if def.is_gen && def.is_async && home.is_none() {
+            // async generator fns: proto is
+            // %AsyncGeneratorFunction.prototype%; `.prototype` is an
+            // ordinary object whose proto is %AsyncGeneratorPrototype%
+            o.borrow_mut().proto = Some(self.p.async_gen_func.clone());
+            let proto = self.new_obj();
+            proto.borrow_mut().proto = Some(self.p.async_gen.clone());
+            self.set_attr(&o, "prototype", Value::Obj(proto), true, false);
+        } else if def.is_gen && def.is_async {
+            // async generator METHOD — %AsyncGeneratorFunction.prototype%
+            // proto, no `.prototype` property
+            o.borrow_mut().proto = Some(self.p.async_gen_func.clone());
+        } else if def.is_gen && home.is_none() {
             // generator fns: proto is %GeneratorFunction.prototype%; the
             // `.prototype` prop is an ordinary object whose proto is
             // %GeneratorPrototype% — no `constructor` back-ref.
@@ -7449,7 +7547,15 @@ impl Interp {
                 }
                 Ok(Completion::Normal(last))
             }
-            Stmt::ForOf { left, right, body } => {
+            Stmt::ForOf {
+                left,
+                right,
+                body,
+                is_await,
+            } => {
+                if *is_await {
+                    return self.exec_for_await(env, left, right, body);
+                }
                 let my_label = self.pending_label.take();
                 // ForIn/OfHeadEvaluation: a `let`/`const` target creates a
                 // declarative env holding the bound names UNINITIALIZED
@@ -7777,7 +7883,17 @@ impl Interp {
             }
             Stmt::Return(e) => {
                 let v = match e {
-                    Some(e) => self.eval_expr(e, env)?,
+                    Some(e) => {
+                        let v = self.eval_expr(e, env)?;
+                        // async-generator `return expr` awaits the value
+                        // (spec AsyncGeneratorAwaitReturn); a bare
+                        // `return` does not
+                        if self.cur_agen {
+                            self.await_value(v)?
+                        } else {
+                            v
+                        }
+                    }
                     None => Value::Und,
                 };
                 Ok(Completion::Return(v))
@@ -7855,6 +7971,238 @@ impl Interp {
             },
             ForTarget::Expr(e) => self.assign_target(scope, e, v).map(|_| ()),
         }
+    }
+
+    /// spec Await suspension — valid only inside an async coroutine:
+    /// yields `v` to the async driver, which PromiseResolves it and
+    /// resumes with the settlement (Next = fulfillment, Throw = rejection)
+    pub fn await_value(&mut self, v: Value) -> Result<Value, Value> {
+        let Some(&y) = self.gen_yielders.last() else {
+            return Err(self.syntax_err("await is only valid in async functions"));
+        };
+        // same yielder dance as yield — pop while parked so a nested
+        // resumer's yielder is current
+        self.await_yield = true;
+        self.gen_yielders.pop();
+        let input = unsafe { (*y).suspend(v) };
+        self.gen_yielders.push(y);
+        match input {
+            GenIn::Next(sent) => Ok(sent),
+            GenIn::Throw(e) => Err(e),
+            // an injected return() aborts the suspend — its value is
+            // the generator's final result (carried via the override)
+            GenIn::Return(v) => {
+                self.gen_ret_override = Some(v);
+                Err(gen_abort_v())
+            }
+        }
+    }
+
+    /// spec GetAsyncIterator: `@@asyncIterator` result object, else the
+    /// `@@iterator` sync iterator wrapped in %AsyncFromSyncIterator%
+    /// so its next() returns promises. `hint` is always `async` here —
+    /// sync iterables get the wrap transparently.
+    pub fn get_async_iterator(&mut self, rv: &Value) -> Result<Value, Value> {
+        let m = self.get_prop(rv, &PropKey::Sym(SYM_ASYNCITERATOR))?;
+        if self.is_callable(&m) {
+            let it = self.call(&m, rv.clone(), vec![])?;
+            if !matches!(it, Value::Obj(_)) {
+                return Err(self.type_err("@@asyncIterator must return an object"));
+            }
+            return Ok(it);
+        }
+        // spec GetMethod: a present-but-non-callable @@asyncIterator is
+        // a TypeError — the @@iterator fallback only fires for
+        // undefined/null
+        if !matches!(m, Value::Und | Value::Null) {
+            return Err(self.type_err("@@asyncIterator is not a function"));
+        }
+        // spec AsyncFromSyncIterator — wrap the sync iterator so every
+        // step's result arrives as a promise
+        let sm = self.get_prop(rv, &PropKey::Sym(SYM_ITERATOR))?;
+        if !self.is_callable(&sm) {
+            return Err(
+                self.type_err("for await: object is not iterable (no @@iterator or @@asyncIterator)")
+            );
+        }
+        let it = self.call(&sm, rv.clone(), vec![])?;
+        if !matches!(it, Value::Obj(_)) {
+            return Err(self.type_err("iterator must return an object"));
+        }
+        Ok(crate::builtins::wrap_async_from_sync(self, it))
+    }
+
+    /// spec AsyncIteratorClose: GetMethod("return"), call it, await the
+    /// result. `err` is the in-flight abrupt completion which the spec
+    /// preserves UNLESS the close itself throws — then the close error
+    /// replaces it (mirroring sync IteratorClose).
+    pub fn async_iter_close(&mut self, iter: &Value) -> Result<(), Value> {
+        let ret = self.get_prop_str(iter, "return")?;
+        if matches!(ret, Value::Und | Value::Null) {
+            return Ok(());
+        }
+        if !self.is_callable(&ret) {
+            return Err(self.type_err("iterator return is not a function"));
+        }
+        let r = self.call(&ret, iter.clone(), vec![])?;
+        let r = self.await_value(r)?;
+        if !matches!(r, Value::Obj(_)) {
+            return Err(self.type_err("iterator return must return an object"));
+        }
+        Ok(())
+    }
+
+    /// `for await (x of y)` — spec AsyncIteratorLoop over the async
+    /// iterator from `get_async_iterator`; every `next()` result is
+    /// awaited via `await_value` (the coroutine suspends). Scoping and
+    /// completion handling mirror the sync `for-of` path.
+    fn exec_for_await(
+        &mut self,
+        env: &EnvRef,
+        left: &ForTarget,
+        right: &Expr,
+        body: &Stmt,
+    ) -> Result<Completion, Value> {
+        let my_label = self.pending_label.take();
+        // same TDZ head-scope rule as sync for-of
+        let tdz_scope;
+        let head_env: &EnvRef = match left {
+            ForTarget::Var(kind, pat) if *kind != VarKind::Var => {
+                let s = Scope::new(Some(env.clone()), false);
+                let mut names = Vec::new();
+                collect_pattern_names(pat, &mut names);
+                {
+                    let mut vars = s.vars.borrow_mut();
+                    for n in names {
+                        vars.entry(self.intern(n)).or_insert(Binding {
+                            val: Value::Und,
+                            mutable: true,
+                            uninit: true,
+                            deletable: false,
+                            lexical: true,
+                        });
+                    }
+                }
+                tdz_scope = s;
+                &tdz_scope
+            }
+            _ => env,
+        };
+        let rv = self.eval_expr(right, head_env)?;
+        let iter = self.get_async_iterator(&rv)?;
+        let next_m = self.get_prop_str(&iter, "next")?;
+        if !self.is_callable(&next_m) {
+            return Err(self.type_err("iterator.next is not a function"));
+        }
+        let per_iter = matches!(left, ForTarget::Var(kind, _) if *kind != VarKind::Var);
+        let loop_scope;
+        let scope: &EnvRef = match left {
+            _ if per_iter || stmt_binds_lexically(body) => {
+                loop_scope = Scope::new(Some(env.clone()), false);
+                &loop_scope
+            }
+            _ => env,
+        };
+        let head_names: Vec<Rc<str>> = match left {
+            ForTarget::Var(_, pat) => {
+                let mut out = Vec::new();
+                collect_pattern_names(pat, &mut out);
+                out.iter().map(|n| self.intern(n)).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut last = Value::Und;
+        let mut prev_iter: Option<EnvRef> = None;
+        let mut iter_done = false;
+        loop {
+            // AsyncIteratorStep: next() → Await → object check → done
+            let res = match self.call(&next_m, iter.clone(), vec![]) {
+                Ok(r) => self.await_value(r),
+                Err(e) => Err(e),
+            };
+            let res = match res {
+                Ok(r) => r,
+                // a thrown step does NOT close the iterator (it threw
+                // itself) — same rule as sync IteratorStepValue
+                Err(e) => return Err(e),
+            };
+            if !matches!(res, Value::Obj(_)) {
+                return Err(self.type_err("for await: iterator result is not an object"));
+            }
+            let done = self.get_prop_str(&res, "done")?;
+            if self.to_bool(&done) {
+                iter_done = true;
+                break;
+            }
+            let it = self.get_prop_str(&res, "value")?;
+            let mut iter_scope: Option<EnvRef> = None;
+            let scope: &EnvRef = if per_iter {
+                let s = Scope::new(Some(env.clone()), false);
+                if let Some(pe) = &prev_iter {
+                    let pv = pe.vars.borrow();
+                    let mut cur = s.vars.borrow_mut();
+                    for n in &head_names {
+                        if let Some(b) = pv.get(n.as_ref()) {
+                            cur.insert(
+                                n.clone(),
+                                Binding {
+                                    val: b.val.clone(),
+                                    mutable: b.mutable,
+                                    uninit: b.uninit,
+                                    deletable: false,
+                                    lexical: true,
+                                },
+                            );
+                        }
+                    }
+                }
+                iter_scope = Some(s);
+                iter_scope.as_ref().unwrap()
+            } else {
+                scope
+            };
+            if let Err(e) = self.bind_for_target(scope, left, it) {
+                let _ = self.async_iter_close(&iter);
+                return Err(e);
+            }
+            let r = self.exec_stmt(body, scope);
+            if per_iter {
+                prev_iter = iter_scope;
+            }
+            match r {
+                Ok(Completion::Normal(v)) => last = v,
+                Ok(Completion::Empty) => {}
+                Ok(Completion::Break(l, v)) => {
+                    self.async_iter_close(&iter)?;
+                    if l.is_some() {
+                        return Ok(Completion::Break(l, v));
+                    }
+                    if let Some(v) = v {
+                        last = v;
+                    }
+                    return Ok(Completion::Normal(last));
+                }
+                Ok(Completion::Continue(l, v)) => {
+                    if !(l.is_none() || l.as_deref() == my_label.as_deref()) {
+                        self.async_iter_close(&iter)?;
+                        return Ok(Completion::Continue(l, v));
+                    }
+                    if let Some(v) = v {
+                        last = v;
+                    }
+                }
+                Ok(r) => {
+                    self.async_iter_close(&iter)?;
+                    return Ok(r);
+                }
+                Err(e) => {
+                    let _ = self.async_iter_close(&iter);
+                    return Err(e);
+                }
+            }
+        }
+        let _ = iter_done;
+        Ok(Completion::Normal(last))
     }
 
     fn bind_pattern_iter(
@@ -8919,7 +9267,12 @@ impl Interp {
                 return match input {
                     GenIn::Next(sent) => Ok(sent),
                     GenIn::Throw(e) => Err(e),
-                    GenIn::Return(_) => Err(gen_abort_v()),
+                    // injected return() — the value is the generator's
+                    // final result (carried via the override)
+                    GenIn::Return(v) => {
+                        self.gen_ret_override = Some(v);
+                        Err(gen_abort_v())
+                    }
                 };
             }
             if n == "$yieldstar" {
@@ -8930,6 +9283,89 @@ impl Interp {
                 let Some(&y) = self.gen_yielders.last() else {
                     return Err(self.syntax_err("yield outside generator"));
                 };
+                if self.cur_agen {
+                    // spec AsyncGeneratorYield*: delegate through the
+                    // ASYNC iterator protocol — each next()/return()/
+                    // throw() result promise is awaited, non-done values
+                    // are yielded on to the outer consumer
+                    enum ADeleg {
+                        Next(Value),
+                        Throw(Value),
+                        Ret(Value),
+                    }
+                    let it = self.get_async_iterator(&v)?;
+                    let next_m = self.get_prop_str(&it, "next")?;
+                    if !self.is_callable(&next_m) {
+                        return Err(self.type_err("async iterator next is not callable"));
+                    }
+                    let mut act = ADeleg::Next(Value::Und);
+                    loop {
+                        let p = match &act {
+                            ADeleg::Next(s) => {
+                                self.call(&next_m, it.clone(), vec![s.clone()])?
+                            }
+                            ADeleg::Throw(e) => {
+                                let tm = self.get_prop_str(&it, "throw")?;
+                                if self.is_callable(&tm) {
+                                    self.call(&tm, it.clone(), vec![e.clone()])?
+                                } else if matches!(tm, Value::Und | Value::Null) {
+                                    let _ = self.async_iter_close(&it);
+                                    return Err(self.type_err(
+                                        "yield*: async iterator has no throw method",
+                                    ));
+                                } else {
+                                    return Err(
+                                        self.type_err("iterator throw is not callable")
+                                    );
+                                }
+                            }
+                            ADeleg::Ret(rv) => {
+                                let rm = self.get_prop_str(&it, "return")?;
+                                if self.is_callable(&rm) {
+                                    self.call(&rm, it.clone(), vec![rv.clone()])?
+                                } else if matches!(rm, Value::Und | Value::Null) {
+                                    // spec AsyncGeneratorReturn — absent
+                                    // return(): the received value is
+                                    // awaited BEFORE the gen completes
+                                    let awaited = self.await_value(rv.clone())?;
+                                    self.gen_ret_override = Some(awaited);
+                                    return Err(gen_abort_v());
+                                } else {
+                                    return Err(
+                                        self.type_err("iterator return is not callable")
+                                    );
+                                }
+                            }
+                        };
+                        let ir = self.await_value(p)?;
+                        if !matches!(ir, Value::Obj(_)) {
+                            return Err(self.type_err("iterator result is not an object"));
+                        }
+                        let done_v = self.get_prop_str(&ir, "done")?;
+                        if self.to_bool(&done_v) {
+                            let rv = self.get_prop_str(&ir, "value")?;
+                            if matches!(act, ADeleg::Ret(_)) {
+                                self.gen_ret_override = Some(rv);
+                                return Err(gen_abort_v());
+                            }
+                            return Ok(rv);
+                        }
+                        // spec yield*'s AsyncGeneratorYield forwards
+                        // `ir.value` UN-AWAITED — read it in-body so a
+                        // throwing `value` getter propagates as a body
+                        // exception (catchable), then suspend it raw
+                        let yv = self.get_prop_str(&ir, "value")?;
+                        self.yieldstar_raw = true;
+                        self.gen_yielders.pop();
+                        let input = unsafe { (*y).suspend(yv) };
+                        self.gen_yielders.push(y);
+                        act = match input {
+                            GenIn::Next(s) => ADeleg::Next(s),
+                            GenIn::Throw(e) => ADeleg::Throw(e),
+                            GenIn::Return(v) => ADeleg::Ret(v),
+                        };
+                    }
+                }
                 let mut inner = crate::builtins::for_of_iter(self, &v)?;
                 // 27.5.3.3 yield* delegation: for a protocol iterator we
                 // drive its next/throw/return record directly so inner
@@ -9281,19 +9717,7 @@ impl Interp {
                 // driver (PromiseResolve + PerformPromiseThen there),
                 // suspend the coroutine until the resume input arrives.
                 let v = self.eval_expr(expr, env)?;
-                let Some(&y) = self.gen_yielders.last() else {
-                    return Err(self.syntax_err("await is only valid in async functions"));
-                };
-                // same yielder dance as yield — pop while parked so a
-                // nested resumer's yielder is current
-                self.gen_yielders.pop();
-                let input = unsafe { (*y).suspend(v) };
-                self.gen_yielders.push(y);
-                match input {
-                    GenIn::Next(sent) => Ok(sent),
-                    GenIn::Throw(e) => Err(e),
-                    GenIn::Return(_) => Err(gen_abort_v()),
-                }
+                self.await_value(v)
             }
             UnaryOp::Delete => match Self::unparen(expr) {
                 Expr::Member { obj, prop, .. } => {

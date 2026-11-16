@@ -44,8 +44,13 @@ pub enum Node {
     },
     /// `\1`..`\9` backreference
     Backref(u32),
-    /// `\k<name>` — resolved to Backref after parse; carries the normalized
-    /// name plus the raw source text (Annex-B literal fallback needs it)
+    /// `\k<name>` where the name maps to several groups (ES2025
+    /// duplicate-named-groups across alternatives) — resolves to the
+    /// LAST non-empty capture at match time
+    Backrefs(Vec<u32>),
+    /// `\k<name>` — resolved to Backref/Backrefs after parse; carries the
+    /// normalized name plus the raw source text (Annex-B literal
+    /// fallback needs it)
     BackrefName(String, String),
     Anchor(Anchor),
     /// `(?=..)` `(?!..)` `(?<=..)` `(?<!..)`
@@ -1147,19 +1152,31 @@ fn count_capture_groups(src: &str) -> (usize, bool) {
 /// here because the parser emits literal atoms for them.
 fn resolve_names(n: Node, names: &[(String, usize)], unicode: bool) -> Result<Node, String> {
     Ok(match n {
-        Node::BackrefName(name, raw) => match names.iter().find(|(nm, _)| *nm == name) {
-            Some((_, idx)) => Node::Backref(*idx as u32),
-            None => {
-                if !unicode && names.is_empty() {
-                    let mut items = vec![lit_node('k', unicode), lit_node('<', unicode)];
-                    items.extend(raw.chars().map(|c| lit_node(c, unicode)));
-                    items.push(lit_node('>', unicode));
-                    Node::Seq(items)
-                } else {
-                    return Err(format!("unknown group name '{name}'"));
+        Node::BackrefName(name, raw) => {
+            let idxs: Vec<u32> = names
+                .iter()
+                .filter(|(nm, _)| *nm == name)
+                .map(|(_, idx)| *idx as u32)
+                .collect();
+            match idxs.len() {
+                // duplicate-named groups: the backreference matches the
+                // last-closed capture among the same-named groups —
+                // i.e. the last non-undefined index in source order
+                n if n > 1 => Node::Backrefs(idxs),
+                1 => Node::Backref(idxs[0]),
+                _ => {
+                    if !unicode && names.is_empty() {
+                        let mut items =
+                            vec![lit_node('k', unicode), lit_node('<', unicode)];
+                        items.extend(raw.chars().map(|c| lit_node(c, unicode)));
+                        items.push(lit_node('>', unicode));
+                        Node::Seq(items)
+                    } else {
+                        return Err(format!("unknown group name '{name}'"));
+                    }
                 }
             }
-        },
+        }
         Node::Seq(items) => Node::Seq(
             items
                 .into_iter()
@@ -1441,6 +1458,20 @@ fn mat<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
             // unmatched group → backref matches empty
             None => k(c, pos),
         },
+        Node::Backrefs(gs) => {
+            // duplicate names — last defined capture in source order
+            let pick = gs
+                .iter()
+                .rev()
+                .find_map(|g| c.caps.get(*g as usize).copied().flatten());
+            match pick {
+                Some((a, b)) => {
+                    let l = b - a;
+                    pos + l <= c.s.len() && units_eq(c, pos, a, l) && k(c, pos + l)
+                }
+                None => k(c, pos),
+            }
+        }
         Node::BackrefName(..) => false, // resolved at compile
         Node::Anchor(a) => {
             let ok = match a {
@@ -1525,6 +1556,19 @@ fn mat_bwd<'h>(c: &mut Ctx<'h>, n: &Node, pos: usize, k: K<'_, 'h>) -> bool {
             }
             None => k(c, pos),
         },
+        Node::Backrefs(gs) => {
+            let pick = gs
+                .iter()
+                .rev()
+                .find_map(|g| c.caps.get(*g as usize).copied().flatten());
+            match pick {
+                Some((a, b)) => {
+                    let l = b - a;
+                    pos >= l && units_eq(c, pos - l, a, l) && k(c, pos - l)
+                }
+                None => k(c, pos),
+            }
+        }
         Node::BackrefName(..) => false,
         Node::Anchor(a) => {
             let ok = match a {

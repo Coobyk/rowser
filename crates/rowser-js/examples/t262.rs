@@ -124,7 +124,8 @@ const SKIP_FEATURES: &[&str] = &[
     "import-attributes",
     "explicit-resource-management",
     "decorators",
-    "regexp-duplicate-named-groups",
+    // regexp-duplicate-named-groups — implemented (Node::Backrefs +
+    // dedup'd groups objects)
     "tail-call-optimization",
     "async-iteration",
     "regexp-v-flag",

@@ -347,6 +347,8 @@ pub enum Stmt {
         left: ForTarget,
         right: Expr,
         body: Box<Stmt>,
+        /// `for await (x of y)` — async iteration inside an async ctx
+        is_await: bool,
     },
     Switch {
         disc: Expr,
@@ -422,4 +424,92 @@ pub enum ExportRec {
     Decl(Box<Stmt>),
     /// `export * from "x"`
     All(String),
+}
+
+// ---- static-semantics walks -----------------------------------------------
+
+/// spec `Contains AwaitExpression` over a parameter — `await` used as a
+/// BINDING name is a separate early error and not included here.
+/// Does not cross nested function/class boundaries — a nested
+/// function's awaits belong to its own parse.
+pub fn param_contains_await(p: &Param) -> bool {
+    match p {
+        Param::Ident(_) => false,
+        Param::Rest(p) => pat_contains_await(p),
+        Param::Pattern(p) => pat_contains_await(p),
+        Param::Default(p, e) => pat_contains_await(p) || expr_contains_await(e),
+    }
+}
+
+pub fn pat_contains_await(p: &Pattern) -> bool {
+    match p {
+        Pattern::Ident(_) => false,
+        Pattern::Target(e) => expr_contains_await(e),
+        Pattern::Array(elems) => elems.iter().any(|el| match el {
+            ArrayPatElem::Hole => false,
+            ArrayPatElem::Elem(p) | ArrayPatElem::Rest(p) => pat_contains_await(p),
+            ArrayPatElem::Default(p, e) => pat_contains_await(p) || expr_contains_await(e),
+        }),
+        Pattern::Object(elems) => elems.iter().any(|el| {
+            matches!(&el.key, PropKey::Computed(e) if expr_contains_await(e))
+                || pat_contains_await(&el.val)
+                || el.default.as_ref().is_some_and(expr_contains_await)
+        }),
+    }
+}
+
+pub fn expr_contains_await(e: &Expr) -> bool {
+    match e {
+        Expr::Unary {
+            op: UnaryOp::Await,
+            ..
+        } => true,
+        // function/class boundaries — nested awaits are theirs
+        Expr::Fn(_) | Expr::Class(_) => false,
+        Expr::Template(parts) => parts
+            .iter()
+            .any(|p| matches!(p, TemplPart::Expr(e) if expr_contains_await(e))),
+        Expr::Array(elems) => elems.iter().any(|el| match el {
+            ArrElem::Hole => false,
+            ArrElem::Expr(e) | ArrElem::Spread(e) | ArrElem::SpreadTrail(e) => {
+                expr_contains_await(e)
+            }
+        }),
+        Expr::Object(props) | Expr::ObjDup(props) => props.iter().any(|p| {
+            matches!(&p.key, PropKey::Computed(e) if expr_contains_await(e))
+                || match &p.val {
+                    PropVal::Expr(e) | PropVal::Spread(e) | PropVal::SpreadTrail(e) => {
+                        expr_contains_await(e)
+                    }
+                    // methods/getters/setters are nested functions
+                    _ => false,
+                }
+        }),
+        Expr::Unary { expr, .. } => expr_contains_await(expr),
+        Expr::Update { target, .. } => expr_contains_await(target),
+        Expr::Binary { l, r, .. } | Expr::Logical { l, r, .. } => {
+            expr_contains_await(l) || expr_contains_await(r)
+        }
+        Expr::Assign { target, value, .. } => {
+            expr_contains_await(target) || expr_contains_await(value)
+        }
+        Expr::Cond { c, t, f } => {
+            expr_contains_await(c) || expr_contains_await(t) || expr_contains_await(f)
+        }
+        Expr::Call { callee, args } | Expr::New { callee, args } => {
+            expr_contains_await(callee)
+                || args.iter().any(|a| match a {
+                    Arg::Expr(e) | Arg::Spread(e) => expr_contains_await(e),
+                })
+        }
+        Expr::Member {
+            obj,
+            prop,
+            computed,
+            ..
+        } => expr_contains_await(obj) || (*computed && expr_contains_await(prop)),
+        Expr::Paren(e) => expr_contains_await(e),
+        Expr::Seq(es) => es.iter().any(expr_contains_await),
+        _ => false,
+    }
 }

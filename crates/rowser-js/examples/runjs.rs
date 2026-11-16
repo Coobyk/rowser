@@ -16,4 +16,7 @@ fn main() {
         Ok(v) => println!("OK: {:?}", ctx.interp.inspect(&v, 0)),
         Err(e) => println!("ERR: {}", e),
     }
+    for line in ctx.output() {
+        println!("| {line}");
+    }
 }

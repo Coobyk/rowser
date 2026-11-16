@@ -649,8 +649,8 @@ impl Parser {
                 if name == "yield" && (self.yield_decl > 0 || self.strict) {
                     return Err(self.err("`yield` is not a valid label here"));
                 }
-                if name == "await" && self.in_static_block {
-                    return Err(self.err("`await` is not a valid label in a class static block"));
+                if name == "await" && (self.await_decl > 0 || self.in_static_block) {
+                    return Err(self.err("`await` is not a valid label here"));
                 }
                 self.next();
                 self.next();
@@ -661,7 +661,7 @@ impl Parser {
                 if is_contextual_ident_kw(&k)
                     && matches!(self.peek2().tok, Tok::Punct(":"))
                     && !(k == Kw::Yield && (self.yield_decl > 0 || self.strict))
-                    && !(k == Kw::Await && self.in_static_block) =>
+                    && !(k == Kw::Await && (self.await_decl > 0 || self.in_static_block)) =>
             {
                 let name = k.name().to_string();
                 self.next();
@@ -683,6 +683,10 @@ impl Parser {
         }
         match self.peek().tok.clone() {
             Tok::Ident(s) => {
+                // an (escaped) `await` label is banned in [Await] contexts
+                if s == "await" && (self.await_decl > 0 || self.in_static_block) {
+                    return Err(self.err("`await` is not a valid label here"));
+                }
                 self.next();
                 Ok(Some(s))
             }
@@ -690,7 +694,9 @@ impl Parser {
                 self.next();
                 Ok(Some("yield".to_string()))
             }
-            Tok::Kw(Kw::Await) if !self.peek().escaped => {
+            Tok::Kw(Kw::Await)
+                if !self.peek().escaped && self.await_decl == 0 && !self.in_static_block =>
+            {
                 self.next();
                 Ok(Some("await".to_string()))
             }
@@ -931,7 +937,15 @@ impl Parser {
 
     fn for_stmt(&mut self) -> Result<Stmt, Error> {
         self.expect_kw(Kw::For)?;
-        self.eat_kw(Kw::Await); // `for await (x of y)` — sync iteration
+        // `for await (` — legal only in [+Await] contexts and only in
+        // the `of` form; in a non-async context `await` starts the
+        // for-init expression instead (e.g. sloppy `for(await(x);…)`)
+        let is_await = self.await_decl > 0
+            && self.at_kw(Kw::Await)
+            && matches!(self.peek2().tok, Tok::Punct("("));
+        if is_await {
+            self.next();
+        }
         self.expect_punct("(")?;
 
         // for-in / for-of heads
@@ -969,7 +983,11 @@ impl Parser {
                     left: ForTarget::Var(kind, pat),
                     right,
                     body,
+                    is_await,
                 });
+            }
+            if is_await {
+                return Err(self.err("for await requires an `of` head"));
             }
             if self.at_kw(Kw::In) {
                 self.next();
@@ -1049,8 +1067,10 @@ impl Parser {
         self.no_in = true;
         // `for (async of` is reserved — `async` LHS directly followed by
         // `of` is an early error (escaped `as\u0079nc` lexes to Ident and
-        // stays legal)
-        if matches!(self.peek().tok, Tok::Kw(Kw::Async))
+        // stays legal). `for await (async of` is EXEMPT — the await
+        // marker unreserves `async` as a valid binding target
+        if !is_await
+            && matches!(self.peek().tok, Tok::Kw(Kw::Async))
             && !self.peek().escaped
             && matches!(self.peek2().tok, Tok::Kw(Kw::Of))
             && !matches!(
@@ -1081,7 +1101,11 @@ impl Parser {
                 left: ForTarget::Expr(first),
                 right,
                 body,
+                is_await,
             });
+        }
+        if is_await {
+            return Err(self.err("for await requires an `of` head"));
         }
         if self.at_kw(Kw::In) {
             self.next();
@@ -1390,21 +1414,29 @@ impl Parser {
         src_start: usize,
     ) -> Result<FnDef, Error> {
         let name = {
-            // fn-DECLARATION names bind in the enclosing [Yield]/[Await]
-            // context; fn-EXPRESSION names are always
-            // BindingIdentifier[~Yield][~Await] — `function yield(){}` /
-            // `function await(){}` are legal even inside generators /
-            // async functions
+            // the fn name's binding context — declarations of sync
+            // functions/generators inherit the enclosing context;
+            // expressions and async declarations use their own markers
             let check = |p: &mut Self, s: &str| {
-                if name_required {
-                    p.check_binding_name(s)
+                // the name's [Yield]/[Await] binding context:
+                //   exprs:  Function(~,~) Generator(+,~)
+                //           AsyncFunction(~,+) AsyncGenerator(+,+)
+                //   decls:  Function/Generator inherit (?,?)
+                //           AsyncFunction(~,+) AsyncGenerator(+,+)
+                let (y, a) = if !name_required {
+                    (gen as usize, is_async as usize)
+                } else if is_async {
+                    (gen as usize, 1)
                 } else {
-                    let saved = (p.yield_decl, p.await_decl);
-                    (p.yield_decl, p.await_decl) = (0, 0);
-                    let r = p.check_binding_name(s);
-                    (p.yield_decl, p.await_decl) = saved;
-                    r
-                }
+                    return p.check_binding_name(s);
+                };
+                let saved = (p.yield_decl, p.await_decl, p.in_static_block);
+                p.yield_decl = y;
+                p.await_decl = a;
+                p.in_static_block = false;
+                let r = p.check_binding_name(s);
+                (p.yield_decl, p.await_decl, p.in_static_block) = saved;
+                r
             };
             let n = match self.peek().tok.clone() {
                 Tok::Ident(s) => {
@@ -1542,6 +1574,13 @@ impl Parser {
                 for n in names {
                     s.check_binding_name(n)?;
                 }
+            }
+            // early error: FormalParameters Contains AwaitExpression —
+            // `x = await 1` in formals is a SyntaxError in any context
+            // (in [~Await] contexts `await` parses as an identifier, so
+            // only an actual AwaitExpression can appear here)
+            if params.iter().any(crate::ast::param_contains_await) {
+                return Err(s.err("`await` is not valid in parameters"));
             }
             Ok(())
         })(self);
@@ -2066,17 +2105,22 @@ impl Parser {
                 self.yield_decl,
             );
             self.ctor_depth = 0;
-            self.method_depth = 0;
+            // formals still belong to the member — `super.x` is legal in
+            // initializers (super() needs the derived-ctor flag)
+            self.method_depth = 1;
             self.await_decl = is_async as usize;
             self.yield_decl = member_gen as usize;
             let params = self.params();
+            // binding-name checks use the member's own [Yield]/[Await]
+            let params = params?;
+            let cpr = self.check_params(&params, false);
             (
                 self.ctor_depth,
                 self.method_depth,
                 self.await_decl,
                 self.yield_decl,
             ) = psaved;
-            let params = params?;
+            cpr?;
             self.expect_punct(")")?;
             match kind {
                 MemberKind::Getter if !params.is_empty() => {
@@ -2087,7 +2131,6 @@ impl Parser {
                 }
                 _ => {}
             }
-            self.check_params(&params, false)?;
             self.expect_punct("{")?;
             // `super()` is only legal inside a DERIVED constructor
             let body = self.method_body(is_ctor && derived, member_gen, is_async, &params)?;
@@ -2867,6 +2910,10 @@ impl Parser {
                 if name == "yield" && (self.yield_decl > 0 || self.strict) {
                     return Err(self.err("`yield` is not a valid identifier here"));
                 }
+                // same for an (escaped) `await` in an [Await] context
+                if name == "await" && (self.await_decl > 0 || self.in_static_block) {
+                    return Err(self.err("`await` is not a valid identifier here"));
+                }
                 self.next();
                 // bare `#x` (only legal as `#x in obj` brand checks) —
                 // a private-name USE
@@ -3038,7 +3085,18 @@ impl Parser {
                         let member_gen = self.eat_punct("*");
                         let key = self.prop_key(true)?;
                         self.expect_punct("(")?;
-                        let params = self.params()?;
+                        // async-method formals parse under the member's
+                        // own [Yield]/[Await]
+                        let fsaved = (self.await_decl, self.yield_decl);
+                        (self.await_decl, self.yield_decl) = (1, member_gen as usize);
+                        let params = self.params();
+                        let cpr = match &params {
+                            Ok(p) => self.check_params(p, false),
+                            Err(_) => Ok(()),
+                        };
+                        (self.await_decl, self.yield_decl) = fsaved;
+                        let params = params?;
+                        cpr?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
                         let body = self.method_body(false, member_gen, true, &params)?;
@@ -3063,7 +3121,17 @@ impl Parser {
                         self.next();
                         let key = self.prop_key(true)?;
                         self.expect_punct("(")?;
-                        let params = self.params()?;
+                        // gen-method formals parse under [+Yield, ~Await]
+                        let fsaved = (self.await_decl, self.yield_decl);
+                        (self.await_decl, self.yield_decl) = (0, 1);
+                        let params = self.params();
+                        let cpr = match &params {
+                            Ok(p) => self.check_params(p, false),
+                            Err(_) => Ok(()),
+                        };
+                        (self.await_decl, self.yield_decl) = fsaved;
+                        let params = params?;
+                        cpr?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
                         let body = self.method_body(false, true, false, &params)?;
@@ -3638,7 +3706,7 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             cx.pop_scope();
             r
         }
-        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body } => {
+        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
             cx.push_scope();
             match left {
                 ForTarget::Var(kind, p) => {
@@ -4400,7 +4468,7 @@ fn stmt_has_arguments(s: &Stmt) -> bool {
                 || update.as_ref().is_some_and(|e| expr_has_arguments(e))
                 || stmt_has_arguments(body)
         }
-        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body } => {
+        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
             (match left {
                 ForTarget::Var(_, p) => pat_has_arguments(p),
                 ForTarget::Expr(e) => expr_has_arguments(e),
@@ -4637,7 +4705,7 @@ fn stmt_has_await(s: &Stmt) -> bool {
                 || update.as_ref().is_some_and(|e| expr_has_await(e))
                 || stmt_has_await(body)
         }
-        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body } => {
+        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
             (match left {
                 ForTarget::Var(_, p) => pat_has_await(p),
                 ForTarget::Expr(e) => expr_has_await(e),
