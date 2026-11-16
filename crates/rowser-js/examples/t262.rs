@@ -132,8 +132,8 @@ const SKIP_FEATURES: &[&str] = &[
     "regexp-modifiers",
     "source-phase-imports",
     "ShadowRealm",
-    "Array.fromAsync",
-    "await-dictionary",
+    // Array.fromAsync — implemented (JS-built async fn + afx wrap)
+    // await-dictionary — implemented (Promise.allKeyed/allSettledKeyed)
     "regexp-unicode-property-escapes",
     // uint8array-base64 — implemented (binary.rs b64/hex section)
     // $262.createRealm / Error.isError — APIs we don't expose

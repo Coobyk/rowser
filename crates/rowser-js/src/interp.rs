@@ -634,6 +634,10 @@ pub struct GenCell {
     pub running: bool,
     /// completed — next() → {value: undefined, done: true}
     pub done: bool,
+    /// the body's effective strictness — the coroutine can't own this
+    /// (a suspended body never runs its epilogue), so the driver swaps
+    /// cur_strict around every resume
+    pub strict: bool,
 }
 
 /// one queued next()/return()/throw() request — the head stays queued
@@ -660,6 +664,8 @@ pub struct AGenCell {
     pub awaiting_return: bool,
     /// completed — remaining queue resolves {value: undefined, done: true}
     pub done: bool,
+    /// the body's effective strictness — see GenCell::strict
+    pub strict: bool,
 }
 
 /// sentinel error value — a `return()` injected at a suspended yield
@@ -2586,35 +2592,18 @@ impl Interp {
     }
 
     /// proxy [[Get]](P, Receiver) — the `get` trap plus the 10.5.8
-    /// invariants (non-config non-writable data ⇒ SameValue result;
-    /// non-config getter-less accessor ⇒ undefined result).
-    /// post-trap revalidation (ES2024 10.5.x): after a trap call the
-    /// proxy may have been revoked mid-call — every subsequent step
-    /// throws TypeError. `p` is the proxy object itself.
-    fn proxy_live(&mut self, p: &ObjRef, op: &str) -> Result<(), Value> {
-        if matches!(&p.borrow().kind, ObjKind::Proxy { handler, .. }
-            if matches!(handler, Value::Null))
-        {
-            return Err(self.type_err(format!(
-                "Cannot perform '{op}' on a proxy that has been revoked"
-            )));
-        }
-        Ok(())
-    }
-
     pub(crate) fn proxy_get(
         &mut self,
         t: &Value,
         h: &Value,
         key: &PropKey,
         receiver: &Value,
-        p: &ObjRef,
+        _p: &ObjRef,
     ) -> ERes {
         match self.proxy_trap(h, "get")? {
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call(&trap, h.clone(), vec![t.clone(), kv, receiver.clone()])?;
-                self.proxy_live(p, "get")?;
                 if let Some(td) = self.proxy_target_desc(t, key)? {
                     if td.configurable == Some(false) {
                         if !td.is_accessor() && td.writable == Some(false) {
@@ -2657,7 +2646,7 @@ impl Interp {
         key: &PropKey,
         v: Value,
         receiver: &Value,
-        p: &ObjRef,
+        _p: &ObjRef,
     ) -> Result<(), Value> {
         match self.proxy_trap(h, "set")? {
             Some(trap) => {
@@ -2667,7 +2656,6 @@ impl Interp {
                     h.clone(),
                     vec![t.clone(), kv, v.clone(), receiver.clone()],
                 )?;
-                self.proxy_live(p, "set")?;
                 if !self.to_bool(&r) {
                     let kn = self.key_to_name(key);
                     return self.set_fail(&kn);
@@ -2711,13 +2699,12 @@ impl Interp {
         t: &Value,
         h: &Value,
         key: &PropKey,
-        p: &ObjRef,
+        _p: &ObjRef,
     ) -> Result<bool, Value> {
         match self.proxy_trap(h, "has")? {
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
-                self.proxy_live(p, "has")?;
                 let br = self.to_bool(&r);
                 if !br {
                     if let Some(td) = self.proxy_target_desc(t, key)? {
@@ -2747,13 +2734,12 @@ impl Interp {
         t: &Value,
         h: &Value,
         key: &PropKey,
-        p: &ObjRef,
+        _p: &ObjRef,
     ) -> Result<bool, Value> {
         match self.proxy_trap(h, "deleteProperty")? {
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
-                self.proxy_live(p, "deleteProperty")?;
                 if !self.to_bool(&r) {
                     return Ok(false);
                 }
@@ -2786,13 +2772,12 @@ impl Interp {
         t: &Value,
         h: &Value,
         key: &PropKey,
-        p: &ObjRef,
+        _p: &ObjRef,
     ) -> Result<Option<PDesc>, Value> {
         match self.proxy_trap(h, "getOwnPropertyDescriptor")? {
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call(&trap, h.clone(), vec![t.clone(), kv])?;
-                self.proxy_live(p, "getOwnPropertyDescriptor")?;
                 if !matches!(r, Value::Und | Value::Obj(_)) {
                     return Err(self.type_err(
                         "proxy getOwnPropertyDescriptor trap must return object or undefined",
@@ -2972,6 +2957,7 @@ impl Interp {
                     SYM_IS_CONCAT_SPREADABLE => "Symbol.isConcatSpreadable",
                     SYM_SPECIES => "Symbol.species",
                     SYM_UNSCOPABLES => "Symbol.unscopables",
+                    SYM_ASYNCITERATOR => "Symbol.asyncIterator",
                     _ => "",
                 };
                 Value::Sym(*id, Rc::from(d))
@@ -3046,6 +3032,23 @@ impl Interp {
     /// matching prototype (Boolean/Number/String/Symbol.prototype).
     pub fn to_object(&mut self, v: &Value) -> ERes {
         match v {
+            // BigInt primitives are Obj stand-ins — ToObject(1n) builds a
+            // real wrapper (mirrors Object(1n) in object_ctor) so sloppy
+            // `this` and Object() boxing stay identity-distinct
+            Value::Obj(o) if crate::binary::bigint_is_prim(v) => {
+                let w = Rc::new(RefCell::new(Obj::new(
+                    Some(self.p.bigint.clone()),
+                    ObjKind::Ord,
+                )));
+                for k in ["__bigint", "__bigint_x"] {
+                    if let Some(p) = o.borrow().props.get_str(k).map(|p| p.val.clone()) {
+                        self.set_attr(&w, k, p, false, false);
+                    }
+                }
+                self.set_attr(&w, "__bigint_wrap", Value::Bool(true), false, false);
+                self.set_builtin(&w, "$value", v.clone());
+                Ok(Value::Obj(w))
+            }
             Value::Obj(_) => Ok(v.clone()),
             Value::Und | Value::Null => {
                 Err(self.type_err("Cannot convert undefined or null to object"))
@@ -3681,21 +3684,13 @@ impl Interp {
                     if no_props_entry {
                         return self.obj_define_data(o, key, v);
                     }
-                    // ArraySetLength coercion — a.length = v runs
-                    // ToNumber → uint32 and rejects non-integral values
-                    let mut v = v;
+                    // a.length = v → ArraySetLength — pass the raw value:
+                    // both ToUint32/ToNumber coercions (and the
+                    // post-coercion writable re-check) run in spec order
+                    // inside obj_define_data
                     let arr_len = matches!(&c.borrow().kind, ObjKind::Arr(_))
                         && matches!(&key, PropKey::S(s) if s.as_ref() == "length");
                     if arr_len && writable {
-                        let nl = self.to_num(&v)?;
-                        let nlu = to_u32(nl) as f64;
-                        if nl != nlu {
-                            return Err(self.range_err("Invalid array length"));
-                        }
-                        v = Value::Num(nlu);
-                        // the full ArraySetLength dance (element deletes,
-                        // partial shrink on non-configurable) lives in
-                        // obj_define_data
                         return self.obj_define_data(o, key, v);
                     }
                     // update own prop
@@ -3755,16 +3750,40 @@ impl Interp {
     /// the dense/props insertion half of a set — writes a data prop on
     /// `o` itself (receiver == object, or an ordinary receiver)
     fn obj_define_data(&mut self, o: &ObjRef, key: PropKey, v: Value) -> Result<(), Value> {
-        // ArraySetLength coercion — writing `length` on an array routes
-        // the value through ToNumber → uint32 first
+        // ArraySetLength — writing `length` on an array runs
+        // ToUint32 then ToNumber as SEPARATE coercions (user code
+        // between them may freeze `length`), then re-reads the
+        // post-coercion writable state before deciding
         let mut v = v;
         if matches!(&o.borrow().kind, ObjKind::Arr(_))
             && matches!(&key, PropKey::S(s) if s.as_ref() == "length")
         {
+            let nlu = to_u32(self.to_num(&v)?) as f64;
             let nl = self.to_num(&v)?;
-            let nlu = to_u32(nl) as f64;
             if nl != nlu {
                 return Err(self.range_err("Invalid array length"));
+            }
+            // a mid-coercion freeze is observed: non-writable length
+            // accepts only a same-value write
+            let (cur_len, cur_w) = {
+                let b = o.borrow();
+                let items_len = match &b.kind {
+                    ObjKind::Arr(it) => it.len(),
+                    _ => 0,
+                };
+                match b.props.get(&PropKey::from_str("length")) {
+                    Some(p) => {
+                        let n = match &p.val {
+                            Value::Num(n) => (*n as usize).max(items_len),
+                            _ => items_len,
+                        };
+                        (n, p.writable)
+                    }
+                    None => (items_len, true),
+                }
+            };
+            if !cur_w && nlu as usize != cur_len {
+                return self.set_fail(&self.key_to_name(&key));
             }
             v = Value::Num(nlu);
         }
@@ -4517,20 +4536,11 @@ impl Interp {
                     if no_props_entry {
                         return self.obj_define_data(o, PropKey::from_str(key), v);
                     }
-                    // ArraySetLength coercion — a.length = v runs
-                    // ToNumber → uint32 and rejects non-integral values
-                    let mut v = v;
+                    // a.length = v → ArraySetLength — pass the raw value:
+                    // both coercions + the post-coercion writable check
+                    // run inside obj_define_data
                     let arr_len = matches!(&c.borrow().kind, ObjKind::Arr(_)) && key == "length";
                     if arr_len && writable {
-                        let nl = self.to_num(&v)?;
-                        let nlu = to_u32(nl) as f64;
-                        if nl != nlu {
-                            return Err(self.range_err("Invalid array length"));
-                        }
-                        v = Value::Num(nlu);
-                        // the full ArraySetLength dance (element deletes,
-                        // partial shrink on non-configurable) lives in
-                        // obj_define_data
                         return self.obj_define_data(o, PropKey::from_str(key), v);
                     }
                     // update own prop
@@ -5497,13 +5507,13 @@ impl Interp {
                 }
                 // strict-mode call semantics: `this` passes through verbatim
                 // in strict code; sloppy code substitutes global for
-                // undefined/null and boxes primitives
+                // undefined/null and boxes primitives (incl. the Obj
+                // stand-in form BigInt primitives take)
                 let this = if def.is_arrow || def.strict || parser::stmts_strict(&def.body) {
                     this
                 } else {
                     match this {
                         Value::Und | Value::Null => Value::Obj(self.p.global.clone()),
-                        Value::Obj(_) => this,
                         v => self.to_object(&v)?,
                     }
                 };
@@ -5659,6 +5669,7 @@ impl Interp {
                         awaiting: false,
                         awaiting_return: false,
                         done: false,
+                        strict: def.strict || crate::parser::stmts_strict(&def.body),
                     }))),
                 )))));
             }
@@ -5681,6 +5692,7 @@ impl Interp {
                         pending: Some((def.clone(), body_scope)),
                         running: false,
                         done: false,
+                        strict: def.strict || crate::parser::stmts_strict(&def.body),
                     }))),
                 )))));
             }
@@ -5694,6 +5706,7 @@ impl Interp {
                     pending: Some((def.clone(), body_scope)),
                     running: false,
                     done: false,
+                    strict: def.strict || crate::parser::stmts_strict(&def.body),
                 }));
                 crate::builtins::async_resume(
                     self,
@@ -5953,11 +5966,22 @@ impl Interp {
             // prototype for the new object: new_target.prototype or obj proto
             // GetPrototypeFromConstructor reads newTarget.prototype
             // through [[Get]] — a proxy newTarget fires its `get`
-            // trap; a non-object result falls back to %Object.prototype%
+            // trap; a non-object result falls back through
+            // GetFunctionRealm — which throws TypeError on a proxy
+            // revoked mid-get (handler slot now null)
             let proto = match &nt {
-                Value::Obj(_) => match self.get_prop(&nt, &PropKey::from_str("prototype"))? {
+                Value::Obj(o) => match self.get_prop(&nt, &PropKey::from_str("prototype"))? {
                     Value::Obj(p) => Some(p),
-                    _ => Some(self.p.obj.clone()),
+                    _ => {
+                        if matches!(&o.borrow().kind, ObjKind::Proxy { handler, .. }
+                            if matches!(handler, Value::Null))
+                        {
+                            return Err(self.type_err(
+                                "Cannot perform 'getPrototypeOf' on a proxy that has been revoked",
+                            ));
+                        }
+                        Some(self.p.obj.clone())
+                    }
                 },
                 _ => Some(self.p.obj.clone()),
             };

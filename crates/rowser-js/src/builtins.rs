@@ -652,6 +652,7 @@ const NATIVE_ARITY: &[(&str, f64)] = &[
     // Promise
     ("all", 1.0),
     ("allKeyed", 1.0),
+    ("allSettledKeyed", 1.0),
     ("allSettled", 1.0),
     ("any", 1.0),
     ("race", 1.0),
@@ -1656,13 +1657,11 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
                     // NOTE: no depth bump here — a suspended coroutine is
                     // off the JS execution stack; the driver bumps depth
                     // around resume() so drain_jobs still sees depth==0
-                    // at the microtask checkpoint while we're parked
-                    let saved_strict = std::mem::replace(
-                        &mut i.cur_strict,
-                        def.strict || crate::parser::stmts_strict(&def.body),
-                    );
+                    // at the microtask checkpoint while we're parked.
+                    // cur_strict is likewise the driver's job — it swaps
+                    // the cell's strict flag around every resume() since
+                    // a suspended body never runs an epilogue.
                     let r = i.exec_block(&def.body, &scope);
-                    i.cur_strict = saved_strict;
                     i.gen_yielders.pop();
                     match r {
                         Ok(Completion::Return(v)) => Ok(v),
@@ -1680,9 +1679,11 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
     let (ocap, ohit) = (i.gen_cap, i.gen_cap_hit);
     i.gen_cap = i.steps.saturating_add(crate::interp::GEN_STEP_BUDGET);
     i.gen_cap_hit = false;
+    let saved_strict = std::mem::replace(&mut i.cur_strict, cell.borrow().strict);
     i.depth += 1;
     let res = coro.resume(input);
     i.depth -= 1;
+    i.cur_strict = saved_strict;
     i.gen_cap = ocap;
     i.gen_cap_hit = ohit;
     let mut c = cell.borrow_mut();
@@ -1748,11 +1749,8 @@ pub fn async_resume(
                 move |y: &corosensei::Yielder<GenIn, Value>, _first: GenIn| -> GenRet {
                     let i = unsafe { &mut *ip };
                     i.gen_yielders.push(y as *const _);
-                    // no depth bump here either — see gen_resume
-                    let saved_strict = std::mem::replace(
-                        &mut i.cur_strict,
-                        def.strict || crate::parser::stmts_strict(&def.body),
-                    );
+                    // no depth bump here either — see gen_resume; strict
+                    // is swapped by the driver around resume()
                     let r = if let Some(e) = &def.arrow_expr {
                         i.eval_expr(e, &scope)
                     } else {
@@ -1762,7 +1760,6 @@ pub fn async_resume(
                             Err(e) => Err(e),
                         }
                     };
-                    i.cur_strict = saved_strict;
                     i.gen_yielders.pop();
                     r
                 },
@@ -1772,9 +1769,11 @@ pub fn async_resume(
     let (ocap, ohit) = (i.gen_cap, i.gen_cap_hit);
     i.gen_cap = i.steps.saturating_add(crate::interp::GEN_STEP_BUDGET);
     i.gen_cap_hit = false;
+    let saved_strict = std::mem::replace(&mut i.cur_strict, cell.borrow().strict);
     i.depth += 1;
     let res = coro.resume(input);
     i.depth -= 1;
+    i.cur_strict = saved_strict;
     i.gen_cap = ocap;
     i.gen_cap_hit = ohit;
     let mut c = cell.borrow_mut();
@@ -3544,15 +3543,11 @@ fn agen_drive(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>, input: GenIn) {
                     }
                     let i = unsafe { &mut *ip };
                     i.gen_yielders.push(y as *const _);
-                    let saved_strict = std::mem::replace(
-                        &mut i.cur_strict,
-                        def.strict || crate::parser::stmts_strict(&def.body),
-                    );
-                    // `cur_agen` is armed by agen_drive around resume —
-                    // a suspended-then-abandoned coroutine never reaches
-                    // a restore placed here, which would leak the flag
+                    // `cur_agen` and `cur_strict` are armed by agen_drive
+                    // around resume — a suspended-then-abandoned coroutine
+                    // never reaches a restore placed here, which would
+                    // leak the flag
                     let r = i.exec_block(&def.body, &scope);
-                    i.cur_strict = saved_strict;
                     i.gen_yielders.pop();
                     match r {
                         Ok(Completion::Return(v)) => Ok(v),
@@ -3574,12 +3569,15 @@ fn agen_drive(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>, input: GenIn) {
     i.gen_cap_hit = false;
     // `cur_agen` marks the async-generator execution context only while
     // its coroutine is on the CPU — restoring after resume keeps it
-    // correct even if a suspended coroutine is later abandoned
+    // correct even if a suspended coroutine is later abandoned.
+    // `cur_strict` gets the same treatment.
     let saved_agen = std::mem::replace(&mut i.cur_agen, true);
+    let saved_strict = std::mem::replace(&mut i.cur_strict, cell.borrow().strict);
     i.depth += 1;
     let res = coro.resume(input);
     i.depth -= 1;
     i.cur_agen = saved_agen;
+    i.cur_strict = saved_strict;
     i.gen_cap = ocap;
     i.gen_cap_hit = ohit;
     match res {
@@ -4479,6 +4477,117 @@ fn install_globals(i: &mut Interp) {
         i.set_builtin(o, "isArray", native(i, "isArray", array_is_array));
         i.set_builtin(o, "from", native(i, "from", array_from));
         i.set_builtin(o, "of", native(i, "of", array_of));
+        // spec Array.fromAsync — the body is an await loop, so it is
+        // built from an async JS function (the coroutine machinery
+        // suspends it). Engine helpers are injected as factory
+        // parameters so nothing leaks onto the global object.
+        let afx = native(i, "$afxWrap", |i, _t, a| {
+            Ok(wrap_async_from_sync(i, arg(a, 0)))
+        });
+        let is_ctor = native(i, "$isCtor", |i, _t, a| {
+            Ok(Value::Bool(i.is_constructor(&arg(a, 0))))
+        });
+        if let Ok(fac) = i.run(
+            r#"(function($afx, $isCtor, $iter, $aiter) {
+                return async function fromAsync(items, mapfn, thisArg) {
+                    "use strict";
+                    const C = this;
+                    if (mapfn !== undefined && typeof mapfn !== "function")
+                        throw new TypeError("mapfn is not a function");
+                    let iter, nextM;
+                    const am = items[$aiter];
+                    if (am !== undefined && am !== null) {
+                        if (typeof am !== "function")
+                            throw new TypeError("Symbol.asyncIterator is not a function");
+                        iter = am.call(items);
+                        if (iter === null || (typeof iter !== "object" && typeof iter !== "function"))
+                            throw new TypeError("Symbol.asyncIterator must return an object");
+                        nextM = iter.next;
+                        if (typeof nextM !== "function")
+                            throw new TypeError("iterator.next is not a function");
+                    } else {
+                        const sm = items[$iter];
+                        if (sm !== undefined && sm !== null) {
+                            if (typeof sm !== "function")
+                                throw new TypeError("Symbol.iterator is not a function");
+                            const sit = sm.call(items);
+                            if (sit === null || typeof sit !== "object")
+                                throw new TypeError("Symbol.iterator must return an object");
+                            iter = $afx(sit);
+                            nextM = iter.next;
+                        }
+                    }
+                    let A, len = 0;
+                    if (iter !== undefined) {
+                        A = $isCtor(C) ? new C() : [];
+                    } else {
+                        let l = +items.length;
+                        len = (l !== l || l <= 0) ? 0 : Math.min(Math.trunc(l), 9007199254740991);
+                        A = $isCtor(C) ? new C(len) : new Array(len);
+                    }
+                    let k = 0;
+                    if (iter !== undefined) {
+                        try {
+                            for (;;) {
+                                const res = await nextM.call(iter);
+                                if (res === null || typeof res !== "object")
+                                    throw new TypeError("iterator result is not an object");
+                                if (res.done) { A.length = k; return A; }
+                                let v = res.value;
+                                if (mapfn !== undefined) v = await mapfn.call(thisArg, v, k);
+                                Object.defineProperty(A, k, { value: v, writable: true, enumerable: true, configurable: true });
+                                k++;
+                            }
+                        } catch (e) {
+                            // AsyncIteratorClose — a close error replaces e
+                            const rm = iter.return;
+                            if (rm !== undefined && rm !== null) {
+                                if (typeof rm !== "function")
+                                    throw new TypeError("iterator return is not a function");
+                                const rr = await rm.call(iter);
+                                if (rr === null || typeof rr !== "object")
+                                    throw new TypeError("iterator return result is not an object");
+                            }
+                            throw e;
+                        }
+                    }
+                    for (; k < len; k++) {
+                        let v = await items[k];
+                        if (mapfn !== undefined) v = await mapfn.call(thisArg, v, k);
+                        Object.defineProperty(A, k, { value: v, writable: true, enumerable: true, configurable: true });
+                    }
+                    A.length = k;
+                    return A;
+                };
+            })"#,
+        ) {
+            if let Ok(f) = i.call(
+                &fac,
+                Value::Und,
+                vec![
+                    afx,
+                    is_ctor,
+                    Value::Sym(SYM_ITERATOR, Rc::from("Symbol.iterator")),
+                    Value::Sym(SYM_ASYNCITERATOR, Rc::from("Symbol.asyncIterator")),
+                ],
+            ) {
+                if let Value::Obj(fo) = &f {
+                    // built-in function object: %Function.prototype% proto,
+                    // no own "prototype" (async fns get %AsyncFunction.proto%
+                    // from the factory — fix both)
+                    fo.borrow_mut().proto = Some(i.p.func.clone());
+                    fo.borrow_mut().props.remove(&PropKey::from_str("prototype"));
+                    // built-ins report the NativeFunction toString form —
+                    // flag the factory text as not-for-toString
+                    fo.borrow_mut().props.insert_str(
+                        "$native_ts",
+                        Prop::builtin(Value::Bool(true)),
+                    );
+                    i.set_attr(fo, "length", Value::Num(1.0), false, true);
+                }
+                i.set_builtin(o, "fromAsync", f);
+            }
+        }
         define_global(i, "Array", ctor);
     }
 
@@ -5195,6 +5304,11 @@ fn install_globals(i: &mut Interp) {
         i.set_builtin(o, "race", native(i, "race", promise_race));
         i.set_builtin(o, "try", native(i, "try", promise_try));
         i.set_builtin(o, "allKeyed", native(i, "allKeyed", promise_all_keyed));
+        i.set_builtin(
+            o,
+            "allSettledKeyed",
+            native(i, "allSettledKeyed", promise_allsettled_keyed),
+        );
         i.set_builtin(
             o,
             "withResolvers",
@@ -6576,14 +6690,16 @@ fn define_prop_from_desc(
                         if is_acc {
                             return Ok(false);
                         }
-                        // 10.4.2.1 ArraySetLength — ToNumber may run user
-                        // code, so release the borrow around the coercion
+                        // 10.4.2.1 ArraySetLength — ToUint32 then
+                        // ToNumber are SEPARATE coercions (user code
+                        // may freeze `length` between them); release
+                        // the borrow around both
                         let new_len = if has_val {
                             drop(b);
+                            let nlu = to_u32(i.to_num(&vv)?) as f64;
                             let numlen = i.to_num(&vv)?;
                             b = o.borrow_mut();
-                            let nlu = to_u32(numlen);
-                            if numlen != nlu as f64 {
+                            if numlen != nlu {
                                 return Err(i.range_err("Invalid array length"));
                             }
                             Some(nlu as usize)
@@ -7981,10 +8097,14 @@ fn fn_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     };
     let kind = o.borrow().kind.clone();
     // a user function retains the verbatim source text of its
-    // definition — toString returns it untouched (spec)
+    // definition — toString returns it untouched (spec). Functions
+    // built by the engine from JS source carry $native_ts and fall
+    // through to the NativeFunction form instead
     if let ObjKind::Func(Func::User { def, .. }) = &kind {
         if let Some(src) = &def.src {
-            return Ok(Value::Str(src.clone()));
+            if !o.borrow().props.contains_str("$native_ts") {
+                return Ok(Value::Str(src.clone()));
+            }
         }
     }
     let name = match &kind {
@@ -8027,15 +8147,12 @@ fn array_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     // Array(n) → length-n array of HOLES; Array(a,b,..) → [a,b,..]
     let (items, declared) = if args.len() == 1 {
         if let Value::Num(n) = args[0] {
-            if n >= 0.0 && n == n.trunc() && n < 4294967295.0 {
-                // dense Vec backing — can't honor holey arrays past a
-                // sane bound (spec allows 2^32-1; real engines go sparse)
-                if n > 8_000_000.0 {
-                    return Err(i.range_err("Invalid array length"));
-                }
+            if n >= 0.0 && n == n.trunc() && n <= 4294967295.0 {
                 // spec: the slots are ABSENT, not undefined — an empty
                 // dense store + a declared `length` keeps `i in arr`
-                // false and lets proto chains (incl. proxies) answer
+                // false and lets proto chains (incl. proxies) answer.
+                // 2^32-1 is a legal length; the array is sparse either
+                // way so no allocation happens here.
                 (Vec::new(), Some(n as usize))
             } else {
                 return Err(i.range_err("Invalid array length"));
@@ -15109,35 +15226,87 @@ fn promise_try(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     }
 }
 
-/// Promise.allKeyed — {fulfilled:{…}, rejected:{…}} snapshot keyed by
-/// the input's enumerable own properties. Elements resolve through
-/// `C.resolve`; every outcome lands in exactly one bucket.
+/// spec Promise.allKeyed / Promise.allSettledKeyed — PerformPromiseAllKeyed.
+/// The result is a null-proto object keyed by the input's enumerable own
+/// properties (ownKeys order); allKeyed rejects on the first element
+/// rejection while allSettledKeyed wraps every outcome in a
+/// {status,value|reason} record. Elements resolve through `C.resolve`.
 fn promise_all_keyed(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    promise_all_keyed_impl(i, this, args, false)
+}
+
+fn promise_allsettled_keyed(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    promise_all_keyed_impl(i, this, args, true)
+}
+
+fn promise_all_keyed_impl(
+    i: &mut Interp,
+    this: &Value,
+    args: &[Value],
+    settled: bool,
+) -> NResult {
     let (p, res, rej) = new_promise_capability(i, this)?;
     let promise_resolve = match get_promise_resolve(i, this) {
         Ok(v) => v,
         Err(e) => return reject_cap(i, &rej, &p, e),
     };
-    let fulfilled = Value::Obj(i.new_obj());
-    let rejected = Value::Obj(i.new_obj());
-    let out_o = i.new_obj();
-    i.set_data(&out_o, "fulfilled", fulfilled.clone());
-    i.set_data(&out_o, "rejected", rejected.clone());
-    let outv = Value::Obj(out_o);
-    let remaining = i.new_obj();
-    i.set_builtin(&remaining, "n", Value::Num(1.0));
-    let entries = match own_enum_entries_full(i, &arg(args, 0), true) {
+    let input = arg(args, 0);
+    // spec step 5: "If promises is not an Object" — typeof semantics;
+    // bigint primitives are Obj stand-ins but aren't spec objects, and
+    // null reports "object" via type_name
+    let is_obj = matches!(input, Value::Obj(_))
+        && matches!(i.type_name(&input), "object" | "function")
+        && !crate::binary::bigint_is_prim(&input);
+    if !is_obj {
+        let e = i.type_err("promises argument is not an object");
+        return reject_cap(i, &rej, &p, e);
+    }
+    // ownKeys + per-key [[GetOwnProperty]] enumerable filter — proxies
+    // get their traps through own_enum_entries_full
+    let entries = match own_enum_entries_full(i, &input, true) {
         Ok(e) => e,
         Err(e) => return reject_cap(i, &rej, &p, e),
     };
+    // CreateKeyedPromiseCombinatorResultObject — null proto; seeding the
+    // keys now pins ownKeys order regardless of async settle order
+    let result = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
+    for (k, _) in &entries {
+        result
+            .borrow_mut()
+            .props
+            .insert(k.clone(), Prop::data(Value::Und));
+    }
+    let remaining = i.new_obj();
+    i.set_builtin(&remaining, "n", Value::Num(1.0));
     for (k, v) in entries {
         let next_promise = match i.call(&promise_resolve, this.clone(), vec![v]) {
             Ok(x) => x,
             Err(e) => return reject_cap(i, &rej, &p, e),
         };
         let kv = i.key_to_value(&k);
-        let res_el = mk_allkeyed_element(i, &kv, &fulfilled, &outv, &remaining, &res);
-        let rej_el = mk_allkeyed_element(i, &kv, &rejected, &outv, &remaining, &res);
+        // spec: ONE alreadyCalled record per key — shared between the
+        // onFulfilled/onRejected pair; a thenable firing both settles
+        // the record once (first call wins)
+        let h = mk_el_holder(i, 0);
+        i.set_builtin(&h, "$k", kv);
+        i.set_builtin(&h, "$result", Value::Obj(result.clone()));
+        i.set_builtin(&h, "$rem", Value::Obj(remaining.clone()));
+        i.set_builtin(&h, "$res", res.clone());
+        i.set_builtin(&h, "$st", Value::Bool(settled));
+        let res_el = bound_native(
+            i,
+            "",
+            promise_keyed_res_el,
+            Value::Obj(h.clone()),
+            1.0,
+        );
+        // allKeyed: onRejected IS the capability reject fn — the first
+        // element rejection settles the whole combinator
+        let rej_el = if settled {
+            bound_native(i, "", promise_keyed_rej_el, Value::Obj(h), 1.0)
+        } else {
+            rej.clone()
+        };
         inc_remaining(i, &remaining);
         let r = match i.get_prop_str(&next_promise, "then") {
             Err(e) => Err(e),
@@ -15150,31 +15319,32 @@ fn promise_all_keyed(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         }
     }
     if dec_remaining(i, &remaining) == 0 {
-        i.call(&res, Value::Und, vec![outv])?;
+        // ? Call(resultCapability.[[Resolve]]) — abrupt feeds
+        // IfAbruptRejectPromise: a throwing custom resolve rejects the
+        // capability with that error
+        if let Err(e) = i.call(&res, Value::Und, vec![Value::Obj(result)]) {
+            return reject_cap(i, &rej, &p, e);
+        }
     }
     Ok(p)
 }
 
-fn mk_allkeyed_element(
-    i: &mut Interp,
-    k: &Value,
-    tgt: &Value,
-    out: &Value,
-    rem: &ObjRef,
-    res: &Value,
-) -> Value {
-    let h = mk_el_holder(i, 0);
-    i.set_builtin(&h, "$k", k.clone());
-    i.set_builtin(&h, "$tgt", tgt.clone());
-    i.set_builtin(&h, "$out", out.clone());
-    i.set_builtin(&h, "$rem", Value::Obj(rem.clone()));
-    i.set_builtin(&h, "$res", res.clone());
-    bound_native(i, "", promise_allkeyed_element, Value::Obj(h), 1.0)
+fn promise_keyed_res_el(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    promise_keyed_element(i, this, args, true)
+}
+fn promise_keyed_rej_el(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    promise_keyed_element(i, this, args, false)
 }
 
-/// allKeyed element fn — writes tgt[key] with the settled value, then
-/// resolves the capability with the {fulfilled,rejected} record on zero
-fn promise_allkeyed_element(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+/// keyed-combinator element fn — writes the value (or the settled
+/// {status,value|reason} record) into result[key]; the pre-seeded prop
+/// slot keeps ownKeys order. On zero remaining, resolves the capability.
+fn promise_keyed_element(
+    i: &mut Interp,
+    this: &Value,
+    args: &[Value],
+    fulfilled: bool,
+) -> NResult {
     let Value::Obj(h) = this else {
         return Ok(Value::Und);
     };
@@ -15183,14 +15353,31 @@ fn promise_allkeyed_element(i: &mut Interp, this: &Value, args: &[Value]) -> NRe
     }
     let kv = i.obj_get_raw_str(h, "$k").unwrap_or(Value::Und);
     let k = i.to_propkey(&kv)?;
-    let tgt = i.obj_get_raw_str(h, "$tgt").unwrap_or(Value::Und);
-    let out = i.obj_get_raw_str(h, "$out").unwrap_or(Value::Und);
+    let result = i.obj_get_raw_str(h, "$result").unwrap_or(Value::Und);
     let rem = i.obj_get_raw_str(h, "$rem");
     let res = i.obj_get_raw_str(h, "$res").unwrap_or(Value::Und);
-    i.set_prop(&tgt, k, arg(args, 0))?;
+    let settled = matches!(
+        i.obj_get_raw_str(h, "$st"),
+        Some(Value::Bool(true))
+    );
+    let v = if settled {
+        let rec = i.new_obj();
+        i.set_data(
+            &rec,
+            "status",
+            Value::Str(Rc::from(if fulfilled { "fulfilled" } else { "rejected" })),
+        );
+        i.set_data(&rec, if fulfilled { "value" } else { "reason" }, arg(args, 0));
+        Value::Obj(rec)
+    } else {
+        arg(args, 0)
+    };
+    if let Value::Obj(ro) = &result {
+        ro.borrow_mut().props.insert(k, Prop::data(v));
+    }
     if let Some(Value::Obj(ro)) = rem {
         if dec_remaining(i, &ro) == 0 {
-            i.call(&res, Value::Und, vec![out])?;
+            i.call(&res, Value::Und, vec![result])?;
         }
     }
     Ok(Value::Und)
