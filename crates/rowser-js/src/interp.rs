@@ -2170,12 +2170,13 @@ impl Interp {
         if mapped {
             // spec: index i maps to the parameter name when i < param
             // count, the param is a bare identifier, and the name hasn't
-            // already been claimed by an earlier parameter
+            // already been claimed — parameters are visited LAST to
+            // FIRST, so a duplicate name's LAST occurrence wins the map
             let mut seen: std::collections::HashSet<Rc<str>> = Default::default();
             map = vec![None; args.len()];
-            for (i, p) in def.params.iter().enumerate() {
+            for (i, p) in def.params.iter().enumerate().rev() {
                 if i >= args.len() {
-                    break;
+                    continue;
                 }
                 if let Param::Ident(n) = p {
                     if n == "arguments" {
@@ -5385,7 +5386,12 @@ impl Interp {
         match kind {
             ObjKind::Func(Func::Native { f: nf, name, .. }) => {
                 self.depth += 1;
+                // new.target is undefined inside every [[Call]] — a
+                // stale [[Construct]] marker from an outer native frame
+                // must not leak in (e.g. Array.apply(this, …))
+                let prev_nt = self.new_target_native.take();
                 let r = nf(self, &this, &args);
+                self.new_target_native = prev_nt;
                 self.depth -= 1;
                 let _ = name;
                 r

@@ -6827,13 +6827,17 @@ fn array_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     };
     // [[Construct]] via super(): `this` was allocated with
     // newTarget.prototype — convert it in place so the subclass proto
-    // survives (`class Sub extends Array {}`)
-    if let Value::Obj(o) = this {
-        o.borrow_mut().kind = ObjKind::Arr(items);
-        if let Some(n) = declared {
-            i.set_attr(o, "length", Value::Num(n as f64), true, false);
+    // survives (`class Sub extends Array {}`). Gated on the live
+    // [[Construct]] marker: Array.apply(this, …) is a [[Call]] and must
+    // return a fresh array, not mutate the receiver.
+    if i.new_target_native.is_some() {
+        if let Value::Obj(o) = this {
+            o.borrow_mut().kind = ObjKind::Arr(items);
+            if let Some(n) = declared {
+                i.set_attr(o, "length", Value::Num(n as f64), true, false);
+            }
+            return Ok(this.clone());
         }
-        return Ok(this.clone());
     }
     let o = i.new_arr(items);
     if let Some(n) = declared {
@@ -7295,15 +7299,17 @@ fn arr_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         };
         if spreadable {
             let elen = length_of_array_like(i, e)?;
+            // spec: n + len > 2^53 - 1 → TypeError BEFORE any element
+            // visit (a sparse spreadable of max length never iterates)
+            if n.saturating_add(elen) > 9007199254740991usize {
+                return Err(
+                    i.type_err("Array.prototype.concat: too many elements")
+                );
+            }
             for k in 0..elen {
                 let key = idx_key(k);
                 if i.has_prop(e, &key)? {
                     let v = i.get_prop(e, &key)?;
-                    if n >= 9007199254740991usize {
-                        return Err(
-                            i.type_err("Array.prototype.concat: too many elements")
-                        );
-                    }
                     create_data_prop(i, &a, n, v)?;
                 }
                 // n tracks the SOURCE index k — holes keep their gap
