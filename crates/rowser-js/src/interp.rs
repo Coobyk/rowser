@@ -1105,10 +1105,14 @@ pub struct Scope {
     pub home: RefCell<Option<ObjRef>>,
     /// set on ctor scopes for `super()`
     pub ctor_fn: RefCell<Value>,
-    /// this scope is a function's parameter environment while defaults are
-    /// being evaluated — `eval("var arguments")` / `var eval` inside it is
+    /// this scope is a function's parameter environment (exists when the
+    /// formal list is non-simple) — `eval("var <formal>")` inside it is
     /// a SyntaxError per EvalDeclarationInstantiation
     pub param_env: std::cell::Cell<bool>,
+    /// the parameter environment carries the implicit `arguments`/`eval`
+    /// binding (non-arrow functions only) — `eval("var arguments")` /
+    /// `var eval` inside it is a SyntaxError
+    pub param_env_implicit: std::cell::Cell<bool>,
     /// `with (obj)` object environment record — bindings resolve as
     /// properties of `obj` (filtered through @@unscopables)
     pub obj_env: Option<ObjRef>,
@@ -1131,6 +1135,7 @@ impl Scope {
             home: RefCell::new(None),
             ctor_fn: RefCell::new(Value::Und),
             param_env: std::cell::Cell::new(false),
+            param_env_implicit: std::cell::Cell::new(false),
             obj_env: None,
             this_uninit: std::cell::Cell::new(false),
         })
@@ -1148,6 +1153,7 @@ impl Scope {
             home: RefCell::new(None),
             ctor_fn: RefCell::new(Value::Und),
             param_env: std::cell::Cell::new(false),
+            param_env_implicit: std::cell::Cell::new(false),
             obj_env: Some(obj),
             this_uninit: std::cell::Cell::new(false),
         })
@@ -5589,19 +5595,17 @@ impl Interp {
                     },
                 );
             }
-            // a non-simple parameter environment rejects
-            // `eval("var arguments")`/`eval("var eval")` — non-arrows
-            // always have the implicit binding; arrows only when a
-            // parameter is literally named arguments/eval. Set BEFORE
-            // defaults evaluate: eval() in an initializer must see it.
-            if def.params.iter().any(|p| matches!(p, Param::Default(..)))
-                && (!def.is_arrow
-                    || def
-                        .params
-                        .iter()
-                        .any(|p| matches!(p, Param::Ident(n) if n == "arguments" || n == "eval")))
-            {
+            // a non-simple formal list creates a distinct parameter
+            // environment — `eval("var <formal>")` inside it is a
+            // SyntaxError. Non-arrows additionally carry the implicit
+            // `arguments`/`eval` binding banning `eval("var arguments")`.
+            // Set BEFORE defaults evaluate: eval() in an initializer
+            // must see it.
+            if def.params.iter().any(|p| !matches!(p, Param::Ident(_))) {
                 scope.param_env.set(true);
+                if !def.is_arrow {
+                    scope.param_env_implicit.set(true);
+                }
             }
             if def.is_async && !def.is_gen {
                 // AsyncFunctionStart: parameter-initializer errors reject
@@ -5994,19 +5998,17 @@ impl Interp {
                     },
                 );
             }
-            // a non-simple parameter environment rejects
-            // `eval("var arguments")`/`eval("var eval")` — non-arrows
-            // always have the implicit binding; arrows only when a
-            // parameter is literally named arguments/eval. Set BEFORE
-            // defaults evaluate: eval() in an initializer must see it.
-            if def.params.iter().any(|p| matches!(p, Param::Default(..)))
-                && (!def.is_arrow
-                    || def
-                        .params
-                        .iter()
-                        .any(|p| matches!(p, Param::Ident(n) if n == "arguments" || n == "eval")))
-            {
+            // a non-simple formal list creates a distinct parameter
+            // environment — `eval("var <formal>")` inside it is a
+            // SyntaxError. Non-arrows additionally carry the implicit
+            // `arguments`/`eval` binding banning `eval("var arguments")`.
+            // Set BEFORE defaults evaluate: eval() in an initializer
+            // must see it.
+            if def.params.iter().any(|p| !matches!(p, Param::Ident(_))) {
                 scope.param_env.set(true);
+                if !def.is_arrow {
+                    scope.param_env_implicit.set(true);
+                }
             }
             self.bind_params(&scope, &def.params, &args)?;
             let body_scope: EnvRef = if def.params.iter().any(|p| !matches!(p, Param::Ident(_))) {
@@ -10298,7 +10300,7 @@ impl Interp {
                     // walk PAST the fresh eval envs to the caller's scopes
                     let mut cur = env.parent.as_ref();
                     while let Some(s) = cur {
-                        if s.param_env.get() {
+                        if s.param_env_implicit.get() {
                             return Err(self.syntax_err(
                                 "cannot declare `arguments`/`eval` in eval within a parameter environment",
                             ));

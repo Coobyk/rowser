@@ -1414,25 +1414,19 @@ impl Parser {
         src_start: usize,
     ) -> Result<FnDef, Error> {
         let name = {
-            // the fn name's binding context — declarations of sync
-            // functions/generators inherit the enclosing context;
-            // expressions and async declarations use their own markers
+            // the fn name's binding context — expressions use their own
+            // markers; declarations always inherit the enclosing context
             let check = |p: &mut Self, s: &str| {
-                // the name's [Yield]/[Await] binding context:
-                //   exprs:  Function(~,~) Generator(+,~)
-                //           AsyncFunction(~,+) AsyncGenerator(+,+)
-                //   decls:  Function/Generator inherit (?,?)
-                //           AsyncFunction(~,+) AsyncGenerator(+,+)
-                let (y, a) = if !name_required {
-                    (gen as usize, is_async as usize)
-                } else if is_async {
-                    (gen as usize, 1)
-                } else {
+                // fn-EXPRESSION names bind under the expression's own
+                // markers: FunctionExpression (~,~) Generator (+,~)
+                // AsyncFunction (~,+) AsyncGenerator (+,+); DECLARATION
+                // names always inherit the enclosing context
+                if name_required {
                     return p.check_binding_name(s);
-                };
+                }
                 let saved = (p.yield_decl, p.await_decl, p.in_static_block);
-                p.yield_decl = y;
-                p.await_decl = a;
+                p.yield_decl = gen as usize;
+                p.await_decl = is_async as usize;
                 p.in_static_block = false;
                 let r = p.check_binding_name(s);
                 (p.yield_decl, p.await_decl, p.in_static_block) = saved;

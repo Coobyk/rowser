@@ -3548,9 +3548,10 @@ fn agen_drive(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>, input: GenIn) {
                         &mut i.cur_strict,
                         def.strict || crate::parser::stmts_strict(&def.body),
                     );
-                    let saved_agen = std::mem::replace(&mut i.cur_agen, true);
+                    // `cur_agen` is armed by agen_drive around resume —
+                    // a suspended-then-abandoned coroutine never reaches
+                    // a restore placed here, which would leak the flag
                     let r = i.exec_block(&def.body, &scope);
-                    i.cur_agen = saved_agen;
                     i.cur_strict = saved_strict;
                     i.gen_yielders.pop();
                     match r {
@@ -3571,9 +3572,14 @@ fn agen_drive(i: &mut Interp, cell: &Rc<RefCell<AGenCell>>, input: GenIn) {
     let (ocap, ohit) = (i.gen_cap, i.gen_cap_hit);
     i.gen_cap = i.steps.saturating_add(crate::interp::GEN_STEP_BUDGET);
     i.gen_cap_hit = false;
+    // `cur_agen` marks the async-generator execution context only while
+    // its coroutine is on the CPU — restoring after resume keeps it
+    // correct even if a suspended coroutine is later abandoned
+    let saved_agen = std::mem::replace(&mut i.cur_agen, true);
     i.depth += 1;
     let res = coro.resume(input);
     i.depth -= 1;
+    i.cur_agen = saved_agen;
     i.gen_cap = ocap;
     i.gen_cap_hit = ohit;
     match res {

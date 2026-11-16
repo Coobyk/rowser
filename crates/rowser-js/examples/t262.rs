@@ -127,7 +127,7 @@ const SKIP_FEATURES: &[&str] = &[
     // regexp-duplicate-named-groups — implemented (Node::Backrefs +
     // dedup'd groups objects)
     "tail-call-optimization",
-    "async-iteration",
+    // async-iteration — implemented (AGen machinery + afx wrap)
     "regexp-v-flag",
     "regexp-modifiers",
     "source-phase-imports",
