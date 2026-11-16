@@ -2272,7 +2272,7 @@ impl Interp {
         def: &FnDef,
         callee: &Value,
     ) -> ObjRef {
-        let strict = def.strict || crate::parser::stmts_strict(&def.body);
+        let strict = def.strict;
         // spec: a non-simple parameter list (defaults, destructuring,
         // rest) yields an UNMAPPED arguments object even when sloppy
         let simple_params = def.params.iter().all(|p| matches!(p, Param::Ident(_)));
@@ -3290,7 +3290,7 @@ impl Interp {
                         && home.is_none()
                         && !*dynamic
                         && !def.strict
-                        && !crate::parser::stmts_strict(&def.body)
+                        && !def.strict
                         && !b.props.contains_str("caller")
                 }
                 _ => false,
@@ -3308,7 +3308,7 @@ impl Interp {
                 let restricted = match &caller {
                     Value::Obj(co) => match &co.borrow().kind {
                         ObjKind::Func(Func::User { def, dynamic, .. }) => {
-                            *dynamic || def.strict || crate::parser::stmts_strict(&def.body)
+                            *dynamic || def.strict
                         }
                         // natives/bound fns are never pushed — but both
                         // are restricted callers if one ever lands here
@@ -3360,6 +3360,11 @@ impl Interp {
                 };
                 let mut cur = proto;
                 while let Some(c) = cur {
+                    // a proxy on the chain runs its own [[Set]] (the trap
+                    // is the [[GetOwnProperty]]+[[Set]] the spec walks into)
+                    if matches!(c.borrow().kind, ObjKind::Proxy { .. }) {
+                        return self.obj_set(&c, key, v, base);
+                    }
                     if let Some(p) = c.borrow().props.get(&key) {
                         if let Some(s) = &p.set {
                             let s = s.clone();
@@ -5530,7 +5535,7 @@ impl Interp {
                 // in strict code; sloppy code substitutes global for
                 // undefined/null and boxes primitives (incl. the Obj
                 // stand-in form BigInt primitives take)
-                let this = if def.is_arrow || def.strict || parser::stmts_strict(&def.body) {
+                let this = if def.is_arrow || def.strict {
                     this
                 } else {
                     match this {
@@ -5540,7 +5545,7 @@ impl Interp {
                 };
                 // effective strictness = inherited (def.strict) or the
                 // body's own "use strict" directive prologue
-                let eff_strict = def.strict || parser::stmts_strict(&def.body);
+                let eff_strict = def.strict;
                 let saved_strict = std::mem::replace(&mut self.cur_strict, eff_strict);
                 // record the live frame — sloppy `.caller` resolves
                 // against call_stack
@@ -5690,7 +5695,7 @@ impl Interp {
                         awaiting: false,
                         awaiting_return: false,
                         done: false,
-                        strict: def.strict || crate::parser::stmts_strict(&def.body),
+                        strict: def.strict,
                     }))),
                 )))));
             }
@@ -5713,7 +5718,7 @@ impl Interp {
                         pending: Some((def.clone(), body_scope)),
                         running: false,
                         done: false,
-                        strict: def.strict || crate::parser::stmts_strict(&def.body),
+                        strict: def.strict,
                     }))),
                 )))));
             }
@@ -5727,7 +5732,7 @@ impl Interp {
                     pending: Some((def.clone(), body_scope)),
                     running: false,
                     done: false,
-                    strict: def.strict || crate::parser::stmts_strict(&def.body),
+                    strict: def.strict,
                 }));
                 crate::builtins::async_resume(
                     self,
@@ -5937,7 +5942,7 @@ impl Interp {
                 {
                     return Err(self.type_err("value is not a constructor"));
                 }
-                let eff_strict = def.strict || parser::stmts_strict(&def.body);
+                let eff_strict = def.strict;
                 let saved_strict = std::mem::replace(&mut self.cur_strict, eff_strict);
                 // `cur_agen` is an execution-context flag — a
                 // constructor's body gets its own context
@@ -6940,6 +6945,46 @@ impl Interp {
         if !self.cur_strict {
             for n in &h.block_fns {
                 names.push((n.clone(), true));
+            }
+        }
+        // GlobalDeclarationInstantiation early errors (atomic — before
+        // any binding is created):
+        //   lexNames ∩ (var-declared | lexically-declared global) → SyntaxError
+        //   varNames ∩ lexically-declared global → SyntaxError
+        // The lex side only applies when `scope` is the global declarative
+        // env itself — eval `let`s land in the eval's own lex env where
+        // shadowing a global lexical is legal
+        {
+            let vars = self.global.vars.borrow();
+            for name in if Rc::ptr_eq(scope, &self.global) {
+                h.lets.as_slice()
+            } else {
+                &[]
+            } {
+                // HasLexicalDeclaration OR HasRestrictedGlobalProperty —
+                // a configurable global prop (non-strict eval `var`) does
+                // NOT block a lex decl; a non-configurable one (script
+                // `var`, `undefined`, builtins) does
+                let lex_hit = vars.get(name.as_ref()).is_some_and(|b| b.lexical);
+                let restricted = g
+                    .borrow()
+                    .props
+                    .get(&PropKey::S(name.clone()))
+                    .is_some_and(|p| !p.configurable);
+                if lex_hit || restricted {
+                    drop(vars);
+                    return Err(self.syntax_err(format!(
+                        "Identifier `{name}` has already been declared"
+                    )));
+                }
+            }
+            for (name, _) in &names {
+                if vars.get(name.as_ref()).is_some_and(|b| b.lexical) {
+                    drop(vars);
+                    return Err(self.syntax_err(format!(
+                        "Identifier `{name}` has already been declared"
+                    )));
+                }
             }
         }
         for (name, is_fn) in names {
@@ -10397,7 +10442,7 @@ impl Interp {
             }
         }
         let r = (|| {
-            let stmts = match parser::parse_eval(
+            let (stmts, strict_eval) = match parser::parse_eval(
                 src,
                 caller_strict,
                 in_fn,
@@ -10415,7 +10460,6 @@ impl Interp {
                     "`arguments` is not allowed in eval inside a class field initializer",
                 ));
             }
-            let strict_eval = caller_strict || parser::stmts_strict(&stmts);
             // eval code runs in a fresh declarative env over the caller's;
             // strict eval also gets a fresh variable env (var bindings must
             // not leak into the caller's var env)
@@ -10533,10 +10577,43 @@ impl Interp {
         }
     }
 
+    /// Run `src` as a top-level SCRIPT in the persistent global env —
+    /// GlobalDeclarationInstantiation semantics for $262.evalScript:
+    /// let/const/class → the shared global declarative env (no
+    /// global-object props); var/fn → non-configurable global props.
+    pub fn eval_script(&mut self, src: &str) -> ERes {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(self.range_err("Maximum call stack size exceeded"));
+        }
+        let r = (|| {
+            let (stmts, strict) = parser::parse(src).map_err(|e| self.syntax_err(e.msg))?;
+            self.cur_strict = strict;
+            let g = self.global.clone();
+            self.hoist_body(&stmts, &g)?;
+            let mut last = Value::Und;
+            for s in &stmts {
+                match self.exec_stmt(s, &g) {
+                    Ok(Completion::Normal(v)) | Ok(Completion::Return(v)) => last = v,
+                    Ok(Completion::Break(_, v)) | Ok(Completion::Continue(_, v)) => {
+                        last = v.unwrap_or(Value::Und);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(v) => return Err(v),
+                }
+            }
+            Ok(last)
+        })();
+        self.depth -= 1;
+        r
+    }
+
     // -- top-level ---------------------------------------------------------------
     pub fn run(&mut self, src: &str) -> Result<Value, Error> {
-        let stmts = parser::parse(src)?;
-        self.cur_strict = parser::stmts_strict(&stmts);
+        let (stmts, program_strict) = parser::parse(src)?;
+        self.cur_strict = program_strict;
         // slice-hoist keys are raw AST pointers: entries from prior runs
         // could collide with freshly parsed addresses, so reset per run
         // (the new AST is fully allocated before this point)

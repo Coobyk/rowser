@@ -20,7 +20,7 @@ fn main() {
         "s=29,n=Error(i(130,",
         "console.log('BAD130'),s=29,n=Error(i(130,",
     );
-    let stmts = rowser_js::parser::parse(&src).unwrap();
+    let (stmts, _) = rowser_js::parser::parse(&src).unwrap();
     let g = dc.ctx.interp.global.clone();
     let _ = dc.ctx.interp.hoist_body(&stmts, &g);
     let mut threw = false;

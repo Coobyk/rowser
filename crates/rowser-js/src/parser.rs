@@ -7,13 +7,15 @@ use std::rc::Rc;
 
 const MAX_PARSE_DEPTH: usize = 300;
 
-pub fn parse(src: &str) -> Result<Vec<Stmt>, Error> {
+pub fn parse(src: &str) -> Result<(Vec<Stmt>, bool), Error> {
     let toks = lex(src)?;
     let mut p = Parser::new(toks, Rc::from(src));
     let stmts = p.program()?;
     p.check_privates()?;
     validate(&stmts)?;
-    Ok(stmts)
+    // `p.strict` = an UNESCAPED "use strict" program directive — a
+    // cooked-string check would wrongly count `'use str\␊ict'`
+    Ok((stmts, p.strict))
 }
 
 /// Parse eval source: `strict` = strictCaller (a "use strict" directive in
@@ -27,7 +29,7 @@ pub fn parse_eval(
     in_fn: bool,
     in_method: bool,
     privs: Vec<String>,
-) -> Result<Vec<Stmt>, Error> {
+) -> Result<(Vec<Stmt>, bool), Error> {
     let toks = lex(src)?;
     let mut p = Parser::new(toks, Rc::from(src));
     p.strict = strict;
@@ -53,7 +55,7 @@ pub fn parse_eval(
     }
     p.check_privates()?;
     validate_strict_ctx(&stmts, strict, in_fn, in_method)?;
-    Ok(stmts)
+    Ok((stmts, p.strict))
 }
 
 /// Does a statement list begin with a "use strict" directive prologue?
@@ -417,7 +419,12 @@ impl Parser {
     /// Function body `{ stmts }`: handles the directive prologue and
     /// saves/restores the context flags that reset at function boundaries.
     /// `arrow`: arrows inherit super/new.target context (but never `yield`).
-    fn fn_body(&mut self, arrow: bool, params: &[Param]) -> Result<Vec<Stmt>, Error> {
+    /// Parses `{ stmts }` and returns `(stmts, strict)` — `strict` is the
+    /// body's EFFECTIVE strictness (enclosing strict or an unescaped
+    /// `"use strict"` directive), captured before the context restore so
+    /// `FnDef.strict` can carry it; an escaped directive like
+    /// `'use str\␊ict'` does NOT count (it's not a directive at all)
+    fn fn_body(&mut self, arrow: bool, params: &[Param]) -> Result<(Vec<Stmt>, bool), Error> {
         let saved = (
             self.strict,
             self.fn_depth,
@@ -475,6 +482,7 @@ impl Parser {
             stmts.push(s);
         }
         self.expect_punct("}")?;
+        let eff_strict = self.strict;
         (
             self.strict,
             self.fn_depth,
@@ -487,7 +495,7 @@ impl Parser {
         if !arrow {
             self.nonarrow_fn_depth -= 1;
         }
-        Ok(stmts)
+        Ok((stmts, eff_strict))
     }
 
     fn statement(&mut self) -> Result<Stmt, Error> {
@@ -1516,8 +1524,8 @@ impl Parser {
                 }
             }
             self.check_params(&params, false)?;
-            let body = self.fn_body(false, &params)?;
-            Ok((params, body))
+            let (body, body_strict) = self.fn_body(false, &params)?;
+            Ok((params, body, body_strict))
         })();
         (
             self.gen_depth,
@@ -1527,7 +1535,7 @@ impl Parser {
             self.method_depth,
             self.await_decl,
         ) = old_ctx;
-        let (params, body) = res?;
+        let (params, body, body_strict) = res?;
         Ok(FnDef {
             name,
             params,
@@ -1536,7 +1544,7 @@ impl Parser {
             arrow_expr: None,
             is_async,
             is_gen: gen,
-            strict: self.strict,
+            strict: body_strict,
             src: self.src_since(src_start),
         })
     }
@@ -1549,7 +1557,7 @@ impl Parser {
         gen: bool,
         is_async: bool,
         params: &[Param],
-    ) -> Result<Vec<Stmt>, Error> {
+    ) -> Result<(Vec<Stmt>, bool), Error> {
         let saved = (
             self.ctor_depth,
             self.method_depth,
@@ -2148,7 +2156,8 @@ impl Parser {
             }
             self.expect_punct("{")?;
             // `super()` is only legal inside a DERIVED constructor
-            let body = self.method_body(is_ctor && derived, member_gen, is_async, &params)?;
+            let (body, body_strict) =
+                self.method_body(is_ctor && derived, member_gen, is_async, &params)?;
             // the ctor's function name comes from the class name, not
             // the member key — leave None so `let D = class {...}` gets
             // NamedEvaluation
@@ -2175,7 +2184,7 @@ impl Parser {
                     arrow_expr: None,
                     is_async,
                     is_gen: member_gen,
-                    strict: self.strict,
+                    strict: body_strict,
                     src: self.src_since(mstart),
                 }),
                 is_static,
@@ -2396,7 +2405,7 @@ impl Parser {
                 }
             }
             self.check_params(&params, true)?;
-            let body = self.fn_body(true, &params)?;
+            let (body, body_strict) = self.fn_body(true, &params)?;
             Ok(Expr::Fn(Rc::new(FnDef {
                 name,
                 params,
@@ -2405,7 +2414,7 @@ impl Parser {
                 arrow_expr: None,
                 is_async,
                 is_gen: false,
-                strict: self.strict,
+                strict: body_strict,
                 src: self.src_since(src_start),
             })))
         } else {
@@ -3160,7 +3169,8 @@ impl Parser {
                             return Err(self.err("setter must have exactly one parameter"));
                         }
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, false, false, &params)?;
+                        let (body, body_strict) =
+                            self.method_body(false, false, false, &params)?;
                         let fname = match &key {
                             PropKey::Ident(s) | PropKey::Str(s) => Some(s.clone()),
                             _ => None,
@@ -3173,7 +3183,7 @@ impl Parser {
                             arrow_expr: None,
                             is_async: false,
                             is_gen: false,
-                            strict: self.strict,
+                            strict: body_strict,
                             src: self.src_since(mstart),
                         });
                         props.push(ObjProp {
@@ -3213,7 +3223,8 @@ impl Parser {
                         cpr?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, member_gen, true, &params)?;
+                        let (body, body_strict) =
+                            self.method_body(false, member_gen, true, &params)?;
                         props.push(ObjProp {
                             key: key.clone(),
                             val: PropVal::Method(Rc::new(FnDef {
@@ -3224,7 +3235,7 @@ impl Parser {
                                 arrow_expr: None,
                                 is_async: true,
                                 is_gen: member_gen,
-                                strict: self.strict,
+                                strict: body_strict,
                                 src: self.src_since(mstart),
                             })),
                         });
@@ -3250,7 +3261,8 @@ impl Parser {
                         cpr?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, true, false, &params)?;
+                        let (body, body_strict) =
+                            self.method_body(false, true, false, &params)?;
                         props.push(ObjProp {
                             key: key.clone(),
                             val: PropVal::Method(Rc::new(FnDef {
@@ -3261,7 +3273,7 @@ impl Parser {
                                 arrow_expr: None,
                                 is_async: false,
                                 is_gen: true,
-                                strict: self.strict,
+                                strict: body_strict,
                                 src: self.src_since(mstart),
                             })),
                         });
@@ -3304,7 +3316,8 @@ impl Parser {
                         cpr?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
-                        let body = self.method_body(false, false, false, &params)?;
+                        let (body, body_strict) =
+                            self.method_body(false, false, false, &params)?;
                         PropVal::Method(Rc::new(FnDef {
                             name: prop_key_name(&key),
                             params,
@@ -3313,7 +3326,7 @@ impl Parser {
                             arrow_expr: None,
                             is_async: false,
                             is_gen: false,
-                            strict: self.strict,
+                            strict: body_strict,
                             src: self.src_since(mstart),
                         }))
                     } else {

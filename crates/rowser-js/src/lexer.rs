@@ -1353,8 +1353,20 @@ fn slash_is_regex(prev: Option<&Token>) -> bool {
 }
 
 fn is_ident_start(c: char) -> bool {
-    c == '_' || c == '$' || unicode_ident::is_xid_start(c)
+    // ECMAScript ID_Start = XID_Start + Other_ID_Start (grandfathered)
+    c == '_'
+        || c == '$'
+        || unicode_ident::is_xid_start(c)
+        || matches!(c, '\u{1885}' | '\u{1886}' | '\u{2118}' | '\u{212e}' | '\u{309b}' | '\u{309c}')
 }
 fn is_ident_part(c: char) -> bool {
-    is_ident_start(c) || unicode_ident::is_xid_continue(c) || c == '\u{200c}' || c == '\u{200d}'
+    // ID_Continue = XID_Continue + Other_ID_Continue + ZWNJ + ZWJ
+    is_ident_start(c)
+        || unicode_ident::is_xid_continue(c)
+        || matches!(
+            c,
+            '\u{00b7}' | '\u{0387}' | '\u{19da}' | '\u{1369}'..='\u{1371}' | '\u{30fb}' | '\u{ff65}'
+        )
+        || c == '\u{200c}'
+        || c == '\u{200d}'
 }

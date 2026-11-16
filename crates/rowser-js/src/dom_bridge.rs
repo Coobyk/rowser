@@ -3524,7 +3524,20 @@ fn acc(i: &Interp, o: &ObjRef, name: &str, get: Option<NativeFn>, set: Option<Na
 
 fn gdef(i: &mut Interp, name: &str, v: Value) {
     let g = i.global.clone();
-    i.declare(&g, name, v.clone(), true);
+    // non-lexical object-record binding (see binary.rs gdef) — builtin
+    // globals must not read as declarative-env lexicals to
+    // GlobalDeclarationInstantiation checks
+    let k = i.intern(name);
+    g.vars.borrow_mut().insert(
+        k,
+        Binding {
+            val: v.clone(),
+            mutable: true,
+            uninit: false,
+            deletable: true,
+            lexical: false,
+        },
+    );
     i.declare_global_prop(name, v);
 }
 

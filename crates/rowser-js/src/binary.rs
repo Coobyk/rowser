@@ -74,7 +74,21 @@ fn mk_ctor_len(i: &mut Interp, name: &str, f: NativeFn, proto: &ObjRef, len: f64
 
 fn gdef(i: &mut Interp, name: &str, v: Value) {
     let g = i.global.clone();
-    i.declare(&g, name, v.clone(), true);
+    // the env binding mirrors a NON-lexical (object-record) global —
+    // `var <builtin>`/`let <builtin>` decl-instantiation checks key off
+    // `lexical`, and builtin globals must behave like global-object
+    // properties, not declarative-env lexicals
+    let k = i.intern(name);
+    g.vars.borrow_mut().insert(
+        k,
+        Binding {
+            val: v.clone(),
+            mutable: true,
+            uninit: false,
+            deletable: true,
+            lexical: false,
+        },
+    );
     // also an own property on the global object — builtin globals are
     // {W:true, E:false, C:true} per spec 18.3
     i.p.global.borrow_mut().props.insert(
@@ -126,9 +140,17 @@ pub fn install(i: &mut Interp) {
 // ===========================================================================
 
 fn install_host_hooks(i: &mut Interp) {
-    let o = plain(Some(i.p.obj.clone()));
+    // merge into the $262 object install_globals already created —
+    // replacing it would drop evalScript/IsHTMLDDA
+    let o = match i.obj_get_raw_str(&i.p.global, "$262") {
+        Some(Value::Obj(o)) => o,
+        _ => {
+            let o = plain(Some(i.p.obj.clone()));
+            gdef(i, "$262", Value::Obj(o.clone()));
+            o
+        }
+    };
     met_a(i, &o, "detachArrayBuffer", h_detach_buffer, 1.0);
-    gdef(i, "$262", Value::Obj(o));
 }
 
 /// `$262.detachArrayBuffer(buf)` — DetachArrayBuffer: byte length → 0,

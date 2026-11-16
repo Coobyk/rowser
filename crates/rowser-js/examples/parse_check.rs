@@ -8,7 +8,7 @@ fn main() {
     let src = std::fs::read_to_string(&path).expect("read failed");
     let t = std::time::Instant::now();
     match rowser_js::parser::parse(&src) {
-        Ok(stmts) => {
+        Ok((stmts, _)) => {
             println!(
                 "PARSE OK: {} bytes, {} stmts, {:?}",
                 src.len(),

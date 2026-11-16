@@ -4428,11 +4428,15 @@ fn install_globals(i: &mut Interp) {
                     Value::Str(s) => s,
                     _ => return Err(i.type_err("evalScript needs a string")),
                 };
-                let g = i.global.clone();
-                // Script goal: no caller strictness inheritance
-                let saved = std::mem::replace(&mut i.cur_strict, false);
-                let r = i.eval_source(&src, g);
-                i.cur_strict = saved;
+                // Script goal — GlobalDeclarationInstantiation: let/const/
+                // class land in the shared declarative env (no global
+                // props); var/fn create NON-configurable global props.
+                // No caller-strictness inheritance, no eval-deletable vars
+                let saved_s = std::mem::replace(&mut i.cur_strict, false);
+                let saved_d = std::mem::replace(&mut i.eval_decl, false);
+                let r = i.eval_script(&src);
+                i.eval_decl = saved_d;
+                i.cur_strict = saved_s;
                 r
             });
             f
