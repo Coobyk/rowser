@@ -433,6 +433,21 @@ pub struct Obj {
     /// creation time — revocation does NOT remove them):
     /// bit0 = callable, bit1 = constructor
     pub pflags: u8,
+    /// WeakRef [[WeakRefTarget]] slot — `Some` IS the brand check.
+    /// Object targets ride a real `std::rc::Weak` so `deref()` mirrors
+    /// Rc reachability exactly: alive while any Rc to the target is
+    /// held, `undefined` after the last one drops.
+    pub weak_ref: Option<WeakTarget>,
+}
+
+/// a WeakRef's target — objects are held weakly (Rc has no GC, but a
+/// dropped last Rc IS collection); symbols are value types with no
+/// heap object to weaken, so the value is kept directly (deref can
+/// still return it — the engine simply never reclaims a symbol)
+#[derive(Clone)]
+pub enum WeakTarget {
+    Obj(std::rc::Weak<RefCell<Obj>>),
+    Prim(Value),
 }
 
 #[derive(Clone)]
@@ -970,9 +985,9 @@ pub(crate) fn is_internal_key(i: &Interp, b: &Obj, s: &str) -> bool {
         }
         // the lazy-installed iterator proto hangs off Object.prototype
         "__taIterProto" => true,
-        // wrapper/promise/date internal slots — engine installs them
-        // non-enumerable; a non-enum `$`-slot is the signature
-        "$value" | "$handlers" | "$ms" | "__wm" | "__ws" => {
+        // wrapper/promise/date/rawJSON internal slots — engine installs
+        // them non-enumerable; a non-enum `$`-slot is the signature
+        "$value" | "$handlers" | "$ms" | "$rawjson" | "__wm" | "__ws" => {
             b.props.get_str(s).is_some_and(|p| !p.enumerable)
         }
         _ => false,
@@ -1011,6 +1026,7 @@ impl Obj {
             immutable: false,
             rab_max: None,
             pflags: 0,
+            weak_ref: None,
         }
     }
     pub fn is_callable(&self) -> bool {
@@ -1176,6 +1192,9 @@ pub struct Protos {
     pub map_iter: ObjRef,
     /// %SetIteratorPrototype%
     pub set_iter: ObjRef,
+    /// %Set.prototype% — the set-methods results inherit from it
+    /// (OrdinaryObjectCreate, not the receiver's class / @@species)
+    pub set: ObjRef,
     /// %StringIteratorPrototype%
     pub string_iter: ObjRef,
     /// %GeneratorPrototype% — proto of objects `function*` calls return
@@ -1183,6 +1202,9 @@ pub struct Protos {
     /// %GeneratorFunction.prototype% — proto of generator *functions*;
     /// its `.prototype` slot is %GeneratorPrototype%
     pub gen_func: ObjRef,
+    /// %AsyncFunction.prototype% — proto of async *functions*;
+    /// non-callable, no `.prototype` slot of its own
+    pub async_func: ObjRef,
     /// %IteratorHelperPrototype% — proto of lazy map/filter/take/… results
     pub iter_helper: ObjRef,
     /// %WrapForValidIteratorPrototype% — proto of `Iterator.from` wraps
@@ -1418,9 +1440,11 @@ impl Interp {
                 array_iter: mk(Some(iterator.clone())),
                 map_iter: mk(Some(iterator.clone())),
                 set_iter: mk(Some(iterator.clone())),
+                set: mk(Some(obj.clone())),
                 string_iter: mk(Some(iterator.clone())),
                 generator: mk(Some(iterator.clone())),
                 gen_func: mk(Some(func.clone())),
+                async_func: mk(Some(func.clone())),
                 iter_helper: mk(Some(iterator.clone())),
                 wrap_iter: mk(Some(iterator.clone())),
                 iterator,
@@ -5520,7 +5544,18 @@ impl Interp {
             {
                 scope.param_env.set(true);
             }
-            self.bind_params(&scope, &def.params, &args)?;
+            if def.is_async {
+                // AsyncFunctionStart: parameter-initializer errors reject
+                // the returned promise — they never propagate to the
+                // caller synchronously
+                if let Err(e) = self.bind_params(&scope, &def.params, &args) {
+                    let p = crate::builtins::new_promise_pub(self);
+                    let _ = crate::builtins::settle_pub(self, &p, false, e);
+                    return Ok(Value::Obj(p));
+                }
+            } else {
+                self.bind_params(&scope, &def.params, &args)?;
+            }
             // non-simple formals get a separate var environment —
             // body `var` decls must not leak into the param scope
             let body_scope: EnvRef = if def.params.iter().any(|p| !matches!(p, Param::Ident(_))) {
@@ -5563,45 +5598,42 @@ impl Interp {
                     }))),
                 )))));
             }
+            if def.is_async {
+                // real AsyncFunctionStart: the body runs on a coroutine;
+                // `await` suspends it and the promise-resolution jobs
+                // resume it — the pending promise returns immediately.
+                let p = crate::builtins::new_promise_pub(self);
+                let cell = Rc::new(RefCell::new(GenCell {
+                    coro: None,
+                    pending: Some((def.clone(), body_scope)),
+                    running: false,
+                    done: false,
+                }));
+                crate::builtins::async_resume(
+                    self,
+                    &cell,
+                    GenIn::Next(Value::Und),
+                    &p,
+                );
+                return Ok(Value::Obj(p));
+            }
             if let Some(e) = &def.arrow_expr {
                 // `(x) => expr` — implicit return
                 let e = e.clone();
                 self.depth += 1;
                 let r = self.eval_expr(&e, &body_scope);
                 self.depth -= 1;
-                return if def.is_async {
-                    Ok(self.async_wrap(r))
-                } else {
-                    r
-                };
+                return r;
             }
             self.depth += 1;
             let r = self.exec_block(&def.body, &body_scope);
             self.depth -= 1;
-            let r = match r {
+            match r {
                 Ok(Completion::Return(v)) => Ok(v),
                 Ok(_) => Ok(Value::Und),
                 Err(e) => Err(e),
-            };
-            if def.is_async {
-                return Ok(self.async_wrap(r));
             }
-            r
         }
-    }
-
-    /// AsyncFunction [[Call]] result: a Promise fulfilled with the return
-    /// value / rejected with the thrown error. Promises settle
-    /// synchronously in this engine.
-    fn async_wrap(&mut self, r: ERes) -> Value {
-        let state = match r {
-            Ok(v) => PromiseState::Fulfilled(Box::new(v)),
-            Err(e) => PromiseState::Rejected(Box::new(e)),
-        };
-        Value::Obj(Rc::new(RefCell::new(Obj::new(
-            Some(self.p.promise.clone()),
-            ObjKind::Promise(state),
-        ))))
     }
 
     fn call_dispatch_end(&mut self, o: &ObjRef, this: Value, args: Vec<Value>) -> ERes {
@@ -6894,6 +6926,10 @@ impl Interp {
             // generator METHOD: %GeneratorFunction.prototype% proto but
             // no `.prototype` property (methods aren't constructable)
             o.borrow_mut().proto = Some(self.p.gen_func.clone());
+        } else if def.is_async {
+            // async fns/methods/arrows: proto is %AsyncFunction.prototype%;
+            // never a `.prototype` prop (they aren't constructable)
+            o.borrow_mut().proto = Some(self.p.async_func.clone());
         } else if !def.is_arrow && !def.is_async && home.is_none() {
             // ordinary fn (or class ctor — make_class overwrites the
             // descriptor with {!writable,!configurable} afterwards).
@@ -9240,7 +9276,25 @@ impl Interp {
                 self.eval_expr(expr, env)?;
                 Ok(Value::Und)
             }
-            UnaryOp::Await => self.eval_expr(expr, env),
+            UnaryOp::Await => {
+                // spec Await: evaluate operand, hand it to the async
+                // driver (PromiseResolve + PerformPromiseThen there),
+                // suspend the coroutine until the resume input arrives.
+                let v = self.eval_expr(expr, env)?;
+                let Some(&y) = self.gen_yielders.last() else {
+                    return Err(self.syntax_err("await is only valid in async functions"));
+                };
+                // same yielder dance as yield — pop while parked so a
+                // nested resumer's yielder is current
+                self.gen_yielders.pop();
+                let input = unsafe { (*y).suspend(v) };
+                self.gen_yielders.push(y);
+                match input {
+                    GenIn::Next(sent) => Ok(sent),
+                    GenIn::Throw(e) => Err(e),
+                    GenIn::Return(_) => Err(gen_abort_v()),
+                }
+            }
             UnaryOp::Delete => match Self::unparen(expr) {
                 Expr::Member { obj, prop, .. } => {
                     // IsSuperReference → ReferenceError, thrown BEFORE

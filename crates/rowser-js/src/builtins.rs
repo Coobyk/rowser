@@ -642,6 +642,8 @@ const NATIVE_ARITY: &[(&str, f64)] = &[
     // JSON
     ("parse", 2.0),
     ("stringify", 3.0),
+    ("rawJSON", 1.0),
+    ("isRawJSON", 1.0),
     // Reflect
     ("construct", 2.0),
     ("deleteProperty", 2.0),
@@ -668,6 +670,13 @@ const NATIVE_ARITY: &[(&str, f64)] = &[
     ("set", 2.0),
     ("getOrInsert", 2.0),
     ("getOrInsertComputed", 2.0),
+    ("union", 1.0),
+    ("intersection", 1.0),
+    ("difference", 1.0),
+    ("symmetricDifference", 1.0),
+    ("isSubsetOf", 1.0),
+    ("isSupersetOf", 1.0),
+    ("isDisjointFrom", 1.0),
     ("toString", 1.0),
     // RegExp / Symbol / Proxy / globals / misc
     ("revocable", 2.0),
@@ -1320,7 +1329,7 @@ fn install_protos(i: &mut Interp) {
         let p = i.p.error.clone();
         i.set_builtin(&p, "name", Value::Str(Rc::from("Error")));
         i.set_builtin(&p, "message", Value::Str(Rc::from("")));
-        method(i, &p, "toString", err_to_string);
+        method_len(i, &p, "toString", err_to_string, 0.0);
         for (proto, name) in [
             (i.p.type_error.clone(), "TypeError"),
             (i.p.range_error.clone(), "RangeError"),
@@ -1383,7 +1392,8 @@ fn install_protos(i: &mut Interp) {
         // `.prototype` slot is %GeneratorPrototype%
         {
             let gf = i.p.gen_func.clone();
-            i.set_builtin(&gf, "prototype", Value::Obj(i.p.generator.clone()));
+            // spec: {writable:false, enumerable:false, configurable:true}
+            i.set_attr(&gf, "prototype", Value::Obj(i.p.generator.clone()), false, true);
             str_tag(&gf, "GeneratorFunction");
         }
         // %GeneratorPrototype% — eager generators step a snapshot, so
@@ -1599,16 +1609,16 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
                     }
                     let i = unsafe { &mut *ip };
                     i.gen_yielders.push(y as *const _);
-                    i.depth += 1;
-                    // the generator body's own strictness governs every
-                    // resume (suspended code keeps its mode)
+                    // NOTE: no depth bump here — a suspended coroutine is
+                    // off the JS execution stack; the driver bumps depth
+                    // around resume() so drain_jobs still sees depth==0
+                    // at the microtask checkpoint while we're parked
                     let saved_strict = std::mem::replace(
                         &mut i.cur_strict,
                         def.strict || crate::parser::stmts_strict(&def.body),
                     );
                     let r = i.exec_block(&def.body, &scope);
                     i.cur_strict = saved_strict;
-                    i.depth -= 1;
                     i.gen_yielders.pop();
                     match r {
                         Ok(Completion::Return(v)) => Ok(v),
@@ -1626,7 +1636,9 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
     let (ocap, ohit) = (i.gen_cap, i.gen_cap_hit);
     i.gen_cap = i.steps.saturating_add(crate::interp::GEN_STEP_BUDGET);
     i.gen_cap_hit = false;
+    i.depth += 1;
     let res = coro.resume(input);
+    i.depth -= 1;
     i.gen_cap = ocap;
     i.gen_cap_hit = ohit;
     let mut c = cell.borrow_mut();
@@ -1653,6 +1665,211 @@ fn gen_resume(i: &mut Interp, cell: &Rc<RefCell<GenCell>>, input: GenIn) -> NRes
             }
         }
     }
+}
+
+/// AsyncFunctionStart driver — same coroutine machinery as
+/// `gen_resume`, but each `await` operand yielded by the body is run
+/// through spec `Await`: PromiseResolve(%Promise%, v) →
+/// PerformPromiseThen(resume-on-fulfilled, resume-on-rejected). The
+/// coroutine finishing resolves `promise`; an abrupt body rejects it.
+/// Called once at [[Call]] and then once per settle reaction.
+pub fn async_resume(
+    i: &mut Interp,
+    cell: &Rc<RefCell<GenCell>>,
+    input: GenIn,
+    promise: &ObjRef,
+) {
+    let mut coro = {
+        let mut c = cell.borrow_mut();
+        if c.running || c.done {
+            return;
+        }
+        c.running = true;
+        c.coro.take()
+    };
+    let mut coro = match coro {
+        Some(c) => c,
+        None => {
+            let Some((def, scope)) = cell.borrow_mut().pending.take() else {
+                cell.borrow_mut().done = true;
+                let _ = settle(i, promise, true, Value::Und);
+                return;
+            };
+            let ip = i as *mut Interp;
+            let stack = corosensei::stack::DefaultStack::new(8 * 1024 * 1024)
+                .expect("async stack");
+            corosensei::Coroutine::with_stack(
+                stack,
+                move |y: &corosensei::Yielder<GenIn, Value>, _first: GenIn| -> GenRet {
+                    let i = unsafe { &mut *ip };
+                    i.gen_yielders.push(y as *const _);
+                    // no depth bump here either — see gen_resume
+                    let saved_strict = std::mem::replace(
+                        &mut i.cur_strict,
+                        def.strict || crate::parser::stmts_strict(&def.body),
+                    );
+                    let r = if let Some(e) = &def.arrow_expr {
+                        i.eval_expr(e, &scope)
+                    } else {
+                        match i.exec_block(&def.body, &scope) {
+                            Ok(Completion::Return(v)) => Ok(v),
+                            Ok(_) => Ok(Value::Und),
+                            Err(e) => Err(e),
+                        }
+                    };
+                    i.cur_strict = saved_strict;
+                    i.gen_yielders.pop();
+                    r
+                },
+            )
+        }
+    };
+    let (ocap, ohit) = (i.gen_cap, i.gen_cap_hit);
+    i.gen_cap = i.steps.saturating_add(crate::interp::GEN_STEP_BUDGET);
+    i.gen_cap_hit = false;
+    i.depth += 1;
+    let res = coro.resume(input);
+    i.depth -= 1;
+    i.gen_cap = ocap;
+    i.gen_cap_hit = ohit;
+    let mut c = cell.borrow_mut();
+    c.running = false;
+    match res {
+        corosensei::CoroutineResult::Yield(v) => {
+            c.coro = Some(coro);
+            drop(c);
+            // spec Await: PromiseResolve(%Promise%, v) — a live
+            // `Promise.resolve` read (user-observable override fires)
+            let resolved = match i.get_prop_str(&Value::Obj(i.p.promise_ctor.clone()), "resolve")
+            {
+                Ok(res_fn) => match i.call(&res_fn, Value::Obj(i.p.promise_ctor.clone()), vec![v]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = settle(i, promise, false, e);
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = settle(i, promise, false, e);
+                    return;
+                }
+            };
+            // PerformPromiseThen with native resume closures — NOT the
+            // user-visible `.then` (patched then methods must not run)
+            let Value::Obj(po) = &resolved else {
+                // a non-promise resolve result — treat as fulfilled
+                let _ = settle(i, promise, true, resolved);
+                return;
+            };
+            let on_f = await_resume_fn(i, cell.clone(), promise.clone(), true);
+            let on_r = await_resume_fn(i, cell.clone(), promise.clone(), false);
+            perform_promise_then(i, po, on_f, on_r);
+        }
+        corosensei::CoroutineResult::Return(r) => {
+            c.done = true;
+            drop(c);
+            match r {
+                // spec AsyncFunctionStart: the body's result flows
+                // through the capability's [[Resolve]]/[[Reject]] — the
+                // resolving fn unwraps thenables itself
+                Ok(v) => {
+                    let (res, _rej) = resolving_fns(i, promise);
+                    let _ = i.call(&res, Value::Und, vec![v]);
+                }
+                Err(e) => {
+                    let (_res, rej) = resolving_fns(i, promise);
+                    let _ = i.call(&rej, Value::Und, vec![e]);
+                }
+            }
+        }
+    }
+}
+
+/// The two native resume closures PerformPromiseThen fires: the holder
+/// `{cell, promise, fulfill}` tells `await_resume_fn` which GenIn to
+/// inject back into the coroutine.
+fn await_resume_fn(i: &mut Interp, cell: Rc<RefCell<GenCell>>, promise: ObjRef, ok: bool) -> Value {
+    let h = i.new_obj();
+    i.set_builtin(&h, "$cell", Value::Obj(Rc::new(RefCell::new(Obj::new(
+        None,
+        ObjKind::Gen(cell),
+    )))));
+    i.set_builtin(&h, "$p", Value::Obj(promise));
+    i.set_builtin(&h, "$ok", Value::Bool(ok));
+    bound_native(i, "", await_resume_step, Value::Obj(h), 1.0)
+}
+
+fn await_resume_step(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let Value::Obj(h) = this else {
+        return Err(i.type_err("await resume called on non-object"));
+    };
+    let (cell, promise, ok) = {
+        let b = h.borrow();
+        let cell = match b.props.get_str("$cell").map(|p| p.val.clone()) {
+            Some(Value::Obj(o)) => match &o.borrow().kind {
+                ObjKind::Gen(c) => c.clone(),
+                _ => return Err(i.type_err("await resume: bad cell")),
+            },
+            _ => return Err(i.type_err("await resume: bad cell")),
+        };
+        let promise = match b.props.get_str("$p").map(|p| p.val.clone()) {
+            Some(Value::Obj(o)) => o,
+            _ => return Err(i.type_err("await resume: bad promise")),
+        };
+        let ok = matches!(b.props.get_str("$ok").map(|p| p.val.clone()), Some(Value::Bool(true)));
+        (cell, promise, ok)
+    };
+    let input = if ok {
+        GenIn::Next(arg(args, 0))
+    } else {
+        GenIn::Throw(arg(args, 0))
+    };
+    async_resume(i, &cell, input, &promise);
+    Ok(Value::Und)
+}
+
+/// Internal PerformPromiseThen — reaction records with no capability:
+/// the resume natives' results are discarded, a patched `.then` on the
+/// promise never runs. Mirrors `promise_then`'s pending/settled paths.
+fn perform_promise_then(i: &mut Interp, po: &ObjRef, on_f: Value, on_r: Value) {
+    match promise_state(po) {
+        PromiseState::Pending => {
+            let rec = i.new_obj();
+            i.set_builtin(&rec, "onF", on_f);
+            i.set_builtin(&rec, "onR", on_r);
+            i.set_builtin(&rec, "resolve", Value::Und);
+            i.set_builtin(&rec, "reject", Value::Und);
+            let h = handlers_arr(i, po);
+            let mut hb = h.borrow_mut();
+            if let ObjKind::Arr(items) = &mut hb.kind {
+                items.push(Value::Obj(rec));
+            }
+        }
+        PromiseState::Fulfilled(v) => {
+            let vv = (*v).clone();
+            i.jobs.push_back(Box::new(move |i: &mut Interp| {
+                run_reaction(i, true, on_f, on_r, Value::Und, Value::Und, vv)
+            }));
+        }
+        PromiseState::Rejected(v) => {
+            let vv = (*v).clone();
+            i.jobs.push_back(Box::new(move |i: &mut Interp| {
+                run_reaction(i, false, on_f, on_r, Value::Und, Value::Und, vv)
+            }));
+        }
+    }
+}
+
+/// pub wrapper — `new_promise` is private to builtins but the async
+/// call path in interp.rs needs a raw pending promise
+pub fn new_promise_pub(i: &mut Interp) -> ObjRef {
+    new_promise(i)
+}
+
+/// pub wrapper — `settle` is private to builtins; the async call path
+/// needs it for pre-coroutine setup failures (param init throws etc.)
+pub fn settle_pub(i: &mut Interp, p: &ObjRef, ok: bool, v: Value) -> NResult {
+    settle(i, p, ok, v)
 }
 
 fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -3529,7 +3746,46 @@ fn install_globals(i: &mut Interp) {
             false,
             false,
         );
-        i.set_builtin(&i.p.gen_func.clone(), "constructor", Value::Obj(gfc));
+        // spec: {writable:false, enumerable:false, configurable:true}
+        i.set_attr(&i.p.gen_func.clone(), "constructor", Value::Obj(gfc), false, true);
+        // %AsyncFunction% — same pattern: not a global binding, reached
+        // via `Object.getPrototypeOf(async function(){}).constructor`.
+        // [[Prototype]] = %Function%, `.prototype` =
+        // %AsyncFunction.prototype%, [[Construct]]-able.
+        let afc = Rc::new(RefCell::new(Obj::new(
+            match &ctor {
+                Value::Obj(o) => Some(o.clone()),
+                _ => unreachable!(),
+            },
+            ObjKind::Func(Func::Native {
+                name: Rc::from("AsyncFunction"),
+                f: async_function_ctor,
+                ctor: true,
+            }),
+        )));
+        i.set_attr(
+            &afc,
+            "name",
+            Value::Str(Rc::from("AsyncFunction")),
+            false,
+            true,
+        );
+        i.set_attr(&afc, "length", Value::Num(1.0), false, true);
+        i.set_attr(
+            &afc,
+            "prototype",
+            Value::Obj(i.p.async_func.clone()),
+            false,
+            false,
+        );
+        i.set_attr(
+            &i.p.async_func.clone(),
+            "constructor",
+            Value::Obj(afc),
+            false,
+            true,
+        );
+        str_tag(&i.p.async_func.clone(), "AsyncFunction");
     }
 
     // -- Symbol --
@@ -3874,6 +4130,9 @@ fn install_globals(i: &mut Interp) {
         legacy("$7", re_static_get_p7, None);
         legacy("$8", re_static_get_p8, None);
         legacy("$9", re_static_get_p9, None);
+        // ES2025 RegExp.escape — a static on %RegExp% itself (length 1
+        // rides the existing NATIVE_ARITY "escape" entry)
+        method(i, o, "escape", regexp_escape);
         // per-realm state object (unreachable) — legacy static slots start
         // as "" per Annex B, and the iterator proto rides along
         let state = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
@@ -3971,6 +4230,8 @@ fn install_globals(i: &mut Interp) {
         let j = i.new_obj();
         method(i, &j, "parse", json_parse);
         method(i, &j, "stringify", json_stringify);
+        method(i, &j, "rawJSON", json_raw_json);
+        method(i, &j, "isRawJSON", json_is_raw_json);
         str_tag(&j, "JSON");
         define_global(i, "JSON", Value::Obj(j));
     }
@@ -4081,7 +4342,7 @@ fn install_globals(i: &mut Interp) {
         let dp = i.new_obj();
         method(i, &dp, "getTime", date_get_time);
         method(i, &dp, "valueOf", date_get_time);
-        method(i, &dp, "toString", date_to_string);
+        method_len(i, &dp, "toString", date_to_string, 0.0);
         method(i, &dp, "toISOString", date_to_iso);
         method(i, &dp, "toJSON", date_to_json);
         method(i, &dp, "toUTCString", date_to_utc);
@@ -4290,13 +4551,20 @@ fn install_globals(i: &mut Interp) {
         i.set_builtin(mo, "groupBy", native(i, "groupBy", map_group_by));
         define_global(i, "Map", ctor);
 
-        let sp = i.new_obj();
+        let sp = i.p.set.clone();
         method(i, &sp, "add", set_add);
         method(i, &sp, "has", set_has);
         method(i, &sp, "delete", set_delete);
         method(i, &sp, "clear", set_clear);
         method_len(i, &sp, "forEach", set_for_each, 1.0);
         method_len(i, &sp, "values", set_values, 0.0);
+        method(i, &sp, "union", set_union);
+        method(i, &sp, "intersection", set_intersection);
+        method(i, &sp, "difference", set_difference);
+        method(i, &sp, "symmetricDifference", set_symmetric_difference);
+        method(i, &sp, "isSubsetOf", set_is_subset_of);
+        method(i, &sp, "isSupersetOf", set_is_superset_of);
+        method(i, &sp, "isDisjointFrom", set_is_disjoint_from);
         // spec: Set.prototype.keys === Set.prototype.values (same fn)
         let sv_keys = i.obj_get_raw_str(&sp, "values").unwrap();
         sp.borrow_mut()
@@ -4391,6 +4659,22 @@ fn install_globals(i: &mut Interp) {
         str_tag(&wsp, "WeakSet");
         let wsctor = make_ctor(i, "WeakSet", weakset_ctor, wsp);
         define_global(i, "WeakSet", wsctor);
+    }
+
+    // WeakRef — the Obj.weak_ref slot holds a real std::rc::Weak, so
+    // deref() mirrors actual Rc reachability (a dropped last strong Rc
+    // is this engine's "collected"). FinalizationRegistry is NOT
+    // implemented: scheduling cleanup jobs needs GC-ordering hooks Rc
+    // can't provide deterministically.
+    {
+        let wrp = i.new_obj();
+        method(i, &wrp, "deref", weakref_deref);
+        str_tag(&wrp, "WeakRef");
+        let wrctor = make_ctor(i, "WeakRef", weakref_ctor, wrp);
+        let Value::Obj(wco) = &wrctor else { unreachable!() };
+        // spec: WeakRef.length is 1 (target)
+        i.set_attr(wco, "length", Value::Num(1.0), false, true);
+        define_global(i, "WeakRef", wrctor);
     }
 
     // Reflect minimal
@@ -11498,6 +11782,45 @@ fn gen_function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     Ok(v)
 }
 
+/// `%AsyncFunction%` ctor — `CreateDynamicFunction` for `async function`:
+/// same shape as `gen_function_ctor`; the fn's [[Prototype]] comes from
+/// newTarget.prototype, falling back to %AsyncFunction.prototype%.
+fn async_function_ctor(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let (params, body) = match args.split_last() {
+        None => (String::new(), String::new()),
+        Some((b, ps)) => {
+            let mut names = Vec::with_capacity(ps.len());
+            for p in ps {
+                names.push(i.to_str(p)?);
+            }
+            (names.join(","), i.to_str(b)?)
+        }
+    };
+    let src = format!("(async function anonymous({params}\n) {{\n{body}\n}})");
+    let v = match i.run(&src) {
+        Ok(v) => v,
+        Err(e) => return Err(i.syntax_err(format!("{e}"))),
+    };
+    if let Value::Obj(o) = &v {
+        let mut b = o.borrow_mut();
+        b.props.remove_str("caller");
+        b.props.remove_str("arguments");
+        if let ObjKind::Func(Func::User { dynamic, .. }) = &mut b.kind {
+            *dynamic = true;
+        }
+    }
+    let nt = i.new_target_native.clone().unwrap_or(Value::Und);
+    if let Value::Obj(nto) = &nt {
+        if let Ok(Value::Obj(p)) = i.get_prop(&nt, &PropKey::from_str("prototype")) {
+            let _ = nto;
+            if let Value::Obj(o) = &v {
+                o.borrow_mut().proto = Some(p);
+            }
+        }
+    }
+    Ok(v)
+}
+
 fn symbol_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if matches!(this, Value::Obj(_)) {
         return Err(i.type_err("Symbol is not a constructor"));
@@ -12187,10 +12510,11 @@ fn json_parse(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let mut p = JsonParser {
         chars: s.chars().collect(),
         pos: 0,
+        child_src: HashMap::new(),
     };
     p.skip_ws();
     let v = match p.value(i) {
-        Ok(v) => {
+        Ok((v, _src)) => {
             p.skip_ws();
             if p.pos != p.chars.len() {
                 return Err(i.syntax_err("Unexpected token in JSON"));
@@ -12204,10 +12528,74 @@ fn json_parse(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let reviver = arg(args, 1);
     if i.is_callable(&reviver) {
         let holder = i.new_obj();
-        i.set_data(&holder, "", v);
-        return json_internalize(i, &Value::Obj(holder), "", &reviver);
+        i.set_data(&holder, "", v.clone());
+        // json-parse-with-source: the root reviver call's context.source
+        // is the whole input text (surrounding whitespace included)
+        let mut root = HashMap::new();
+        root.insert(Rc::from(""), (v, Rc::from(s.as_str())));
+        p.child_src.insert(
+            Rc::as_ptr(&holder) as usize,
+            (holder.clone(), root),
+        );
+        return json_internalize(i, &Value::Obj(holder), "", &reviver, &p.child_src);
     }
     Ok(v)
+}
+
+/// `JSON.rawJSON(text)` — validates `text` is a primitive JSON value
+/// (no outer object/array), then returns a frozen null-proto object
+/// carrying a hidden `$rawjson` brand and the raw text in `rawJSON`.
+fn json_raw_json(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    // spec step 1: ToString — Symbol throws TypeError here
+    let json_string = i.to_str(&arg(args, 0))?;
+    let chars: Vec<char> = json_string.chars().collect();
+    // step 2: empty or first/last char in TAB/LF/CR/SPACE → SyntaxError
+    let edge_ws = |c: char| matches!(c, '\t' | '\n' | '\r' | ' ');
+    if chars.is_empty() || edge_ws(chars[0]) || edge_ws(*chars.last().unwrap()) {
+        return Err(i.syntax_err("JSON.rawJSON: illegal empty or edge-whitespace text"));
+    }
+    // step 3: the whole text must parse as exactly one JSON text whose
+    // outermost value is NOT an object or array
+    let mut p = JsonParser {
+        chars,
+        pos: 0,
+        child_src: HashMap::new(),
+    };
+    p.skip_ws();
+    let v = match p.value(i) {
+        Ok((v, _)) => v,
+        Err(msg) => {
+            return Err(i.syntax_err(format!("JSON.rawJSON: invalid JSON text: {msg}")))
+        }
+    };
+    p.skip_ws();
+    if p.pos != p.chars.len() {
+        return Err(i.syntax_err("JSON.rawJSON: trailing characters"));
+    }
+    if matches!(v, Value::Obj(_)) {
+        return Err(i.syntax_err("JSON.rawJSON: outermost value must be primitive"));
+    }
+    // step 5-8: OrdinaryObjectCreate(null) + rawJSON own prop + freeze
+    let o = Rc::new(RefCell::new(Obj::new(None, ObjKind::Ord)));
+    i.set_builtin(&o, "$rawjson", Value::Bool(true));
+    i.set_data(&o, "rawJSON", Value::Str(Rc::from(json_string.as_str())));
+    {
+        let mut b = o.borrow_mut();
+        if let Some(pr) = b.props.get_str_mut("rawJSON") {
+            pr.writable = false;
+            pr.configurable = false;
+        }
+    }
+    Ok(Value::Obj(o))
+}
+
+/// `JSON.isRawJSON(O)` — true iff O carries the [[IsRawJSON]] slot
+/// (our `$rawjson` brand); a plain `{rawJSON: "…"}` shape does not count
+fn json_is_raw_json(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let _ = i;
+    Ok(Value::Bool(
+        matches!(arg(args, 0), Value::Obj(ref o) if o.borrow().props.get_str("$rawjson").is_some()),
+    ))
 }
 
 /// CreateDataProperty — [[DefineOwnProperty]]({value,W:T,E:T,C:T})
@@ -12230,10 +12618,44 @@ fn json_create_data_prop(i: &mut Interp, obj: &Value, key: PropKey, v: Value) ->
     Ok(())
 }
 
+/// json-parse-with-source bookkeeping: `child_src` maps a parsed
+/// container's Rc pointer to (a keepalive clone of it, map of member
+/// key → that member's raw source text). Members read back under a
+/// DIFFERENT holder (reviver-swapped objects, proxies, plain foreign
+/// objects) have no entry and get `context.source === undefined`, which
+/// matches the spec: source text is a property of the parse node, not
+/// of whatever value happens to sit in the slot at reviver time.
+type JsonSrcMap = HashMap<usize, (ObjRef, HashMap<Rc<str>, (Value, Rc<str>)>)>;
+
 /// InternalizeJSONProperty — `holder`/`name` name the slot holding `val`
 /// (read inside, not passed in, so the reviver sees fresh values)
-fn json_internalize(i: &mut Interp, holder: &Value, name: &str, reviver: &Value) -> NResult {
+fn json_internalize(
+    i: &mut Interp,
+    holder: &Value,
+    name: &str,
+    reviver: &Value,
+    srcs: &JsonSrcMap,
+) -> NResult {
     let val = i.get_prop_str(holder, name)?;
+    // source text of the JSON node parsed at THIS position
+    // the recorded source only applies while the slot still holds the
+    // value the parser produced — a reviver that overwrote the slot
+    // with a foreign value sees `context.source === undefined` even
+    // when that value coincidentally equals another parsed node
+    let my_src: Value = match holder {
+        Value::Obj(h) => srcs
+            .get(&(Rc::as_ptr(h) as usize))
+            .and_then(|(_, m)| m.get(name))
+            .and_then(|(pv, s)| {
+                if i.same_value(&val, pv).unwrap_or(false) {
+                    Some(Value::Str(s.clone()))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(Value::Und),
+        _ => Value::Und,
+    };
     if let Value::Obj(o) = &val {
         let is_arr = matches!(
             array_is_array(i, &Value::Und, &[val.clone()])?,
@@ -12245,7 +12667,7 @@ fn json_internalize(i: &mut Interp, holder: &Value, name: &str, reviver: &Value)
             let len = to_length_num(i.to_num(&len_v)?).min(1_000_000);
             for k in 0..len {
                 let kk = k.to_string();
-                let new_elem = json_internalize(i, &val, &kk, reviver)?;
+                let new_elem = json_internalize(i, &val, &kk, reviver, srcs)?;
                 if matches!(new_elem, Value::Und) {
                     i.delete_prop(&val, &PropKey::S(Rc::from(kk.as_str())))?;
                 } else {
@@ -12262,7 +12684,7 @@ fn json_internalize(i: &mut Interp, holder: &Value, name: &str, reviver: &Value)
                 }
             }
             for kk in keys {
-                let new_elem = json_internalize(i, &val, &kk, reviver)?;
+                let new_elem = json_internalize(i, &val, &kk, reviver, srcs)?;
                 if matches!(new_elem, Value::Und) {
                     i.delete_prop(&val, &PropKey::S(Rc::from(kk.as_str())))?;
                 } else {
@@ -12272,16 +12694,30 @@ fn json_internalize(i: &mut Interp, holder: &Value, name: &str, reviver: &Value)
         }
         let _ = o;
     }
+    // json-parse-with-source: third reviver arg is a fresh ordinary
+    // object per call; `source` is present only when the internalized
+    // value is a primitive — object/array nodes get an empty context
+    let ctx = i.new_obj();
+    if !matches!(val, Value::Obj(_)) {
+        i.set_data(&ctx, "source", my_src);
+    }
     i.call(
         reviver,
         holder.clone(),
-        vec![Value::Str(Rc::from(name)), val],
+        vec![Value::Str(Rc::from(name)), val, Value::Obj(ctx)],
     )
 }
 
 struct JsonParser {
     chars: Vec<char>,
     pos: usize,
+    /// json-parse-with-source: per parsed container, member key → the
+    /// (parsed value, raw source text) pair for that member. The value
+    /// rides along so a reviver-overwritten slot stops reporting source
+    /// (source belongs to the parse result, not the slot). The `ObjRef`
+    /// inside each entry keeps the container's allocation alive so a
+    /// freed address can't alias while the map lives.
+    child_src: HashMap<usize, (ObjRef, HashMap<Rc<str>, (Value, Rc<str>)>)>,
 }
 
 impl JsonParser {
@@ -12306,15 +12742,27 @@ impl JsonParser {
             Err(format!("expected '{c}'"))
         }
     }
-    fn value(&mut self, i: &mut Interp) -> Result<Value, String> {
+    /// returns the value plus the exact source text it was parsed from
+    /// (leading ws skipped, trailing ws unconsumed) — the `source`
+    /// string the reviver's context carries for this node
+    fn value(&mut self, i: &mut Interp) -> Result<(Value, Rc<str>), String> {
         self.skip_ws();
+        let start = self.pos;
+        let v = self.node(i)?;
+        let src: Rc<str> = self.chars[start..self.pos].iter().collect::<String>().into();
+        Ok((v, src))
+    }
+    fn node(&mut self, i: &mut Interp) -> Result<Value, String> {
         match self.peek() {
             Some('{') => {
                 self.pos += 1;
                 let o = i.new_obj();
+                let mut kids: HashMap<Rc<str>, (Value, Rc<str>)> = HashMap::new();
                 self.skip_ws();
                 if self.peek() == Some('}') {
                     self.pos += 1;
+                    self.child_src
+                        .insert(Rc::as_ptr(&o) as usize, (o.clone(), kids));
                     return Ok(Value::Obj(o));
                 }
                 loop {
@@ -12322,8 +12770,11 @@ impl JsonParser {
                     let key = self.string()?;
                     self.skip_ws();
                     self.expect(':')?;
-                    let v = self.value(i)?;
-                    i.set_data(&o, &key, v);
+                    let (v, vsrc) = self.value(i)?;
+                    i.set_data(&o, &key, v.clone());
+                    // duplicate keys: the surviving (last) member's node
+                    // is the one the reviver sees — insert overwrites
+                    kids.insert(Rc::from(key.as_str()), (v, vsrc));
                     self.skip_ws();
                     match self.peek() {
                         Some(',') => {
@@ -12331,6 +12782,8 @@ impl JsonParser {
                         }
                         Some('}') => {
                             self.pos += 1;
+                            self.child_src
+                                .insert(Rc::as_ptr(&o) as usize, (o.clone(), kids));
                             return Ok(Value::Obj(o));
                         }
                         _ => return Err("expected ',' or '}'".into()),
@@ -12340,13 +12793,22 @@ impl JsonParser {
             Some('[') => {
                 self.pos += 1;
                 let mut items = Vec::new();
+                let mut kids: HashMap<Rc<str>, (Value, Rc<str>)> = HashMap::new();
                 self.skip_ws();
                 if self.peek() == Some(']') {
                     self.pos += 1;
-                    return Ok(Value::Obj(i.new_arr(items)));
+                    let a = i.new_arr(items);
+                    self.child_src
+                        .insert(Rc::as_ptr(&a) as usize, (a.clone(), kids));
+                    return Ok(Value::Obj(a));
                 }
                 loop {
-                    items.push(self.value(i)?);
+                    let (v, vsrc) = self.value(i)?;
+                    kids.insert(
+                        Rc::from(items.len().to_string().as_str()),
+                        (v.clone(), vsrc),
+                    );
+                    items.push(v);
                     self.skip_ws();
                     match self.peek() {
                         Some(',') => {
@@ -12354,7 +12816,10 @@ impl JsonParser {
                         }
                         Some(']') => {
                             self.pos += 1;
-                            return Ok(Value::Obj(i.new_arr(items)));
+                            let a = i.new_arr(items);
+                            self.child_src
+                                .insert(Rc::as_ptr(&a) as usize, (a.clone(), kids));
+                            return Ok(Value::Obj(a));
                         }
                         _ => return Err("expected ',' or ']'".into()),
                     }
@@ -12644,6 +13109,15 @@ fn json_ser_prop(
             Some(o)
         }
         Value::Obj(o) => {
+            // a rawJSON-branded object emits its raw text verbatim —
+            // SerializeJSONProperty returns it before structural descent
+            if o.borrow().props.get_str("$rawjson").is_some() {
+                if let Some(Value::Str(rs)) =
+                    o.borrow().props.get_str("rawJSON").map(|p| p.val.clone())
+                {
+                    return Ok(Some(rs.to_string()));
+                }
+            }
             // bigint stand-ins throw on bare stringify
             if crate::binary::bigint_is_prim(&value) {
                 return Err(i.type_err("Do not know how to serialize a BigInt"));
@@ -13092,10 +13566,16 @@ fn run_reaction(
     };
     match r {
         Ok(x) => {
-            i.call(&resolve, Value::Und, vec![x])?;
+            // capability-less reactions (await's PerformPromiseThen)
+            // discard the outcome — resolve/reject aren't callable
+            if i.is_callable(&resolve) {
+                i.call(&resolve, Value::Und, vec![x])?;
+            }
         }
         Err(e) => {
-            i.call(&reject, Value::Und, vec![e])?;
+            if i.is_callable(&reject) {
+                i.call(&reject, Value::Und, vec![e])?;
+            }
         }
     }
     Ok(())
@@ -14706,6 +15186,66 @@ fn weakmap_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(Value::Obj(m))
 }
 
+/// `new WeakRef(target)` — CanBeHeldWeakly(target) else TypeError:
+/// objects pass; symbols pass only when neither well-known (ids below
+/// the user range) nor registry-shared (Symbol.for ids >= 1e6). The
+/// [[WeakRefTarget]] slot is the brand deref() checks.
+fn weakref_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    need_new_target(i, "WeakRef")?;
+    let target = arg(args, 0);
+    let ok = match &target {
+        Value::Obj(_) => true,
+        // CanBeHeldWeakly: any symbol whose keyFor is undefined —
+        // well-known (0..16) and ordinary (16..1M) symbols qualify;
+        // only Symbol.for-registered keys (>= 1M) are barred
+        Value::Sym(id, _) => *id < 1_000_000,
+        _ => false,
+    };
+    if !ok {
+        return Err(i.type_err("Invalid value used in weak ref"));
+    }
+    let slot = match &target {
+        Value::Obj(t) => WeakTarget::Obj(Rc::downgrade(t)),
+        _ => WeakTarget::Prim(target.clone()),
+    };
+    if let Value::Obj(o) = this {
+        o.borrow_mut().weak_ref = Some(slot);
+        return Ok(this.clone());
+    }
+    // `this` is Und only when newTarget.prototype wasn't an object —
+    // spec GetPrototypeFromConstructor falls back to %WeakRef.prototype%
+    // (approximated via newTarget.prototype when it IS an object)
+    let proto = i
+        .new_target_native
+        .clone()
+        .and_then(|nt| i.get_prop_str(&nt, "prototype").ok())
+        .and_then(|p| match p {
+            Value::Obj(o) => Some(o),
+            _ => None,
+        })
+        .unwrap_or_else(|| i.p.obj.clone());
+    let o = Rc::new(RefCell::new(Obj::new(Some(proto), ObjKind::Ord)));
+    o.borrow_mut().weak_ref = Some(slot);
+    Ok(Value::Obj(o))
+}
+
+/// `WeakRef.prototype.deref()` — returns the target while it lives
+/// (Weak::upgrade), undefined once every strong Rc to it has dropped.
+fn weakref_deref(i: &mut Interp, this: &Value, _args: &[Value]) -> NResult {
+    let Value::Obj(o) = this else {
+        return Err(i.type_err(
+            "WeakRef.prototype.deref requires that 'this' be a WeakRef",
+        ));
+    };
+    match &o.borrow().weak_ref {
+        Some(WeakTarget::Obj(w)) => Ok(w.upgrade().map(Value::Obj).unwrap_or(Value::Und)),
+        Some(WeakTarget::Prim(v)) => Ok(v.clone()),
+        None => Err(i.type_err(
+            "WeakRef.prototype.deref requires that 'this' be a WeakRef",
+        )),
+    }
+}
+
 fn weakset_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     need_new_target(i, "WeakSet")?;
     let s = if let Value::Obj(o) = this {
@@ -15236,6 +15776,297 @@ fn set_size(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         return Ok(Value::Num(items.len() as f64));
     }
     Ok(Value::Num(0.0))
+}
+
+// -- ES2025 set methods ------------------------------------------------------
+
+/// spec GetSetRecord — `size` (number-coerced), `has` and `keys`
+/// (callable-checked) are Get'd in that order off any set-LIKE object;
+/// real Sets satisfy it through their own prototype methods.
+struct SetRec {
+    obj: Value,
+    size: f64,
+    has: Value,
+    keys: Value,
+}
+
+fn get_set_record(i: &mut Interp, obj: &Value) -> Result<SetRec, Value> {
+    if !is_spec_obj(obj) {
+        return Err(i.type_err("set method argument is not an object"));
+    }
+    let raw = i.get_prop_str(obj, "size")?;
+    // ToNumber: BigInt throws — to_num alone would accept the magnitude
+    if crate::binary::bigint_is_prim(&raw) {
+        return Err(i.type_err("set-like size is a BigInt"));
+    }
+    let num = i.to_num(&raw)?;
+    if num.is_nan() {
+        return Err(i.type_err("set-like size is not a number"));
+    }
+    let size = to_integer_or_inf(num);
+    if size < 0.0 {
+        return Err(i.range_err("set-like size is negative"));
+    }
+    let has = i.get_prop_str(obj, "has")?;
+    if !i.is_callable(&has) {
+        return Err(i.type_err("set-like has is not callable"));
+    }
+    let keys = i.get_prop_str(obj, "keys")?;
+    if !i.is_callable(&keys) {
+        return Err(i.type_err("set-like keys is not callable"));
+    }
+    Ok(SetRec {
+        obj: obj.clone(),
+        size,
+        has,
+        keys,
+    })
+}
+
+/// spec GetIteratorFromMethod: Call(record.keys) then GetIteratorDirect —
+/// the result must be an object and `next` is fetched once up front.
+fn set_keys_iter(i: &mut Interp, rec: &SetRec) -> Result<IterLazy, Value> {
+    let it = i.call(&rec.keys, rec.obj.clone(), Vec::new())?;
+    if !is_spec_obj(&it) {
+        return Err(i.type_err("set-like keys() result is not an object"));
+    }
+    iter_direct(i, &it)
+}
+
+fn set_items(o: &ObjRef) -> Vec<Value> {
+    match &o.borrow().kind {
+        ObjKind::Set(items) => items.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn set_len(o: &ObjRef) -> usize {
+    match &o.borrow().kind {
+        ObjKind::Set(items) => items.len(),
+        _ => 0,
+    }
+}
+
+/// spec SetDataHas — live membership read (the record's `has` is never
+/// substituted for `this`'s own data)
+fn set_contains(o: &ObjRef, v: &Value) -> bool {
+    match &o.borrow().kind {
+        ObjKind::Set(items) => items.iter().any(|x| same_value_zero(x, v)),
+        _ => false,
+    }
+}
+
+/// OrdinaryObjectCreate(%Set.prototype%, «[[SetData]]»): the result is a
+/// base Set whatever the receiver's class (no @@species lookup).
+fn new_result_set(i: &mut Interp, items: Vec<Value>) -> Value {
+    let o = Rc::new(RefCell::new(Obj::new(
+        Some(i.p.set.clone()),
+        ObjKind::Set(items),
+    )));
+    o.borrow_mut()
+        .props
+        .insert_str("__set", Prop::builtin(Value::Bool(true)));
+    Value::Obj(o)
+}
+
+/// The this-side index loops (intersection / isSubsetOf / isDisjointFrom
+/// small-case) walk `O.[[SetData]]` LIVE: spec [[SetData]] is a slot list
+/// where delete leaves EMPTY and add appends, while our Vec compacts.
+/// `slots` shadows the spec list; `set_slots_sync` re-aligns it to the
+/// element Vec after `has` calls that may have mutated the set.
+fn set_slots(o: &ObjRef) -> Vec<Option<Value>> {
+    set_items(o).into_iter().map(Some).collect()
+}
+
+/// Re-sync the shadow list to the live Vec: elements that left (or moved
+/// = delete+re-add) lose their slot; new ones append in current order.
+/// A re-add preserving the element sequence is invisible to a value
+/// diff — accepted divergence.
+fn set_slots_sync(slots: &mut Vec<Option<Value>>, o: &ObjRef) {
+    let items = set_items(o);
+    let mut p = 0;
+    for s in slots.iter_mut() {
+        if let Some(x) = s {
+            if p < items.len() && same_value_zero(x, &items[p]) {
+                p += 1;
+            } else {
+                *s = None;
+            }
+        }
+    }
+    slots.extend(items[p..].iter().cloned().map(Some));
+}
+
+fn set_union(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let o = need_set(i, this, "union")?;
+    let rec = get_set_record(i, &arg(args, 0))?;
+    let mut lz = set_keys_iter(i, &rec)?;
+    // spec: this's data copies AFTER the record reads and keys() call
+    let mut data = set_items(&o);
+    while let Some(v) = iter_lazy_step(i, &mut lz)? {
+        let v = canon_key(v);
+        if !data.iter().any(|x| same_value_zero(x, &v)) {
+            data.push(v);
+        }
+    }
+    Ok(new_result_set(i, data))
+}
+
+fn set_intersection(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let o = need_set(i, this, "intersection")?;
+    let rec = get_set_record(i, &arg(args, 0))?;
+    let mut data = Vec::new();
+    if set_len(&o) as f64 <= rec.size {
+        // this-side scan over the spec slot list: thisSize is fixed at
+        // capture, delete tombstones, delete+re-add lands past the bound
+        let mut slots = set_slots(&o);
+        let n = slots.len();
+        let mut idx = 0;
+        while idx < n {
+            let e = slots[idx].clone();
+            idx += 1;
+            let Some(e) = e else { continue };
+            let hv = i.call(&rec.has, rec.obj.clone(), vec![e.clone()])?;
+            let in_other = i.to_bool(&hv);
+            set_slots_sync(&mut slots, &o);
+            if in_other && !data.iter().any(|x| same_value_zero(x, &e)) {
+                data.push(e);
+            }
+        }
+    } else {
+        // other's key stream filters through this's data
+        let mut lz = set_keys_iter(i, &rec)?;
+        while let Some(v) = iter_lazy_step(i, &mut lz)? {
+            let v = canon_key(v);
+            if set_contains(&o, &v) && !data.iter().any(|x| same_value_zero(x, &v)) {
+                data.push(v);
+            }
+        }
+    }
+    Ok(new_result_set(i, data))
+}
+
+fn set_difference(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let o = need_set(i, this, "difference")?;
+    let rec = get_set_record(i, &arg(args, 0))?;
+    let mut slots = set_slots(&o);
+    if set_len(&o) as f64 <= rec.size {
+        // spec scans resultSetData itself — a snapshot: `has` mutations
+        // of the receiver can't reach this loop
+        let n = slots.len();
+        for idx in 0..n {
+            let Some(e) = slots[idx].clone() else {
+                continue;
+            };
+            let hv = i.call(&rec.has, rec.obj.clone(), vec![e])?;
+            if i.to_bool(&hv) {
+                slots[idx] = None;
+            }
+        }
+    } else {
+        let mut lz = set_keys_iter(i, &rec)?;
+        while let Some(v) = iter_lazy_step(i, &mut lz)? {
+            let v = canon_key(v);
+            if let Some(s) = slots
+                .iter_mut()
+                .find(|s| s.as_ref().is_some_and(|x| same_value_zero(x, &v)))
+            {
+                *s = None;
+            }
+        }
+    }
+    Ok(new_result_set(i, slots.into_iter().flatten().collect()))
+}
+
+fn set_symmetric_difference(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let o = need_set(i, this, "symmetricDifference")?;
+    let rec = get_set_record(i, &arg(args, 0))?;
+    let mut lz = set_keys_iter(i, &rec)?;
+    let mut data = set_items(&o);
+    while let Some(v) = iter_lazy_step(i, &mut lz)? {
+        let v = canon_key(v);
+        let in_result = data.iter().any(|x| same_value_zero(x, &v));
+        if set_contains(&o, &v) {
+            // spec: a live member of this drops out of the result
+            if in_result {
+                data.retain(|x| !same_value_zero(x, &v));
+            }
+        } else if !in_result {
+            data.push(v);
+        }
+    }
+    Ok(new_result_set(i, data))
+}
+
+fn set_is_subset_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let o = need_set(i, this, "isSubsetOf")?;
+    let rec = get_set_record(i, &arg(args, 0))?;
+    if set_len(&o) as f64 > rec.size {
+        return Ok(Value::Bool(false));
+    }
+    let mut slots = set_slots(&o);
+    let n = slots.len();
+    let mut idx = 0;
+    while idx < n {
+        let e = slots[idx].clone();
+        idx += 1;
+        let Some(e) = e else { continue };
+        let hv = i.call(&rec.has, rec.obj.clone(), vec![e])?;
+        let in_other = i.to_bool(&hv);
+        set_slots_sync(&mut slots, &o);
+        if !in_other {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn set_is_superset_of(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let o = need_set(i, this, "isSupersetOf")?;
+    let rec = get_set_record(i, &arg(args, 0))?;
+    if (set_len(&o) as f64) < rec.size {
+        return Ok(Value::Bool(false));
+    }
+    let mut lz = set_keys_iter(i, &rec)?;
+    while let Some(v) = iter_lazy_step(i, &mut lz)? {
+        if !set_contains(&o, &v) {
+            // spec: IteratorClose on the not-yet-exhausted iterator
+            iter_lazy_close(i, &mut lz)?;
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn set_is_disjoint_from(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
+    let o = need_set(i, this, "isDisjointFrom")?;
+    let rec = get_set_record(i, &arg(args, 0))?;
+    if set_len(&o) as f64 <= rec.size {
+        let mut slots = set_slots(&o);
+        let n = slots.len();
+        let mut idx = 0;
+        while idx < n {
+            let e = slots[idx].clone();
+            idx += 1;
+            let Some(e) = e else { continue };
+            let hv = i.call(&rec.has, rec.obj.clone(), vec![e])?;
+            let in_other = i.to_bool(&hv);
+            set_slots_sync(&mut slots, &o);
+            if in_other {
+                return Ok(Value::Bool(false));
+            }
+        }
+        Ok(Value::Bool(true))
+    } else {
+        let mut lz = set_keys_iter(i, &rec)?;
+        while let Some(v) = iter_lazy_step(i, &mut lz)? {
+            if set_contains(&o, &v) {
+                iter_lazy_close(i, &mut lz)?;
+                return Ok(Value::Bool(false));
+            }
+        }
+        Ok(Value::Bool(true))
+    }
 }
 
 // ===========================================================================
@@ -16260,6 +17091,71 @@ fn regexp_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         regexp_init(i, &v, &p, &f)?;
         Ok(v)
     }
+}
+
+/// ES2025 `RegExp.escape ( S )` — escapes a String so it can be
+/// embedded in a pattern and match itself literally. Unlike most
+/// builtins there is NO coercion: a non-String S is a TypeError.
+///
+/// Per code point (the spec iterates code points, not code units):
+///   - a leading DecimalDigit or ASCII letter → `\xHH` — keeps the
+///     output from merging into escape sequences / backrefs /
+///     quantifiers written before it in a composed pattern
+///   - a ControlEscape char (t/n/v/f/r) → `\t` `\n` `\v` `\f` `\r`
+///   - a SyntaxCharacter or `/` → `\` + the char
+///   - an "otherPunctuator" (,-=<>&#!%:;@~'`") or WhiteSpace /
+///     LineTerminator → `\xHH` / `\uHHHH`
+///   - a surrogate code unit → `\uHHHH`
+///   - everything else passes through verbatim — including non-ASCII
+/// The empty string escapes to `""`.
+fn regexp_escape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
+    let Value::Str(s) = arg(args, 0) else {
+        return Err(i.type_err("RegExp.escape: argument must be a String"));
+    };
+    let mut out = String::new();
+    for (idx, c) in s.chars().enumerate() {
+        let cp = c as u32;
+        // a leading ASCII alphanumeric must never read back as part of
+        // a larger escape sequence — always hex-escape it
+        if idx == 0 && c.is_ascii_alphanumeric() {
+            out.push_str(&format!("\\x{cp:02x}"));
+            continue;
+        }
+        match c {
+            // ControlEscape table (t/n/v/f/r)
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{b}' => out.push_str("\\v"),
+            '\u{c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            // SyntaxCharacters ∪ '/' → backslash escape
+            '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
+            | '|' | '/' => {
+                out.push('\\');
+                out.push(c);
+            }
+            // otherPunctuators → \xHH
+            ',' | '-' | '=' | '<' | '>' | '#' | '&' | '!' | '%' | ':' | ';' | '@' | '~'
+            | '\'' | '`' | '"' => {
+                out.push_str(&format!("\\x{cp:02x}"));
+            }
+            // WhiteSpace / LineTerminator → UnicodeEscape — ZWNBSP
+            // (U+FEFF) counts per spec though Rust's table omits it
+            c if c.is_whitespace() || c == '\u{feff}' => {
+                if cp <= 0xff {
+                    out.push_str(&format!("\\x{cp:02x}"));
+                } else {
+                    out.push_str(&format!("\\u{cp:04x}"));
+                }
+            }
+            // lone surrogates escape per code unit
+            c if (0xd800..=0xdfff).contains(&cp) => {
+                out.push_str(&format!("\\u{cp:04x}"));
+            }
+            _ => out.push(c),
+        }
+    }
+    Ok(Value::Str(Rc::from(out.as_str())))
 }
 
 fn re_exec(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {

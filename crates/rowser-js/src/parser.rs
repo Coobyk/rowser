@@ -2244,8 +2244,13 @@ impl Parser {
         let start = self.pos;
         let c0 = self.toks[start].pos;
         let is_async = self.at_kw(Kw::Async) && !self.peek2().newline_before;
+        let saved_await = self.await_decl;
         if is_async {
             self.next();
+            // async-arrow parameter initializers may themselves await —
+            // `async (x = await f()) => x` — so [Await] applies while
+            // the head parses too
+            self.await_decl = 1;
         }
         // case 1: `ident => ...` (contextual keywords are valid param
         // names too: `async of => {}`, `async yield => {}`)
@@ -2258,6 +2263,9 @@ impl Parser {
             if matches!(self.peek2().tok, Tok::Punct("=>")) {
                 self.next();
                 self.next();
+                // arrow_body owns the body's [Await] scope — restore the
+                // head-parse flag so it can save/set/clear cleanly
+                self.await_decl = saved_await;
                 return Ok(Some(self.arrow_body(
                     vec![Param::Ident(name)],
                     None,
@@ -2266,6 +2274,7 @@ impl Parser {
                 )?));
             }
             self.pos = start;
+            self.await_decl = saved_await;
             return Ok(None);
         }
         // case 2: `( params ) => ...`
@@ -2275,14 +2284,17 @@ impl Parser {
                 if self.at_punct(")") {
                     self.next();
                     if self.eat_punct("=>") {
+                        self.await_decl = saved_await;
                         return Ok(Some(self.arrow_body(params, None, is_async, c0)?));
                     }
                 }
             }
             self.pos = start;
+            self.await_decl = saved_await;
             return Ok(None);
         }
         self.pos = start;
+        self.await_decl = saved_await;
         Ok(None)
     }
 
@@ -2294,7 +2306,14 @@ impl Parser {
         src_start: usize,
     ) -> Result<Expr, Error> {
         let saved_strict = self.strict;
+        // non-async arrows INHERIT the enclosing [Await] (await binds to
+        // the outer async fn lexically); async arrows set their own
+        let saved_await = self.await_decl;
+        if is_async {
+            self.await_decl = 1;
+        }
         let res = self.arrow_body_inner(params, name, is_async, src_start);
+        self.await_decl = saved_await;
         self.strict = saved_strict;
         res
     }

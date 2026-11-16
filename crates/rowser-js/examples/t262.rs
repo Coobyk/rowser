@@ -116,7 +116,6 @@ const SKIP_FEATURES: &[&str] = &[
     "SharedArrayBuffer",
     "Atomics",
     "FinalizationRegistry",
-    "WeakRef",
     "Intl",
     "Temporal",
     "Float16Array",
@@ -125,22 +124,17 @@ const SKIP_FEATURES: &[&str] = &[
     "import-attributes",
     "explicit-resource-management",
     "decorators",
-    "RegExp.escape",
     "regexp-duplicate-named-groups",
     "tail-call-optimization",
-    "async-functions",
     "async-iteration",
     "regexp-v-flag",
-    "set-methods",
     "regexp-modifiers",
-    "json-parse-with-source",
     "source-phase-imports",
     "ShadowRealm",
     "Array.fromAsync",
     "await-dictionary",
     "regexp-unicode-property-escapes",
-    "weakrefs",
-    "uint8array-base64",
+    // uint8array-base64 — implemented (binary.rs b64/hex section)
     // $262.createRealm / Error.isError — APIs we don't expose
     "cross-realm",
     "Error.isError",
@@ -213,7 +207,7 @@ fn main() {
         if m.flags.iter().any(|f| {
             matches!(
                 f.as_str(),
-                "module" | "async" | "CanBlockIsFalse" | "SharedArrayBuffer"
+                "module" | "CanBlockIsFalse" | "SharedArrayBuffer"
             )
         }) {
             skip += 1;
@@ -253,11 +247,19 @@ fn main() {
         }
 
         let strict = !m.raw && m.flags.iter().any(|f| f == "onlyStrict");
+        // async-flagged tests signal completion through $DONE() — the
+        // marker lands in console output once jobs drain
+        let async_pre = if m.flags.iter().any(|f| f == "async") {
+            std::fs::read_to_string(harness_dir.join("doneprintHandle.js"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         let body = if m.raw {
             src.clone()
         } else {
             // `print` — SpiderMonkey-era harness global some old tests use
-            format!("var print = console.log;\n{sta}\n{assert}\n{inc_src}\n{src}")
+            format!("var print = console.log;\n{sta}\n{assert}\n{async_pre}\n{inc_src}\n{src}")
         };
         let body = if strict {
             format!("\"use strict\";\n{body}")
@@ -276,7 +278,8 @@ fn main() {
             eprintln!("RUN {rel}");
         }
         // a panic in one test must not kill the run — count it as a fail
-        let res = std::panic::catch_unwind(|| {
+        let is_async_test = m.flags.iter().any(|f| f == "async");
+        let (res, output) = std::panic::catch_unwind(|| {
             let mut ctx = rowser_js::Context::new();
             let secs: u64 = std::env::var("T262_TIMEOUT_SECS")
                 .ok()
@@ -286,9 +289,15 @@ fn main() {
                 ctx.interp
                     .arm_deadline(std::time::Duration::from_secs(secs));
             }
-            ctx.eval(&body)
+            let r = ctx.eval(&body);
+            (r, ctx.take_output())
         })
-        .unwrap_or_else(|_| Err(rowser_js::Error::new("panic during test", 0, 0)));
+        .unwrap_or_else(|_| {
+            (
+                Err(rowser_js::Error::new("panic during test", 0, 0)),
+                Vec::new(),
+            )
+        });
         if std::env::var("T262_DEBUG").is_ok() {
             if let Err(e) = &res {
                 eprintln!("ERR {rel}: {e}");
@@ -311,6 +320,14 @@ fn main() {
                     .is_none_or(|t| e.to_string().contains(t))
             }
             (Some(_), Ok(_)) => false,
+            // async-flagged tests pass only on the $DONE() marker —
+            // "AsyncTestComplete" must appear with no "AsyncTestFailure"
+            (None, Ok(_)) if is_async_test => {
+                output.iter().any(|l| l.contains("Test262:AsyncTestComplete"))
+                    && !output
+                        .iter()
+                        .any(|l| l.contains("Test262:AsyncTestFailure"))
+            }
             (None, Ok(_)) => true,
             (None, Err(_)) => false,
         };

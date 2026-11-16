@@ -452,6 +452,12 @@ fn install_typed_arrays(i: &mut Interp) {
             // every concrete TypedArray ctor declares (buffer,
             // byteOffset, length) → .length = 3
             i.set_attr(co, "length", Value::Num(3.0), false, true);
+            // Uint8Array.fromBase64 / .fromHex — statics on %Uint8Array%
+            // only (the receiver is ignored; results use the intrinsic).
+            if *kind == TAK::U8 {
+                met_a(i, co, "fromBase64", u8_from_base64, 1.0);
+                met_a(i, co, "fromHex", u8_from_hex, 1.0);
+            }
         }
         i.set_attr(
             &proto,
@@ -460,6 +466,14 @@ fn install_typed_arrays(i: &mut Interp) {
             false,
             false,
         );
+        // Uint8Array.prototype base64/hex methods — %Uint8Array.prototype%
+        // only; other element kinds don't see them at all.
+        if *kind == TAK::U8 {
+            met_a(i, &proto, "toBase64", m_u8_to_base64, 0.0);
+            met_a(i, &proto, "toHex", m_u8_to_hex, 0.0);
+            met_a(i, &proto, "setFromBase64", m_u8_set_from_base64, 1.0);
+            met_a(i, &proto, "setFromHex", m_u8_set_from_hex, 1.0);
+        }
         i.set_builtin(&proto, "constructor", ctor.clone());
         gdef(i, name, ctor);
     }
@@ -2354,6 +2368,511 @@ fn m_ta_with(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
         }
     }
     Ok(a)
+}
+
+// ===========================================================================
+// Uint8Array base64 / hex (ES2025 — the Uint8ArrayBase64 methods)
+// ===========================================================================
+
+/// ASCII whitespace skipped inside base64 input — spec
+/// SkipAsciiWhitespace accepts only TAB, LF, FF, CR, SPACE (no other
+/// Unicode whitespace).
+fn b64_is_ws(c: u8) -> bool {
+    matches!(c, 0x09 | 0x0A | 0x0C | 0x0D | 0x20)
+}
+
+/// standard base64 alphabet → 6-bit value (RFC 4648 §4). base64url
+/// input is normalized to this alphabet before lookup (`b64_decode`).
+fn b64_val(c: u8) -> Option<u8> {
+    Some(match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => return None,
+    })
+}
+
+/// spec DecodeFullLengthBase64Chunk — four alphabet chars → three bytes.
+fn b64_quad(c: [u8; 4]) -> [u8; 3] {
+    let n = (b64_val(c[0]).unwrap_or(0) as u32) << 18
+        | (b64_val(c[1]).unwrap_or(0) as u32) << 12
+        | (b64_val(c[2]).unwrap_or(0) as u32) << 6
+        | b64_val(c[3]).unwrap_or(0) as u32;
+    [(n >> 16) as u8, (n >> 8) as u8, n as u8]
+}
+
+/// spec DecodeFinalBase64Chunk — a trailing 2- or 3-char chunk produces
+/// one or two bytes; it is padded with "A" (zero bits) to a full quad
+/// for decoding. `throw_on_extra_bits` (the strict check) rejects a
+/// nonzero dropped byte: the unused bits of the last char must be 0.
+fn b64_tail(c: &[u8], throw_on_extra_bits: bool) -> Result<Vec<u8>, ()> {
+    let mut full = [b'A'; 4];
+    full[..c.len()].copy_from_slice(c);
+    let b = b64_quad(full);
+    if c.len() == 2 {
+        if throw_on_extra_bits && b[1] != 0 {
+            return Err(());
+        }
+        return Ok(vec![b[0]]);
+    }
+    if throw_on_extra_bits && b[2] != 0 {
+        return Err(());
+    }
+    Ok(vec![b[0], b[1]])
+}
+
+/// lastChunkHandling option — "loose" (default), "strict", or
+/// "stop-before-partial".
+#[derive(Clone, Copy, PartialEq)]
+enum Lch {
+    Loose,
+    Strict,
+    StopBeforePartial,
+}
+
+/// spec Record { [[Read]], [[Bytes]], [[Error]] } produced by
+/// FromBase64 / FromHex. `err` carries the SyntaxError message, which
+/// the caller materializes only after writing [[Bytes]] (setFrom*
+/// commit partial output before throwing).
+struct DecOut {
+    read: usize,
+    bytes: Vec<u8>,
+    err: Option<&'static str>,
+}
+
+impl DecOut {
+    fn ok(read: usize, bytes: Vec<u8>) -> DecOut {
+        DecOut {
+            read,
+            bytes,
+            err: None,
+        }
+    }
+    fn err_at(read: usize, bytes: Vec<u8>, msg: &'static str) -> DecOut {
+        DecOut {
+            read,
+            bytes,
+            err: Some(msg),
+        }
+    }
+}
+
+/// spec FromBase64 — decode `s` (already a String). Every accepted code
+/// unit is ASCII, so scanning the UTF-8 bytes is equivalent to scanning
+/// UTF-16 units: any non-ASCII byte is an invalid char, and on every
+/// path where [[Read]] is observable the consumed prefix is ASCII
+/// (byte index == code-unit index).
+///
+/// `url` selects the base64url alphabet ("-"/"_" for 62/63; "+" and
+/// "/" become invalid). `max_len` caps output — the destination view's
+/// live length for setFromBase64, effectively unlimited otherwise.
+fn b64_decode(s: &[u8], url: bool, lch: Lch, max_len: usize) -> DecOut {
+    if max_len == 0 {
+        // spec: maxLength 0 returns before the string is examined —
+        // an empty destination accepts anything without reading it.
+        return DecOut::ok(0, Vec::new());
+    }
+    let length = s.len();
+    let mut bytes: Vec<u8> = Vec::new();
+    // `read` = index just past the last *committed* chunk — it is
+    // updated only when a 4-char chunk decodes, so a partially
+    // consumed tail never counts.
+    let mut read = 0usize;
+    let mut index = 0usize;
+    let mut chunk = [0u8; 4];
+    let mut cl = 0usize;
+    loop {
+        while index < length && b64_is_ws(s[index]) {
+            index += 1;
+        }
+        if index == length {
+            // end of input: `cl` leftover chars are the last chunk.
+            if cl > 0 {
+                match lch {
+                    Lch::StopBeforePartial => return DecOut::ok(read, bytes),
+                    Lch::Loose => {
+                        if cl == 1 {
+                            return DecOut::err_at(
+                                read,
+                                bytes,
+                                "a single extra base64 character in the last chunk",
+                            );
+                        }
+                        let extra = b64_tail(&chunk[..cl], false).unwrap_or_default();
+                        bytes.extend_from_slice(&extra);
+                    }
+                    Lch::Strict => {
+                        return DecOut::err_at(read, bytes, "the last chunk is not padded");
+                    }
+                }
+            }
+            return DecOut::ok(length, bytes);
+        }
+        let mut c = s[index];
+        index += 1;
+        if c == b'=' {
+            // padding may only complete a 2- or 3-char chunk, and only
+            // whitespace may follow it (a 2-char chunk takes a second
+            // '=').
+            if cl < 2 {
+                return DecOut::err_at(read, bytes, "unexpected padding character");
+            }
+            while index < length && b64_is_ws(s[index]) {
+                index += 1;
+            }
+            if cl == 2 {
+                if index == length {
+                    match lch {
+                        Lch::StopBeforePartial => return DecOut::ok(read, bytes),
+                        _ => return DecOut::err_at(read, bytes, "missing padding character"),
+                    }
+                }
+                if s[index] == b'=' {
+                    index += 1;
+                    while index < length && b64_is_ws(s[index]) {
+                        index += 1;
+                    }
+                }
+            }
+            if index < length {
+                return DecOut::err_at(read, bytes, "unexpected character after padding");
+            }
+            match b64_tail(&chunk[..cl], lch == Lch::Strict) {
+                Ok(extra) => bytes.extend_from_slice(&extra),
+                Err(()) => {
+                    return DecOut::err_at(read, bytes, "extra bits in the last base64 character")
+                }
+            }
+            return DecOut::ok(length, bytes);
+        }
+        if url {
+            match c {
+                b'+' | b'/' => {
+                    return DecOut::err_at(read, bytes, "invalid character in a base64url string")
+                }
+                b'-' => c = b'+',
+                b'_' => c = b'/',
+                _ => {}
+            }
+        }
+        if b64_val(c).is_none() {
+            return DecOut::err_at(read, bytes, "invalid base64 character");
+        }
+        // spec: stop before consuming a char when growing the chunk
+        // would make it produce more bytes than the capacity left —
+        // the whole current chunk is left unread. (bytes.len() is a
+        // multiple of 3 here, so `remaining` below is exact.)
+        let remaining = max_len - bytes.len();
+        if (remaining == 1 && cl == 2) || (remaining == 2 && cl == 3) {
+            return DecOut::ok(read, bytes);
+        }
+        chunk[cl] = c;
+        cl += 1;
+        if cl == 4 {
+            bytes.extend_from_slice(&b64_quad(chunk));
+            cl = 0;
+            read = index;
+            if bytes.len() >= max_len {
+                return DecOut::ok(read, bytes);
+            }
+        }
+    }
+}
+
+/// hex digit → value (both cases accepted).
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// spec FromHex — two hex digits per byte, no whitespace. An odd input
+/// length is a SyntaxError checked *before* any reading (unlike
+/// FromBase64's maxLength shortcut, it fires even with no capacity).
+/// `read` counts UTF-16 code units; consumed input is ASCII.
+fn hex_decode(s: &[u8], max_len: usize) -> DecOut {
+    let mut bytes = Vec::new();
+    if s.len() % 2 != 0 {
+        return DecOut::err_at(0, bytes, "hex string must have an even length");
+    }
+    let mut read = 0usize;
+    while read < s.len() && bytes.len() < max_len {
+        let b = match (hex_val(s[read]), hex_val(s[read + 1])) {
+            (Some(h), Some(l)) => h << 4 | l,
+            _ => return DecOut::err_at(read, bytes, "invalid hex character"),
+        };
+        bytes.push(b);
+        read += 2;
+    }
+    DecOut::ok(read, bytes)
+}
+
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// RFC 4648 §4 base64 (§5 base64url when `url`) — padding included
+/// unless `omit_padding` (spec ToBase64).
+fn b64_encode(data: &[u8], url: bool, omit_padding: bool) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for trip in data.chunks(3) {
+        let b0 = trip[0] as u32;
+        let b1 = *trip.get(1).unwrap_or(&0) as u32;
+        let b2 = *trip.get(2).unwrap_or(&0) as u32;
+        let n = b0 << 16 | b1 << 8 | b2;
+        let emit = |out: &mut String, v: u32| {
+            let c = B64_ALPHABET[(v & 63) as usize];
+            out.push(if url {
+                match c {
+                    b'+' => '-',
+                    b'/' => '_',
+                    c => c as char,
+                }
+            } else {
+                c as char
+            });
+        };
+        emit(&mut out, n >> 18);
+        emit(&mut out, n >> 12);
+        match trip.len() {
+            3 => {
+                emit(&mut out, n >> 6);
+                emit(&mut out, n);
+            }
+            2 => {
+                emit(&mut out, n >> 6);
+                out.push('=');
+            }
+            _ => {
+                out.push('=');
+                out.push('=');
+            }
+        }
+    }
+    if omit_padding {
+        while out.ends_with('=') {
+            out.pop();
+        }
+    }
+    out
+}
+
+/// spec GetOptionsObject — `undefined` → None (a fresh null-prototype
+/// object whose every Get yields undefined); an Object → Some(it);
+/// anything else → TypeError.
+fn u8_opts(i: &mut Interp, v: &Value) -> Result<Option<Value>, Value> {
+    match v {
+        Value::Und => Ok(None),
+        Value::Obj(_) => Ok(Some(v.clone())),
+        _ => Err(i.type_err("options must be an object or undefined")),
+    }
+}
+
+/// `? Get(opts, key)` — the fresh options object has no properties, so
+/// a missing options argument always reads `undefined`.
+fn u8_opt(i: &mut Interp, opts: &Option<Value>, key: &str) -> Result<Value, Value> {
+    match opts {
+        Some(o) => i.get_prop(o, &PropKey::from_str(key)),
+        None => Ok(Value::Und),
+    }
+}
+
+/// the `alphabet` option — "base64" (default) or "base64url"; a
+/// present value of any other string or type is a TypeError (the spec
+/// compares the option value, it does not ToString it).
+fn u8_alphabet(i: &mut Interp, opts: &Option<Value>) -> Result<bool, Value> {
+    match u8_opt(i, opts, "alphabet")? {
+        Value::Und => Ok(false),
+        Value::Str(s) if &*s == "base64" => Ok(false),
+        Value::Str(s) if &*s == "base64url" => Ok(true),
+        _ => Err(i.type_err("alphabet option must be \"base64\" or \"base64url\"")),
+    }
+}
+
+/// the `lastChunkHandling` option — "loose" (default), "strict", or
+/// "stop-before-partial"; anything else is a TypeError.
+fn u8_lch(i: &mut Interp, opts: &Option<Value>) -> Result<Lch, Value> {
+    match u8_opt(i, opts, "lastChunkHandling")? {
+        Value::Und => Ok(Lch::Loose),
+        Value::Str(s) if &*s == "loose" => Ok(Lch::Loose),
+        Value::Str(s) if &*s == "strict" => Ok(Lch::Strict),
+        Value::Str(s) if &*s == "stop-before-partial" => Ok(Lch::StopBeforePartial),
+        _ => Err(i.type_err(
+            "lastChunkHandling option must be \"loose\", \"strict\", or \"stop-before-partial\"",
+        )),
+    }
+}
+
+/// spec ValidateUint8Array — RequireInternalSlot [[TypedArrayName]] and
+/// it must be "Uint8Array". `kind` U8 is exactly that name (BigInt
+/// stand-ins share F64, and a user-set `__name` prop can't reach U8
+/// internals). `write` adds the merged immutable-buffer check (the
+/// spec's ~write~ access mode used by the setFrom* methods).
+fn need_u8(i: &mut Interp, this: &Value, write: bool) -> Result<Tap, Value> {
+    let t = ta_parts(this).ok_or_else(|| {
+        i.type_err("Method called on incompatible receiver (expected a Uint8Array)")
+    })?;
+    if t.kind != TAK::U8 {
+        return Err(i.type_err("Method called on incompatible receiver (expected a Uint8Array)"));
+    }
+    if write && t.buf.borrow().immutable {
+        return Err(i.type_err("Cannot write to an immutable ArrayBuffer"));
+    }
+    Ok(t)
+}
+
+/// spec GetUint8ArrayBytes — the view's live bytes; a detached or
+/// out-of-bounds buffer (possibly via an options getter's side effect)
+/// is a TypeError.
+fn u8_live_bytes(i: &mut Interp, t: &Tap) -> Result<Vec<u8>, Value> {
+    let Some(eff) = t.eff() else {
+        return Err(i.type_err(
+            "Cannot perform the operation on a detached or out-of-bounds Uint8Array",
+        ));
+    };
+    let Some(b) = buffer_bytes(&t.buf) else {
+        return Err(i.type_err("Uint8Array has no ArrayBuffer"));
+    };
+    let v = b.borrow()[t.off..t.off + eff].to_vec();
+    Ok(v)
+}
+
+/// `{ read, written }` — OrdinaryObjectCreate(%Object.prototype%) with
+/// two data properties; the spec result of setFromBase64 / setFromHex.
+fn u8_rw_obj(i: &mut Interp, read: usize, written: usize) -> NR {
+    let r = i.new_obj();
+    i.set_data(&r, "read", Value::Num(read as f64));
+    i.set_data(&r, "written", Value::Num(written as f64));
+    Ok(Value::Obj(r))
+}
+
+/// spec SetUint8ArrayBytes + the delayed error throw: the decoded
+/// bytes are written into the view *before* a SyntaxError is reported,
+/// so a partially-valid input still lands in the destination.
+fn u8_write_result(i: &mut Interp, t: &Tap, out: DecOut) -> NR {
+    let written = out.bytes.len();
+    if written > 0 {
+        if let Some(b) = buffer_bytes(&t.buf) {
+            b.borrow_mut()[t.off..t.off + written].copy_from_slice(&out.bytes);
+        }
+    }
+    if let Some(m) = out.err {
+        return Err(i.syntax_err(m));
+    }
+    u8_rw_obj(i, out.read, written)
+}
+
+/// `Uint8Array.fromBase64(string[, options])` — the receiver is ignored;
+/// the result is always a fresh Uint8Array on a fresh ArrayBuffer.
+fn u8_from_base64(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
+    let s = match arg(args, 0) {
+        Value::Str(s) => s,
+        _ => return Err(i.type_err("Uint8Array.fromBase64 requires a string")),
+    };
+    let opts = u8_opts(i, &arg(args, 1))?;
+    let url = u8_alphabet(i, &opts)?;
+    let lch = u8_lch(i, &opts)?;
+    let out = b64_decode(s.as_bytes(), url, lch, usize::MAX);
+    if let Some(m) = out.err {
+        return Err(i.syntax_err(m));
+    }
+    let n = out.bytes.len();
+    Ok(Value::Obj(mk_typed(
+        global_ctor_proto(i, "Uint8Array"),
+        mk_buffer(i, out.bytes),
+        0,
+        n,
+        TAK::U8,
+        false,
+    )))
+}
+
+/// `Uint8Array.fromHex(string)` — fresh Uint8Array from a hex string.
+fn u8_from_hex(i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
+    let s = match arg(args, 0) {
+        Value::Str(s) => s,
+        _ => return Err(i.type_err("Uint8Array.fromHex requires a string")),
+    };
+    let out = hex_decode(s.as_bytes(), usize::MAX);
+    if let Some(m) = out.err {
+        return Err(i.syntax_err(m));
+    }
+    let n = out.bytes.len();
+    Ok(Value::Obj(mk_typed(
+        global_ctor_proto(i, "Uint8Array"),
+        mk_buffer(i, out.bytes),
+        0,
+        n,
+        TAK::U8,
+        false,
+    )))
+}
+
+/// `Uint8Array.prototype.toBase64([options])`.
+fn m_u8_to_base64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let t = need_u8(i, this, false)?;
+    let opts = u8_opts(i, &arg(args, 0))?;
+    let url = u8_alphabet(i, &opts)?;
+    let omit_v = u8_opt(i, &opts, "omitPadding")?;
+    let omit = i.to_bool(&omit_v);
+    // spec GetUint8ArrayBytes — the out-of-bounds check runs *after*
+    // the options getters, which may have detached the buffer.
+    let bytes = u8_live_bytes(i, &t)?;
+    Ok(Value::Str(Rc::from(b64_encode(&bytes, url, omit).as_str())))
+}
+
+/// `Uint8Array.prototype.toHex()` — lowercase hex, two digits per byte.
+fn m_u8_to_hex(i: &mut Interp, this: &Value, _a: &[Value]) -> NR {
+    let t = need_u8(i, this, false)?;
+    let bytes = u8_live_bytes(i, &t)?;
+    const H: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(H[(b >> 4) as usize] as char);
+        s.push(H[(b & 15) as usize] as char);
+    }
+    Ok(Value::Str(Rc::from(s.as_str())))
+}
+
+/// `Uint8Array.prototype.setFromBase64(string[, options])`.
+fn m_u8_set_from_base64(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let t = need_u8(i, this, true)?;
+    let s = match arg(args, 0) {
+        Value::Str(s) => s,
+        _ => return Err(i.type_err("setFromBase64 requires a string")),
+    };
+    let opts = u8_opts(i, &arg(args, 1))?;
+    let url = u8_alphabet(i, &opts)?;
+    let lch = u8_lch(i, &opts)?;
+    // spec MakeTypedArrayWithBufferWitnessRecord + IsTypedArrayOutOfBounds
+    // run *after* the options coercion — a getter may have detached or
+    // shrunk the buffer.
+    let Some(eff) = t.eff() else {
+        return Err(i.type_err(
+            "Cannot perform setFromBase64 on a detached or out-of-bounds Uint8Array",
+        ));
+    };
+    let out = b64_decode(s.as_bytes(), url, lch, eff);
+    u8_write_result(i, &t, out)
+}
+
+/// `Uint8Array.prototype.setFromHex(string)`.
+fn m_u8_set_from_hex(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
+    let t = need_u8(i, this, true)?;
+    let s = match arg(args, 0) {
+        Value::Str(s) => s,
+        _ => return Err(i.type_err("setFromHex requires a string")),
+    };
+    let Some(eff) = t.eff() else {
+        return Err(i.type_err(
+            "Cannot perform setFromHex on a detached or out-of-bounds Uint8Array",
+        ));
+    };
+    let out = hex_decode(s.as_bytes(), eff);
+    u8_write_result(i, &t, out)
 }
 
 // ===========================================================================

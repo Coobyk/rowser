@@ -1581,6 +1581,78 @@ mod tests {
     }
 
     #[test]
+    fn uint8_array_base64_hex() {
+        // encode
+        assert_eq!(s("new Uint8Array([102,111,111]).toBase64()"), "Zm9v");
+        assert_eq!(s("new Uint8Array([251,255,191]).toBase64()"), "+/+/");
+        assert_eq!(
+            s("new Uint8Array([251,255,191]).toBase64({alphabet: 'base64url'})"),
+            "-_-_"
+        );
+        assert_eq!(s("new Uint8Array([72]).toBase64()"), "SA==");
+        assert_eq!(s("new Uint8Array([72]).toBase64({omitPadding: true})"), "SA");
+        assert_eq!(s("new Uint8Array([202,254,208,13]).toHex()"), "cafed00d");
+        // decode — fresh Uint8Array on a fresh ArrayBuffer
+        assert_eq!(s("Uint8Array.fromHex('CAFEd00d').join(',')"), "202,254,208,13");
+        assert_eq!(s("Uint8Array.fromBase64('Zm9v').join(',')"), "102,111,111");
+        assert_eq!(
+            s("Uint8Array.fromBase64('-_-_', {alphabet: 'base64url'}).join(',')"),
+            "251,255,191"
+        );
+        assert!(b("Uint8Array.fromBase64('Zm9v') instanceof Uint8Array"));
+        assert!(b(
+            "Object.getPrototypeOf(Uint8Array.fromBase64.call(Int8Array, 'Zm9v')) === Uint8Array.prototype"
+        ));
+        // whitespace skipping + lastChunkHandling
+        assert_eq!(
+            s("Uint8Array.fromBase64(' SGVsbG8g\\nV29ybGQ ').join(',')"),
+            "72,101,108,108,111,32,87,111,114,108,100"
+        );
+        assert_eq!(s("Uint8Array.fromBase64('ZH==').join(',')"), "100");
+        assert_eq!(
+            s("Uint8Array.fromBase64('QUJDQQ', {lastChunkHandling: 'stop-before-partial'}).join(',')"),
+            "65,66,67"
+        );
+        assert!(b(
+            "(function(){ try { Uint8Array.fromBase64('ZH==', {lastChunkHandling:'strict'}); return false; } catch(e) { return e instanceof SyntaxError; } })()"
+        ));
+        // setFrom* — writes into the view, returns {read, written}
+        assert_eq!(
+            s("let u = new Uint8Array(8); let r = u.setFromHex('cafed00d'); [r.read, r.written, u[0], u[7]].join(',')"),
+            "8,4,202,0"
+        );
+        assert_eq!(
+            s("let u = new Uint8Array(3); let r = u.setFromBase64('QUJD'); [r.read, r.written].join(',') + ';' + u.join(',')"),
+            "4,3;65,66,67"
+        );
+        // a chunk that doesn't fit is left entirely unread
+        assert_eq!(
+            s("let u = new Uint8Array(4); let r = u.setFromBase64('QUJDQUJD'); [r.read, r.written].join(',')"),
+            "4,3"
+        );
+        assert!(b(
+            "Object.getPrototypeOf(new Uint8Array(1).setFromHex('aa')) === Object.prototype"
+        ));
+        // decoded prefix is written before the SyntaxError is thrown
+        assert!(b(
+            "(function(){ let u = new Uint8Array(4); try { u.setFromHex('aagg'); return false; } catch(e) { return e instanceof SyntaxError && u[0] === 170; } })()"
+        ));
+        // argument / receiver validation
+        assert!(b(
+            "(function(){ try { Uint8Array.fromBase64(5); return false; } catch(e) { return e instanceof TypeError; } })()"
+        ));
+        assert!(b(
+            "(function(){ try { Uint8Array.fromBase64('Zg==', {alphabet: 'nope'}); return false; } catch(e) { return e instanceof TypeError; } })()"
+        ));
+        assert!(b(
+            "(function(){ try { Uint8Array.prototype.toHex.call(new Int8Array(2)); return false; } catch(e) { return e instanceof TypeError; } })()"
+        ));
+        assert_eq!(num("Uint8Array.fromBase64.length"), 1.0);
+        assert_eq!(num("Uint8Array.prototype.toBase64.length"), 0.0);
+        assert_eq!(num("Uint8Array.prototype.setFromHex.length"), 1.0);
+    }
+
+    #[test]
     fn data_view_endian() {
         assert_eq!(
             num("let b = new ArrayBuffer(4); let d = new DataView(b); d.setUint16(0, 0x1234, true); d.getUint16(0, false)"),
@@ -1968,5 +2040,80 @@ mod tests {
         assert!(b(
             "Math.PI === Math.PI && Object.getOwnPropertyDescriptor(Math,'PI').writable === false"
         ));
+    }
+
+    #[test]
+    fn regexp_escape() {
+        // ES2025 RegExp.escape — leading alnum hex-escapes, syntax
+        // chars backslash-escape, other punctuators → \xHH, whitespace
+        // and surrogates → Unicode escapes, control chars → \t\n\v\f\r
+        assert_eq!(s("RegExp.escape('')"), "");
+        assert_eq!(s("RegExp.escape('foo')"), "\\x66oo");
+        assert_eq!(s("RegExp.escape('9x')"), "\\x39x");
+        assert_eq!(s("RegExp.escape('[bar]')"), "\\[bar\\]");
+        assert_eq!(s("RegExp.escape('\\\\d')"), "\\\\d");
+        assert_eq!(s("RegExp.escape('\\n')"), "\\n");
+        assert_eq!(s("RegExp.escape(' ')"), "\\x20");
+        assert_eq!(s("RegExp.escape('a.c*')"), "\\x61\\.c\\*");
+        assert_eq!(s("RegExp.escape('-,')"), "\\x2d\\x2c");
+        // U+1F496 is one code point — not a surrogate — so it stays
+        // literal (spec escapes only surrogate CODE UNITS, which a
+        // well-formed pair does not produce)
+        assert_eq!(s("RegExp.escape('💖')"), "💖");
+        assert_eq!(num("RegExp.escape.length"), 1.0);
+        // output embeds into a pattern and matches the literal input
+        assert!(b(
+            "new RegExp('^' + RegExp.escape('a.c(x|y)$') + '$').test('a.c(x|y)$')"
+        ));
+        // non-String argument → TypeError (no coercion)
+        assert!(eval("RegExp.escape()").is_err());
+        assert!(eval("RegExp.escape(42)").is_err());
+        assert!(eval("RegExp.escape(null)").is_err());
+        assert!(eval("RegExp.escape({})").is_err());
+    }
+
+    #[test]
+    fn json_parse_reviver_source() {
+        // json-parse-with-source: third reviver arg is { source }
+        assert_eq!(
+            s("var o; JSON.parse('{\"a\":1}', function(k,v,c){ if(k==='a') o=c.source; return v; }); o"),
+            "1"
+        );
+        // the root value is an object → its context has no `source`
+        // (source is a property of parsed PRIMITIVE values only)
+        assert!(b(
+            "var seen='x'; JSON.parse('{\"a\":1}', function(k,v,c){ if(k==='') seen=c.source; return v; }); seen===undefined"
+        ));
+        // raw text preserved: string quotes/escapes and number spelling;
+        // object/array contexts contribute `undefined`
+        assert_eq!(
+            s("var o; JSON.parse('{\"s\":\"hi\\\\n\",\"n\":1e3}', function(k,v,c){ o=(o||'')+c.source+'|'; return v; }); o"),
+            "\"hi\\n\"|1e3|undefined|"
+        );
+        // a root primitive DOES see the whole input text
+        assert_eq!(
+            s("var o; JSON.parse(' 1e3 ', function(k,v,c){ if(k==='') o=c.source; return v; }); o"),
+            " 1e3 "
+        );
+        // context is a fresh ordinary object with only `source`
+        assert!(b(
+            "JSON.parse('1', function(k,v,c){ return Object.getPrototypeOf(c)===Object.prototype && Object.keys(c).length===1 && c.source==='1'; })"
+        ));
+    }
+
+    #[test]
+    fn weakref_basics() {
+        assert!(b("var t={x:1}; var w=new WeakRef(t); w.deref()===t"));
+        assert!(b("Object.prototype.toString.call(new WeakRef({})) === '[object WeakRef]'"));
+        assert_eq!(num("WeakRef.length"), 1.0);
+        assert!(eval("WeakRef({})").is_err()); // requires new
+        assert!(eval("new WeakRef(1)").is_err()); // non-object target
+        assert!(eval("new WeakRef('x')").is_err());
+        assert!(eval("new WeakRef(Symbol.for('k'))").is_err()); // registry sym
+        assert!(eval("WeakRef.prototype.deref.call({})").is_err()); // brand check
+        // user AND well-known symbols are weakly-referenceable — only
+        // Symbol.for-registered symbols are rejected (CanBeHeldWeakly)
+        assert!(b("typeof new WeakRef(Symbol('s')).deref() === 'symbol'"));
+        assert!(b("typeof new WeakRef(Symbol.iterator).deref() === 'symbol'"));
     }
 }
