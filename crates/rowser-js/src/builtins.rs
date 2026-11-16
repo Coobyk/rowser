@@ -1620,6 +1620,24 @@ fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
                 let tv = || Value::Obj(target.clone());
                 match mode {
                     0 | 1 | 2 => {
+                        // typed-array target gone out-of-bounds or
+                        // detached mid-iteration → TypeError on next()
+                        // (resizable-buffer spec); `.length` itself still
+                        // reports 0, the element access path rejects.
+                        if let ObjKind::Typed {
+                            buf,
+                            off,
+                            len,
+                            kind,
+                            track,
+                        } = &target.borrow().kind
+                        {
+                            if typed_state(buf, *off, *len, *kind, *track).is_none() {
+                                return Err(i.type_err(
+                                    "Cannot perform Array iterator operation on a detached or out-of-bounds TypedArray",
+                                ));
+                            }
+                        }
                         // array-like (incl. arguments): length re-read per
                         // step (LengthOfArrayLike is live)
                         let lv = i.get_prop(&tv(), &PropKey::from_str("length"))?;
@@ -7277,16 +7295,19 @@ fn arr_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         };
         if spreadable {
             let elen = length_of_array_like(i, e)?;
-            if n + elen > 9007199254740991usize {
-                return Err(i.type_err("Array.prototype.concat: too many elements"));
-            }
             for k in 0..elen {
                 let key = idx_key(k);
                 if i.has_prop(e, &key)? {
                     let v = i.get_prop(e, &key)?;
+                    if n >= 9007199254740991usize {
+                        return Err(
+                            i.type_err("Array.prototype.concat: too many elements")
+                        );
+                    }
                     create_data_prop(i, &a, n, v)?;
-                    n += 1;
                 }
+                // n tracks the SOURCE index k — holes keep their gap
+                n += 1;
             }
         } else {
             if n >= 9007199254740991usize {
@@ -7984,10 +8005,8 @@ fn arr_reverse(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         } else if lower_exists {
             spec_del_idx(i, &obj, lower)?;
             spec_set(i, &obj, upper_key, lower_v)?;
-        } else {
-            spec_del_idx(i, &obj, lower)?;
-            spec_del_idx(i, &obj, upper)?;
         }
+        // both absent: no operation
     }
     Ok(obj)
 }
