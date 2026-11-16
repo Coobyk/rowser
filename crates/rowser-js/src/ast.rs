@@ -135,8 +135,14 @@ pub struct ObjProp {
 
 #[derive(Debug, Clone)]
 pub enum PropVal {
-    /// `key: expr` or shorthand `key`
+    /// `key: expr`
     Expr(Expr),
+    /// bare shorthand `{x}` — always an ordinary data prop (never a
+    /// `__proto__` setter, unlike the colon form)
+    Shorthand(Expr),
+    /// `{x = e}` cover-init — valid only as a destructuring pattern
+    /// element; vexpr rejects it in expression position
+    CoverInit(Expr),
     /// `key() {}` — function def (non-arrow)
     Method(Rc<FnDef>),
     Get(Rc<FnDef>),

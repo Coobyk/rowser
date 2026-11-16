@@ -857,24 +857,20 @@ impl Lexer {
             };
             match c {
                 '`' => {
+                    // take unconditionally — a poisoned segment's buffer
+                    // must not leak into the next segment's cooked
+                    let ck = std::mem::take(&mut cooked);
                     parts.push(TemplPart::Str {
-                        cooked: if ok {
-                            Some(std::mem::take(&mut cooked))
-                        } else {
-                            None
-                        },
+                        cooked: if ok { Some(ck) } else { None },
                         raw: std::mem::take(&mut raw),
                     });
                     return Ok(parts);
                 }
                 '$' if self.peek() == Some('{') => {
                     self.bump();
+                    let ck = std::mem::take(&mut cooked);
                     parts.push(TemplPart::Str {
-                        cooked: if ok {
-                            Some(std::mem::take(&mut cooked))
-                        } else {
-                            None
-                        },
+                        cooked: if ok { Some(ck) } else { None },
                         raw: std::mem::take(&mut raw),
                     });
                     ok = true;

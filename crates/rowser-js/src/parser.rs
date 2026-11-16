@@ -339,6 +339,15 @@ impl Parser {
                 self.next();
                 Ok(PropKey::Num(n))
             }
+            // NumericLiteral covers BigIntegerLiteral — a bigint prop
+            // name is ToString of the value (any radix → decimal)
+            Tok::BigInt(n) => {
+                self.next();
+                let name = crate::binary::lit_to_bits(&n)
+                    .map(|(_, m)| crate::binary::bits_to_dec(&m))
+                    .unwrap_or_else(|| n.to_string());
+                Ok(PropKey::Str(name))
+            }
             Tok::Punct("[") if computed_ok => {
                 self.next();
                 // ComputedPropertyName is AssignmentExpression[+In] —
@@ -440,6 +449,16 @@ impl Parser {
                         return Err(
                             self.err("\"use strict\" not allowed with non-simple parameters")
                         );
+                    }
+                    // strictness is retroactive to the parameter list —
+                    // `eval`/`arguments` names parsed before the
+                    // directive become early errors now
+                    for p in params {
+                        let mut names = Vec::new();
+                        pattern_names(p, &mut names);
+                        for n in names {
+                            self.check_binding_name(n)?;
+                        }
                     }
                 }
             }
@@ -2107,7 +2126,9 @@ impl Parser {
             let params = self.params();
             // binding-name checks use the member's own [Yield]/[Await]
             let params = params?;
-            let cpr = self.check_params(&params, false);
+            // MethodDefinition formals are UniqueFormalParameters —
+            // duplicates are an early error in every mode
+            let cpr = self.check_params(&params, true);
             (
                 self.ctor_depth,
                 self.method_depth,
@@ -2297,7 +2318,8 @@ impl Parser {
             _ => None,
         };
         if let Some(name) = single {
-            if matches!(self.peek2().tok, Tok::Punct("=>")) {
+            // [no LineTerminator here] between ArrowParameters and `=>`
+            if matches!(self.peek2().tok, Tok::Punct("=>")) && !self.peek2().newline_before {
                 self.next();
                 self.next();
                 // arrow_body owns the body's [Await] scope — restore the
@@ -2320,7 +2342,8 @@ impl Parser {
             if let Ok(params) = self.params() {
                 if self.at_punct(")") {
                     self.next();
-                    if self.eat_punct("=>") {
+                    // [no LineTerminator here] between ArrowParameters and `=>`
+                    if !self.peek().newline_before && self.eat_punct("=>") {
                         self.await_decl = saved_await;
                         return Ok(Some(self.arrow_body(params, None, is_async, c0)?));
                     }
@@ -2388,11 +2411,13 @@ impl Parser {
         } else {
             self.check_params(&params, true)?;
             // expression body — `yield`/`super`-context rules for arrows
-            // apply inside it too
-            let saved = self.fn_depth;
+            // apply inside it too; the static-block `await` ban doesn't
+            // reach across the function boundary
+            let saved = (self.fn_depth, self.in_static_block);
             self.fn_depth += 1;
+            self.in_static_block = false;
             let res = self.assign_expr();
-            self.fn_depth = saved;
+            (self.fn_depth, self.in_static_block) = saved;
             let e = res?;
             Ok(Expr::Fn(Rc::new(FnDef {
                 name,
@@ -2411,7 +2436,12 @@ impl Parser {
     fn cond_expr(&mut self) -> Result<Expr, Error> {
         let c = self.binary_expr(0)?;
         if self.eat_punct("?") {
-            let t = self.assign_expr()?;
+            // the true branch is AssignmentExpression[+In] unconditionally —
+            // a [~In] context (for-head) doesn't reach inside `? :`
+            let no_in = std::mem::replace(&mut self.no_in, false);
+            let t = self.assign_expr();
+            self.no_in = no_in;
+            let t = t?;
             self.expect_punct(":")?;
             let f = self.assign_expr()?;
             Ok(Expr::Cond {
@@ -2446,6 +2476,19 @@ impl Parser {
             // `**` is right-associative; everything else left.
             let next_min = if kind == BinKind::Pow { prec } else { prec + 1 };
             let r = self.binary_expr(next_min)?;
+            // `??` operands may not be unparenthesized `&&`/`||`
+            // expressions — a parenthesized operand arrives as
+            // Expr::Paren and stays legal
+            if kind == BinKind::Log(LogOp::Nullish) {
+                let bad = |e: &Expr| {
+                    matches!(e, Expr::Logical { op, .. } if *op != LogOp::Nullish)
+                };
+                if bad(&l) || bad(&r) {
+                    return Err(self.err(
+                        "cannot mix ?? with && or || without parentheses",
+                    ));
+                }
+            }
             l = match kind {
                 BinKind::Log(op) => Expr::Logical {
                     op,
@@ -2563,9 +2606,13 @@ impl Parser {
     fn left_hand_side(&mut self) -> Result<Expr, Error> {
         let mut e = if self.at_kw(Kw::New) {
             self.next();
-            // `new.target` — only `target` is a valid meta-property, and
-            // only inside a function body
+            // `new.target` — only `target` is a valid meta-property,
+            // written literally (no Unicode escapes), and only inside
+            // a function body
             if self.eat_punct(".") {
+                if self.peek().escaped {
+                    return Err(self.err("new.target may not contain escape sequences"));
+                }
                 let name = self.ident_name()?;
                 if name != "target" {
                     return Err(self.err(format!("unsupported meta property new.{name}")));
@@ -2596,6 +2643,14 @@ impl Parser {
             match self.peek().tok.clone() {
                 Tok::Punct(".") => {
                     self.next();
+                    // only an IdentifierName may follow `.` — string,
+                    // number, and bigint literals are early errors
+                    if matches!(
+                        self.peek().tok,
+                        Tok::Str(_) | Tok::Num(_) | Tok::BigInt(_)
+                    ) {
+                        return Err(self.err("expected identifier name after '.'"));
+                    }
                     let name = self.prop_key(false)?;
                     let prop = match name {
                         PropKey::Ident(s) | PropKey::Str(s) => Expr::Str(s),
@@ -2630,6 +2685,15 @@ impl Parser {
                             self.expect_punct("]")?;
                             (p, true)
                         } else {
+                            // same IdentifierName rule after `?.`
+                            if matches!(
+                                self.peek().tok,
+                                Tok::Str(_) | Tok::Num(_) | Tok::BigInt(_)
+                            ) {
+                                return Err(
+                                    self.err("expected identifier name after '?.'")
+                                );
+                            }
                             (
                                 match self.prop_key(false)? {
                                     PropKey::Ident(s) | PropKey::Str(s) => Expr::Str(s),
@@ -2670,6 +2734,13 @@ impl Parser {
                     };
                 }
                 Tok::Template(parts) => {
+                    // OptionalChain TemplateLiteral is an early error —
+                    // a `?.`-tainted chain can't tag a template
+                    if opt_chain {
+                        return Err(
+                            self.err("invalid template literal after optional chain")
+                        );
+                    }
                     // tagged template — a call whose first argument is the
                     // site's (cached, frozen) template object
                     self.next();
@@ -2704,6 +2775,13 @@ impl Parser {
         };
         loop {
             if self.eat_punct(".") {
+                // only an IdentifierName may follow `.`
+                if matches!(
+                    self.peek().tok,
+                    Tok::Str(_) | Tok::Num(_) | Tok::BigInt(_)
+                ) {
+                    return Err(self.err("expected identifier name after '.'"));
+                }
                 let name = self.prop_key(false)?;
                 let prop = match name {
                     PropKey::Ident(s) | PropKey::Str(s) => Expr::Str(s),
@@ -2888,7 +2966,18 @@ impl Parser {
                     })
                 } else {
                     self.expect_punct(".")?;
-                    let _ = self.ident_name()?;
+                    // `import.meta` — written literally, no escapes
+                    if self.peek().escaped {
+                        return Err(
+                            self.err("import.meta may not contain escape sequences")
+                        );
+                    }
+                    let name = self.ident_name()?;
+                    if name != "meta" {
+                        return Err(
+                            self.err(format!("unsupported meta property import.{name}"))
+                        );
+                    }
                     Ok(Expr::Ident("$import_meta".into()))
                 }
             }
@@ -2907,6 +2996,23 @@ impl Parser {
                 // same for an (escaped) `await` in an [Await] context
                 if name == "await" && (self.await_decl > 0 || self.in_static_block) {
                     return Err(self.err("`await` is not a valid identifier here"));
+                }
+                // strict-mode IdentifierReference — the ES5 future
+                // reserved words can't be referenced either
+                if self.strict
+                    && matches!(
+                        name.as_str(),
+                        "implements"
+                            | "interface"
+                            | "package"
+                            | "private"
+                            | "protected"
+                            | "public"
+                    )
+                {
+                    return Err(
+                        self.err(format!("`{name}` is not a valid identifier here"))
+                    );
                 }
                 self.next();
                 // bare `#x` (only legal as `#x in obj` brand checks) —
@@ -3032,7 +3138,20 @@ impl Parser {
                         self.next();
                         let key = self.prop_key(true)?;
                         self.expect_punct("(")?;
-                        let params = self.params()?;
+                        // accessor formals are MethodDefinition formals —
+                        // [~Yield, ~Await] regardless of the enclosing fn;
+                        // the member context (`super.x` in defaults) too
+                        let fsaved = (self.await_decl, self.yield_decl, self.method_depth);
+                        (self.await_decl, self.yield_decl) = (0, 0);
+                        self.method_depth = 1;
+                        let params = self.params();
+                        let cpr = match &params {
+                            Ok(p) => self.check_params(p, true),
+                            Err(_) => Ok(()),
+                        };
+                        (self.await_decl, self.yield_decl, self.method_depth) = fsaved;
+                        let params = params?;
+                        cpr?;
                         self.expect_punct(")")?;
                         if is_get && !params.is_empty() {
                             return Err(self.err("getter must not have parameters"));
@@ -3080,15 +3199,16 @@ impl Parser {
                         let key = self.prop_key(true)?;
                         self.expect_punct("(")?;
                         // async-method formals parse under the member's
-                        // own [Yield]/[Await]
-                        let fsaved = (self.await_decl, self.yield_decl);
+                        // own [Yield]/[Await] and member context
+                        let fsaved = (self.await_decl, self.yield_decl, self.method_depth);
                         (self.await_decl, self.yield_decl) = (1, member_gen as usize);
+                        self.method_depth = 1;
                         let params = self.params();
                         let cpr = match &params {
-                            Ok(p) => self.check_params(p, false),
+                            Ok(p) => self.check_params(p, true),
                             Err(_) => Ok(()),
                         };
-                        (self.await_decl, self.yield_decl) = fsaved;
+                        (self.await_decl, self.yield_decl, self.method_depth) = fsaved;
                         let params = params?;
                         cpr?;
                         self.expect_punct(")")?;
@@ -3116,14 +3236,16 @@ impl Parser {
                         let key = self.prop_key(true)?;
                         self.expect_punct("(")?;
                         // gen-method formals parse under [+Yield, ~Await]
-                        let fsaved = (self.await_decl, self.yield_decl);
+                        // and the member context (`super.x` in defaults)
+                        let fsaved = (self.await_decl, self.yield_decl, self.method_depth);
                         (self.await_decl, self.yield_decl) = (0, 1);
+                        self.method_depth = 1;
                         let params = self.params();
                         let cpr = match &params {
-                            Ok(p) => self.check_params(p, false),
+                            Ok(p) => self.check_params(p, true),
                             Err(_) => Ok(()),
                         };
-                        (self.await_decl, self.yield_decl) = fsaved;
+                        (self.await_decl, self.yield_decl, self.method_depth) = fsaved;
                         let params = params?;
                         cpr?;
                         self.expect_punct(")")?;
@@ -3164,7 +3286,22 @@ impl Parser {
                         PropVal::Expr(self.assign_expr()?)
                     } else if self.at_punct("(") {
                         self.next();
-                        let params = self.params()?;
+                        // plain-method formals parse under the method's
+                        // own [~Yield, ~Await] — `yield`/`await` names
+                        // stay legal even inside gens/async fns — and
+                        // the member context (`super.x` in defaults)
+                        let fsaved = (self.await_decl, self.yield_decl, self.method_depth);
+                        (self.await_decl, self.yield_decl) = (0, 0);
+                        self.method_depth = 1;
+                        let params = self.params();
+                        let cpr = match &params {
+                            // UniqueFormalParameters — dups always error
+                            Ok(p) => self.check_params(p, true),
+                            Err(_) => Ok(()),
+                        };
+                        (self.await_decl, self.yield_decl, self.method_depth) = fsaved;
+                        let params = params?;
+                        cpr?;
                         self.expect_punct(")")?;
                         self.expect_punct("{")?;
                         let body = self.method_body(false, false, false, &params)?;
@@ -3189,16 +3326,9 @@ impl Parser {
                                     )));
                                 }
                                 self.check_binding_name(s)?;
-                                let ident = Expr::Ident(s.clone());
-                                if self.at_punct("=") {
-                                    // `{a = 1}` in destructuring — keep as
-                                    // Cond-free marker via Assign? Just parse
-                                    // and store the assign expr; the binder
-                                    // converts Expr→Pattern anyway.
-                                    PropVal::Expr(ident)
-                                } else {
-                                    PropVal::Expr(ident)
-                                }
+                                // bare `{x}` shorthand — ordinary data
+                                // prop even when the name is __proto__
+                                PropVal::Shorthand(Expr::Ident(s.clone()))
                             }
                             PropKey::Num(n) => {
                                 return Err(self.err(format!("expected `:` after key {n}")))
@@ -3209,22 +3339,21 @@ impl Parser {
                         }
                     };
                     // cover-init default `{a = 1}` — consume the `= expr` so
-                    // object-destructuring assignments parse; interp converts.
+                    // object-destructuring assignments parse; vexpr
+                    // rejects it if the object ever lands in expression
+                    // position (expr_to_pattern converts it for dstr)
                     if self.at_punct("=") {
                         self.next();
                         let d = self.assign_expr()?;
-                        if let PropVal::Expr(Expr::Ident(s)) = &val {
+                        if matches!(&val, PropVal::Shorthand(Expr::Ident(_))) {
                             props.push(ObjProp {
                                 key: key.clone(),
-                                val: PropVal::Expr(Expr::Assign {
-                                    op: AssignOp::Assign,
-                                    target: Box::new(Expr::Ident(s.clone())),
-                                    value: Box::new(d),
-                                }),
+                                val: PropVal::CoverInit(d),
                             });
                             self.eat_punct(",");
                             continue;
                         }
+                        return Err(self.err("unexpected `=` after property name"));
                     }
                     props.push(ObjProp { key, val });
                     if !self.eat_punct(",") {
@@ -3278,11 +3407,34 @@ fn prop_key_name(k: &PropKey) -> Option<String> {
 /// no optional chains).
 fn is_assignable(e: &Expr, strict: bool) -> bool {
     match e {
-        Expr::Paren(inner) => return is_assignable(inner, strict),
-        // `new.target` desugars to a synthetic ident — not a target;
-        // strict mode forbids `eval`/`arguments` as assignment targets
+        // a parenthesized name/member stays a target ((x) = 1 is
+        // legal); a parenthesized literal is a plain expression —
+        // `([a]) = [1]` and `({a}) = o` are early errors
+        Expr::Paren(inner) => match &**inner {
+            Expr::Array(_) | Expr::Object(_) | Expr::ObjDup(_) => false,
+            _ => return is_assignable(inner, strict),
+        },
+        // `new.target`/`import.meta` desugar to synthetic idents — not
+        // targets; strict mode forbids every strict-reserved name as a
+        // target (`eval`/`arguments` plus the future reserved words)
         Expr::Ident(n) => {
-            n.as_str() != "$new_target" && !(strict && matches!(n.as_str(), "eval" | "arguments"))
+            n.as_str() != "$new_target"
+                && n.as_str() != "$import_meta"
+                && !(strict
+                    && matches!(
+                        n.as_str(),
+                        "eval"
+                            | "arguments"
+                            | "implements"
+                            | "interface"
+                            | "package"
+                            | "private"
+                            | "protected"
+                            | "public"
+                            | "let"
+                            | "static"
+                            | "yield"
+                    ))
         }
         Expr::Member { optional, .. } => !optional,
         Expr::Array(elems) => elems.iter().enumerate().all(|(i, el)| match el {
@@ -3293,7 +3445,10 @@ fn is_assignable(e: &Expr, strict: bool) -> bool {
         }),
         Expr::Object(props) | Expr::ObjDup(props) => {
             props.iter().enumerate().all(|(i, p)| match &p.val {
-                PropVal::Expr(ex) => is_assignable_elem(ex, strict),
+                PropVal::Expr(ex) | PropVal::Shorthand(ex) => {
+                    is_assignable_elem(ex, strict)
+                }
+                PropVal::CoverInit(_) => true,
                 PropVal::Spread(ex) => i + 1 == props.len() && is_assignable(ex, strict),
                 PropVal::SpreadTrail(_) => false,
                 PropVal::Method(_) | PropVal::Get(_) | PropVal::Set(_) => false,
@@ -3768,6 +3923,26 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
                 }
             }
             if let Some(h) = handler {
+                // BoundNames of the CatchParameter ∩ LexicallyDeclaredNames
+                // of the Block is a SyntaxError in every mode — including
+                // sloppy block fns (`catch (e) { function e(){} }`). The
+                // shared-scope vblock below routes fns through decl_var, so
+                // check the handler's top-level fn names directly
+                if let Some(p) = param {
+                    let mut pns = Vec::new();
+                    collect_pat_names(p, &mut pns);
+                    for s in h.iter() {
+                        if let Stmt::FnDecl(f) = s {
+                            if let Some(n) = &f.name {
+                                if pns.iter().any(|pn| *pn == n.as_str()) {
+                                    return Err(cx.err(format!(
+                                        "Identifier `{n}` has already been declared"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
                 vblock(h, cx, param.is_none())?;
             }
             if param.is_some() {
@@ -4161,7 +4336,12 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
                     vexpr(c, cx)?;
                 }
                 match &p.val {
-                    PropVal::Expr(e) => vexpr(e, cx)?,
+                    PropVal::Expr(e) | PropVal::Shorthand(e) => vexpr(e, cx)?,
+                    // `{a = 1}` — CoverInitializedName is cover grammar
+                    // only; it never survives to expression position
+                    PropVal::CoverInit(_) => {
+                        return Err(cx.err("Invalid shorthand property initializer"))
+                    }
                     PropVal::Spread(e) | PropVal::SpreadTrail(e) => vexpr(e, cx)?,
                     PropVal::Get(f) | PropVal::Set(f) | PropVal::Method(f) => {
                         vfn(f, cx, Some(false))?;
@@ -4225,7 +4405,10 @@ fn vexpr_pat(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
         Expr::ObjDup(props) | Expr::Object(props) => {
             for p in props {
                 match &p.val {
-                    PropVal::Expr(ex) => vexpr_pat(ex, cx)?,
+                    PropVal::Expr(ex) | PropVal::Shorthand(ex) => vexpr_pat(ex, cx)?,
+                    // `{a = e}` — the key binds `a`; `e` is an ordinary
+                    // default-value expression
+                    PropVal::CoverInit(e) => vexpr(e, cx)?,
                     PropVal::Spread(ex) | PropVal::SpreadTrail(ex) => vexpr_pat(ex, cx)?,
                     PropVal::Method(d) | PropVal::Get(d) | PropVal::Set(d) => {
                         vfn(d, cx, Some(false))?
@@ -4524,9 +4707,11 @@ fn expr_has_arguments(e: &Expr) -> bool {
         Expr::Object(props) | Expr::ObjDup(props) => props.iter().any(|p| {
             matches!(&p.key, PropKey::Computed(x) if expr_has_arguments(x))
                 || match &p.val {
-                    PropVal::Expr(e) | PropVal::Spread(e) | PropVal::SpreadTrail(e) => {
-                        expr_has_arguments(e)
-                    }
+                    PropVal::Expr(e)
+                    | PropVal::Shorthand(e)
+                    | PropVal::CoverInit(e)
+                    | PropVal::Spread(e)
+                    | PropVal::SpreadTrail(e) => expr_has_arguments(e),
                     PropVal::Method(_) | PropVal::Get(_) | PropVal::Set(_) => false,
                 }
         }),
@@ -4563,10 +4748,10 @@ fn expr_has_await(e: &Expr) -> bool {
         Expr::Unary {
             op: UnaryOp::Await, ..
         } => true,
-        // arrows are transparent to `await` (they inherit the context);
-        // non-arrow functions get their own — an `await` inside them is
-        // either legal (async) or a plain identifier (non-async)
-        Expr::Fn(f) => f.is_arrow && !f.is_async && fndef_has_await(f),
+        // arrow bodies are their own context for `await`, but arrow
+        // formal parameters are transparent — binding names, pattern
+        // contents, and default expressions all count
+        Expr::Fn(f) => f.is_arrow && !f.is_async && f.params.iter().any(arrow_param_has_await),
         // a nested class's own member contexts re-check themselves;
         // only the heritage expr + computed keys live in OUR context
         Expr::Class(c) => {
@@ -4585,9 +4770,11 @@ fn expr_has_await(e: &Expr) -> bool {
         Expr::Object(props) | Expr::ObjDup(props) => props.iter().any(|p| {
             matches!(&p.key, PropKey::Computed(x) if expr_has_await(x))
                 || match &p.val {
-                    PropVal::Expr(e) | PropVal::Spread(e) | PropVal::SpreadTrail(e) => {
-                        expr_has_await(e)
-                    }
+                    PropVal::Expr(e)
+                    | PropVal::Shorthand(e)
+                    | PropVal::CoverInit(e)
+                    | PropVal::Spread(e)
+                    | PropVal::SpreadTrail(e) => expr_has_await(e),
                     // object methods are non-arrow fns — their own context
                     PropVal::Method(_) | PropVal::Get(_) | PropVal::Set(_) => false,
                 }
@@ -4610,33 +4797,21 @@ fn expr_has_await(e: &Expr) -> bool {
     }
 }
 
-fn fndef_has_await(f: &FnDef) -> bool {
-    for p in &f.params {
-        match p {
-            Param::Rest(p) => {
-                if pat_has_await(p) {
-                    return true;
-                }
-            }
-            Param::Pattern(p) => {
-                if pat_has_await(p) {
-                    return true;
-                }
-            }
-            Param::Default(p, d) => {
-                if pat_has_await(p) || expr_has_await(d) {
-                    return true;
-                }
-            }
-            Param::Ident(_) => {}
-        }
+// arrow formal parameters stay in the enclosing context for the
+// class-static-block `await` ban — an `await` binding name, `await`
+// inside a pattern, or an `await` expression in a default all count
+fn arrow_param_has_await(p: &Param) -> bool {
+    let mut names = Vec::new();
+    pattern_names(p, &mut names);
+    if names.iter().any(|n| *n == "await") {
+        return true;
     }
-    if let Some(e) = &f.arrow_expr {
-        if expr_has_await(e) {
-            return true;
-        }
+    match p {
+        Param::Ident(_) => false,
+        Param::Rest(pat) => pat_has_await(pat),
+        Param::Pattern(pat) => pat_has_await(pat),
+        Param::Default(pat, d) => pat_has_await(pat) || expr_has_await(d),
     }
-    stmts_have_await(&f.body)
 }
 
 fn pat_has_await(p: &Pattern) -> bool {

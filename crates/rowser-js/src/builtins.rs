@@ -4,7 +4,7 @@ use crate::ast::{self, ArrayPatElem, Param, Pattern};
 use crate::interp::*;
 use crate::regexp::{Regex, RxMatch};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 type NResult = Result<Value, Value>;
@@ -294,12 +294,27 @@ pub(crate) fn own_enum_entries_full(
     v: &Value,
     syms: bool,
 ) -> Result<Vec<(PropKey, Value)>, Value> {
+    own_enum_entries_excl(i, v, syms, None)
+}
+
+/// `own_enum_entries_full` with CopyDataProperties exclusion semantics:
+/// keys in `exclude` are skipped BEFORE their [[GetOwnProperty]] runs —
+/// a proxy source never sees gOPD calls for excluded keys
+pub(crate) fn own_enum_entries_excl(
+    i: &mut Interp,
+    v: &Value,
+    syms: bool,
+    exclude: Option<&HashSet<PropKey>>,
+) -> Result<Vec<(PropKey, Value)>, Value> {
     if let Value::Obj(o) = v {
         // `{ }` scopes the borrow — traps may touch the proxy
         if { matches!(&o.borrow().kind, ObjKind::Proxy { .. }) } {
             let mut out = Vec::new();
             for k in own_keys_all(i, v)? {
                 if !syms && matches!(k, PropKey::Sym(_)) {
+                    continue;
+                }
+                if exclude.is_some_and(|x| x.contains(&k)) {
                     continue;
                 }
                 let kv = i.key_to_value(&k);
@@ -322,6 +337,9 @@ pub(crate) fn own_enum_entries_full(
     let mut out = Vec::new();
     for k in keys {
         if !syms && matches!(k, PropKey::Sym(_)) {
+            continue;
+        }
+        if exclude.is_some_and(|x| x.contains(&k)) {
             continue;
         }
         if !own_prop_enumerable(i, v, &k)? {
@@ -4594,11 +4612,23 @@ fn install_globals(i: &mut Interp) {
     // -- String --
     {
         // %String.prototype% is itself a String object ([[StringData]] =
-        // the empty string) — proto methods accept it as `this`
+        // the empty string) — proto methods accept it as `this`; its
+        // exotic `length` is 0 and fully locked
         i.p.string
             .borrow_mut()
             .props
             .insert_str("$value", Prop::builtin(Value::Str(Rc::from(""))));
+        i.p.string.borrow_mut().props.insert_str(
+            "length",
+            Prop {
+                val: Value::Num(0.0),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+                get: None,
+                set: None,
+            },
+        );
         let ctor = make_ctor(i, "String", string_ctor, i.p.string.clone());
         let Value::Obj(o) = &ctor else { unreachable!() };
         i.set_builtin(
@@ -16459,6 +16489,25 @@ fn wm_get(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     Ok(Value::Und)
 }
 
+/// entry index under a SHARED borrow — key equality borrows the
+/// compared values, and a collection may be its own key
+/// (`m.set(m, v)`), so no mutable borrow can be held during compare
+fn map_key_pos(o: &ObjRef, k: &Value) -> Option<usize> {
+    let b = o.borrow();
+    match &b.kind {
+        ObjKind::Map(items) => items.iter().position(|(k2, _)| same_value_zero(k2, k)),
+        _ => None,
+    }
+}
+
+fn set_val_pos(o: &ObjRef, v: &Value) -> Option<usize> {
+    let b = o.borrow();
+    match &b.kind {
+        ObjKind::Set(items) => items.iter().position(|x| same_value_zero(x, v)),
+        _ => None,
+    }
+}
+
 fn wm_set(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let k = arg(args, 0);
     let o = need_wm(i, this, "set")?;
@@ -16466,11 +16515,11 @@ fn wm_set(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(i.type_err("Invalid value used as weak map key"));
     }
     let v = arg(args, 1);
+    let pos = map_key_pos(&o, &k);
     if let ObjKind::Map(items) = &mut o.borrow_mut().kind {
-        if let Some(slot) = items.iter_mut().find(|(k2, _)| same_value_zero(k2, &k)) {
-            slot.1 = v;
-        } else {
-            items.push((k, v));
+        match pos {
+            Some(ix) => items[ix].1 = v,
+            None => items.push((k, v)),
         }
     }
     Ok(this.clone())
@@ -16497,10 +16546,12 @@ fn wm_delete(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !weak_key_ok(&k) {
         return Ok(Value::Bool(false));
     }
-    if let ObjKind::Map(items) = &mut o.borrow_mut().kind {
-        let before = items.len();
-        items.retain(|(k2, _)| !same_value_zero(k2, &k));
-        return Ok(Value::Bool(items.len() != before));
+    let pos = map_key_pos(&o, &k);
+    if let Some(ix) = pos {
+        if let ObjKind::Map(items) = &mut o.borrow_mut().kind {
+            items.remove(ix);
+        }
+        return Ok(Value::Bool(true));
     }
     Ok(Value::Bool(false))
 }
@@ -16540,11 +16591,11 @@ fn map_get_or_insert_computed(i: &mut Interp, this: &Value, args: &[Value]) -> N
     }
     let v = i.call(&cb, Value::Und, vec![k.clone()])?;
     // the callback may have installed the key — the RETURN value wins
+    let pos = map_key_pos(&o, &k);
     if let ObjKind::Map(items) = &mut o.borrow_mut().kind {
-        if let Some(slot) = items.iter_mut().find(|(k2, _)| same_value_zero(k2, &k)) {
-            slot.1 = v.clone();
-        } else {
-            items.push((k, v.clone()));
+        match pos {
+            Some(ix) => items[ix].1 = v.clone(),
+            None => items.push((k, v.clone())),
         }
     }
     Ok(v)
@@ -16592,11 +16643,11 @@ fn wm_get_or_insert_computed(i: &mut Interp, this: &Value, args: &[Value]) -> NR
     let v = i.call(&cb, Value::Und, vec![k.clone()])?;
     // spec: the callback may have installed the key itself — the
     // callback's RETURN value wins (overwrite in place)
+    let pos = map_key_pos(&o, &k);
     if let ObjKind::Map(items) = &mut o.borrow_mut().kind {
-        if let Some(slot) = items.iter_mut().find(|(k2, _)| same_value_zero(k2, &k)) {
-            slot.1 = v.clone();
-        } else {
-            items.push((k, v.clone()));
+        match pos {
+            Some(ix) => items[ix].1 = v.clone(),
+            None => items.push((k, v.clone())),
         }
     }
     Ok(v)
@@ -16608,8 +16659,8 @@ fn ws_add(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !weak_key_ok(&v) {
         return Err(i.type_err("Invalid value used in weak set"));
     }
-    if let ObjKind::Set(items) = &mut o.borrow_mut().kind {
-        if !items.iter().any(|x| same_value_zero(x, &v)) {
+    if set_val_pos(&o, &v).is_none() {
+        if let ObjKind::Set(items) = &mut o.borrow_mut().kind {
             items.push(v);
         }
     }
@@ -16635,10 +16686,11 @@ fn ws_delete(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if !weak_key_ok(&v) {
         return Ok(Value::Bool(false));
     }
-    if let ObjKind::Set(items) = &mut o.borrow_mut().kind {
-        let before = items.len();
-        items.retain(|x| !same_value_zero(x, &v));
-        return Ok(Value::Bool(items.len() != before));
+    if let Some(ix) = set_val_pos(&o, &v) {
+        if let ObjKind::Set(items) = &mut o.borrow_mut().kind {
+            items.remove(ix);
+        }
+        return Ok(Value::Bool(true));
     }
     Ok(Value::Bool(false))
 }
@@ -16661,11 +16713,11 @@ fn map_set(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let k = canon_key(arg(args, 0));
     let v = arg(args, 1);
     let o = need_map(i, this, "set")?;
+    let pos = map_key_pos(&o, &k);
     if let ObjKind::Map(items) = &mut o.borrow_mut().kind {
-        if let Some(slot) = items.iter_mut().find(|(k2, _)| same_value_zero(k2, &k)) {
-            slot.1 = v;
-        } else {
-            items.push((k, v));
+        match pos {
+            Some(ix) => items[ix].1 = v,
+            None => items.push((k, v)),
         }
     }
     Ok(this.clone())
@@ -16686,10 +16738,11 @@ fn map_has(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn map_delete(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let o = need_map(i, this, "delete")?;
     let k = canon_key(arg(args, 0));
-    if let ObjKind::Map(items) = &mut o.borrow_mut().kind {
-        let before = items.len();
-        items.retain(|(k2, _)| !same_value_zero(k2, &k));
-        return Ok(Value::Bool(items.len() != before));
+    if let Some(ix) = map_key_pos(&o, &k) {
+        if let ObjKind::Map(items) = &mut o.borrow_mut().kind {
+            items.remove(ix);
+        }
+        return Ok(Value::Bool(true));
     }
     Ok(Value::Bool(false))
 }
@@ -16830,8 +16883,8 @@ fn set_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn set_add(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let v = arg(args, 0);
     let o = need_set(i, this, "add")?;
-    if let ObjKind::Set(items) = &mut o.borrow_mut().kind {
-        if !items.iter().any(|x| same_value_zero(x, &v)) {
+    if set_val_pos(&o, &v).is_none() {
+        if let ObjKind::Set(items) = &mut o.borrow_mut().kind {
             items.push(v);
         }
     }
@@ -16851,10 +16904,11 @@ fn set_has(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 fn set_delete(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     let o = need_set(i, this, "delete")?;
     let v = arg(args, 0);
-    if let ObjKind::Set(items) = &mut o.borrow_mut().kind {
-        let before = items.len();
-        items.retain(|x| !same_value_zero(x, &v));
-        return Ok(Value::Bool(items.len() != before));
+    if let Some(ix) = set_val_pos(&o, &v) {
+        if let ObjKind::Set(items) = &mut o.borrow_mut().kind {
+            items.remove(ix);
+        }
+        return Ok(Value::Bool(true));
     }
     Ok(Value::Bool(false))
 }

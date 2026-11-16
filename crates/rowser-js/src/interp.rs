@@ -148,8 +148,14 @@ enum LRef {
     /// member base + unevaluated-key value — ToPropertyKey is deferred
     /// to PutValue (ES2019+ assignment evaluation order)
     PropV(Value, Value),
-    /// `super.x` — home object and receiver captured at eval time
-    Super(ObjRef, Value, PropKey),
+    /// `a?.b` whose base evaluated nullish — the reference
+    /// shortcircuits: reads are `undefined`, writes can't reach here
+    /// (the parser rejects optional members as assignment targets)
+    Short,
+    /// `super.x` — the super BASE (home object's proto, resolved once
+    /// at reference creation) and receiver; `None` base = null proto,
+    /// which fails RequireObjectCoercible → TypeError at use time
+    Super(Option<ObjRef>, Value, PropKey),
     SuperV(ObjRef, Value, Value),
     /// identifier resolved to a specific env record (the reference's
     /// [[Base]] survives mid-RHS mutation of the scope chain)
@@ -168,6 +174,10 @@ enum LRef {
 enum PrepPat<'a> {
     Pat(&'a Pattern),
     Resolved(LRef),
+    /// a `Pattern::Ident` whose binding reference was resolved at
+    /// element order — spec ResolveBinding precedes the source [[Get]],
+    /// so `with`-env `has` checks fire before the getter
+    Bound(LRef),
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1820,10 +1830,14 @@ impl Interp {
                 None => break,
             }
         }
-        // fall back to global object properties (globalThis.x = …)
-        Ok(self
-            .obj_get_raw_str(&self.p.global, name)
-            .map(|v| (v, false)))
+        // fall back to the global environment's object record — full
+        // HasProperty/Get semantics: own + inherited props resolve as
+        // globals, and accessor getters run with the global as receiver
+        let g = Value::Obj(self.p.global.clone());
+        if self.has_prop(&g, &PropKey::from_str(name))? {
+            return self.get_prop_str(&g, name).map(|v| Some((v, false)));
+        }
+        Ok(None)
     }
 
     /// `set_prop` on the global object must update a var-declared env
@@ -1907,6 +1921,13 @@ impl Interp {
                 Some(p) => cur = p,
                 None => break,
             }
+        }
+        // unresolved — delegate to the global object env record:
+        // Set(globalObj, name, v, strict) — runs setters, honors
+        // writable=false, and covers inherited properties
+        let g = Value::Obj(self.p.global.clone());
+        if self.has_prop(&g, &PropKey::from_str(name))? {
+            return self.set_prop_str(&g, name, v);
         }
         if self.cur_strict {
             return Err(self.ref_err(format!("{name} is not defined")));
@@ -6229,7 +6250,7 @@ impl Interp {
             obj,
             prop,
             computed,
-            ..
+            optional,
         } = e
         else {
             return Err(self.syntax_err("invalid assignment target"));
@@ -6245,12 +6266,21 @@ impl Interp {
             }
             let this = fscope.thisv.borrow().clone();
             if let Expr::Str(s) = &**prop {
-                return Ok(LRef::Super(home, this, PropKey::from_str(s)));
+                // GetSuperBase at reference creation — the proto is
+                // pinned even if the home object is re-proto'd before
+                // the read/write completes
+                let base = home.borrow().proto.clone();
+                return Ok(LRef::Super(base, this, PropKey::from_str(s)));
             }
             let pv = self.eval_expr(prop, env)?;
             return Ok(LRef::SuperV(home, this, pv));
         }
         let ov = self.eval_expr(obj, env)?;
+        // `a?.b` on a nullish base shortcircuits the whole reference —
+        // reads produce `undefined` without touching the key
+        if *optional && matches!(ov, Value::Und | Value::Null) {
+            return Ok(LRef::Short);
+        }
         if let Expr::Str(s) = &**prop {
             // `o.#x` — resolve the PrivateName through the class env to
             // its Sym slot; `o["#x"]` stays an ordinary string-key write.
@@ -6326,6 +6356,7 @@ impl Interp {
     /// object even if HasProperty flips mid-operation
     fn get_lref(&mut self, lr: &mut LRef) -> ERes {
         match lr {
+            LRef::Short => Ok(Value::Und),
             LRef::Prop(b, k) => self.get_prop(b, k),
             LRef::PropV(b, kv) => {
                 // ES2019 order: a nullish base throws before the key
@@ -6339,21 +6370,29 @@ impl Interp {
                 *lr = LRef::Prop(b.clone(), k.clone());
                 self.get_prop(&b, &k)
             }
-            LRef::Super(home, this, k) => {
-                let parent = home.borrow().proto.clone();
-                match parent {
-                    Some(p) => self.obj_get(&p, k, this),
-                    None => Ok(Value::Und),
+            LRef::Super(base, this, k) => {
+                match base {
+                    Some(p) => self.obj_get(p, k, this),
+                    // RequireObjectCoercible on a null-proto home's
+                    // super base → TypeError (not undefined)
+                    None => {
+                        Err(self.type_err("Cannot read property of null (via super)"))
+                    }
                 }
             }
             LRef::SuperV(home, this, kv) => {
+                // GetSuperBase precedes ToPropertyKey — the proto is
+                // captured before the key conversion can re-proto the
+                // home object
+                let base = home.borrow().proto.clone();
                 let k = self.to_propkey(kv)?;
                 let (home, this) = (home.clone(), this.clone());
-                *lr = LRef::Super(home.clone(), this.clone(), k.clone());
-                let parent = home.borrow().proto.clone();
-                match parent {
+                *lr = LRef::Super(base.clone(), this.clone(), k.clone());
+                match base {
                     Some(p) => self.obj_get(&p, &k, &this),
-                    None => Ok(Value::Und),
+                    None => {
+                        Err(self.type_err("Cannot read property of null (via super)"))
+                    }
                 }
             }
             LRef::Env(sc, name) => {
@@ -6377,21 +6416,31 @@ impl Interp {
 
     fn put_lref(&mut self, lr: LRef, v: Value) -> Result<(), Value> {
         match lr {
+            // optional members can't be assignment targets — the parser
+            // rejects them before a Short reference could be written
+            LRef::Short => Ok(()),
             LRef::Prop(b, k) => self.set_prop(&b, k, v),
             LRef::PropV(b, kv) => {
+                // same coercion order as reads: base check precedes
+                // ToPropertyKey so a nullish base throws first
+                if matches!(b, Value::Und | Value::Null) {
+                    return Err(
+                        self.type_err("Cannot convert undefined or null to object")
+                    );
+                }
                 let k = self.to_propkey(&kv)?;
                 self.set_prop(&b, k, v)
             }
-            LRef::Super(home, this, k) => {
-                let parent = home.borrow().proto.clone();
-                let Some(parent) = parent else {
+            LRef::Super(base, this, k) => {
+                let Some(parent) = base else {
                     return Err(self.type_err("Cannot set property of null (via super)"));
                 };
                 self.obj_set(&parent, k, v, &this)
             }
             LRef::SuperV(home, this, kv) => {
-                let parent = home.borrow().proto.clone();
-                let Some(parent) = parent else {
+                // GetSuperBase precedes ToPropertyKey (same as reads)
+                let base = home.borrow().proto.clone();
+                let Some(parent) = base else {
                     return Err(self.type_err("Cannot set property of null (via super)"));
                 };
                 let k = self.to_propkey(&kv)?;
@@ -6483,10 +6532,13 @@ impl Interp {
     /// requires lref evaluation before the value read (array elements,
     /// rest, keyed object properties).
     fn prep_pat<'a>(&mut self, scope: &EnvRef, p: &'a Pattern) -> Result<PrepPat<'a>, Value> {
-        if let Pattern::Target(e) = p {
-            Ok(PrepPat::Resolved(self.eval_lref(e, scope)?))
-        } else {
-            Ok(PrepPat::Pat(p))
+        match p {
+            Pattern::Target(e) => Ok(PrepPat::Resolved(self.eval_lref(e, scope)?)),
+            // ResolveBinding runs before the source [[Get]] (and the
+            // default-expression eval) — pin the reference now so
+            // `with`-object `has` checks observe the right order
+            Pattern::Ident(n) => Ok(PrepPat::Bound(self.eval_lref_ident(scope, n)?)),
+            _ => Ok(PrepPat::Pat(p)),
         }
     }
 
@@ -6500,6 +6552,15 @@ impl Interp {
         match pp {
             PrepPat::Pat(p) => self.pat_bind(scope, p, v, mode),
             PrepPat::Resolved(lr) => self.put_lref(lr, v),
+            PrepPat::Bound(lr) => match (mode, lr) {
+                // let/const initialize their (resolved) lexical binding;
+                // var writes through the reference like env_assign
+                (BindMode::Decl(k), LRef::Env(sc, n)) if k != VarKind::Var => {
+                    self.declare(&sc, &n, v, k != VarKind::Const);
+                    Ok(())
+                }
+                (_, lr) => self.put_lref(lr, v),
+            },
         }
     }
 
@@ -6510,6 +6571,31 @@ impl Interp {
         v: Value,
         mode: BindMode,
     ) -> Result<(), Value> {
+        // spec: a declarative binding env instantiates the pattern's
+        // BoundNames BEFORE BindingInitialization runs (catch params,
+        // per-iteration for-head envs) — ResolveBinding during element
+        // binding must find THIS scope, not leak to an outer one. Var
+        // decls skip this — var names resolve through the chain to the
+        // hoisted var-boundary binding
+        if let BindMode::Decl(k) = mode {
+            if k != VarKind::Var {
+                let mut names = Vec::new();
+                collect_pattern_names(pat, &mut names);
+                if !names.is_empty() {
+                    let keys: Vec<Rc<str>> = names.iter().map(|n| self.intern(n)).collect();
+                    let mut vars = scope.vars.borrow_mut();
+                    for k in keys {
+                        vars.entry(k).or_insert(Binding {
+                            val: Value::Und,
+                            mutable: true,
+                            uninit: true,
+                            deletable: false,
+                            lexical: true,
+                        });
+                    }
+                }
+            }
+        }
         match pat {
             Pattern::Target(e) => {
                 if !matches!(mode, BindMode::Assign) {
@@ -6651,6 +6737,11 @@ impl Interp {
                                         {
                                             Some(PropKey::from_str(s))
                                         }
+                                        // numeric keys exclude too —
+                                        // `0:` keeps `"0"` out of rest
+                                        ast::PropKey::Num(n) => Some(
+                                            PropKey::from_str(&js_num_str(*n)),
+                                        ),
                                         _ => None,
                                     })
                                     .collect();
@@ -6665,11 +6756,15 @@ impl Interp {
                                     }
                                 }
                                 // CopyDataProperties: [[OwnPropertyKeys]] +
-                                // gOPD-enum filter + [[Get]] per key — a
-                                // proxy source runs the full trap set
-                                for (k, val) in
-                                    crate::builtins::own_enum_entries_full(self, &v, true)?
-                                {
+                                // gOPD-enum filter + [[Get]] per key —
+                                // excluded keys are skipped BEFORE gOPD,
+                                // so a proxy never sees them at all
+                                for (k, val) in crate::builtins::own_enum_entries_excl(
+                                    self,
+                                    &v,
+                                    true,
+                                    Some(&taken),
+                                )? {
                                     if taken.contains(&k) {
                                         continue;
                                     }
@@ -7024,32 +7119,25 @@ impl Interp {
         // function gets own caller/arguments props (strict or not); the
         // throws come from %Function.prototype%'s inherited poisoned
         // accessors (spec: FunctionInitialize post-ES2017 semantics)
-        if def.is_gen && def.is_async && home.is_none() {
-            // async generator fns: proto is
-            // %AsyncGeneratorFunction.prototype%; `.prototype` is an
-            // ordinary object whose proto is %AsyncGeneratorPrototype%
-            o.borrow_mut().proto = Some(self.p.async_gen_func.clone());
-            let proto = self.new_obj();
-            proto.borrow_mut().proto = Some(self.p.async_gen.clone());
-            self.set_attr(&o, "prototype", Value::Obj(proto), true, false);
-        } else if def.is_gen && def.is_async {
-            // async generator METHOD — %AsyncGeneratorFunction.prototype%
-            // proto, no `.prototype` property
-            o.borrow_mut().proto = Some(self.p.async_gen_func.clone());
-        } else if def.is_gen && home.is_none() {
-            // generator fns: proto is %GeneratorFunction.prototype%; the
+        if def.is_gen {
+            // generator fns AND methods: %GeneratorFunction.prototype%
+            // (%AsyncGeneratorFunction.prototype% for async gens); the
             // `.prototype` prop is an ordinary object whose proto is
-            // %GeneratorPrototype% — no `constructor` back-ref.
-            // Descriptor: {writable: true, enumerable: false,
-            // configurable: false}
-            o.borrow_mut().proto = Some(self.p.gen_func.clone());
+            // %GeneratorPrototype% / %AsyncGeneratorPrototype% — no
+            // `constructor` back-ref. Descriptor: {writable: true,
+            // enumerable: false, configurable: false}
+            o.borrow_mut().proto = Some(if def.is_async {
+                self.p.async_gen_func.clone()
+            } else {
+                self.p.gen_func.clone()
+            });
             let proto = self.new_obj();
-            proto.borrow_mut().proto = Some(self.p.generator.clone());
+            proto.borrow_mut().proto = Some(if def.is_async {
+                self.p.async_gen.clone()
+            } else {
+                self.p.generator.clone()
+            });
             self.set_attr(&o, "prototype", Value::Obj(proto), true, false);
-        } else if def.is_gen {
-            // generator METHOD: %GeneratorFunction.prototype% proto but
-            // no `.prototype` property (methods aren't constructable)
-            o.borrow_mut().proto = Some(self.p.gen_func.clone());
         } else if def.is_async {
             // async fns/methods/arrows: proto is %AsyncFunction.prototype%;
             // never a `.prototype` prop (they aren't constructable)
@@ -8946,15 +9034,18 @@ impl Interp {
                             };
                             match &p.val {
                                 PropVal::Expr(ex) => {
-                                    let v = if Self::is_anon_fn_def(ex) {
+                                    let is_proto = matches!(&p.key, ast::PropKey::Ident(s) | ast::PropKey::Str(s) if s == "__proto__");
+                                    // `{__proto__: fn}` suppresses
+                                    // NamedEvaluation — the proto-setter
+                                    // is not a named property definition
+                                    let v = if Self::is_anon_fn_def(ex) && !is_proto {
                                         self.eval_expr_named(ex, env, &fname)?
                                     } else {
                                         self.eval_expr(ex, env)?
                                     };
                                     // `{__proto__: v}` sets the prototype
                                     // instead of creating a property
-                                    if matches!(&p.key, ast::PropKey::Ident(s) | ast::PropKey::Str(s) if s == "__proto__")
-                                    {
+                                    if is_proto {
                                         if let Value::Obj(pv) = &v {
                                             o.borrow_mut().proto = Some(pv.clone());
                                         } else if matches!(v, Value::Null) {
@@ -8963,6 +9054,17 @@ impl Interp {
                                     } else {
                                         o.borrow_mut().props.insert(key, Prop::data(v));
                                     }
+                                }
+                                // `{x}` — always an ordinary data prop
+                                // (`{__proto__}` does NOT set the proto)
+                                PropVal::Shorthand(ex) => {
+                                    let v = self.eval_expr(ex, env)?;
+                                    o.borrow_mut().props.insert(key, Prop::data(v));
+                                }
+                                PropVal::CoverInit(_) => {
+                                    return Err(self.syntax_err(
+                                        "Invalid shorthand property initializer",
+                                    ))
                                 }
                                 PropVal::Method(def) => {
                                     let f = self.make_fn_home(
@@ -9199,6 +9301,14 @@ impl Interp {
                     return self.get_prop_str(&ov, s);
                 }
                 let pv = self.eval_expr(prop, env)?;
+                // RequireObjectCoercible(base) runs before ToPropertyKey —
+                // a null/undefined base throws before the key's
+                // conversion hooks (valueOf/toString) can run
+                if matches!(ov, Value::Und | Value::Null) {
+                    return Err(
+                        self.type_err("Cannot convert undefined or null to object")
+                    );
+                }
                 let key = self.to_propkey(&pv)?;
                 self.get_prop(&ov, &key)
             }
@@ -9227,7 +9337,9 @@ impl Interp {
         }
         let parent = home.borrow().proto.clone();
         let Some(parent) = parent else {
-            return Ok(Value::Und);
+            // RequireObjectCoercible on a null-proto super base →
+            // TypeError, not undefined
+            return Err(self.type_err("Cannot read property of null (via super)"));
         };
         if let Expr::Str(s) = prop {
             let this = fscope.thisv.borrow().clone();
@@ -9540,17 +9652,53 @@ impl Interp {
                     let r = self.call(&f, this, argv);
                     return r;
                 }
+                // `ref?.()` — optional call: EvaluateCall keeps the
+                // reference — a member callee's base becomes `this`
+                // (a.b?.() === a.b()), `?.` inside still shortcircuits
+                if let Expr::Str(s) = &**prop {
+                    if s == "\u{0}call" {
+                        let (f, thisv) = match Self::unparen(obj) {
+                            m @ Expr::Member { .. } => {
+                                let mut lr = self.eval_lref(m, env)?;
+                                if matches!(lr, LRef::Short) {
+                                    return Ok(Value::Und);
+                                }
+                                let thisv = match &lr {
+                                    LRef::Prop(b, _) | LRef::PropV(b, _) => b.clone(),
+                                    LRef::Super(_, t, _) | LRef::SuperV(_, t, _) => {
+                                        t.clone()
+                                    }
+                                    _ => Value::Und,
+                                };
+                                (self.get_lref(&mut lr)?, thisv)
+                            }
+                            _ => {
+                                let ov = self.eval_expr(obj, env)?;
+                                if *optional && matches!(ov, Value::Und | Value::Null) {
+                                    return Ok(Value::Und);
+                                }
+                                (ov, Value::Und)
+                            }
+                        };
+                        // `?.(` nullish-checks the callee VALUE — a
+                        // missing function shortcircuits to undefined
+                        // without evaluating the arguments
+                        if matches!(f, Value::Und | Value::Null) {
+                            return Ok(Value::Und);
+                        }
+                        let argv = self.eval_args(args, env)?;
+                        if !self.is_callable(&f) {
+                            return Err(self.type_err("value is not a function"));
+                        }
+                        return self.call(&f, thisv, argv);
+                    }
+                }
                 let ov = self.eval_expr(obj, env)?;
                 if *optional && matches!(ov, Value::Und | Value::Null) {
                     return Ok(Value::Und);
                 }
                 // `obj.name(...)` — dot-prop fast path (no PropKey alloc)
                 if let Expr::Str(s) = &**prop {
-                    // `a?.()` sentinel
-                    if s == "\u{0}call" {
-                        let argv = self.eval_args(args, env)?;
-                        return self.call(&ov, Value::Und, argv);
-                    }
                     // `o.#m(...)` — private call: resolve the
                     // PrivateName in the class env → own Sym-keyed slot
                     // or TypeError, never a proto walk; a getter's result
@@ -9647,6 +9795,17 @@ impl Interp {
                         };
                         (self.get_lref(&mut lr)?, tv)
                     }
+                    // `(a.b)()` / `(a?.b)()` — parens preserve the
+                    // member reference: the base stays `this`
+                    m @ Expr::Member { .. } => {
+                        let mut lr = self.eval_lref(m, env)?;
+                        let tv = match &lr {
+                            LRef::Prop(b, _) | LRef::PropV(b, _) => b.clone(),
+                            LRef::Super(_, t, _) | LRef::SuperV(_, t, _) => t.clone(),
+                            _ => Value::Und,
+                        };
+                        (self.get_lref(&mut lr)?, tv)
+                    }
                     _ => (self.eval_expr(callee, env)?, Value::Und),
                 };
                 let argv = self.eval_args(args, env)?;
@@ -9717,6 +9876,14 @@ impl Interp {
                 // keeps the reference through parens
                 let expr = Self::unparen(expr);
                 if let Expr::Ident(n) = expr {
+                    // synthetic idents don't live in env scopes — evaluate
+                    // them through the generic path (also keeps
+                    // `typeof` from masking their semantics)
+                    if n == "$new_target" || n == "$import_meta" {
+                        let v = self.eval_expr(expr, env)?;
+                        let tn = self.type_name(&v);
+                        return Ok(Value::Str(self.intern(tn)));
+                    }
                     match self.env_lookup_st(env, n)? {
                         Some((_, true)) => {
                             return Err(
@@ -10709,9 +10876,11 @@ fn expr_uses_arguments(e: &Expr) -> bool {
                 return true;
             }
             match &p.val {
-                PropVal::Expr(e) | PropVal::Spread(e) | PropVal::SpreadTrail(e) => {
-                    expr_uses_arguments(e)
-                }
+                PropVal::Expr(e)
+                | PropVal::Shorthand(e)
+                | PropVal::CoverInit(e)
+                | PropVal::Spread(e)
+                | PropVal::SpreadTrail(e) => expr_uses_arguments(e),
                 PropVal::Method(d) | PropVal::Get(d) | PropVal::Set(d) => fndef_uses_arguments(d),
             }
         }),
@@ -11027,7 +11196,7 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                             default: None,
                         });
                     }
-                    PropVal::Expr(ex) => {
+                    PropVal::Expr(ex) | PropVal::Shorthand(ex) => {
                         let (val, dflt) = match ex {
                             Expr::Assign {
                                 op: AssignOp::Assign,
@@ -11046,6 +11215,18 @@ fn expr_to_pattern(e: &Expr) -> Option<Pattern> {
                             key: p.key.clone(),
                             val,
                             default: dflt,
+                        });
+                    }
+                    // `{a = e}` — ident key + default value expr
+                    PropVal::CoverInit(d) => {
+                        let name = match &p.key {
+                            ast::PropKey::Ident(s) | ast::PropKey::Str(s) => s.clone(),
+                            _ => return None,
+                        };
+                        out.push(ObjPatElem {
+                            key: p.key.clone(),
+                            val: Pattern::Ident(name),
+                            default: Some(d.clone()),
                         });
                     }
                     _ => return None,
