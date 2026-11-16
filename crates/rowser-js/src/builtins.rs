@@ -79,6 +79,53 @@ fn idx_key(k: usize) -> PropKey {
     pk(std::str::from_utf8(&buf[20 - len..]).unwrap_or("0"))
 }
 
+/// Per-index probe loops (HasProperty/Get over `0..len`) become
+/// quadratic-to-hanging for array-likes declaring near-2^53 lengths.
+/// Spec only *visits* indices where HasProperty is true — when no link
+/// of the proto chain can observe the probe (no Proxy, no exotic
+/// indexed objects), enumerate the present indices directly instead.
+/// `own_only` collects indices whose DELETE/SET would have an effect —
+/// own props only (proto props can't be deleted off `obj`). `None` =
+/// probes may be observed → the spec loop must run.
+const SPARSE_LEN: usize = 1 << 24;
+
+fn sparse_present_indices(obj: &Value, lo: usize, hi: usize, own_only: bool) -> Option<Vec<usize>> {
+    let Value::Obj(root) = obj else { return None };
+    let mut out: Vec<usize> = Vec::new();
+    let mut cur = Some(root.clone());
+    for _ in 0..1000 {
+        let Some(o) = cur else { break };
+        let b = o.borrow();
+        match &b.kind {
+            ObjKind::Ord => {}
+            ObjKind::Arr(items) => {
+                for idx in lo..hi.min(items.len()) {
+                    if !b.holes.as_ref().is_some_and(|h| h.contains(&idx)) {
+                        out.push(idx);
+                    }
+                }
+            }
+            // proxy, typed array, arguments, strings — probes observable
+            _ => return None,
+        }
+        for (k, _) in b.props.iter() {
+            let PropKey::S(s) = k else { continue };
+            if let Some(n) = canonical_numeric_index(s) {
+                if n >= 0.0 && n.fract() == 0.0 && n < 9007199254740992.0 && s.as_ref() != "-0" {
+                    let idx = n as usize;
+                    if idx >= lo && idx < hi {
+                        out.push(idx);
+                    }
+                }
+            }
+        }
+        cur = if own_only { None } else { b.proto.clone() };
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
 /// `to_str` that shares the `Rc<str>` for `Value::Str` instead of copying
 /// the whole string.
 fn to_rc(i: &mut Interp, v: &Value) -> Result<Rc<str>, Value> {
@@ -864,8 +911,12 @@ fn species_create(i: &mut Interp, o: &Value, len: usize) -> Result<Value, Value>
     }
     match c {
         Value::Und => {
-            // ArrayCreate(len): empty dense store + declared length — the
-            // indices are ABSENT (holes), not `undefined`
+            // ArrayCreate(len): length > 2^32-1 → RangeError (spec); an
+            // empty dense store + declared length — the indices are
+            // ABSENT (holes), not `undefined`
+            if len >= 4294967296usize {
+                return Err(i.range_err("Invalid array length"));
+            }
             let a = i.new_arr(Vec::new());
             i.set_attr(&a, "length", Value::Num(len as f64), true, false);
             Ok(Value::Obj(a))
@@ -880,6 +931,12 @@ fn species_create(i: &mut Interp, o: &Value, len: usize) -> Result<Value, Value>
 /// props / non-extensible targets).
 fn create_data_prop(i: &mut Interp, a: &Value, k: usize, v: Value) -> Result<(), Value> {
     if let Value::Obj(o) = a {
+        // exotic kinds (Proxy, typed views, …): go through
+        // [[DefineOwnProperty]] so traps fire and invariants are
+        // enforced — the fast path below is ordinary objects only
+        if !matches!(o.borrow().kind, ObjKind::Arr(_) | ObjKind::Ord) {
+            return i.recv_define(o, &PropKey::from_str(&k.to_string()), v, true);
+        }
         let mut b = o.borrow_mut();
         let b = &mut *b;
         if let ObjKind::Arr(items) = &mut b.kind {
@@ -1134,7 +1191,7 @@ fn install_protos(i: &mut Interp) {
         method_len(i, &p, "keys", arr_keys, 0.0);
         method_len(i, &p, "values", arr_values, 0.0);
         method_len(i, &p, "entries", arr_entries, 0.0);
-        method(i, &p, "toString", arr_to_string);
+        method_len(i, &p, "toString", arr_to_string, 0.0);
         method(i, &p, "toLocaleString", arr_to_locale_string);
         let values_fn = i.obj_get_raw_str(&p, "values").unwrap();
         p.borrow_mut()
@@ -4644,13 +4701,17 @@ fn obj_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
         // spec IsArray forwards through proxies to the target chain; a
         // revoked proxy throws
         ObjKind::Proxy { target, .. } => {
+            // spec: IsArray(proxy) walks the target chain → "Array";
+            // else IsCallable → "Function"; else "Object". A revoked
+            // proxy throws on the IsArray step.
             let mut cur = target.clone();
+            let callable = i.is_callable(&cur);
             loop {
                 let step = match &cur {
                     Value::Obj(p) => match &p.borrow().kind {
                         ObjKind::Proxy { target: nt, .. } => Some(nt.clone()),
                         ObjKind::Arr(_) => break "Array",
-                        _ => break "Object",
+                        _ => break if callable { "Function" } else { "Object" },
                     },
                     _ => {
                         return Err(
@@ -4660,7 +4721,7 @@ fn obj_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
                 };
                 match step {
                     Some(nt) => cur = nt,
-                    None => break "Object",
+                    None => break if callable { "Function" } else { "Object" },
                 }
             }
         }
@@ -7066,6 +7127,17 @@ fn arr_slice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         v => clamp_index(to_integer_or_inf(i.to_num(&v)?), len),
     };
     let a = species_create(i, &obj, end.saturating_sub(start))?;
+    // huge declared lengths: enumerate only present indices — identical
+    // to the spec loop whenever the probes are unobservable
+    if end - start > SPARSE_LEN {
+        if let Some(idxs) = sparse_present_indices(&obj, start, end, false) {
+            for k in idxs {
+                let v = i.get_prop(&obj, &idx_key(k))?;
+                create_data_prop(i, &a, k - start, v)?;
+            }
+            return Ok(a);
+        }
+    }
     let mut n = 0usize;
     for k in start..end {
         let key = idx_key(k);
@@ -7227,40 +7299,146 @@ fn arr_splice(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(i.type_err("Array.prototype.splice: too many elements"));
     }
     let a = species_create(i, &obj, delete_count)?;
-    for k in 0..delete_count {
-        let from = idx_key(actual_start + k);
-        if i.has_prop(&obj, &from)? {
-            let v = i.get_prop(&obj, &from)?;
-            create_data_prop(i, &a, k, v)?;
+    // sparse fast-path: when no probe is observable, only indices that
+    // can answer HasProperty (read side) or hold a deletable own prop
+    // (write side) are visited — identical to the spec loops below.
+    let sparse_ok = len > SPARSE_LEN
+        && sparse_present_indices(&obj, 0, len, false).is_some();
+    if !sparse_ok || delete_count <= SPARSE_LEN {
+        for k in 0..delete_count {
+            let from = idx_key(actual_start + k);
+            if i.has_prop(&obj, &from)? {
+                let v = i.get_prop(&obj, &from)?;
+                create_data_prop(i, &a, k, v)?;
+            }
+        }
+    } else if let Some(idxs) =
+        sparse_present_indices(&obj, actual_start, actual_start + delete_count, false)
+    {
+        for f in idxs {
+            let v = i.get_prop(&obj, &idx_key(f))?;
+            create_data_prop(i, &a, f - actual_start, v)?;
         }
     }
     spec_set(i, &a, pk("length"), Value::Num(delete_count as f64))?;
     if insert_count < delete_count {
-        for k in actual_start..(len - delete_count) {
-            let from = idx_key(k + delete_count);
-            let to = k + insert_count;
-            if i.has_prop(&obj, &from)? {
-                let v = i.get_prop(&obj, &from)?;
-                spec_set_idx(i, &obj, to, v)?;
-            } else {
-                spec_del_idx(i, &obj, to)?;
+        let k_lo = actual_start;
+        let k_hi = len - delete_count;
+        // k visited iff (k+dc) present (→Get/Set) or (k+ic) own (→Delete)
+        let mut ks: Option<Vec<usize>> = None;
+        if sparse_ok && k_hi - k_lo > SPARSE_LEN {
+            let mut set: Vec<usize> = sparse_present_indices(
+                &obj,
+                k_lo + delete_count,
+                k_hi + delete_count,
+                false,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| f - delete_count)
+            .collect();
+            set.extend(
+                sparse_present_indices(
+                    &obj,
+                    k_lo + insert_count,
+                    k_hi + insert_count,
+                    true,
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t - insert_count),
+            );
+            set.sort_unstable();
+            set.dedup();
+            ks = Some(set);
+        }
+        match ks {
+            Some(ks) => {
+                for k in ks {
+                    let from = idx_key(k + delete_count);
+                    let to = k + insert_count;
+                    if i.has_prop(&obj, &from)? {
+                        let v = i.get_prop(&obj, &from)?;
+                        spec_set_idx(i, &obj, to, v)?;
+                    } else {
+                        spec_del_idx(i, &obj, to)?;
+                    }
+                }
+            }
+            None => {
+                for k in actual_start..(len - delete_count) {
+                    let from = idx_key(k + delete_count);
+                    let to = k + insert_count;
+                    if i.has_prop(&obj, &from)? {
+                        let v = i.get_prop(&obj, &from)?;
+                        spec_set_idx(i, &obj, to, v)?;
+                    } else {
+                        spec_del_idx(i, &obj, to)?;
+                    }
+                }
             }
         }
-        for k in ((len - delete_count + insert_count)..len).rev() {
-            spec_del_idx(i, &obj, k)?;
+        let del_lo = len - delete_count + insert_count;
+        if sparse_ok && len - del_lo > SPARSE_LEN {
+            for k in sparse_present_indices(&obj, del_lo, len, true)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+            {
+                spec_del_idx(i, &obj, k)?;
+            }
+        } else {
+            for k in (del_lo..len).rev() {
+                spec_del_idx(i, &obj, k)?;
+            }
         }
     } else if insert_count > delete_count {
-        let mut k = len - delete_count;
-        while k > actual_start {
-            let from = idx_key(k + delete_count - 1);
-            let to = k + insert_count - 1;
-            if i.has_prop(&obj, &from)? {
-                let v = i.get_prop(&obj, &from)?;
-                spec_set_idx(i, &obj, to, v)?;
-            } else {
-                spec_del_idx(i, &obj, to)?;
+        // grow: k walks len-dc .. actual_start descending
+        let mut ks: Option<Vec<usize>> = None;
+        if sparse_ok && len - delete_count - actual_start > SPARSE_LEN {
+            let mut set: Vec<usize> =
+                sparse_present_indices(&obj, actual_start + delete_count, len, false)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|f| f - delete_count + 1)
+                    .collect();
+            set.extend(
+                sparse_present_indices(&obj, actual_start + insert_count, len - delete_count + insert_count, true)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t - insert_count + 1),
+            );
+            set.sort_unstable();
+            set.dedup();
+            ks = Some(set);
+        }
+        match ks {
+            Some(ks) => {
+                for k in ks.into_iter().rev() {
+                    let from = idx_key(k + delete_count - 1);
+                    let to = k + insert_count - 1;
+                    if i.has_prop(&obj, &from)? {
+                        let v = i.get_prop(&obj, &from)?;
+                        spec_set_idx(i, &obj, to, v)?;
+                    } else {
+                        spec_del_idx(i, &obj, to)?;
+                    }
+                }
             }
-            k -= 1;
+            None => {
+                let mut k = len - delete_count;
+                while k > actual_start {
+                    let from = idx_key(k + delete_count - 1);
+                    let to = k + insert_count - 1;
+                    if i.has_prop(&obj, &from)? {
+                        let v = i.get_prop(&obj, &from)?;
+                        spec_set_idx(i, &obj, to, v)?;
+                    } else {
+                        spec_del_idx(i, &obj, to)?;
+                    }
+                    k -= 1;
+                }
+            }
         }
     }
     let mut k = actual_start;
@@ -7305,6 +7483,16 @@ fn arr_concat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 return Err(
                     i.type_err("Array.prototype.concat: too many elements")
                 );
+            }
+            if elen > SPARSE_LEN {
+                if let Some(idxs) = sparse_present_indices(e, 0, elen, false) {
+                    for k in idxs {
+                        let v = i.get_prop(e, &idx_key(k))?;
+                        create_data_prop(i, &a, n + k, v)?;
+                    }
+                    n += elen;
+                    continue;
+                }
             }
             for k in 0..elen {
                 let key = idx_key(k);
