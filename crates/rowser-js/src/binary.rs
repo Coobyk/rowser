@@ -452,6 +452,10 @@ fn install_typed_arrays(i: &mut Interp) {
             if let ObjKind::Func(Func::Native { ctor, .. }) = &mut co.borrow_mut().kind {
                 *ctor = true;
             }
+            // marker: `construct` skips its eager newTarget.prototype
+            // read — the TA spec reads it inside AllocateTypedArray,
+            // AFTER ToIndex coercion of a non-object firstArgument
+            hid(i, co, "__ta_ctor", Value::Bool(true));
             co.borrow_mut().proto = Some(ta_intr.clone());
             co.borrow_mut().props.insert(
                 PropKey::from_str("prototype"),
@@ -537,6 +541,7 @@ fn install_typed_arrays(i: &mut Interp) {
             if let ObjKind::Func(Func::Native { ctor, .. }) = &mut co.borrow_mut().kind {
                 *ctor = true;
             }
+            hid(i, co, "__ta_ctor", Value::Bool(true));
             co.borrow_mut().proto = Some(ta_intr.clone());
             co.borrow_mut().props.insert(
                 PropKey::from_str("prototype"),
@@ -784,6 +789,11 @@ fn ta_store_val(i: &mut Interp, a: &Value, k: usize, v: &Value, big: bool) -> Re
 
 /// ? ToIntegerOrInfinity — NaN → 0, fraction truncated, ±∞ preserved.
 fn ta_to_int(i: &mut Interp, v: &Value) -> Result<f64, Value> {
+    // spec ToIntegerOrInfinity goes through ToNumber — a bigint arg
+    // (primitive or wrapper) is a TypeError, not its magnitude
+    if bigint_magnitude(v).is_some() {
+        return Err(i.type_err("Cannot convert a BigInt value to a number"));
+    }
     let n = i.to_num(v)?;
     Ok(if n.is_nan() { 0.0 } else { n.trunc() })
 }
@@ -1113,14 +1123,26 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bo
     if !(i.new_target_native.is_some() && fresh_this) {
         return Err(i.type_err("TypedArray constructor cannot be invoked without 'new'"));
     }
-    // spec OrdinaryCreateFromConstructor happens before argument
+    let sz = kind.size();
+    let src = arg(args, 0);
+    // spec ordering: a non-object firstArgument is ToIndex'd BEFORE
+    // OrdinaryCreateFromConstructor reads newTarget.prototype — a
+    // Symbol/BigInt/out-of-range arg throws TypeError ahead of a
+    // throwing `prototype` getter
+    let pre_len = if bigint_magnitude(&src).is_some() {
+        // a bigint primitive reaches ToIndex → spec TypeError
+        return Err(i.type_err("Cannot convert a BigInt value to a number"));
+    } else if !matches!(src, Value::Obj(_) | Value::Und | Value::Null) {
+        Some(to_index(i, &src)?)
+    } else {
+        None
+    };
+    // spec OrdinaryCreateFromConstructor happens before object-argument
     // processing — `construct` resolved the proto without invoking
     // getters, so replay the observable Get(newTarget,"prototype")
     // (and adopt an object result): a getter may detach or resize a
     // source buffer.
     apply_new_target_proto(i, this)?;
-    let sz = kind.size();
-    let src = arg(args, 0);
     // spec [[ContentType]] — from the invoked constructor, not the
     // receiver's proto chain (see `ctor_big`).
     let target_big = ctor_big;
@@ -1257,12 +1279,13 @@ fn ta_ctor(i: &mut Interp, this: &Value, args: &[Value], kind: TAK, ctor_big: bo
             }
         }
         Value::Und | Value::Null => (mk_buffer(i, Vec::new()), 0, 0, false),
-        other => {
+        _ => {
             // spec InitializeTypedArrayFromLength — ToIndex semantics:
             // NaN → +0, fractions truncate, negatives / ±∞ / ≥ 2^53 are
             // RangeErrors. The host limit applies to the BYTE count —
             // `n * sz` must not overflow or exceed the data-block cap.
-            let n = to_index(i, other)?;
+            // (`to_index` already ran above the proto access.)
+            let n = pre_len.unwrap_or(0);
             if n > AB_HOST_MAX / sz {
                 return Err(i.range_err("Invalid typed array length"));
             }
@@ -1290,18 +1313,22 @@ fn ta_static_of(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
     }
     let obj = i.construct(t, vec![Value::Num(args.len() as f64)], None)?;
     // spec TypedArrayCreateFromConstructor — the single-argument length
-    // check plus ValidateTypedArray.
+    // check plus ValidateTypedArray; the "write" usage rejects
+    // immutable-buffer results up front (before element coercion)
     let Some(tp) = ta_parts(&obj) else {
         return Err(i.type_err("of result is not a TypedArray"));
     };
     if tp.eff().is_none() {
         return Err(i.type_err("of result is a detached or out-of-bounds TypedArray"));
     }
+    if tp.buf.borrow().immutable {
+        return Err(i.type_err("cannot write to an immutable ArrayBuffer"));
+    }
     if tp.eff().unwrap_or(0) < args.len() {
         return Err(i.type_err("of result is too short"));
     }
     for (k, v) in args.iter().enumerate() {
-        i.set_prop(&obj, ta_elem_key(k), v.clone())?;
+        crate::builtins::spec_set(i, &obj, ta_elem_key(k), v.clone())?;
     }
     Ok(obj)
 }
@@ -1325,14 +1352,16 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
             return Err(i.type_err("value is not iterable"));
         }
         let iter = i.call(&iterm, src.clone(), Vec::new())?;
+        // spec GetIterator fetches `next` ONCE — a `next` accessor that
+        // returns a fresh closure must not be re-read per step
+        let next = i.get_prop_str(&iter, "next")?;
+        if !i.is_callable(&next) {
+            return Err(i.type_err("iterator.next is not a function"));
+        }
         let mut items = Vec::new();
         loop {
             if items.len() > 200_000 {
                 return Err(i.range_err("iteration limit exceeded"));
-            }
-            let next = i.get_prop_str(&iter, "next")?;
-            if !i.is_callable(&next) {
-                return Err(i.type_err("iterator.next is not a function"));
             }
             let r = i.call(&next, iter.clone(), Vec::new())?;
             if !matches!(r, Value::Obj(_)) {
@@ -1345,8 +1374,20 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
             items.push(i.get_prop_str(&r, "value")?);
         }
         let obj = i.construct(t, vec![Value::Num(items.len() as f64)], None)?;
-        if ta_parts(&obj).is_none() {
+        let Some(tp) = ta_parts(&obj) else {
             return Err(i.type_err("from result is not a TypedArray"));
+        };
+        let Some(eff) = tp.eff() else {
+            return Err(i.type_err("from result is a detached or out-of-bounds TypedArray"));
+        };
+        // TypedArrayCreateFromConstructor usage "write" — immutable
+        // buffer results throw before any element writes
+        if tp.buf.borrow().immutable {
+            return Err(i.type_err("cannot write to an immutable ArrayBuffer"));
+        }
+        // TypedArrayCreate: the result must hold all collected values
+        if eff < items.len() {
+            return Err(i.type_err("from result is too short"));
         }
         for (k, it) in items.into_iter().enumerate() {
             let v = if use_map {
@@ -1354,7 +1395,7 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
             } else {
                 it
             };
-            i.set_prop(&obj, ta_elem_key(k), v)?;
+            crate::builtins::spec_set(i, &obj, ta_elem_key(k), v)?;
         }
         return Ok(obj);
     }
@@ -1368,8 +1409,17 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
         n.min(9_007_199_254_740_991.0) as usize
     };
     let obj = i.construct(t, vec![Value::Num(len as f64)], None)?;
-    if ta_parts(&obj).is_none() {
+    let Some(tp) = ta_parts(&obj) else {
         return Err(i.type_err("from result is not a TypedArray"));
+    };
+    let Some(eff) = tp.eff() else {
+        return Err(i.type_err("from result is a detached or out-of-bounds TypedArray"));
+    };
+    if tp.buf.borrow().immutable {
+        return Err(i.type_err("cannot write to an immutable ArrayBuffer"));
+    }
+    if eff < len {
+        return Err(i.type_err("from result is too short"));
     }
     let big = ta_is_big(&obj);
     for k in 0..len {
@@ -1379,7 +1429,7 @@ fn ta_static_from(i: &mut Interp, t: &Value, args: &[Value]) -> NR {
         } else {
             kv
         };
-        i.set_prop(&obj, ta_elem_key(k), v)?;
+        crate::builtins::spec_set(i, &obj, ta_elem_key(k), v)?;
     }
     Ok(obj)
 }
@@ -2927,6 +2977,11 @@ fn install_array_buffer(i: &mut Interp) {
     );
     let ctor = mk_ctor_len(i, "ArrayBuffer", ab_ctor, &p.clone(), 1.0);
     if let Value::Obj(co) = &ctor {
+        // marker: `construct` skips its eager newTarget.prototype read —
+        // spec AllocateArrayBuffer validates byteLength vs maxByteLength
+        // BEFORE OrdinaryCreateFromConstructor; the ctor replays the
+        // observable get itself at the spec position
+        hid(i, co, "__ta_ctor", Value::Bool(true));
         met_a(i, co, "isView", ab_is_view, 1.0);
         i.set_builtin(co, "maxByteLength", Value::Num(268435456.0));
         // get %ArrayBuffer%[Symbol.species] — returns `this`
@@ -3223,11 +3278,36 @@ fn m_ab_transfer_immutable(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
 }
 
 fn m_ab_slice_to_immutable(i: &mut Interp, this: &Value, args: &[Value]) -> NR {
-    let v = m_ab_slice(i, this, args)?;
-    if let Value::Obj(o) = &v {
-        o.borrow_mut().immutable = true;
+    // spec sliceToImmutable: the result is built with %ArrayBuffer%
+    // directly — NO SpeciesConstructor lookup (unlike slice).
+    let (o, sb) = need_ab(i, this)?;
+    if o.borrow().detached {
+        return Err(i.type_err("Cannot perform sliceToImmutable on a detached ArrayBuffer"));
     }
-    Ok(v)
+    let len = sb.borrow().len();
+    let first = clamp_index(ta_to_int(i, &arg(args, 0))?, len);
+    let last = match arg(args, 1) {
+        Value::Und => len,
+        v => clamp_index(ta_to_int(i, &v)?, len),
+    };
+    let new_len = last.saturating_sub(first);
+    let nb = mk_buffer(i, vec![0u8; new_len]);
+    // post-coercion revalidation — a valueOf may have detached or
+    // shrunk a resizable source: detach → TypeError; shrink below the
+    // resolved end (first + newLen) → RangeError
+    if o.borrow().detached {
+        return Err(i.type_err("Cannot perform sliceToImmutable on a detached ArrayBuffer"));
+    }
+    let avail = sb.borrow().len();
+    if avail < first + new_len {
+        return Err(i.range_err("source buffer shrunk below the resolved end"));
+    }
+    if new_len > 0 {
+        let db = buffer_bytes(&nb).unwrap();
+        db.borrow_mut()[..new_len].copy_from_slice(&sb.borrow()[first..first + new_len]);
+    }
+    nb.borrow_mut().immutable = true;
+    Ok(Value::Obj(nb))
 }
 
 fn ab_is_view(_i: &mut Interp, _t: &Value, args: &[Value]) -> NR {
@@ -3420,6 +3500,12 @@ fn install_data_view(i: &mut Interp) {
         },
     );
     let ctor = mk_ctor_len(i, "DataView", dv_ctor, &p, 1.0);
+    if let Value::Obj(co) = &ctor {
+        // marker: defer the eager newTarget.prototype read — spec
+        // validates byteOffset/byteLength bounds BEFORE
+        // OrdinaryCreateFromConstructor; dv_ctor replays the get
+        hid(i, co, "__ta_ctor", Value::Bool(true));
+    }
     gdef(i, "DataView", ctor);
 }
 

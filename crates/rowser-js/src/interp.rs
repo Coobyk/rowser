@@ -3436,9 +3436,9 @@ impl Interp {
                                 // writes the element store.
                                 let n =
                                     crate::binary::ta_elem_write(self, &Value::Obj(o.clone()), &v)?;
-                                if typed_state(&buf, off, len, kind, track)
-                                    .is_some_and(|eff| valid_int_index(ni, eff))
-                                {
+                                let still_valid = typed_state(&buf, off, len, kind, track)
+                                    .is_some_and(|eff| valid_int_index(ni, eff));
+                                if still_valid {
                                     if buf.borrow().immutable {
                                         return Err(self
                                             .type_err("Cannot write to an immutable ArrayBuffer"));
@@ -3451,6 +3451,8 @@ impl Interp {
                                         );
                                     }
                                 }
+                                // invalid index: the write is skipped but
+                                // [[Set]] still reports true (9.4.5.5)
                                 return Ok(());
                             }
                             // distinct receiver: a valid index falls
@@ -5891,9 +5893,15 @@ impl Interp {
                 }
                 // OrdinaryCreateFromConstructor: new_target.prototype wins —
                 // read through [[Get]] so a proxy newTarget fires its
-                // `get` trap (revoked / throwing traps propagate)
+                // `get` trap (revoked / throwing traps propagate).
+                // TypedArray ctors defer the read: their spec path
+                // coerces a non-object firstArgument (ToIndex) BEFORE
+                // AllocateTypedArray touches newTarget.prototype — the
+                // ctor replays the observable get itself via
+                // apply_new_target_proto at the spec position.
+                let late_proto = o.borrow().props.contains_str("__ta_ctor");
                 let nt_proto = match &new_target {
-                    Some(ntv @ Value::Obj(_)) => {
+                    Some(ntv @ Value::Obj(_)) if !late_proto => {
                         self.get_prop(ntv, &PropKey::from_str("prototype"))?
                     }
                     _ => Value::Und,
@@ -10731,7 +10739,8 @@ pub fn to_u32(n: f64) -> u32 {
 }
 
 pub fn js_str_to_num(s: &str) -> f64 {
-    let t = s.trim();
+    // spec trims StringWhiteSpace — includes U+FEFF, excludes NEL
+    let t = s.trim_matches(crate::builtins::is_js_space);
     if t.is_empty() {
         return 0.0;
     }

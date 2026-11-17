@@ -900,7 +900,7 @@ fn is_array_val(i: &mut Interp, v: &Value) -> Result<bool, Value> {
 
 /// spec `Set(O, P, V, true)` — a failed [[Set]] is always a TypeError;
 /// the interpreter's sloppy-mode `set_failed` flag converts to that here.
-fn spec_set(i: &mut Interp, o: &Value, key: PropKey, v: Value) -> Result<(), Value> {
+pub(crate) fn spec_set(i: &mut Interp, o: &Value, key: PropKey, v: Value) -> Result<(), Value> {
     i.set_failed = false;
     i.set_prop(o, key, v)?;
     if i.set_failed {
@@ -1416,19 +1416,40 @@ fn install_protos(i: &mut Interp) {
             i.set_attr(&gf, "prototype", Value::Obj(i.p.generator.clone()), false, true);
             str_tag(&gf, "GeneratorFunction");
         }
-        // %GeneratorPrototype% — eager generators step a snapshot, so
-        // `next` is the Iter stepper; `return`/`throw` finish the snapshot
+        // %GeneratorPrototype% — next/return/throw need a real generator
+        // receiver ([[GeneratorState]]); spec arity for all three is 1
         let gp = i.p.generator.clone();
-        method(i, &gp, "next", iter_next);
-        method(i, &gp, "return", gen_return);
-        method(i, &gp, "throw", gen_throw);
+        method_len(i, &gp, "next", gen_next_checked, 1.0);
+        method_len(i, &gp, "return", gen_return_checked, 1.0);
+        method_len(i, &gp, "throw", gen_throw_checked, 1.0);
+        // spec: constructor = %GeneratorFunction.prototype% — non-writable,
+        // configurable (same shape as %AsyncGeneratorPrototype%)
+        let gf = i.p.gen_func.clone();
+        i.set_attr(&gp, "constructor", Value::Obj(gf), false, true);
         str_tag(&gp, "Generator");
         // builtin iterator protos — names come from @@toStringTag so
-        // Object.prototype.toString sees them through Get
+        // Object.prototype.toString sees them through Get; `next` is an own
+        // property of each proto and brand-checks its receiver
         str_tag(&i.p.array_iter.clone(), "Array Iterator");
         str_tag(&i.p.map_iter.clone(), "Map Iterator");
         str_tag(&i.p.set_iter.clone(), "Set Iterator");
         str_tag(&i.p.string_iter.clone(), "String Iterator");
+        {
+            let p = i.p.array_iter.clone();
+            method(i, &p, "next", arr_iter_next);
+        }
+        {
+            let p = i.p.map_iter.clone();
+            method(i, &p, "next", map_iter_next);
+        }
+        {
+            let p = i.p.set_iter.clone();
+            method(i, &p, "next", set_iter_next);
+        }
+        {
+            let p = i.p.string_iter.clone();
+            method(i, &p, "next", str_iter_next);
+        }
         // %AsyncIteratorPrototype% — proto of every async iterator:
         // `{ [Symbol.asyncIterator]() { return this } }`
         {
@@ -1936,6 +1957,83 @@ pub fn new_promise_pub(i: &mut Interp) -> ObjRef {
 /// needs it for pre-coroutine setup failures (param init throws etc.)
 pub fn settle_pub(i: &mut Interp, p: &ObjRef, ok: bool, v: Value) -> NResult {
     settle(i, p, ok, v)
+}
+
+/// spec [[XxxIteratorInternalSlots]] this-check for collection-iterator
+/// `next` methods — the receiver must be an iterator object whose proto
+/// chain contains the collection's own iter proto (a Set iterator passed
+/// to %MapIteratorPrototype%.next throws, and so does a plain object)
+fn iter_proto_check(i: &mut Interp, this: &Value, proto: &ObjRef) -> Result<(), Value> {
+    let Value::Obj(o) = this else {
+        return Err(i.type_err("method called on incompatible receiver"));
+    };
+    let is_iter = matches!(
+        o.borrow().kind,
+        ObjKind::IterLive { .. }
+            | ObjKind::Iter { .. }
+            | ObjKind::IterLazy(_)
+            | ObjKind::IterBusy
+    );
+    if is_iter {
+        let mut cur = Some(o.clone());
+        while let Some(c) = cur {
+            if Rc::ptr_eq(&c, proto) {
+                return Ok(());
+            }
+            cur = c.borrow().proto.clone();
+        }
+    }
+    Err(i.type_err("method called on incompatible receiver"))
+}
+
+fn arr_iter_next(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
+    let p = i.p.array_iter.clone();
+    iter_proto_check(i, this, &p)?;
+    iter_next(i, this, a)
+}
+
+fn map_iter_next(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
+    let p = i.p.map_iter.clone();
+    iter_proto_check(i, this, &p)?;
+    iter_next(i, this, a)
+}
+
+fn set_iter_next(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
+    let p = i.p.set_iter.clone();
+    iter_proto_check(i, this, &p)?;
+    iter_next(i, this, a)
+}
+
+fn str_iter_next(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
+    let p = i.p.string_iter.clone();
+    iter_proto_check(i, this, &p)?;
+    iter_next(i, this, a)
+}
+
+/// `%GeneratorPrototype%.next` this-check — spec requires a real
+/// generator object ([[GeneratorState]] slot), not just an iterator kind
+fn need_gen(i: &mut Interp, this: &Value) -> Result<Rc<RefCell<GenCell>>, Value> {
+    if let Value::Obj(o) = this {
+        if let ObjKind::Gen(cell) = &o.borrow().kind {
+            return Ok(cell.clone());
+        }
+    }
+    Err(i.type_err("method called on incompatible receiver"))
+}
+
+fn gen_next_checked(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
+    let cell = need_gen(i, this)?;
+    gen_resume(i, &cell, GenIn::Next(arg(a, 0)))
+}
+
+fn gen_return_checked(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
+    let cell = need_gen(i, this)?;
+    gen_resume(i, &cell, GenIn::Return(arg(a, 0)))
+}
+
+fn gen_throw_checked(i: &mut Interp, this: &Value, a: &[Value]) -> NResult {
+    let cell = need_gen(i, this)?;
+    gen_resume(i, &cell, GenIn::Throw(arg(a, 0)))
 }
 
 fn iter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
@@ -4448,6 +4546,21 @@ fn install_globals(i: &mut Interp) {
             ObjKind::Und,
         ))));
         i.set_builtin(&h, "IsHTMLDDA", dda);
+        // createRealm — fresh global with all builtins. The realm's
+        // Interp is leaked: ObjRefs are plain Rc graphs and methods run
+        // under whichever Interp invokes them, so cross-realm objects
+        // are safe to share with the calling realm.
+        i.set_builtin(&h, "createRealm", {
+            let f = native(i, "createRealm", |i, _t, _a| {
+                let mut realm = Box::new(Interp::new());
+                install(&mut realm);
+                let realm = Box::leak(realm);
+                let r = i.new_obj();
+                i.set_data(&r, "global", Value::Obj(realm.p.global.clone()));
+                Ok(Value::Obj(r))
+            });
+            f
+        });
         define_global(i, "$262", Value::Obj(h));
     }
 
@@ -5751,6 +5864,25 @@ fn install_globals(i: &mut Interp) {
             },
         );
         define_global(i, "Reflect", Value::Obj(r));
+    }
+
+    // Atomics — the namespace exists with the trivially-implementable
+    // members; wait/notify/store/load need SharedArrayBuffer (uninstalled)
+    {
+        let a = i.new_obj();
+        method(i, &a, "pause", |_i, _t, _a| Ok(Value::Und));
+        a.borrow_mut().props.insert(
+            PropKey::Sym(SYM_TOSTRINGTAG),
+            Prop {
+                val: Value::Str(Rc::from("Atomics")),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                get: None,
+                set: None,
+            },
+        );
+        define_global(i, "Atomics", Value::Obj(a));
     }
 
     // binary views + web-platform surface (TextEncoder, URL, Blob, …)
@@ -7193,8 +7325,9 @@ pub(crate) fn obj_get_own_prop_desc(i: &mut Interp, _t: &Value, args: &[Value]) 
                 i.set_data(&d, "value", elem);
                 i.set_data(&d, "writable", Value::Bool(true));
                 i.set_data(&d, "enumerable", Value::Bool(true));
-                // integer-indexed props are non-configurable (10.4.5.3)
-                i.set_data(&d, "configurable", Value::Bool(false));
+                // integer-indexed props report configurable:true since the
+                // detached-buffer semantics alignment (10.4.5.1)
+                i.set_data(&d, "configurable", Value::Bool(true));
                 return Ok(Value::Obj(d));
             }
         }
@@ -7461,25 +7594,12 @@ fn ord_prevent_ext(i: &mut Interp, o: &ObjRef) -> Result<bool, Value> {
             },
         };
     }
-    // 10.4.5.4: a TA backed by a resizable buffer can never become
-    // non-extensible — neither can one with live elements
+    // 10.4.5.4: a TA on a resizable buffer can never become
+    // non-extensible; fixed-buffer views take the ordinary path
     {
         let b = o.borrow();
-        if let ObjKind::Typed {
-            buf,
-            off,
-            len,
-            kind,
-            track,
-        } = &b.kind
-        {
+        if let ObjKind::Typed { buf, .. } = &b.kind {
             if buf.borrow().rab_max.is_some() {
-                return Ok(false);
-            }
-            if *track {
-                return Ok(false);
-            }
-            if typed_state(buf, *off, *len, *kind, *track).is_some_and(|eff| eff > 0) {
                 return Ok(false);
             }
         }
@@ -10200,7 +10320,7 @@ fn str_to_upper(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 
 /// spec WhiteSpace + LineTerminator set — NOT Rust is_whitespace
 /// (U+0085 NEL is ws in Unicode but not in JS)
-fn is_js_space(c: char) -> bool {
+pub(crate) fn is_js_space(c: char) -> bool {
     matches!(
         c,
         '\u{9}'
