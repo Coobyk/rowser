@@ -828,7 +828,13 @@ impl ReParser {
                     _ if self.unicode => {
                         return Err("invalid \\c escape".into());
                     }
-                    _ => Node::Ch('c' as u32),
+                    // Annex B: `\c<invalid>` is a literal `\` — `c`
+                    // reparses as its own literal atom (`/\c_/` matches
+                    // the two-char string "\c", not "c")
+                    _ => {
+                        self.i -= 1;
+                        Node::Ch('\\' as u32)
+                    }
                 }
             }
             'k' => {
@@ -962,7 +968,12 @@ impl ReParser {
                     self.i += 1;
                     ClassItem::Ch((l as u32) % 32)
                 }
-                _ => ClassItem::Ch('c' as u32),
+                // `\c<other>` is a literal `\` — `c` becomes the next
+                // class item on its own
+                _ => {
+                    self.i -= 1;
+                    ClassItem::Ch('\\' as u32)
+                }
             },
             '1'..='9' => {
                 if self.unicode {

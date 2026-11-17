@@ -9927,6 +9927,7 @@ fn is_obj_arg(v: &Value) -> bool {
     matches!(v, Value::Obj(_)) && !crate::binary::bigint_is_prim(v)
 }
 
+
 /// spec ToNumber for String.prototype arguments — rejects BigInt even
 /// when a bigint surfaces from ToPrimitive (i.to_num quietly reads the
 /// magnitude back, which would swallow the required TypeError).
@@ -17837,14 +17838,21 @@ fn g_decode_uri_component(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult
 fn g_escape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let s = i.to_str(&arg(args, 0))?;
     let mut out = String::new();
-    for ch in s.chars() {
-        let cp = ch as u32;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '@' | '*' | '_' | '+' | '-' | '.' | '/') {
-            out.push(ch);
-        } else if cp < 256 {
-            out.push_str(&format!("%{cp:02X}"));
+    // escape() works on UTF-16 code units — astral characters emit
+    // their surrogate pair separately (%uD834%uDF06, not %u1D306)
+    for u in u16s(&s) {
+        if let Some(ch) = char::from_u32(u as u32) {
+            if ch.is_ascii_alphanumeric()
+                || matches!(ch, '@' | '*' | '_' | '+' | '-' | '.' | '/')
+            {
+                out.push(ch);
+                continue;
+            }
+        }
+        if u < 256 {
+            out.push_str(&format!("%{u:02X}"));
         } else {
-            out.push_str(&format!("%u{cp:04X}"));
+            out.push_str(&format!("%u{u:04X}"));
         }
     }
     Ok(Value::Str(Rc::from(out.as_str())))
@@ -17854,15 +17862,17 @@ fn g_escape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
 fn g_unescape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
     let s = i.to_str(&arg(args, 0))?;
     let b: Vec<char> = s.chars().collect();
-    let mut out = String::new();
+    // collect UTF-16 units so %uD834%uDF06 decodes as a surrogate pair
+    // and lone surrogates keep their units
+    let mut units: Vec<u16> = Vec::new();
     let mut k = 0;
     while k < b.len() {
         if b[k] == '%' {
             if b.get(k + 1) == Some(&'u') && k + 5 < b.len() {
                 let hex: String = b[k + 2..k + 6].iter().collect();
                 if let Ok(v) = u32::from_str_radix(&hex, 16) {
-                    if let Some(c) = char::from_u32(v) {
-                        out.push(c);
+                    if v <= 0xFFFF {
+                        units.push(v as u16);
                         k += 6;
                         continue;
                     }
@@ -17870,17 +17880,21 @@ fn g_unescape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
             } else if k + 2 < b.len() {
                 let hex: String = b[k + 1..k + 3].iter().collect();
                 if let Ok(v) = u32::from_str_radix(&hex, 16) {
-                    if let Some(c) = char::from_u32(v) {
-                        out.push(c);
+                    if v <= 0xFF {
+                        units.push(v as u16);
                         k += 3;
                         continue;
                     }
                 }
             }
         }
-        out.push(b[k]);
+        units.extend(u16s(&b[k].to_string()));
         k += 1;
     }
+    let out = match u16s_val(&units) {
+        Value::Str(s) => s.to_string(),
+        _ => String::new(),
+    };
     Ok(Value::Str(Rc::from(out.as_str())))
 }
 
@@ -18780,11 +18794,23 @@ fn re_to_string(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
 }
 
 /// `re.compile(pat, flags)` — Annex B: reinitialize in place, return `this`.
-/// The receiver must have the [[RegExpMatcher]] slot (B.2.4.1 step 2); a
-/// subclass instance compiles fine, plain objects throw.
+/// The receiver must have the [[RegExpMatcher]] slot AND %RegExp.prototype%
+/// as its [[Prototype]] — subclass instances throw.
 fn re_compile(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if re_of(this).is_none() {
         return Err(i.type_err("RegExp.prototype.compile called on incompatible receiver"));
+    }
+    // B.2.5.1: compile is only defined for objects whose [[Prototype]] is
+    // %RegExp.prototype% — subclass instances throw
+    if let Value::Obj(o) = this {
+        let proto_is_re = o
+            .borrow()
+            .proto
+            .as_ref()
+            .is_some_and(|p| Rc::ptr_eq(p, &i.p.regexp));
+        if !proto_is_re {
+            return Err(i.type_err("RegExp.prototype.compile called on incompatible receiver"));
+        }
     }
     let pattern = arg(args, 0);
     let flags = arg(args, 1);

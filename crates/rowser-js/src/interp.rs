@@ -5785,7 +5785,8 @@ impl Interp {
         // mutate the object while the call runs
         let kind = { o.borrow().kind.clone() };
         match kind {
-            ObjKind::Und => Ok(Value::Und),
+            // [[IsHTMLDDA]] objects are callable — [[Call]] yields null
+            ObjKind::Und => Ok(Value::Null),
             ObjKind::Bound {
                 target,
                 thisv,
