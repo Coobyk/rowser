@@ -1129,6 +1129,10 @@ pub struct Scope {
     /// binding (non-arrow functions only) — `eval("var arguments")` /
     /// `var eval` inside it is a SyntaxError
     pub param_env_implicit: std::cell::Cell<bool>,
+    /// names that got the Annex-B `undefined` placeholder binding at this
+    /// var boundary — the block-fn sync at FnDecl exec only fires for
+    /// these (a same-named param/`arguments` binding does NOT count)
+    pub annexed: RefCell<FxSet<usize>>,
     /// `with (obj)` object environment record — bindings resolve as
     /// properties of `obj` (filtered through @@unscopables)
     pub obj_env: Option<ObjRef>,
@@ -1152,6 +1156,7 @@ impl Scope {
             ctor_fn: RefCell::new(Value::Und),
             param_env: std::cell::Cell::new(false),
             param_env_implicit: std::cell::Cell::new(false),
+            annexed: RefCell::new(FxSet::default()),
             obj_env: None,
             this_uninit: std::cell::Cell::new(false),
         })
@@ -1170,6 +1175,7 @@ impl Scope {
             ctor_fn: RefCell::new(Value::Und),
             param_env: std::cell::Cell::new(false),
             param_env_implicit: std::cell::Cell::new(false),
+            annexed: RefCell::new(FxSet::default()),
             obj_env: Some(obj),
             this_uninit: std::cell::Cell::new(false),
         })
@@ -1212,7 +1218,7 @@ struct Hoisted {
     /// Annex B block-level function names — hoisted `undefined` into the
     /// var environment in sloppy code (block-scoped binding lives in the
     /// block; see `exec_hoisted_block` + `Stmt::FnDecl` exec)
-    block_fns: Vec<Rc<str>>,
+    block_fns: Vec<(Rc<str>, usize)>,
     uses_arguments: bool,
 }
 
@@ -2072,7 +2078,18 @@ impl Interp {
             let next = cur.parent.clone().unwrap();
             cur = next;
         }
-        let exists = cur.vars.borrow().contains_key(name.as_ref());
+        let vars_has = cur.vars.borrow().contains_key(name.as_ref());
+        // an existing global PROP counts as an existing binding —
+        // `var f` must not clobber a defineProperty'd `f` with undefined
+        // (CreateGlobalVarBinding leaves existing props alone)
+        let exists = vars_has
+            || (Rc::ptr_eq(&cur, &self.global)
+                && self
+                    .p
+                    .global
+                    .borrow()
+                    .props
+                    .contains_key(&PropKey::S(name.clone())));
         let deletable = self.eval_decl;
         if !exists {
             cur.vars.borrow_mut().insert(
@@ -2085,7 +2102,7 @@ impl Interp {
                     lexical: false,
                 },
             );
-        } else if !matches!(v, Value::Und) {
+        } else if !matches!(v, Value::Und) && vars_has {
             let mut vv = cur.vars.borrow_mut();
             let b = vv.get_mut(name.as_ref()).unwrap();
             b.val = v.clone();
@@ -6949,7 +6966,7 @@ impl Interp {
         }
         if !self.cur_strict {
             for n in &h.block_fns {
-                names.push((n.clone(), true));
+                names.push((n.0.clone(), true));
             }
         }
         // GlobalDeclarationInstantiation early errors (atomic — before
@@ -7020,13 +7037,27 @@ impl Interp {
     }
 
     /// declare the precomputed hoisted vars/fns into `scope`'s var boundary.
+    /// Annex-B nested fn names are initialized `undefined` at the var
+    /// boundary in sloppy code — created here (at scope entry, where the
+    /// shadow context was collected) and never inside nested blocks.
     fn apply_hoisted(&mut self, h: &Hoisted, scope: &EnvRef) {
+        if !self.cur_strict && !h.block_fns.is_empty() {
+            let mut ve = scope.clone();
+            while !ve.var_boundary.get() && ve.parent.is_some() {
+                let next = ve.parent.clone().unwrap();
+                ve = next;
+            }
+            let mut annexed = ve.annexed.borrow_mut();
+            for (name, ptr) in &h.block_fns {
+                annexed.insert(*ptr);
+                self.declare_var_rc(scope, name, Value::Und, false);
+            }
+        }
         self.apply_hoisted_mode(h, scope, false);
     }
 
     /// `block_scope`: fns bind lexically in `scope` (the Annex-B block
-    /// binding) instead of the var boundary. Annex-B nested fn names are
-    /// initialized `undefined` at the var boundary in sloppy code.
+    /// binding) instead of the var boundary.
     fn apply_hoisted_mode(&mut self, h: &Hoisted, scope: &EnvRef, block_scope: bool) {
         // lexical declarations instantiate as uninitialized bindings at
         // scope entry — reads/writes before their decl throws (TDZ)
@@ -7044,11 +7075,6 @@ impl Interp {
         }
         for name in &h.vars {
             self.declare_var_rc(scope, name, Value::Und, false);
-        }
-        if !self.cur_strict {
-            for name in &h.block_fns {
-                self.declare_var_rc(scope, name, Value::Und, false);
-            }
         }
         for f in &h.fns {
             if let Some(name) = f.name.clone() {
@@ -7069,7 +7095,23 @@ impl Interp {
         if let Some((_, h)) = self.fn_hoist.get(&key) {
             return h.clone();
         }
-        let mut h = collect_hoisted_owned(&def.body);
+        // B.3.3.2: a block-level fn named like a parameter — or named
+        // `arguments` — never gets the Annex-B var binding, so seed the
+        // lexical-shadow set with them
+        let mut seeds: Vec<&str> = Vec::new();
+        for p in &def.params {
+            match p {
+                Param::Ident(n) => seeds.push(n.as_str()),
+                Param::Rest(pat) | Param::Default(pat, _) => {
+                    collect_pattern_names(pat, &mut seeds)
+                }
+                Param::Pattern(pat) => collect_pattern_names(pat, &mut seeds),
+            }
+        }
+        if !def.is_arrow {
+            seeds.push("arguments");
+        }
+        let mut h = collect_hoisted_seeded(&def.body, &seeds);
         h.uses_arguments = !def.is_arrow && fndef_uses_arguments(def);
         let h = Rc::new(h);
         // store the def Rc alongside the entry: pinning it keeps the
@@ -7093,8 +7135,33 @@ impl Interp {
 
     fn hoist_stmts(&mut self, stmts: &[Stmt], scope: &EnvRef) -> Result<(), Value> {
         let h = self.hoisted_slice(stmts);
-        self.apply_hoisted(&h, scope);
+        // block-scope semantics: the catch block's own fns/lets bind into
+        // `scope`; nested-block Annex-B var bindings were already created
+        // at the enclosing var boundary's entry — the collect here has no
+        // access to enclosing shadow context (e.g. the catch param).
+        self.apply_hoisted_mode(&h, scope, true);
         Ok(())
+    }
+
+    /// Execute a statement that sits in a single-statement position
+    /// (an `if` arm or a labeled item). Annex B.3.4: a plain
+    /// `function f(){}` there is sloppy-only and behaves as if wrapped
+    /// in a block — it gets an ad-hoc scope with the fn pre-instantiated
+    /// so the B.3.3 var-boundary sync reads the inner value.
+    fn exec_branch_stmt(&mut self, s: &Stmt, env: &EnvRef) -> SRes {
+        if !self.cur_strict {
+            if let Stmt::FnDecl(f) = s {
+                if !f.is_gen && !f.is_async {
+                    if let Some(n) = f.name.clone() {
+                        let scope = Scope::new(Some(env.clone()), false);
+                        let fv = self.make_fn(f.clone(), &scope, CtorKind::NotClass);
+                        self.declare(&scope, &n, fv, true);
+                        return self.exec_stmt(s, &scope);
+                    }
+                }
+            }
+        }
+        self.exec_stmt(s, env)
     }
 
     /// Execute a braced body (block / try / finally). A fresh child scope is
@@ -7321,10 +7388,21 @@ impl Interp {
                     // Annex B.3.3: executing a block-level fn decl syncs the
                     // block-scoped value into the var-environment binding —
                     // plain functions only; generators/async fns stay purely
-                    // block-scoped
+                    // block-scoped. The sync only fires when the boundary
+                    // actually holds a non-lexical binding: it's skipped when
+                    // an enclosing lexical shadowed it (the Annex-B var
+                    // binding was never created).
                     if !self.cur_strict && !f.is_gen && !f.is_async {
-                        if let Some(fv) = self.env_lookup(env, name)? {
-                            self.declare_var(env, name, fv);
+                        // B.3.3: sync only when THIS declaration was
+                        // var-ified — tracked by node ptr, since a skipped
+                        // same-name decl (shadowed lexical / dup) must not
+                        // overwrite the boundary binding
+                        let annexed =
+                            ve.annexed.borrow().contains(&(Rc::as_ptr(f) as usize));
+                        if annexed {
+                            if let Some(fv) = self.env_lookup(env, name)? {
+                                self.declare_var(env, name, fv);
+                            }
                         }
                     }
                 }
@@ -7344,9 +7422,9 @@ impl Interp {
             Stmt::If { c, t, e } => {
                 let cv = self.eval_expr(c, env)?;
                 let r = if self.to_bool(&cv) {
-                    self.exec_stmt(t, env)?
+                    self.exec_branch_stmt(t, env)?
                 } else if let Some(e) = e {
-                    self.exec_stmt(e, env)?
+                    self.exec_branch_stmt(e, env)?
                 } else {
                     Completion::Empty
                 };
@@ -7860,11 +7938,13 @@ impl Interp {
                 let dv = self.eval_expr(disc, env)?;
                 let scope = Scope::new(Some(env.clone()), false);
                 // hoist across all case bodies (shared block scope): case
-                // fns bind block-locally (B.3.5), nested-block fns get the
-                // Annex-B `undefined` var binding, `var`s hoist normally
+                // fns bind block-locally (B.3.5) and `var`s hoist normally;
+                // Annex-B `undefined` var bindings were already created at
+                // the enclosing var boundary's entry (with the shared
+                // switch-scope shadow applied)
                 {
                     let mut fns: Vec<&Rc<FnDef>> = Vec::new();
-                    let mut block_fns: Vec<&str> = Vec::new();
+                    let mut block_fns: Vec<&Rc<FnDef>> = Vec::new();
                     let mut vars: Vec<&str> = Vec::new();
                     let mut lets: Vec<&str> = Vec::new();
                     for c in cases {
@@ -7887,12 +7967,7 @@ impl Interp {
                     for n in vars {
                         self.declare_var(&scope, n, Value::Und);
                     }
-                    if !self.cur_strict {
-                        for n in block_fns {
-                            let k = self.intern(n);
-                            self.declare_var_rc(&scope, &k, Value::Und, false);
-                        }
-                    }
+                    let _ = block_fns;
                     for f in fns {
                         if let Some(n) = f.name.clone() {
                             let fv = self.make_fn(f.clone(), &scope, CtorKind::NotClass);
@@ -7976,9 +8051,26 @@ impl Interp {
                         res = Err(exc);
                     } else if let Some(h) = handler {
                         if let Some(p) = param {
-                            // `catch (e)` param binds into the catch scope
+                            // `catch (e)` param binds into the catch scope —
+                            // simple ident params are var-compatible
+                            // bindings (`var e`/`eval('var e')` inside is
+                            // legal); destructured params are real lexicals
                             let catch_scope = Scope::new(Some(env.clone()), false);
-                            self.bind_pattern(&catch_scope, p, exc, VarKind::Let, true)?;
+                            if let Pattern::Ident(n) = p {
+                                let k = self.intern(n);
+                                catch_scope.vars.borrow_mut().insert(
+                                    k,
+                                    Binding {
+                                        val: exc.clone(),
+                                        mutable: true,
+                                        uninit: false,
+                                        deletable: false,
+                                        lexical: false,
+                                    },
+                                );
+                            } else {
+                                self.bind_pattern(&catch_scope, p, exc, VarKind::Let, true)?;
+                            }
                             // catch-block lexicals live in a child env of
                             // the param env — param-default closures must
                             // NOT see the body's `let`s
@@ -8034,7 +8126,7 @@ impl Interp {
                 if is_loop {
                     self.pending_label = Some(label.clone());
                 }
-                let res = self.exec_stmt(inner, env);
+                let res = self.exec_branch_stmt(inner, env);
                 if is_loop && self.pending_label.as_deref() == Some(label.as_str()) {
                     self.pending_label = None;
                 }
@@ -10826,38 +10918,102 @@ fn param_count(params: &[Param]) -> usize {
 fn collect_hoisted<'a>(
     stmts: &'a [Stmt],
     fns: &mut Vec<&'a Rc<FnDef>>,
-    block_fns: &mut Vec<&'a str>,
+    block_fns: &mut Vec<&'a Rc<FnDef>>,
     vars: &mut Vec<&'a str>,
     lets: &mut Vec<&'a str>,
 ) {
-    collect_hoisted_at(stmts, fns, block_fns, vars, lets, true)
+    let mut shadow = Vec::new();
+    collect_hoisted_at(stmts, fns, block_fns, vars, lets, &mut shadow, true)
 }
 
 fn collect_hoisted_at<'a>(
     stmts: &'a [Stmt],
     fns: &mut Vec<&'a Rc<FnDef>>,
-    block_fns: &mut Vec<&'a str>,
+    block_fns: &mut Vec<&'a Rc<FnDef>>,
     vars: &mut Vec<&'a str>,
     lets: &mut Vec<&'a str>,
+    shadow: &mut Vec<&'a str>,
     top: bool,
 ) {
+    // Pre-scan this level's own lexical names into `shadow` — they
+    // suppress Annex-B block-fn var bindings in every nested scope
+    // (B.3.3 skip rule: `var f` at that position would early-error
+    // against an enclosing lexical `f`). The same names land in `lets`
+    // when this level is the boundary itself.
+    let shadow_base = shadow.len();
+    // count this level's own block-fn decls — a `var` replacement at a
+    // fn's position conflicts with OTHER same-level lexical bindings of
+    // its name, never with itself, so the fn only skips when a same-level
+    // `let`/class (in `shadow`) or a SECOND same-level fn binds it
+    let mut level_fns: FxMap<&'a str, u32> = FxMap::default();
     for s in stmts {
-        collect_stmt(s, fns, block_fns, vars, lets, top);
+        match s {
+            Stmt::VarDecl { kind, decls } if *kind != VarKind::Var => {
+                for (p, _) in decls {
+                    collect_pattern_names(p, shadow);
+                }
+            }
+            Stmt::ClassDecl(c) => {
+                if let Some(n) = c.name.as_deref() {
+                    shadow.push(n);
+                }
+            }
+            Stmt::FnDecl(f) if !top => {
+                if let Some(n) = f.name.as_deref() {
+                    *level_fns.entry(n).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
     }
+    if top {
+        lets.extend_from_slice(&shadow[shadow_base..]);
+    }
+    for s in stmts {
+        collect_stmt(
+            s, fns, block_fns, vars, lets, shadow, &level_fns, top, true,
+        );
+    }
+    shadow.truncate(shadow_base);
 }
 
 /// Owned (cacheable) form of `collect_hoisted`.
 fn collect_hoisted_owned(stmts: &[Stmt]) -> Hoisted {
+    collect_hoisted_seeded(stmts, &[])
+}
+
+/// `seeds`: names pre-loaded into the lexical-shadow set — for function
+/// bodies the BoundNames of argumentsList plus `arguments` itself
+/// (B.3.3.2: a block-level fn with a param's name never gets the Annex-B
+/// var binding).
+fn collect_hoisted_seeded<'a>(stmts: &'a [Stmt], seeds: &[&'a str]) -> Hoisted {
     let mut fns: Vec<&Rc<FnDef>> = Vec::new();
-    let mut block_fns: Vec<&str> = Vec::new();
+    let mut block_fns: Vec<&Rc<FnDef>> = Vec::new();
     let mut vars: Vec<&str> = Vec::new();
     let mut lets: Vec<&str> = Vec::new();
-    collect_hoisted(stmts, &mut fns, &mut block_fns, &mut vars, &mut lets);
+    let mut shadow: Vec<&'a str> = seeds.to_vec();
+    collect_hoisted_at(
+        stmts,
+        &mut fns,
+        &mut block_fns,
+        &mut vars,
+        &mut lets,
+        &mut shadow,
+        true,
+    );
     Hoisted {
         fns: fns.into_iter().cloned().collect(),
         vars: vars.into_iter().map(|s| Rc::<str>::from(s)).collect(),
         lets: lets.into_iter().map(|s| Rc::<str>::from(s)).collect(),
-        block_fns: block_fns.into_iter().map(|s| Rc::<str>::from(s)).collect(),
+        block_fns: block_fns
+            .into_iter()
+            .map(|f| {
+                (
+                    Rc::<str>::from(f.name.as_deref().unwrap_or("")),
+                    Rc::as_ptr(f) as usize,
+                )
+            })
+            .collect(),
         uses_arguments: false,
     }
 }
@@ -11124,26 +11280,32 @@ fn stmt_uses_arguments(s: &Stmt) -> bool {
 fn collect_stmt<'a>(
     s: &'a Stmt,
     fns: &mut Vec<&'a Rc<FnDef>>,
-    block_fns: &mut Vec<&'a str>,
+    block_fns: &mut Vec<&'a Rc<FnDef>>,
     vars: &mut Vec<&'a str>,
     lets: &mut Vec<&'a str>,
+    shadow: &mut Vec<&'a str>,
+    level_fns: &FxMap<&'a str, u32>,
     top: bool,
+    direct: bool,
 ) {
-    // Annex-B block-fn var bindings only cover plain `function` decls —
-    // generators and async fns stay purely block-scoped
-    let nested = |f: &'a Rc<FnDef>, block_fns: &mut Vec<&'a str>| {
-        if !f.is_gen && !f.is_async {
-            if let Some(n) = f.name.as_deref() {
-                block_fns.push(n);
-            }
-        }
-    };
     match s {
         Stmt::FnDecl(f) => {
             if top {
                 fns.push(f)
-            } else {
-                nested(f, block_fns)
+            } else if !f.is_gen && !f.is_async {
+                // Annex-B block-fn var bindings only cover plain
+                // `function` decls — generators and async fns stay
+                // purely block-scoped. The binding is skipped when a
+                // same-named lexical shadows it in an enclosing block,
+                // or when ANOTHER decl of the name sits at this level
+                // (B.3.3: the `var f` replacement would early-error —
+                // a `direct` decl is itself counted in `level_fns`).
+                if let Some(n) = f.name.as_deref() {
+                    let others = level_fns.get(&n).copied().unwrap_or(0) > direct as u32;
+                    if !shadow.contains(&n) && !others {
+                        block_fns.push(f);
+                    }
+                }
             }
         }
         Stmt::VarDecl { kind, decls } => {
@@ -11151,66 +11313,120 @@ fn collect_stmt<'a>(
                 for (p, _) in decls {
                     collect_pattern_names(p, vars);
                 }
-            } else if top {
-                // lexical decls instantiate uninit at THIS scope —
-                // decls inside nested scopes hoist on their own entry
-                for (p, _) in decls {
-                    collect_pattern_names(p, lets);
-                }
             }
         }
-        Stmt::ClassDecl(c) => {
-            if top {
-                if let Some(n) = c.name.as_deref() {
-                    lets.push(n);
-                }
-            }
+        Stmt::Block(ss) => {
+            // this level's block fns are lexical bindings for every
+            // nested scope — descend with them in shadow
+            let base = shadow.len();
+            shadow.extend(level_fns.keys().copied());
+            collect_hoisted_at(ss, fns, block_fns, vars, lets, shadow, false);
+            shadow.truncate(base);
         }
-        Stmt::Block(ss) => collect_hoisted_at(ss, fns, block_fns, vars, lets, false),
         Stmt::If { t, e, .. } => {
-            collect_stmt(t, fns, block_fns, vars, lets, false);
+            collect_stmt(t, fns, block_fns, vars, lets, shadow, level_fns, false, false);
             if let Some(e) = e {
-                collect_stmt(e, fns, block_fns, vars, lets, false);
+                collect_stmt(e, fns, block_fns, vars, lets, shadow, level_fns, false, false);
             }
         }
         Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
-            collect_stmt(body, fns, block_fns, vars, lets, false)
+            collect_stmt(body, fns, block_fns, vars, lets, shadow, level_fns, false, false)
         }
         Stmt::For { init, body, .. } => {
-            if let Some(ForInit::Var(VarKind::Var, decls)) = init {
-                for (p, _) in decls {
-                    collect_pattern_names(p, vars);
+            let base = shadow.len();
+            match init {
+                Some(ForInit::Var(VarKind::Var, decls)) => {
+                    for (p, _) in decls {
+                        collect_pattern_names(p, vars);
+                    }
                 }
+                Some(ForInit::Var(_, decls)) => {
+                    for (p, _) in decls {
+                        collect_pattern_names(p, shadow);
+                    }
+                }
+                _ => {}
             }
-            collect_stmt(body, fns, block_fns, vars, lets, false);
+            collect_stmt(body, fns, block_fns, vars, lets, shadow, level_fns, false, false);
+            shadow.truncate(base);
         }
         Stmt::ForIn { left, body, .. } | Stmt::ForOf { left, body, .. } => {
-            if let ForTarget::Var(VarKind::Var, p) = left {
-                collect_pattern_names(p, vars);
+            let base = shadow.len();
+            match left {
+                ForTarget::Var(VarKind::Var, p) => collect_pattern_names(p, vars),
+                ForTarget::Var(_, p) => collect_pattern_names(p, shadow),
+                _ => {}
             }
-            collect_stmt(body, fns, block_fns, vars, lets, false);
+            collect_stmt(body, fns, block_fns, vars, lets, shadow, level_fns, false, false);
+            shadow.truncate(base);
         }
         Stmt::Switch { cases, .. } => {
+            // Switch cases share one block scope — a `let` in any case
+            // shadows block fns in every case; case-level fns count
+            // together for the duplicate-decl skip
+            let base = shadow.len();
+            let mut case_fns: FxMap<&'a str, u32> = FxMap::default();
             for c in cases {
-                collect_hoisted_at(&c.body, fns, block_fns, vars, lets, false);
+                for s in &c.body {
+                    match s {
+                        Stmt::VarDecl { kind, decls } if *kind != VarKind::Var => {
+                            for (p, _) in decls {
+                                collect_pattern_names(p, shadow);
+                            }
+                        }
+                        Stmt::ClassDecl(c) => {
+                            if let Some(n) = c.name.as_deref() {
+                                shadow.push(n);
+                            }
+                        }
+                        Stmt::FnDecl(f) => {
+                            if let Some(n) = f.name.as_deref() {
+                                *case_fns.entry(n).or_insert(0) += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
+            for c in cases {
+                for s in &c.body {
+                    collect_stmt(s, fns, block_fns, vars, lets, shadow, &case_fns, false, true);
+                }
+            }
+            shadow.truncate(base);
         }
         Stmt::Try {
             block,
+            param,
             handler,
             finally,
-            ..
         } => {
-            collect_hoisted_at(block, fns, block_fns, vars, lets, false);
+            let base = shadow.len();
+            shadow.extend(level_fns.keys().copied());
+            collect_hoisted_at(block, fns, block_fns, vars, lets, shadow, false);
             if let Some(h) = handler {
-                collect_hoisted_at(h, fns, block_fns, vars, lets, false);
+                // a destructured catch param is a real lexical — `var f`
+                // at the fn's position would early-error, so it shadows
+                // the Annex-B binding. A simple `catch (f)` is var-
+                // compatible and does NOT shadow.
+                if let Some(p) = param {
+                    if !matches!(p, Pattern::Ident(_)) {
+                        collect_pattern_names(p, shadow);
+                    }
+                }
+                collect_hoisted_at(h, fns, block_fns, vars, lets, shadow, false);
             }
             if let Some(f) = finally {
-                collect_hoisted_at(f, fns, block_fns, vars, lets, false);
+                collect_hoisted_at(f, fns, block_fns, vars, lets, shadow, false);
             }
+            shadow.truncate(base);
         }
-        Stmt::Labeled(_, inner) => collect_stmt(inner, fns, block_fns, vars, lets, false),
-        Stmt::With { body, .. } => collect_stmt(body, fns, block_fns, vars, lets, false),
+        Stmt::Labeled(_, inner) => {
+            collect_stmt(inner, fns, block_fns, vars, lets, shadow, level_fns, false, false)
+        }
+        Stmt::With { body, .. } => {
+            collect_stmt(body, fns, block_fns, vars, lets, shadow, level_fns, false, false)
+        }
         _ => {}
     }
 }

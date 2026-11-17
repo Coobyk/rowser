@@ -1215,8 +1215,33 @@ impl Parser {
             collect_switch_vars(&c.body, &mut vars);
         }
         let mut lex_s = std::collections::HashSet::new();
+        let mut fn_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        let mut lex_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for c in &cases {
+            for st in &c.body {
+                if let Stmt::FnDecl(f) = st {
+                    // only plain functions get Annex-B dup tolerance —
+                    // generators/async fns are real lexical decls
+                    if !f.is_gen && !f.is_async {
+                        if let Some(n) = f.name.as_deref() {
+                            *fn_counts.entry(n).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
         for n in &lex {
-            if !lex_s.insert(n.clone()) {
+            *lex_counts.entry(n.as_str()).or_insert(0) += 1;
+        }
+        for n in &lex {
+            // B.3.3.5: sloppy code allows duplicate case-level names when
+            // every entry is a FunctionDeclaration
+            let fn_only_dup = !self.strict
+                && fn_counts.get(n.as_str()).copied().unwrap_or(0)
+                    == lex_counts.get(n.as_str()).copied().unwrap_or(0);
+            if !lex_s.insert(n.clone()) && !fn_only_dup {
                 return Err(self.err(format!("Identifier `{n}` has already been declared")));
             }
         }
@@ -3558,6 +3583,10 @@ struct VCtx {
     /// "hard" lexical names per scope (let/const/class only) — `var`
     /// declarations conflict against these; Annex-B fn names don't block var
     hard: Vec<std::collections::HashSet<String>>,
+    /// names bound by block-level function decls per scope — B.3.3.4: in
+    /// sloppy code duplicate entries are allowed when ONLY functions bound
+    /// the name
+    fns: Vec<std::collections::HashSet<String>>,
     /// per-function var-name sets (var hoists to nearest fn boundary)
     vars: Vec<std::collections::HashSet<String>>,
     /// label stack: (name, is_iteration)
@@ -3607,15 +3636,24 @@ impl VCtx {
     /// declare a block-level function name: conflicts with var names in
     /// the SAME statement list (`{var f; function f(){}}`) and lex names;
     /// a same-name block fn is an error only in strict code
-    fn decl_fn(&mut self, name: &str, in_block: bool) -> Result<(), Error> {
+    fn decl_fn(&mut self, name: &str, in_block: bool, plain: bool) -> Result<(), Error> {
         if in_block {
-            if self.hard.last().is_some_and(|h| h.contains(name))
-                || self.vars.last().is_some_and(|v| v.contains(name))
+            // B.3.3.4: sloppy code allows a duplicate when ONLY function
+            // declarations bound the name at this level so far — both the
+            // existing and the new decl must be plain (Annex-B-eligible)
+            let fn_only_dup = plain
+                && !self.strict
+                && self.fns.last().is_some_and(|s| s.contains(name));
+            if (self.hard.last().is_some_and(|h| h.contains(name)) && !fn_only_dup)
+                || (self.vars.last().is_some_and(|v| v.contains(name)) && !fn_only_dup)
                 || (self.strict && self.lexes.last().is_some_and(|t| t.contains(name)))
             {
                 return Err(self.err(format!("duplicate declaration `{name}`")));
             }
             self.lexes.last_mut().unwrap().insert(name.to_string());
+            if plain {
+                self.fns.last_mut().unwrap().insert(name.to_string());
+            }
             // a block-fn name is a lexical decl for `var`-conflict
             // purposes (`{function f(){} {var f}}` and
             // `{function f(){} var f}` both error)
@@ -3636,11 +3674,13 @@ impl VCtx {
     fn push_scope(&mut self) {
         self.lexes.push(Default::default());
         self.hard.push(Default::default());
+        self.fns.push(Default::default());
         self.vars.push(Default::default());
     }
     fn pop_scope(&mut self) {
         self.lexes.pop();
         self.hard.pop();
+        self.fns.pop();
         // var names declared inside the popped block propagate UP into
         // the parent's VarDeclaredNames
         if let Some(inner) = self.vars.pop() {
@@ -3695,6 +3735,7 @@ fn validate_strict_ctx(
     let mut cx = VCtx {
         lexes: vec![Default::default()],
         hard: vec![Default::default()],
+        fns: vec![Default::default()],
         vars: vec![Default::default()],
         labels: Vec::new(),
         in_iter: 0,
@@ -3708,12 +3749,20 @@ fn validate_strict_ctx(
 }
 
 /// Validate one block's statements: `new_scope` opens a fresh lex scope
-/// (false at program/fn top level where the scope was pre-opened).
+/// (false at program/fn top level where the scope was pre-opened);
+/// `in_block` marks fn decls as block-level (Annex-B) rather than
+/// function-level — case bodies share the switch's scope but their fns
+/// are still block decls.
 fn vstmts(stmts: &[Stmt], cx: &mut VCtx) -> Result<(), Error> {
-    vblock(stmts, cx, false)
+    vblock(stmts, cx, false, false)
 }
 
-fn vblock(stmts: &[Stmt], cx: &mut VCtx, new_scope: bool) -> Result<(), Error> {
+fn vblock(
+    stmts: &[Stmt],
+    cx: &mut VCtx,
+    new_scope: bool,
+    in_block: bool,
+) -> Result<(), Error> {
     if new_scope {
         cx.push_scope();
     }
@@ -3727,7 +3776,7 @@ fn vblock(stmts: &[Stmt], cx: &mut VCtx, new_scope: bool) -> Result<(), Error> {
         var_names(s, &mut vars);
         if let Stmt::FnDecl(f) = s {
             if let Some(n) = &f.name {
-                fns.push(n.clone());
+                fns.push((n.clone(), !f.is_gen && !f.is_async));
             }
         }
     }
@@ -3747,8 +3796,8 @@ fn vblock(stmts: &[Stmt], cx: &mut VCtx, new_scope: bool) -> Result<(), Error> {
         }
     }
     if r.is_ok() {
-        for n in &fns {
-            if let Err(e) = cx.decl_fn(n, new_scope) {
+        for (n, plain) in &fns {
+            if let Err(e) = cx.decl_fn(n, in_block, *plain) {
                 r = Err(e);
                 break;
             }
@@ -3771,7 +3820,7 @@ fn vblock(stmts: &[Stmt], cx: &mut VCtx, new_scope: bool) -> Result<(), Error> {
 
 fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
     match s {
-        Stmt::Block(b) => vblock(b, cx, true),
+        Stmt::Block(b) => vblock(b, cx, true, true),
         Stmt::VarDecl { decls, .. } => {
             for (_, i) in decls {
                 if let Some(e) = i {
@@ -3905,7 +3954,7 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             cx.push_scope();
             let mut r = Ok(());
             for c in cases {
-                if let Err(e) = vblock(&c.body, cx, false) {
+                if let Err(e) = vblock(&c.body, cx, false, true) {
                     r = Err(e);
                     break;
                 }
@@ -3920,7 +3969,7 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             handler,
             finally,
         } => {
-            vblock(block, cx, true)?;
+            vblock(block, cx, true, true)?;
             if let Some(p) = param {
                 cx.push_scope();
                 let mut ns = Vec::new();
@@ -3956,13 +4005,13 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
                         }
                     }
                 }
-                vblock(h, cx, param.is_none())?;
+                vblock(h, cx, param.is_none(), true)?;
             }
             if param.is_some() {
                 cx.pop_scope();
             }
             if let Some(f) = finally {
-                vblock(f, cx, true)?;
+                vblock(f, cx, true, true)?;
             }
             Ok(())
         }
@@ -4050,6 +4099,7 @@ fn vfn(f: &FnDef, cx: &mut VCtx, method: Option<bool>) -> Result<(), Error> {
     let saved = (
         std::mem::take(&mut cx.lexes),
         std::mem::take(&mut cx.hard),
+        std::mem::take(&mut cx.fns),
         std::mem::take(&mut cx.vars),
         std::mem::take(&mut cx.labels),
         cx.in_iter,
@@ -4104,7 +4154,7 @@ fn vfn(f: &FnDef, cx: &mut VCtx, method: Option<bool>) -> Result<(), Error> {
             for n in &pnames {
                 cx.lexes.last_mut().unwrap().insert(n.clone());
             }
-            r = vblock(&f.body, cx, false);
+            r = vblock(&f.body, cx, false, false);
             cx.pop_scope();
         } else {
             r = vstmts(&f.body, cx);
@@ -4118,6 +4168,7 @@ fn vfn(f: &FnDef, cx: &mut VCtx, method: Option<bool>) -> Result<(), Error> {
     (
         cx.lexes,
         cx.hard,
+        cx.fns,
         cx.vars,
         cx.labels,
         cx.in_iter,
@@ -4168,6 +4219,7 @@ fn vclass(c: &ClassDef, cx: &mut VCtx) -> Result<(), Error> {
                 let bsaved = (
                     std::mem::take(&mut cx.lexes),
                     std::mem::take(&mut cx.hard),
+                    std::mem::take(&mut cx.fns),
                     std::mem::take(&mut cx.vars),
                     std::mem::take(&mut cx.labels),
                     cx.in_iter,
@@ -4187,6 +4239,7 @@ fn vclass(c: &ClassDef, cx: &mut VCtx) -> Result<(), Error> {
                 (
                     cx.lexes,
                     cx.hard,
+                    cx.fns,
                     cx.vars,
                     cx.labels,
                     cx.in_iter,
