@@ -601,7 +601,7 @@ impl Parser {
                 self.expect_punct("(")?;
                 let obj = self.expression()?;
                 self.expect_punct(")")?;
-                let body = self.stmt_body(false)?;
+                let body = self.stmt_body(false, false)?;
                 // early error: IsLabelledFunction(body)
                 let mut inner: &Stmt = &body;
                 loop {
@@ -681,7 +681,7 @@ impl Parser {
                 }
                 self.next();
                 self.next();
-                let inner = self.stmt_body(true)?;
+                let inner = self.stmt_body(true, true)?;
                 Ok(Stmt::Labeled(name, inner))
             }
             Tok::Kw(k)
@@ -693,7 +693,7 @@ impl Parser {
                 let name = k.name().to_string();
                 self.next();
                 self.next();
-                let inner = self.stmt_body(true)?;
+                let inner = self.stmt_body(true, true)?;
                 Ok(Stmt::Labeled(name, inner))
             }
             _ => {
@@ -895,9 +895,9 @@ impl Parser {
         self.expect_punct("(")?;
         let c = self.expression()?;
         self.expect_punct(")")?;
-        let t = self.stmt_body(true)?;
+        let t = self.stmt_body(true, false)?;
         let e = if self.eat_kw(Kw::Else) {
-            let inner = self.stmt_body(true)?;
+            let inner = self.stmt_body(true, false)?;
             Some(inner)
         } else {
             None
@@ -911,7 +911,7 @@ impl Parser {
     /// loops, with, labelled items). Lexical declarations are
     /// StatementListItems, never legal here; `function` is only legal via
     /// Annex B.3.2/B.3.3 contexts (`fn_ok` = sloppy if/else or label).
-    fn stmt_body(&mut self, fn_ok: bool) -> Result<Box<Stmt>, Error> {
+    fn stmt_body(&mut self, fn_ok: bool, label_fn_ok: bool) -> Result<Box<Stmt>, Error> {
         // `let` in statement position is an ExpressionStatement under the
         // `let [` lookahead restriction — never a lexical declaration.
         // `let\nx`/`let\n{}` split via ASI into `let;` + a statement.
@@ -935,11 +935,9 @@ impl Parser {
             Stmt::FnDecl(f) if f.is_gen || f.is_async || !(fn_ok && !self.strict) => {
                 return Err(self.err("function declaration not allowed in statement position"));
             }
-            // `for (...) label: function f(){}` — a fn decl reachable
-            // through labels is still in a single-statement position:
-            // Annex B labelled fns are only legal at function/script/block
-            // top level
-            Stmt::Labeled(_, inner) => {
+            // a fn decl reachable through labels is only legal where
+            // LabelledItems are — label bodies yes, if/loop/with bodies no
+            Stmt::Labeled(_, inner) if !label_fn_ok => {
                 let mut cur: &Stmt = inner;
                 loop {
                     match cur {
@@ -959,7 +957,7 @@ impl Parser {
     }
 
     fn loop_body(&mut self) -> Result<Box<Stmt>, Error> {
-        self.stmt_body(false)
+        self.stmt_body(false, false)
     }
 
     fn for_stmt(&mut self) -> Result<Stmt, Error> {
@@ -1025,15 +1023,39 @@ impl Parser {
                     left: ForTarget::Var(kind, pat),
                     right,
                     body,
+                    init: None,
                 });
             }
             // regular for with decl — continue decl list
             let mut decls = Vec::new();
+            // sloppy `var x = …` could still be the legacy
+            // `for (var x = init in obj)` head — parse the init with `in`
+            // disabled so it doesn't eat the loop keyword
+            let legacy_ok =
+                kind == VarKind::Var && matches!(pat, Pattern::Ident(_)) && !self.strict;
             let init = if self.eat_punct("=") {
-                Some(self.assign_expr()?)
+                let no_in = std::mem::replace(&mut self.no_in, legacy_ok);
+                let e = self.assign_expr()?;
+                self.no_in = no_in;
+                Some(e)
             } else {
                 None
             };
+            // Annex-B B.3.5: sloppy `for (var x = init in obj)` — the init
+            // was consumed on the regular-for path; `in` after it is the
+            // legacy head, only for `var` + a plain identifier
+            if init.is_some() && legacy_ok && self.at_kw(Kw::In) {
+                self.next();
+                let right = self.expression()?;
+                self.expect_punct(")")?;
+                let body = self.loop_body()?;
+                return Ok(Stmt::ForIn {
+                    left: ForTarget::Var(kind, pat),
+                    right,
+                    body,
+                    init: init.map(Box::new),
+                });
+            }
             decls.push((pat, init));
             while self.eat_punct(",") {
                 let p = self.binding_pattern()?;
@@ -1143,6 +1165,7 @@ impl Parser {
                 left: ForTarget::Expr(first),
                 right,
                 body,
+                init: None,
             });
         }
         self.expect_punct(";")?;
@@ -2312,7 +2335,15 @@ impl Parser {
             _ => return Ok(lhs),
         };
         self.next();
-        if !is_assignable(&lhs, self.strict) {
+        let logical = matches!(
+            op,
+            AssignOp::LogAnd | AssignOp::LogOr | AssignOp::Nullish
+        );
+        // Annex-B call targets only cover `=`/compound/update/for-in —
+        // logical assignment keeps the strict IsSimpleAssignmentTarget
+        if !is_assignable(&lhs, self.strict)
+            || (logical && matches!(unparen(&lhs), Expr::Call { .. }))
+        {
             return Err(self.err("invalid assignment target"));
         }
         if self.strict {
@@ -3443,6 +3474,14 @@ fn prop_key_name(k: &PropKey) -> Option<String> {
 /// that is an array/object literal must additionally satisfy the
 /// destructuring pattern grammar (rest last, no methods/get/set,
 /// no optional chains).
+/// peel parens — `(f())` is the same assignment target as `f()`
+fn unparen(e: &Expr) -> &Expr {
+    match e {
+        Expr::Paren(inner) => unparen(inner),
+        _ => e,
+    }
+}
+
 fn is_assignable(e: &Expr, strict: bool) -> bool {
     match e {
         // a parenthesized name/member stays a target ((x) = 1 is
@@ -3475,6 +3514,17 @@ fn is_assignable(e: &Expr, strict: bool) -> bool {
                     ))
         }
         Expr::Member { optional, .. } => !optional,
+        // Annex-B: a plain call is a "simple assignment target" — the
+        // grammar accepts it in sloppy code and the reference check
+        // throws ReferenceError at runtime. Tagged templates and the
+        // desugared intrinsics ($yield/$await) are not simple targets.
+        Expr::Call { callee, args } => {
+            !strict
+                && !args
+                    .iter()
+                    .any(|a| matches!(a, Arg::Expr(Expr::TemplateObj(_))))
+                && !matches!(&**callee, Expr::Ident(n) if n.starts_with('$'))
+        }
         Expr::Array(elems) => elems.iter().enumerate().all(|(i, el)| match el {
             ArrElem::Hole => true,
             ArrElem::Expr(ex) => is_assignable_elem(ex, strict),
@@ -3917,7 +3967,10 @@ fn vstmt(s: &Stmt, cx: &mut VCtx) -> Result<(), Error> {
             cx.pop_scope();
             r
         }
-        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
+        Stmt::ForIn { left, right, body, .. } | Stmt::ForOf { left, right, body, .. } => {
+            if let Stmt::ForIn { init: Some(ie), .. } = s {
+                vexpr(ie, cx)?;
+            }
             cx.push_scope();
             match left {
                 ForTarget::Var(kind, p) => {
@@ -4287,8 +4340,14 @@ fn vexpr(e: &Expr, cx: &mut VCtx) -> Result<(), Error> {
             }
             Ok(())
         }
-        Expr::Assign { target, value, .. } => {
-            if !is_assignable(target, cx.strict) {
+        Expr::Assign { op, target, value, .. } => {
+            let logical = matches!(
+                op,
+                AssignOp::LogAnd | AssignOp::LogOr | AssignOp::Nullish
+            );
+            if !is_assignable(target, cx.strict)
+                || (logical && matches!(unparen(target), Expr::Call { .. }))
+            {
                 return Err(cx.err("invalid assignment target"));
             }
             if cx.strict {
@@ -4711,11 +4770,12 @@ fn stmt_has_arguments(s: &Stmt) -> bool {
                 || update.as_ref().is_some_and(|e| expr_has_arguments(e))
                 || stmt_has_arguments(body)
         }
-        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
+        Stmt::ForIn { left, right, body, .. } | Stmt::ForOf { left, right, body, .. } => {
             (match left {
                 ForTarget::Var(_, p) => pat_has_arguments(p),
                 ForTarget::Expr(e) => expr_has_arguments(e),
             }) || expr_has_arguments(right)
+                || matches!(s, Stmt::ForIn { init: Some(ie), .. } if expr_has_arguments(ie))
                 || stmt_has_arguments(body)
         }
         Stmt::Switch { disc, cases } => {
@@ -4940,11 +5000,12 @@ fn stmt_has_await(s: &Stmt) -> bool {
                 || update.as_ref().is_some_and(|e| expr_has_await(e))
                 || stmt_has_await(body)
         }
-        Stmt::ForIn { left, right, body } | Stmt::ForOf { left, right, body, .. } => {
+        Stmt::ForIn { left, right, body, .. } | Stmt::ForOf { left, right, body, .. } => {
             (match left {
                 ForTarget::Var(_, p) => pat_has_await(p),
                 ForTarget::Expr(e) => expr_has_await(e),
             }) || expr_has_await(right)
+                || matches!(s, Stmt::ForIn { init: Some(ie), .. } if expr_has_await(ie))
                 || stmt_has_await(body)
         }
         Stmt::Switch { disc, cases } => {

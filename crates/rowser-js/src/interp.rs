@@ -7536,7 +7536,18 @@ impl Interp {
                                 };
                                 match pat {
                                     Pattern::Ident(n) => match kind {
-                                        VarKind::Var => self.declare_var(scope, n, v),
+                                        // `var` initializers assign via
+                                        // normal name resolution — a
+                                        // catch param of the same name
+                                        // shadows the hoisted binding
+                                        VarKind::Var => {
+                                            match self.eval_lref_ident(scope, n)? {
+                                                LRef::Env(sc, n2) => {
+                                                    self.env_assign(&sc, &n2, v)?
+                                                }
+                                                lr => self.put_lref(lr, v)?,
+                                            }
+                                        }
                                         _ => self.declare(scope, n, v, *kind != VarKind::Const),
                                     },
                                     other => self.bind_pattern(scope, other, v, *kind, true)?,
@@ -7646,8 +7657,26 @@ impl Interp {
                 }
                 Ok(Completion::Normal(last))
             }
-            Stmt::ForIn { left, right, body } => {
+            Stmt::ForIn {
+                left,
+                right,
+                body,
+                init,
+            } => {
                 let my_label = self.pending_label.take();
+                if let Some(ie) = init {
+                    // Annex-B legacy `for (var x = init in obj)` — init
+                    // evaluates before the head expr, assigned via
+                    // normal name resolution
+                    let v = self.eval_expr(ie, env)?;
+                    if let (ForTarget::Var(VarKind::Var, Pattern::Ident(n)), _) =
+                        (left, ()) {
+                        match self.eval_lref_ident(env, n)? {
+                            LRef::Env(sc, n2) => self.env_assign(&sc, &n2, v)?,
+                            lr => self.put_lref(lr, v)?,
+                        }
+                    }
+                }
                 // ForIn/OfHeadEvaluation: a `let`/`const` target creates a
                 // declarative env holding the bound names UNINITIALIZED
                 // before the head expression evaluates — reading them there
@@ -9309,6 +9338,10 @@ impl Interp {
                 let mut lr = match Self::unparen(target) {
                     Expr::Member { .. } => Some(self.eval_lref(target, env)?),
                     Expr::Ident(n) => Some(self.eval_lref_ident(env, n)?),
+                    Expr::Call { .. } => {
+                        self.eval_expr(target, env)?;
+                        return Err(self.ref_err("Invalid left-hand side in assignment"));
+                    }
                     _ => None,
                 };
                 let cur = match &mut lr {
@@ -10377,6 +10410,12 @@ impl Interp {
                     let lr = match target {
                         Expr::Member { .. } => Some(self.eval_lref(target, env)?),
                         Expr::Ident(n) => Some(self.eval_lref_ident(env, n)?),
+                        // Annex-B call target: the callee evaluates, then
+                        // the reference check throws — before the RHS runs
+                        Expr::Call { .. } => {
+                            self.eval_expr(target, env)?;
+                            return Err(self.ref_err("Invalid left-hand side in assignment"));
+                        }
                         _ => None,
                     };
                     let v = self.eval_expr(value, env)?;
@@ -10401,6 +10440,10 @@ impl Interp {
         let mut lr = match Self::unparen(target) {
             Expr::Member { .. } => Some(self.eval_lref(target, env)?),
             Expr::Ident(n) => Some(self.eval_lref_ident(env, n)?),
+            Expr::Call { .. } => {
+                self.eval_expr(target, env)?;
+                return Err(self.ref_err("Invalid left-hand side in assignment"));
+            }
             _ => None,
         };
         let put = |this: &mut Self, lr: Option<LRef>, v: Value| -> Result<(), Value> {
@@ -10495,6 +10538,12 @@ impl Interp {
                 Ok(v)
             }
             Expr::Paren(inner) => self.assign_target(env, inner, v),
+            // Annex-B call target (for-in/of LHS): the callee evaluates,
+            // then the reference check throws
+            Expr::Call { .. } => {
+                self.eval_expr(target, env)?;
+                Err(self.ref_err("Invalid left-hand side in assignment"))
+            }
             Expr::Array(_) | Expr::Object(_) | Expr::ObjDup(_) => {
                 if let Some(pat) = expr_to_pattern(target) {
                     self.assign_pattern(env, &pat, v.clone())?;

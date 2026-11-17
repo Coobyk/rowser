@@ -348,6 +348,9 @@ pub enum Stmt {
         left: ForTarget,
         right: Expr,
         body: Box<Stmt>,
+        /// Annex-B sloppy `for (var x = init in obj)` — initializer runs
+        /// once before the head expression
+        init: Option<Box<Expr>>,
     },
     ForOf {
         left: ForTarget,
