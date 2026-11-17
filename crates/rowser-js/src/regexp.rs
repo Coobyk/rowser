@@ -133,7 +133,7 @@ impl Regex {
         let icase = seen.contains('i');
         let (total_groups, has_named) = count_capture_groups(source);
         let mut p = ReParser {
-            s: source.chars().collect(),
+            s: rx_cooked_chars(source),
             i: 0,
             n_groups: 0,
             names: Vec::new(),
@@ -280,8 +280,41 @@ fn split_pair(v: u32) -> (u32, u32) {
 
 /// a literal char node — astral chars become a unit sequence outside
 /// unicode patterns
+/// pattern-source chars: a stored lone surrogate (FDCF sentinel +
+/// E000..=E7FF marker) becomes a scratch char U+F0000+(unit-0xD800)
+/// so it survives as one parse atom; `lit_node`/`lit_char` map it back
+/// to its real code unit
+fn rx_cooked_chars(source: &str) -> Vec<char> {
+    let mut out = Vec::with_capacity(source.len());
+    let mut it = source.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\u{fdcf}' {
+            if let Some(&m) = it.peek() {
+                let mp = m as u32;
+                if (0xE000..=0xE7FF).contains(&mp) {
+                    it.next();
+                    out.push(char::from_u32(mp - 0xE000 + 0xF0000).unwrap());
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// scratch char → real surrogate code unit, when in the channel
+fn scratch_unit(v: u32) -> Option<u32> {
+    (0xF0000..=0xF07FF)
+        .contains(&v)
+        .then(|| v - 0xF0000 + 0xD800)
+}
+
 fn lit_node(c: char, unicode: bool) -> Node {
     let v = c as u32;
+    if let Some(u) = scratch_unit(v) {
+        return Node::Ch(u);
+    }
     if v > 0xFFFF && !unicode {
         let (hi, lo) = split_pair(v);
         Node::Seq(vec![Node::Ch(hi), Node::Ch(lo)])
@@ -352,6 +385,9 @@ impl ReParser {
     /// quantifier binds to the low unit, matching unit-level parsing).
     fn lit_char(&mut self, c: char) -> Node {
         let v = c as u32;
+        if let Some(u) = scratch_unit(v) {
+            return Node::Ch(u);
+        }
         if v > 0xFFFF && !self.unicode {
             let (hi, lo) = split_pair(v);
             self.pending = Some(lo);
@@ -364,6 +400,9 @@ impl ReParser {
     /// same, as a character-class item (`pending_class` queues the low half)
     fn lit_class(&mut self, c: char) -> ClassItem {
         let v = c as u32;
+        if let Some(u) = scratch_unit(v) {
+            return ClassItem::Ch(u);
+        }
         if v > 0xFFFF && !self.unicode {
             let (hi, lo) = split_pair(v);
             self.pending_class = Some(lo);

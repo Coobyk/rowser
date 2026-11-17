@@ -188,7 +188,7 @@ pub enum PropKey {
 
 impl PropKey {
     pub fn from_str(s: &str) -> PropKey {
-        PropKey::S(Rc::from(s))
+        PropKey::S(crate::builtins::str_canon(s))
     }
 }
 
@@ -3019,15 +3019,15 @@ impl Interp {
                 if let PropKey::S(k) = key {
                     if k.as_ref() == "length" {
                         // spec: String length is a UTF-16 code-unit count
-                        return Ok(Value::Num(s.encode_utf16().count() as f64));
+                        return Ok(Value::Num(crate::builtins::u16s(s).len() as f64));
                     }
                     if let Some(i) = arr_index(k) {
-                        // UTF-16 indexed access — a lone surrogate unit
-                        // degrades to U+FFFD (UTF-8 repr can't hold it)
-                        let u: Vec<u16> = s.encode_utf16().collect();
+                        // UTF-16 indexed access — the PUA channel keeps
+                        // lone surrogate units intact
+                        let u = crate::builtins::u16s(s);
                         return Ok(u
                             .get(i)
-                            .map(|c| Value::Str(Rc::from(String::from_utf16_lossy(&[*c]).as_str())))
+                            .map(|c| crate::builtins::u16s_val(&[*c]))
                             .unwrap_or(Value::Und));
                     }
                 }
@@ -3101,14 +3101,14 @@ impl Interp {
                 // length {W:false,E:false,C:false}
                 if let Value::Str(s) = v {
                     // string-exotic own props are indexed by UTF-16 code
-                    // unit — astral chars occupy two slots (lossy units)
-                    let units: Vec<u16> = s.encode_utf16().collect();
+                    // unit — astral chars occupy two slots
+                    let units = crate::builtins::u16s(s);
                     let len = units.len();
                     for (k, c) in units.iter().enumerate() {
                         obj.borrow_mut().props.insert(
                             PropKey::from_str(&k.to_string()),
                             Prop {
-                                val: Value::Str(Rc::from(String::from_utf16_lossy(&[*c]).as_str())),
+                                val: crate::builtins::u16s_val(&[*c]),
                                 writable: false,
                                 enumerable: true,
                                 configurable: false,
@@ -3161,13 +3161,13 @@ impl Interp {
             }
             Value::Str(s) => {
                 if key == "length" {
-                    return Ok(Value::Num(s.encode_utf16().count() as f64));
+                    return Ok(Value::Num(crate::builtins::u16s(s).len() as f64));
                 }
                 if let Some(i) = arr_index(key) {
-                    let u: Vec<u16> = s.encode_utf16().collect();
+                    let u = crate::builtins::u16s(s);
                     return Ok(u
                         .get(i)
-                        .map(|c| Value::Str(Rc::from(String::from_utf16_lossy(&[*c]).as_str())))
+                        .map(|c| crate::builtins::u16s_val(&[*c]))
                         .unwrap_or(Value::Und));
                 }
                 let p = self.p.string.clone();
@@ -4765,7 +4765,7 @@ impl Interp {
                     return Ok(false);
                 }
                 if let Some(i) = arr_index(k) {
-                    if i < s.encode_utf16().count() {
+                    if i < crate::builtins::u16s(s).len() {
                         return Ok(false);
                     }
                 }
@@ -4860,7 +4860,7 @@ impl Interp {
         let mut out = Vec::new();
         let mut seen: FxSet<String> = FxSet::default();
         if let Value::Str(s) = base {
-            for i in 0..s.encode_utf16().count() {
+            for i in 0..crate::builtins::u16s(s).len() {
                 out.push(i.to_string());
             }
             return Ok(out);
@@ -5211,7 +5211,7 @@ impl Interp {
         Ok(match v {
             Value::Sym(id, _) => PropKey::Sym(*id),
             Value::Num(n) => PropKey::from_str(&js_num_str(*n)),
-            Value::Str(s) => PropKey::S(s.clone()),
+            Value::Str(s) => PropKey::S(crate::builtins::str_canon(s)),
             // ToPropertyKey: ToPrimitive with a *string* hint (toString
             // before valueOf) — a Symbol result keys the property by
             // that symbol, anything else stringifies
@@ -5247,7 +5247,7 @@ impl Interp {
                     x == y
                 }
             }
-            (Str(x), Str(y)) => x == y,
+            (Str(x), Str(y)) => crate::builtins::str_units_eq(x, y),
             (Sym(x, _), Sym(y, _)) => x == y,
             (Obj(x), Obj(y)) => {
                 Rc::ptr_eq(x, y) || bigint_mag_eq(&Value::Obj(x.clone()), &Value::Obj(y.clone()))
@@ -5267,7 +5267,7 @@ impl Interp {
                 true
             }
             (Num(x), Num(y)) => x == y,
-            (Str(x), Str(y)) => x == y,
+            (Str(x), Str(y)) => crate::builtins::str_units_eq(x, y),
             (Bool(x), Bool(y)) => x == y,
             (Sym(x, _), Sym(y, _)) => x == y,
             (Obj(x), Obj(y)) => {
@@ -5352,7 +5352,7 @@ impl Interp {
             (Und, Und) | (Null, Null) => true,
             (Bool(x), Bool(y)) => x == y,
             (Num(x), Num(y)) => x == y, // NaN != NaN naturally
-            (Str(x), Str(y)) => x == y,
+            (Str(x), Str(y)) => crate::builtins::str_units_eq(x, y),
             (Sym(x, _), Sym(y, _)) => x == y,
             (Obj(x), Obj(y)) => {
                 Rc::ptr_eq(x, y) || bigint_mag_eq(&Value::Obj(x.clone()), &Value::Obj(y.clone()))
@@ -6838,10 +6838,7 @@ impl Interp {
     /// Convert an iterable to a Vec of values (for-of, spread, destructuring).
     pub fn iter_values(&mut self, v: &Value) -> Result<Vec<Value>, Value> {
         match v {
-            Value::Str(s) => Ok(s
-                .chars()
-                .map(|c| Value::Str(Rc::from(c.to_string().as_str())))
-                .collect()),
+            Value::Str(s) => Ok(crate::builtins::str_code_points(s)),
             Value::Obj(o) => {
                 // lazy iterators drain through their state machine
                 if matches!(o.borrow().kind, ObjKind::IterLazy(_)) {
@@ -10164,11 +10161,15 @@ impl Interp {
                     }));
                 }
                 if let (Value::Str(a), Value::Str(b)) = (&lp, &rp) {
+                    // spec: lexicographic over UTF-16 code units — byte
+                    // order diverges once astral chars (F0 lead byte)
+                    // compare against BMP (≤ EF)
+                    let (au, bu) = (crate::builtins::u16s(a), crate::builtins::u16s(b));
                     let c = match op {
-                        Lt => a < b,
-                        Le => a <= b,
-                        Gt => a > b,
-                        Ge => a >= b,
+                        Lt => au < bu,
+                        Le => au <= bu,
+                        Gt => au > bu,
+                        Ge => au >= bu,
                         _ => unreachable!(),
                     };
                     Value::Bool(c)

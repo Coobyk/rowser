@@ -975,7 +975,7 @@ fn ta_strict_eq(a: &Value, b: &Value) -> bool {
         (Und, Und) | (Null, Null) => true,
         (Bool(x), Bool(y)) => x == y,
         (Num(x), Num(y)) => x == y,
-        (Str(x), Str(y)) => x == y,
+        (Str(x), Str(y)) => crate::builtins::str_units_eq(x, y),
         (Sym(x, _), Sym(y, _)) => x == y,
         (Obj(x), Obj(y)) => Rc::ptr_eq(x, y),
         _ => false,

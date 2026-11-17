@@ -2363,11 +2363,10 @@ pub(crate) fn for_of_iter(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> 
 fn iter_direct(i: &mut Interp, v: &Value) -> Result<IterLazy, Value> {
     match v {
         Value::Str(s) => {
-            let items: Vec<Value> = s
-                .chars()
-                .map(|c| Value::Str(Rc::from(c.to_string().as_str())))
-                .collect();
-            return Ok(IterLazy::id(IterSrc::List { items, idx: 0 }));
+            return Ok(IterLazy::id(IterSrc::List {
+                items: str_code_points(s),
+                idx: 0,
+            }));
         }
         Value::Obj(o) if !crate::binary::bigint_is_prim(&Value::Obj(o.clone())) => {}
         _ => return Err(i.type_err("value is not iterable")),
@@ -9115,7 +9114,7 @@ fn strict_val_eq(a: &Value, b: &Value) -> bool {
         (Value::Und, Value::Und) | (Value::Null, Value::Null) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Num(x), Value::Num(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
+        (Value::Str(x), Value::Str(y)) => str_units_eq(x, y),
         (Value::Sym(x, _), Value::Sym(y, _)) => x == y,
         (Value::Obj(x), Value::Obj(y)) => {
             // bigint primitives are Obj standins — compare by magnitude
@@ -9774,8 +9773,8 @@ fn arr_sort(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 // UTF-16 code units
                 match (i.to_str(x), i.to_str(y)) {
                     (Ok(a), Ok(b)) => {
-                        let a16: Vec<u16> = a.encode_utf16().collect();
-                        let b16: Vec<u16> = b.encode_utf16().collect();
+                        let a16 = u16s(&a);
+                        let b16 = u16s(&b);
                         a16.cmp(&b16)
                     }
                     (Err(e), _) | (_, Err(e)) => {
@@ -9966,15 +9965,108 @@ fn str_pos(n: f64, len: usize) -> usize {
 }
 
 /// UTF-16 code-unit view — String methods index/count in units.
-fn u16s(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
+/// Lone-surrogate channel: a Rust `String` can't hold unpaired UTF-16
+/// surrogates, so `u16s_val` stores them as noncharacter sentinel
+/// U+FDCF + marker U+E000..=U+E7FF (unit = marker - 0x800); `u16s`
+/// maps the pair back to the real unit. A bare sentinel or marker in
+/// real text still decodes to itself. Every UTF-16-unit API
+/// (charCodeAt, codePointAt, encodeURI, JSON escaping, iterators,
+/// ordering) reads true units through this pair.
+pub(crate) fn u16s(s: &str) -> Vec<u16> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut buf = [0u16; 2];
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\u{fdcf}' {
+            if let Some(&m) = it.peek() {
+                let mp = m as u32;
+                if (0xE000..=0xE7FF).contains(&mp) {
+                    it.next();
+                    out.push((mp - 0x800) as u16);
+                    continue;
+                }
+            }
+            out.push(0xFDCF);
+        } else {
+            out.extend_from_slice(c.encode_utf16(&mut buf));
+        }
+    }
+    out
 }
 
-/// UTF-16 code units → engine string. Lone surrogates cannot live in a
-/// Rust &str — from_utf16_lossy maps them to U+FFFD, matching the lexer's
-/// own handling of \uXXXX surrogate escapes (UTF-16 representation debt).
-fn u16s_val(u: &[u16]) -> Value {
-    Value::Str(Rc::from(String::from_utf16_lossy(u).as_str()))
+/// UTF-16 code units → engine string. Lone surrogates store as the
+/// U+FDCF-sentinel + U+E000..=U+E7FF-marker pair; a valid hi+lo pair
+/// decodes to its astral char.
+pub(crate) fn u16s_val(u: &[u16]) -> Value {
+    let mut s = String::new();
+    let mut k = 0;
+    while k < u.len() {
+        let w = u[k];
+        if (0xD800..=0xDBFF).contains(&w)
+            && u.get(k + 1).is_some_and(|&l| (0xDC00..=0xDFFF).contains(&l))
+        {
+            let cp =
+                0x10000 + ((w as u32 - 0xD800) << 10) + (u[k + 1] as u32 - 0xDC00);
+            s.push(char::from_u32(cp).unwrap());
+            k += 2;
+        } else if (0xD800..=0xDFFF).contains(&w) {
+            s.push('\u{fdcf}');
+            s.push(char::from_u32(w as u32 + 0x800).unwrap());
+            k += 1;
+        } else {
+            s.push(char::from_u32(w as u32).unwrap());
+            k += 1;
+        }
+    }
+    Value::Str(Rc::from(s.as_str()))
+}
+
+/// string equality over UTF-16 units — byte-equal fast path; the
+/// sentinel+marker channel makes stored forms differ for equal unit
+/// sequences (`lone + lone` concat vs the pair's astral char)
+pub(crate) fn str_units_eq(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if !a.contains('\u{fdcf}') && !b.contains('\u{fdcf}') {
+        return false;
+    }
+    u16s(a) == u16s(b)
+}
+
+/// canonical stored form of a unit sequence — pairs re-encode as their
+/// astral char, lone units as sentinel+marker. Property keys canonicalize
+/// so unit-equal names share a slot (`o["\ud834\udf06"]` ≡ `o[lo+hi]`)
+pub(crate) fn str_canon(s: &str) -> Rc<str> {
+    if !s.contains('\u{fdcf}') {
+        return Rc::from(s);
+    }
+    match u16s_val(&u16s(s)) {
+        Value::Str(r) => r,
+        _ => unreachable!(),
+    }
+}
+
+/// spec StringIterator code-point sequence — hi+lo pairs combine to the
+/// astral char, lone surrogates yield alone. All char-walk sites
+/// (str_iter, iter_direct, iter_values) share this so stored and
+/// spec-visible units agree.
+pub(crate) fn str_code_points(s: &str) -> Vec<Value> {
+    let u = u16s(s);
+    let mut vals = Vec::with_capacity(u.len());
+    let mut k = 0;
+    while k < u.len() {
+        let n = if (0xD800..=0xDBFF).contains(&u[k])
+            && u.get(k + 1).is_some_and(|&l| (0xDC00..=0xDFFF).contains(&l))
+        {
+            2
+        } else {
+            1
+        };
+        vals.push(u16s_val(&u[k..k + n]));
+        k += n;
+    }
+    vals
 }
 
 /// spec StringIndexOf on UTF-16 units: smallest k >= pos such that
@@ -10019,7 +10111,7 @@ fn str_code_point_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if idx < 0.0 {
         return Ok(Value::Und);
     }
-    let units: Vec<u16> = s.encode_utf16().collect();
+    let units = u16s(&s);
     let k = idx as usize;
     let Some(&first) = units.get(k) else {
         return Ok(Value::Und);
@@ -10036,13 +10128,62 @@ fn str_code_point_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 }
 
 fn str_is_well_formed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    let _ = unbox_str(i, this)?;
-    // UTF-8 strings can't represent lone surrogates — always well-formed
-    Ok(Value::Bool(true))
+    let s = unbox_str(i, this)?;
+    // spec: well-formed ⇔ no unpaired surrogate — u16s maps the PUA
+    // channel back to real surrogate units, so scan for a hi without a
+    // following lo (or a bare lo)
+    let u = u16s(&s);
+    let mut k = 0;
+    let mut well = true;
+    while k < u.len() {
+        let w = u[k];
+        if (0xD800..=0xDBFF).contains(&w) {
+            if u.get(k + 1).is_some_and(|&l| (0xDC00..=0xDFFF).contains(&l)) {
+                k += 2;
+                continue;
+            }
+            well = false;
+            break;
+        }
+        if (0xDC00..=0xDFFF).contains(&w) {
+            well = false;
+            break;
+        }
+        k += 1;
+    }
+    Ok(Value::Bool(well))
 }
 
 fn str_to_well_formed(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
-    Ok(Value::Str(unbox_str(i, this)?))
+    let s = unbox_str(i, this)?;
+    // spec: lone surrogates → U+FFFD; valid pairs + BMP pass through
+    let u = u16s(&s);
+    let mut out: Vec<u16> = Vec::with_capacity(u.len());
+    let mut k = 0;
+    let mut dirty = false;
+    while k < u.len() {
+        let w = u[k];
+        if (0xD800..=0xDBFF).contains(&w)
+            && u.get(k + 1).is_some_and(|&l| (0xDC00..=0xDFFF).contains(&l))
+        {
+            out.push(w);
+            out.push(u[k + 1]);
+            k += 2;
+        } else if (0xD800..=0xDFFF).contains(&w) {
+            out.push(0xFFFD);
+            dirty = true;
+            k += 1;
+        } else {
+            out.push(w);
+            k += 1;
+        }
+    }
+    if !dirty {
+        return Ok(Value::Str(s));
+    }
+    // lone units became FFFD — the PUA channel is gone, so decode
+    // strictly (from_utf16_lossy is exact here)
+    Ok(u16s_val(&out))
 }
 
 fn str_char_code_at(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
@@ -10472,7 +10613,7 @@ fn str_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     };
     let mut out: Vec<u16> = Vec::with_capacity(su.len() + u16s(&replacement).len());
     out.extend_from_slice(&su[..pos]);
-    out.extend(replacement.encode_utf16());
+    out.extend(u16s(&replacement));
     out.extend_from_slice(&su[pos + nu.len()..]);
     Ok(u16s_val(&out))
 }
@@ -10551,7 +10692,7 @@ fn str_replace_all(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 rep_str.as_deref().unwrap_or_default(),
             )?
         };
-        out.extend(replacement.encode_utf16());
+        out.extend(u16s(&replacement));
         prev = k + nu.len();
     }
     out.extend_from_slice(&su[prev..]);
@@ -10739,7 +10880,7 @@ fn str_repeat(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(i.range_err("Invalid count value"));
     }
     let n = n as usize;
-    if s.encode_utf16().count().saturating_mul(n) > STR_LEN_MAX {
+    if u16s(&s).len().saturating_mul(n) > STR_LEN_MAX {
         return Err(i.range_err("Invalid string length"));
     }
     Ok(Value::Str(Rc::from(s.repeat(n).as_str())))
@@ -10859,8 +11000,10 @@ fn str_locale_compare(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
 
 fn str_iter(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let s = unbox_str(i, this)?;
+    // spec: StringIterator yields code points — a hi+lo pair combines
+    // into its astral char, lone surrogates yield alone
     Ok(make_iter_in(
-        s.chars().map(char_val).collect(),
+        str_code_points(&s),
         i.p.string_iter.clone(),
     ))
 }
@@ -12399,7 +12542,7 @@ fn string_ctor(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
                 ob.props.insert(
                     PropKey::from_str(&k.to_string()),
                     Prop {
-                        val: Value::Str(Rc::from(String::from_utf16_lossy(&[*c]).as_str())),
+                        val: u16s_val(&[*c]),
                         writable: false,
                         enumerable: true,
                         configurable: false,
@@ -12444,7 +12587,7 @@ fn string_from_code_point(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult
         }
         let cp = n as u32;
         match char::from_u32(cp) {
-            Some(c) => u.extend(c.to_string().encode_utf16()),
+            Some(c) => u.extend_from_slice(c.encode_utf16(&mut [0; 2])),
             None => u.push(cp as u16),
         }
     }
@@ -14152,7 +14295,47 @@ impl JsonParser {
                                 v = v * 16 + d;
                             }
                             self.pos += 4;
-                            if let Some(c) = char::from_u32(v) {
+                            if (0xd800..=0xdbff).contains(&v) {
+                                // a following \uDC00-\uDFFF completes the
+                                // astral char; a lone hi surrogate maps to
+                                // the PUA channel
+                                let p = self.pos + 1;
+                                let lo: Option<u32> = (|| {
+                                    if self.chars.get(p) == Some(&'\\')
+                                        && self.chars.get(p + 1) == Some(&'u')
+                                    {
+                                        let mut w = 0u32;
+                                        for k in 2..=5 {
+                                            w = w * 16
+                                                + self
+                                                    .chars
+                                                    .get(p + k)?
+                                                    .to_digit(16)?;
+                                        }
+                                        Some(w)
+                                    } else {
+                                        None
+                                    }
+                                })();
+                                match lo.filter(|w| (0xdc00..=0xdfff).contains(w)) {
+                                    Some(l) => {
+                                        self.pos += 6;
+                                        s.push(
+                                            char::from_u32(
+                                                0x10000 + ((v - 0xd800) << 10) + (l - 0xdc00),
+                                            )
+                                            .unwrap(),
+                                        );
+                                    }
+                                    None => {
+                                        s.push('\u{fdcf}');
+                                        s.push(char::from_u32(v + 0x800).unwrap());
+                                    }
+                                }
+                            } else if (0xdc00..=0xdfff).contains(&v) {
+                                s.push('\u{fdcf}');
+                                s.push(char::from_u32(v + 0x800).unwrap());
+                            } else if let Some(c) = char::from_u32(v) {
                                 s.push(c);
                             }
                         }
@@ -14499,7 +14682,19 @@ fn json_ser_obj(
 
 fn json_escape_into(s: &str, out: &mut String) {
     out.push('"');
-    for c in s.chars() {
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        // lone surrogates (FDCF sentinel + E000-E7FF marker) escape per
+        // code unit — spec JSON.stringify emits \udXXX for unpaired halves
+        if c == '\u{fdcf}' {
+            if let Some(&m) = it.peek() {
+                if ('\u{e000}'..='\u{e7ff}').contains(&m) {
+                    it.next();
+                    out.push_str(&format!("\\u{:04x}", m as u32 - 0x800));
+                    continue;
+                }
+            }
+        }
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -17521,9 +17716,32 @@ fn uri_err(i: &mut Interp, m: &str) -> Value {
 /// (astral chars → their surrogate pair's UTF-8 = same bytes)
 fn uri_encode(i: &mut Interp, v: &Value, extra: &str) -> Result<String, Value> {
     let s = i.to_str(v)?;
+    // spec Encode iterates UTF-16 code units: a hi surrogate must be
+    // followed by a lo surrogate (combined → 4-octet UTF-8), any lone
+    // surrogate throws URIError
+    let u = u16s(&s);
     let mut out = String::new();
     let mut buf = [0u8; 4];
-    for ch in s.chars() {
+    let mut k = 0;
+    while k < u.len() {
+        let w = u[k];
+        let ch = if (0xD800..=0xDBFF).contains(&w) {
+            match u.get(k + 1) {
+                Some(&l) if (0xDC00..=0xDFFF).contains(&l) => {
+                    k += 1;
+                    char::from_u32(
+                        0x10000 + ((w as u32 - 0xD800) << 10) + (l as u32 - 0xDC00),
+                    )
+                    .unwrap()
+                }
+                _ => return Err(uri_err(i, "URI malformed")),
+            }
+        } else if (0xDC00..=0xDFFF).contains(&w) {
+            return Err(uri_err(i, "URI malformed"));
+        } else {
+            char::from_u32(w as u32).unwrap()
+        };
+        k += 1;
         if ch.is_ascii_alphanumeric() || URI_MARK.contains(ch) || extra.contains(ch) {
             out.push(ch);
         } else {
@@ -18132,12 +18350,14 @@ fn set_strict(i: &mut Interp, ov: &Value, key: &str, v: Value) -> Result<(), Val
 }
 
 fn chars_str(chars: &[u16], a: usize, b: usize) -> Value {
-    let s = String::from_utf16_lossy(&chars[a..b]);
-    Value::Str(Rc::from(s.as_str()))
+    u16s_val(&chars[a..b])
 }
 
 fn chars_string(chars: &[u16]) -> String {
-    String::from_utf16_lossy(chars)
+    match u16s_val(chars) {
+        Value::Str(r) => r.to_string(),
+        _ => unreachable!(),
+    }
 }
 
 /// exec result: array [m0, g1..gn] + index/input/groups/indices props.
@@ -18346,7 +18566,7 @@ fn regexp_builtin_exec(i: &mut Interp, r: &Value, s: &str) -> Result<Value, Valu
     };
     // JS strings are UTF-16 — the matcher works on code units (with `u`/`v`
     // consuming surrogate pairs atomically)
-    let chars: Vec<u16> = s.encode_utf16().collect();
+    let chars: Vec<u16> = u16s(&s);
     match regexp_run(i, r, &re, &chars)? {
         Some(m) => Ok(match_obj(i, &chars, &re, &m)),
         None => Ok(Value::Null),
@@ -18475,12 +18695,27 @@ fn regexp_escape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
         return Err(i.type_err("RegExp.escape: argument must be a String"));
     };
     let mut out = String::new();
-    for (idx, c) in s.chars().enumerate() {
+    let mut it = s.chars().peekable();
+    let mut idx = 0usize;
+    while let Some(c) = it.next() {
         let cp = c as u32;
+        // lone surrogates (FDCF sentinel + E000-E7FF marker) escape per
+        // code unit
+        if c == '\u{fdcf}' {
+            if let Some(&m) = it.peek() {
+                if ('\u{e000}'..='\u{e7ff}').contains(&m) {
+                    it.next();
+                    out.push_str(&format!("\\u{:04x}", m as u32 - 0x800));
+                    idx += 1;
+                    continue;
+                }
+            }
+        }
         // a leading ASCII alphanumeric must never read back as part of
         // a larger escape sequence — always hex-escape it
         if idx == 0 && c.is_ascii_alphanumeric() {
             out.push_str(&format!("\\x{cp:02x}"));
+            idx += 1;
             continue;
         }
         match c {
@@ -18510,12 +18745,9 @@ fn regexp_escape(i: &mut Interp, _t: &Value, args: &[Value]) -> NResult {
                     out.push_str(&format!("\\u{cp:04x}"));
                 }
             }
-            // lone surrogates escape per code unit
-            c if (0xd800..=0xdfff).contains(&cp) => {
-                out.push_str(&format!("\\u{cp:04x}"));
-            }
             _ => out.push(c),
         }
+        idx += 1;
     }
     Ok(Value::Str(Rc::from(out.as_str())))
 }
@@ -18779,7 +19011,7 @@ fn re_sym_match(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     set_strict(i, rx, "lastIndex", Value::Num(0.0))?;
     let arr = i.new_arr(Vec::new());
     let a = Value::Obj(arr);
-    let chars: Vec<u16> = s.encode_utf16().collect();
+    let chars: Vec<u16> = u16s(&s);
     let mut n = 0usize;
     loop {
         let result = regexp_exec(i, rx, &s)?;
@@ -18890,7 +19122,7 @@ fn re_striter_next(i: &mut Interp, this: &Value, _a: &[Value]) -> NResult {
     let m0 = i.get_prop_str(&m, "0")?;
     let match_str = re_coerce_str(i, &m0)?;
     if match_str.is_empty() {
-        let chars: Vec<u16> = s.encode_utf16().collect();
+        let chars: Vec<u16> = u16s(&s);
         let lv = i.get_prop_str(&rx, "lastIndex")?;
         let this_index = to_length_num(i.to_num(&lv)?);
         let next = advance_string_index(&chars, this_index, unicode);
@@ -18932,8 +19164,8 @@ fn get_substitution(
     named: &Value,
     rep: &str,
 ) -> Result<String, Value> {
-    let chars: Vec<u16> = s.encode_utf16().collect();
-    let tail_start = (position + matched.encode_utf16().count()).min(chars.len());
+    let chars: Vec<u16> = u16s(&s);
+    let tail_start = (position + u16s(&matched).len()).min(chars.len());
     let mut out = String::new();
     let cs: Vec<char> = rep.chars().collect();
     let n_caps = captures.len();
@@ -19027,7 +19259,7 @@ fn re_sym_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         return Err(i.type_err("Symbol.replace called on non-object"));
     }
     let s = re_coerce_str(i, &arg(args, 0))?;
-    let length_s = s.encode_utf16().count();
+    let length_s = u16s(&s).len();
     let repl_arg = arg(args, 1);
     let functional = i.is_callable(&repl_arg);
     let rep_str = if functional {
@@ -19042,7 +19274,7 @@ fn re_sym_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if global {
         set_strict(i, rx, "lastIndex", Value::Num(0.0))?;
     }
-    let chars: Vec<u16> = s.encode_utf16().collect();
+    let chars: Vec<u16> = u16s(&s);
     // collect all exec results first (spec gathers them before splicing)
     let mut results: Vec<Value> = Vec::new();
     loop {
@@ -19074,7 +19306,7 @@ fn re_sym_replace(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
         let n_caps = res_len.saturating_sub(1);
         let matched_v = i.get_prop_str(result, "0")?;
         let matched = re_coerce_str(i, &matched_v)?;
-        let match_len = matched.encode_utf16().count();
+        let match_len = u16s(&matched).len();
         let idx_v = i.get_prop_str(result, "index")?;
         let pos_num = i.to_num(&idx_v)?.trunc();
         let position = if pos_num.is_nan() || pos_num <= 0.0 {
@@ -19159,7 +19391,7 @@ fn re_sym_split(i: &mut Interp, this: &Value, args: &[Value]) -> NResult {
     if lim == 0 {
         return Ok(a);
     }
-    let chars: Vec<u16> = s.encode_utf16().collect();
+    let chars: Vec<u16> = u16s(&s);
     let size = chars.len();
     let mut length_a = 0usize;
     if size == 0 {

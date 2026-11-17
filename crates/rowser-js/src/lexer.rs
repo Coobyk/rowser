@@ -513,6 +513,21 @@ impl Lexer {
         Ok(s)
     }
 
+    /// code point → stored char(s): lone surrogates store as noncharacter
+    /// sentinel U+FDCF + marker U+E000..=U+E7FF (unit = marker - 0x800) —
+    /// a two-char encoding so single-char sweeps (String.fromCharCode over
+    /// 0xE000..=0xFFFF, astral pairs, etc.) never collide with the channel
+    fn push_cp(s: &mut String, cp: u32) {
+        match char::from_u32(cp) {
+            Some(c) => s.push(c),
+            None if (0xD800..=0xDFFF).contains(&cp) => {
+                s.push('\u{fdcf}');
+                s.push(char::from_u32(cp + 0x800).unwrap());
+            }
+            None => s.push('\u{fffd}'),
+        }
+    }
+
     fn hex_digits(&mut self, n: usize) -> Option<u32> {
         let mut v: u32 = 0;
         for _ in 0..n {
@@ -766,7 +781,7 @@ impl Lexer {
                             let Some(cp) = self.hex_digits(2) else {
                                 return Err(self.err("bad \\x escape"));
                             };
-                            s.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+                            Self::push_cp(&mut s, cp);
                         }
                         'u' => {
                             let cp = if self.peek() == Some('{') {
@@ -808,11 +823,14 @@ impl Lexer {
                                         self.col = scol;
                                     }
                                 }
-                                paired.and_then(char::from_u32).unwrap_or('\u{fffd}')
+                                paired.and_then(char::from_u32)
                             } else {
-                                char::from_u32(cp).unwrap_or('\u{fffd}')
+                                char::from_u32(cp)
                             };
-                            s.push(ch);
+                            match ch {
+                                Some(c) => s.push(c),
+                                None => Self::push_cp(&mut s, cp),
+                            }
                         }
                         '\n' => {} // line continuation
                         '\r' => {} // \r or \r\n continuation — bump already folded
@@ -923,7 +941,7 @@ impl Lexer {
                             match self.hex_digits(2) {
                                 Some(cp) => {
                                     self.push_raw_since(&mut raw, s0);
-                                    cooked.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+                                    Self::push_cp(&mut cooked, cp);
                                 }
                                 None => {
                                     self.push_raw_since(&mut raw, s0);
@@ -946,7 +964,14 @@ impl Lexer {
                                 if self.peek() == Some('}') && any && v <= 0x10ffff {
                                     self.bump();
                                     self.push_raw_since(&mut raw, s0);
-                                    Some(char::from_u32(v).unwrap_or('\u{fffd}'))
+                                    Some({
+                                        if (0xd800..=0xdfff).contains(&v) {
+                                            cooked.push('\u{fdcf}');
+                                            char::from_u32(v + 0x800).unwrap()
+                                        } else {
+                                            char::from_u32(v).unwrap_or('\u{fffd}')
+                                        }
+                                    })
                                 } else {
                                     self.push_raw_since(&mut raw, s0);
                                     None
@@ -980,12 +1005,21 @@ impl Lexer {
                                                     self.col = scol;
                                                 }
                                             }
-                                            paired.and_then(char::from_u32).unwrap_or('\u{fffd}')
+                                            paired.and_then(char::from_u32)
                                         } else {
-                                            char::from_u32(cp).unwrap_or('\u{fffd}')
+                                            char::from_u32(cp)
+                                        };
+                                        let ch = match ch {
+                                            Some(c) => Some(c),
+                                            // lone surrogate — sentinel +
+                                            // marker ride cooked together
+                                            None => {
+                                                cooked.push('\u{fdcf}');
+                                                char::from_u32(cp + 0x800)
+                                            }
                                         };
                                         self.push_raw_since(&mut raw, s0);
-                                        Some(ch)
+                                        ch
                                     }
                                     None => {
                                         self.push_raw_since(&mut raw, s0);
