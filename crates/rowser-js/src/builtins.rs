@@ -5381,6 +5381,20 @@ fn install_globals(i: &mut Interp) {
             true,
         );
         define_global(i, "Error", err.clone());
+        // Error.isError — checks the [[ErrorData]] slot (ObjKind::Err)
+        i.set_builtin(
+            match &err {
+                Value::Obj(o) => o,
+                _ => unreachable!(),
+            },
+            "isError",
+            native(i, "isError", |_i, _t, a| {
+                Ok(Value::Bool(matches!(
+                    a.first(),
+                    Some(Value::Obj(o)) if matches!(o.borrow().kind, ObjKind::Err)
+                )))
+            }),
+        );
         // NativeError ctors' [[Prototype]] is %Error% (19.5.6.2)
         let err_ref = match &err {
             Value::Obj(o) => o.clone(),

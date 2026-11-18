@@ -138,7 +138,6 @@ const SKIP_FEATURES: &[&str] = &[
     // uint8array-base64 — implemented (binary.rs b64/hex section)
     // $262.createRealm / Error.isError — APIs we don't expose
     "cross-realm",
-    "Error.isError",
     "host-gc-required",
     // stage-3 Error.prototype.stack accessor proposal — unimplemented
     "error-stack-accessor",
