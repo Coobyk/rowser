@@ -273,26 +273,8 @@ fn dlog(msg: &str) {
 impl BrowserView {
     fn new(cx: &mut Context<Self>, initial_url: Option<String>) -> Self {
         let (outbox, mut inbox) = inbox::channel::<(usize, TabEvent)>();
-        let mut view = Self {
-            bookmarks: Bookmarks::new(config_dir().join("bookmarks.txt")),
-            tabs: Vec::new(),
-            active: 0,
-            next_id: 0,
-            outbox,
-            last_viewport: (1280, 720),
-            logs: Vec::new(),
-            url_text: "rowser://newtab/0".into(),
-            url_cursor: 0,
-            url_anchor: None,
-            url_editing: false,
-            url_focus_pending: false,
-            url_focus: cx.focus_handle(),
-            page_focus: cx.focus_handle(),
-            inspector: false,
-            dom_dump: String::new(),
-            drag: None,
-            page_cursor: CursorStyle::Arrow,
-        };
+        let bookmarks = Bookmarks::new(config_dir().join("bookmarks.txt"));
+        let mut view = Self::without_tabs(cx, bookmarks, outbox);
 
         // Await renderer messages, batching queued events into one repaint.
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -335,6 +317,33 @@ impl BrowserView {
             view.tabs[0].navigate(&url);
         }
         view
+    }
+
+    fn without_tabs(
+        cx: &App,
+        bookmarks: Bookmarks,
+        outbox: inbox::Sender<(usize, TabEvent)>,
+    ) -> Self {
+        Self {
+            bookmarks,
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 0,
+            outbox,
+            last_viewport: (1280, 720),
+            logs: Vec::new(),
+            url_text: "rowser://newtab/0".into(),
+            url_cursor: 0,
+            url_anchor: None,
+            url_editing: false,
+            url_focus_pending: false,
+            url_focus: cx.focus_handle(),
+            page_focus: cx.focus_handle(),
+            inspector: false,
+            dom_dump: String::new(),
+            drag: None,
+            page_cursor: CursorStyle::Arrow,
+        }
     }
 
     fn spawn_renderer() -> Option<(Child, UnixStream, UnixStream)> {
@@ -392,6 +401,7 @@ impl BrowserView {
 
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.dom_dump.clear();
 
         // A new tab puts its whole URL in the bar pre-selected, so typing
         // immediately replaces it — like Ctrl+L + type in a real browser.
@@ -496,15 +506,22 @@ impl BrowserView {
         }
         let old = std::mem::replace(&mut self.tabs[idx], fresh);
         old.shut_down();
+        if idx == self.active {
+            self.dom_dump.clear();
+        }
     }
 
     fn close_tab(&mut self, idx: usize) {
         dlog(&format!("close_tab {idx}"));
+        let active_id = self.tabs[self.active].id;
         self.tabs.remove(idx).shut_down();
         if self.tabs.is_empty() {
             self.open_tab();
         } else {
             self.active = self.active.min(self.tabs.len() - 1);
+            if self.tabs[self.active].id != active_id {
+                self.refresh_inspector();
+            }
         }
     }
 
@@ -519,7 +536,21 @@ impl BrowserView {
         self.url_editing = false;
         self.url_anchor = None;
         self.page_focus.focus(window);
-        self.active = idx;
+        self.set_active_tab(idx);
+    }
+
+    fn set_active_tab(&mut self, idx: usize) {
+        if self.active != idx {
+            self.active = idx;
+            self.refresh_inspector();
+        }
+    }
+
+    fn refresh_inspector(&mut self) {
+        self.dom_dump.clear();
+        if self.inspector {
+            self.tabs[self.active].send(&ToRenderer::DomDump);
+        }
     }
 
     /// Step back/forward in the active tab's history (the ◀ ▶ buttons).
@@ -562,17 +593,20 @@ impl BrowserView {
         let mut changed = false;
         for (id, event) in std::iter::once(first).chain(std::iter::from_fn(|| inbox.try_recv())) {
             let is_active = self.tabs.get(self.active).is_some_and(|t| t.id == id);
+            let is_inspected = is_active && self.inspector;
             let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
                 continue;
             };
-            changed |= event.needs_repaint(self.inspector);
+            changed |= event.needs_repaint(is_inspected);
             match event {
                 TabEvent::Msg(msg) => match msg {
                     ToBrowser::Pong(_) => {}
                     ToBrowser::LoadStarted => tab.title = "Loading…".into(),
                     ToBrowser::Title(t) => {
                         tab.set_title(t);
-                        tab.send(&ToRenderer::DomDump);
+                        if is_inspected {
+                            tab.send(&ToRenderer::DomDump);
+                        }
                         if !self.url_editing && is_active {
                             self.url_text = tab.url.clone();
                         }
@@ -610,7 +644,7 @@ impl BrowserView {
                     ToBrowser::LoadDone => {}
                     ToBrowser::NavigationRequest(url) => tab.navigate(&url),
                     ToBrowser::DomDump(text) => {
-                        if self.inspector {
+                        if is_inspected {
                             self.dom_dump = text;
                         }
                     }
@@ -626,6 +660,9 @@ impl BrowserView {
                     tab.pixels.clear();
                     tab.buf_size = (0, 0);
                     tab.title = "crashed".into();
+                    if is_active {
+                        self.dom_dump.clear();
+                    }
                 }
             }
         }
@@ -1032,10 +1069,7 @@ impl Render for BrowserView {
                         MouseButton::Left,
                         cx.listener(|view, _e, _w, cx| {
                             view.inspector = !view.inspector;
-                            if view.inspector {
-                                let i = view.active;
-                                view.tabs[i].send(&ToRenderer::DomDump);
-                            }
+                            view.refresh_inspector();
                             cx.notify();
                         }),
                     )
@@ -1407,6 +1441,57 @@ mod tests {
         ] {
             assert!(event.needs_repaint(false));
         }
+    }
+
+    fn with_inspector(
+        test: impl FnOnce(&mut super::BrowserView, &super::inbox::Receiver<(usize, super::TabEvent)>)
+            + 'static,
+    ) {
+        gpui::Application::headless().run(|cx| {
+            let (tx, rx) = super::inbox::channel();
+            let mut view =
+                super::BrowserView::without_tabs(cx, super::Bookmarks::new("".into()), tx);
+            view.tabs = vec![
+                Tab::new(7, "rowser://history".into()),
+                Tab::new(8, "rowser://newtab/1".into()),
+            ];
+            view.inspector = true;
+            view.dom_dump = "<history>".into();
+            test(&mut view, &rx);
+            cx.spawn(async |cx| cx.update(|cx| cx.quit()).unwrap())
+                .detach();
+        });
+    }
+
+    #[test]
+    fn inspector_requests_dom_after_switching_tabs() {
+        with_inspector(|view, _| {
+            let (out, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            view.tabs[1].ipc_out = Some(out);
+
+            view.set_active_tab(1);
+
+            assert!(view.dom_dump.is_empty(), "still showing the old tab's DOM");
+            let frame = read_frame(&mut peer).unwrap();
+            assert!(matches!(
+                ToRenderer::decode(&frame).unwrap(),
+                ToRenderer::DomDump
+            ));
+        });
+    }
+
+    #[test]
+    fn inspector_ignores_late_dom_from_inactive_tab() {
+        use super::{TabEvent, ToBrowser};
+
+        with_inspector(|view, inbox| {
+            let dump = |text: &str| TabEvent::Msg(ToBrowser::DomDump(text.into()));
+            assert!(view.drain_inbox((7, dump("<history>")), inbox));
+            let repainted = view.drain_inbox((8, dump("<welcome>")), inbox);
+            assert_eq!(view.dom_dump, "<history>");
+            assert!(!repainted);
+        });
     }
 
     #[test]
