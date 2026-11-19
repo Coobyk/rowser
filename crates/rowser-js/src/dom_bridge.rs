@@ -149,6 +149,9 @@ pub struct DomState {
     /// attributes by `sync_dom_side_effects` without scanning every node.
     styled_objs: Vec<ObjRef>,
     dataset_objs: Vec<ObjRef>,
+    /// Exceptions thrown by event listeners, reported (not rethrown) per
+    /// the DOM spec; moved into `DomContext::errors` by the host.
+    listener_errors: Vec<String>,
 }
 
 /// Run `f` with the `DomState` out of `interp.ext`. `f` must not call back
@@ -672,7 +675,7 @@ fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
                 i.set_prop_str(&ev, "eventPhase", Value::Num(1.0))?;
                 i.set_prop_str(&ev, "currentTarget", target.clone())?;
                 for h in fns {
-                    i.call(&h, target.clone(), vec![ev.clone()])?;
+                    invoke_listener(i, &h, target, ev)?;
                     if ev_flag(&ev, K_STOPIMM) {
                         break;
                     }
@@ -698,7 +701,7 @@ fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
                 i.set_prop_str(&ev, "eventPhase", Value::Num(phase))?;
                 i.set_prop_str(&ev, "currentTarget", target.clone())?;
                 for h in fns {
-                    i.call(&h, target.clone(), vec![ev.clone()])?;
+                    invoke_listener(i, &h, target, ev)?;
                     if ev_flag(&ev, K_STOPIMM) {
                         break;
                     }
@@ -713,6 +716,24 @@ fn run_event_path(i: &mut Interp, this: &Value, ev: &Value) -> NR {
     i.set_prop_str(&ev, "currentTarget", Value::Null)?;
     let dp = i.get_prop_str(&ev, "defaultPrevented")?;
     Ok(Value::Bool(!i.to_bool(&dp)))
+}
+
+/// Call one event listener. Per the DOM spec an exception is reported and
+/// dispatch continues, so later listeners still run and `defaultPrevented`
+/// survives; only an execution-budget interrupt stops the walk.
+fn invoke_listener(i: &mut Interp, h: &Value, target: &Value, ev: &Value) -> Result<(), Value> {
+    match i.call(h, target.clone(), vec![ev.clone()]) {
+        Ok(_) => Ok(()),
+        Err(e) if i.interrupted => Err(e),
+        Err(e) => {
+            let msg = i.inspect(&e, 0);
+            with_ds(i, |ds| {
+                ds.listener_errors
+                    .push(format!("Uncaught (in event listener) {msg}"))
+            });
+            Ok(())
+        }
+    }
 }
 
 /// hidden stop flags on event objects
@@ -3607,6 +3628,7 @@ pub fn install_dom(i: &mut Interp, doc: Document, url: &str, vw: f64, vh: f64) {
         nav: None,
         styled_objs: Vec::new(),
         dataset_objs: Vec::new(),
+        listener_errors: Vec::new(),
     }));
 
     // ---- Node.prototype ----
@@ -4364,6 +4386,7 @@ impl DomContext {
 
     /// Run the microtask queue to quiescence (bounded).
     pub fn drain_microtasks(&mut self) {
+        self.take_listener_errors();
         let i = &mut self.ctx.interp;
         for n in 0..100_000usize {
             if i.interrupted {
@@ -4386,6 +4409,15 @@ impl DomContext {
                 self.errors.push(format!("Uncaught (in microtask) {msg}"));
             }
         }
+        self.take_listener_errors();
+    }
+
+    /// Move exceptions reported by event listeners into `errors`.
+    fn take_listener_errors(&mut self) {
+        let errs = with_ds(&mut self.ctx.interp, |ds| {
+            std::mem::take(&mut ds.listener_errors)
+        });
+        self.errors.extend(errs);
     }
 
     /// Drain the requestAnimationFrame queue once (timestamp arg in ms).
@@ -4580,8 +4612,9 @@ impl DomContext {
         i.set_prop_str(&ev, "button", Value::Num(0.0))?;
         i.set_prop_str(&ev, "buttons", Value::Num(1.0))?;
         i.set_prop_str(&ev, "detail", Value::Num(1.0))?;
-        let r = run_event_path(i, &target, &ev)?;
-        Ok(matches!(r, Value::Bool(true)))
+        let r = run_event_path(i, &target, &ev);
+        self.take_listener_errors();
+        Ok(matches!(r?, Value::Bool(true)))
     }
 }
 
@@ -4982,6 +5015,63 @@ mod tests {
         );
         assert_eq!(s(&mut dc, "fired"), "1");
         assert_eq!(s(&mut dc, "qtxt"), "hi");
+    }
+
+    #[test]
+    fn throwing_listener_keeps_cancellation_and_later_listeners() {
+        let mut dc = ctx("<html><body><a id='a' href='http://example.com/'>go</a></body></html>");
+        run(
+            &mut dc,
+            r#"
+            var hits = [];
+            var a = document.getElementById('a');
+            a.addEventListener('click', function(e) {
+                hits.push('cancel');
+                e.preventDefault();
+                throw new Error('lightbox failed');
+            });
+            a.addEventListener('click', function() { hits.push('next'); });
+            document.addEventListener('click', function() { hits.push('doc'); });
+            "#,
+        );
+        let a = with_ds(&mut dc.ctx.interp, |ds| {
+            let doc = &ds.docs[0];
+            doc.descendants(doc.root)
+                .find(|&n| doc.attr(n, "id") == Some("a"))
+                .unwrap()
+        });
+        let r = dc.dispatch_event_pumped(a, "click", (1.0, 1.0), std::time::Duration::from_secs(1));
+        let not_cancelled = match r {
+            Ok(b) => b,
+            Err(e) => panic!(
+                "a listener exception aborted dispatch: {}",
+                dc.ctx.interp.inspect(&e, 0)
+            ),
+        };
+        assert!(!not_cancelled, "preventDefault() before the throw is kept");
+        assert_eq!(s(&mut dc, "hits.join(',')"), "cancel,next,doc");
+        assert!(
+            dc.errors.iter().any(|e| e.contains("lightbox failed")),
+            "the exception is reported: {:?}",
+            dc.errors
+        );
+    }
+
+    #[test]
+    fn dispatch_event_reports_listener_exception_instead_of_throwing() {
+        let mut dc = ctx("<html><body><div id='x'></div></body></html>");
+        let out = s(
+            &mut dc,
+            r#"
+            var x = document.getElementById('x'), hits = [];
+            x.addEventListener('ping', function(e) { e.preventDefault(); throw new Error('boom'); });
+            x.addEventListener('ping', function() { hits.push('second'); });
+            var r = x.dispatchEvent(new Event('ping', { cancelable: true }));
+            r + ':' + hits.join(',')
+            "#,
+        );
+        assert_eq!(out, "false:second");
+        assert!(dc.errors.iter().any(|e| e.contains("boom")), "{:?}", dc.errors);
     }
 
     #[test]

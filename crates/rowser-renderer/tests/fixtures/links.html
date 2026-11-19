@@ -10,6 +10,7 @@
 <a href="http://example.test/clicked"><span id="moved">moved</span></a>
 <a id="elsewhere" href="http://example.test/elsewhere"></a>
 <a id="late">late</a>
+<a id="throws" href="http://example.test/throws">throws</a>
 <script>
   document.getElementById("cancel").addEventListener("click", (e) => {
     e.preventDefault();
@@ -25,4 +26,10 @@
   document.getElementById("late").addEventListener("click", (e) => {
     e.currentTarget.href = "http://example.test/late";
   });
+  const throws = document.getElementById("throws");
+  throws.addEventListener("click", (e) => {
+    e.preventDefault();
+    throw new Error("lightbox failed");
+  });
+  throws.addEventListener("click", () => console.log("after throw"));
 </script>
