@@ -178,18 +178,27 @@ fn same_page_navigation_preserves_tab_title() {
 
 #[test]
 fn navigation_reports_committed_redirect_url() {
-    use std::io::Read;
-    use std::net::TcpListener;
+    check_redirect_url("/final", "", "");
+}
 
+#[test]
+fn navigation_preserves_redirect_fragments() {
+    check_redirect_url("/final", "#details", "#details");
+    check_redirect_url("/final#destination", "#details", "#destination");
+    check_redirect_url("/final#", "#details", "#");
+}
+
+fn check_redirect_url(location: &str, requested_fragment: &str, expected_fragment: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    let location = location.to_string();
     let server = std::thread::spawn(move || {
         for redirect in [true, false] {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0; 4096];
             stream.read(&mut request).unwrap();
             let response = if redirect {
-                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             } else {
                 let body = "<title>Final document</title><h1>FINAL DESTINATION</h1>";
                 format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
@@ -199,9 +208,9 @@ fn navigation_reports_committed_redirect_url() {
     });
     let mut renderer = Renderer::new();
     let mut title = String::new();
-    let committed = renderer.navigate(format!("{base}/start"), &mut title);
+    let committed = renderer.navigate(format!("{base}/start{requested_fragment}"), &mut title);
     server.join().unwrap();
-    assert_eq!(committed, Some(format!("{base}/final")));
+    assert_eq!(committed, Some(format!("{base}/final{expected_fragment}")));
     assert_eq!(title, "Final document");
 }
 
