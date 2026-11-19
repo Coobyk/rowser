@@ -6,9 +6,10 @@ type Version = (u64, u64, u64, i64, i64, i64, i64);
 pub struct Bookmarks {
     path: PathBuf,
     version: Option<Version>,
+    contents: Option<String>,
     entries: Vec<String>,
     #[cfg(test)]
-    reads: usize,
+    reloads: usize,
 }
 
 impl Bookmarks {
@@ -16,9 +17,10 @@ impl Bookmarks {
         let mut bookmarks = Self {
             path,
             version: None,
+            contents: None,
             entries: Vec::new(),
             #[cfg(test)]
-            reads: 0,
+            reloads: 0,
         };
         bookmarks.reload();
         bookmarks
@@ -42,15 +44,20 @@ impl Bookmarks {
         self.version = self.version();
         #[cfg(test)]
         {
-            self.reads += 1;
+            self.reloads += 1;
         }
-        self.entries = std::fs::read_to_string(&self.path)
+        self.contents = std::fs::read_to_string(&self.path).ok();
+        self.entries = self
+            .contents
+            .as_ref()
             .map(|s| s.lines().map(str::to_string).collect())
             .unwrap_or_default();
     }
 
     pub fn has_changed(&self) -> bool {
         self.version != self.version()
+            // Same-length writes can share both mtime and ctime.
+            || self.contents != std::fs::read_to_string(&self.path).ok()
     }
 
     fn refresh(&mut self) {
@@ -107,33 +114,33 @@ mod tests {
     }
 
     #[test]
-    fn change_detection_does_not_read_or_reload() {
+    fn change_detection_does_not_reload() {
         let fixture = Fixture::new();
         let mut bookmarks = Bookmarks::new(fixture.file());
         assert!(!bookmarks.has_changed());
         std::fs::write(fixture.file(), "one\n").unwrap();
         assert!(bookmarks.has_changed());
         assert!(bookmarks.has_changed());
-        assert_eq!(bookmarks.reads, 1);
+        assert_eq!(bookmarks.reloads, 1);
         assert!(bookmarks.entries.is_empty());
         assert!(bookmarks.contains("one"));
         assert!(!bookmarks.has_changed());
 
         std::fs::write(fixture.file(), "longer-url\n").unwrap();
         assert!(bookmarks.has_changed());
-        assert_eq!(bookmarks.reads, 2);
+        assert_eq!(bookmarks.reloads, 2);
         assert!(bookmarks.contains("longer-url"));
         assert!(!bookmarks.has_changed());
 
         std::fs::remove_file(fixture.file()).unwrap();
         assert!(bookmarks.has_changed());
-        assert_eq!(bookmarks.reads, 3);
+        assert_eq!(bookmarks.reloads, 3);
         assert!(!bookmarks.contains("longer-url"));
         assert!(!bookmarks.has_changed());
     }
 
     #[test]
-    fn unchanged_bookmarks_are_read_only_once() {
+    fn unchanged_bookmarks_are_loaded_only_once() {
         let fixture = Fixture::new();
         std::fs::write(fixture.file(), "https://example.org\n").unwrap();
         let mut bookmarks = Bookmarks::new(fixture.file());
@@ -141,7 +148,21 @@ mod tests {
             assert!(bookmarks.contains("https://example.org"));
             assert!(!bookmarks.contains("https://other.org"));
         }
-        assert_eq!(bookmarks.reads, 1);
+        assert_eq!(bookmarks.reloads, 1);
+    }
+
+    #[test]
+    fn external_edit_with_matching_metadata_is_detected() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.file(), "one\n").unwrap();
+        let mut bookmarks = Bookmarks::new(fixture.file());
+        std::fs::write(fixture.file(), "two\n").unwrap();
+        // Model a timestamp collision regardless of filesystem granularity.
+        bookmarks.version = bookmarks.version();
+        assert!(bookmarks.has_changed());
+        assert!(!bookmarks.contains("one"));
+        assert!(bookmarks.contains("two"));
+        assert!(!bookmarks.has_changed());
     }
 
     #[test]
@@ -149,7 +170,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut bookmarks = Bookmarks::new(fixture.file());
         assert!(!bookmarks.contains("one"));
-        assert_eq!(bookmarks.reads, 1);
+        assert_eq!(bookmarks.reloads, 1);
         bookmarks.toggle("one");
         assert!(bookmarks.contains("one"));
         assert_eq!(std::fs::read_to_string(fixture.file()).unwrap(), "one\n");
@@ -173,6 +194,6 @@ mod tests {
         for _ in 0..100 {
             assert!(!bookmarks.contains("one"));
         }
-        assert_eq!(bookmarks.reads, 2);
+        assert_eq!(bookmarks.reloads, 2);
     }
 }
