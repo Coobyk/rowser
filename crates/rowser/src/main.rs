@@ -51,6 +51,23 @@ impl Drop for Tab {
 }
 
 impl Tab {
+    fn new(id: usize, url: String) -> Self {
+        Self {
+            id,
+            child: None,
+            ipc_out: None,
+            frame: None,
+            pixels: Vec::new(),
+            buf_size: (0, 0),
+            title: "New Tab".into(),
+            url,
+            alive: false,
+            history: Vec::new(),
+            hist: 0,
+            sel_text: String::new(),
+        }
+    }
+
     fn stop_renderer(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -296,20 +313,7 @@ impl BrowserView {
         self.next_id += 1;
         let url = format!("rowser://newtab/{id}");
 
-        let mut tab = Tab {
-            id,
-            child: None,
-            ipc_out: None,
-            frame: None,
-            pixels: Vec::new(),
-            buf_size: (0, 0),
-            title: "New Tab".into(),
-            url: url.clone(),
-            alive: false,
-            history: vec![url.clone()],
-            hist: 0,
-            sel_text: String::new(),
-        };
+        let mut tab = Tab::new(id, url.clone());
 
         if let Some((child, out, reader)) = Self::spawn_renderer() {
             tab.child = Some(child);
@@ -1296,6 +1300,28 @@ mod tests {
         }
         let state = std::fs::read_to_string(path);
         assert!(state.is_err(), "child {pid} not reaped: {state:?}");
+    }
+
+    #[test]
+    fn fresh_tab_has_no_back_entry() {
+        let url = "rowser://newtab/0";
+        let mut tab = Tab::new(0, url.into());
+        tab.navigate(url);
+        assert_eq!(tab.history, [url]);
+        assert_eq!(tab.hist, 0);
+
+        tab.navigate("about:blank");
+        assert_eq!(tab.hist, 1);
+        tab.go(0);
+        assert_eq!(tab.url, url);
+        tab.go(1);
+        assert_eq!(tab.url, "about:blank");
+        tab.go(2);
+        assert_eq!(tab.hist, 1);
+        tab.go(0);
+        tab.navigate("rowser://newtab/1");
+        assert_eq!(tab.history, [url, "rowser://newtab/1"]);
+        assert_eq!(tab.hist, 1);
     }
 
     #[test]
