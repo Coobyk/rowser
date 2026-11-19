@@ -221,4 +221,11 @@ fn link_follows_href_set_by_click_handler() {
         renderer.click(10.0, 210.0).0.as_deref(),
         Some("http://example.test/rewritten")
     );
+    let (nav, logs) = renderer.click(45.0, 350.0);
+    assert!(logs.iter().any(|l| l == "[js console] moved"), "listener ran: {logs:?}");
+    assert_eq!(
+        nav.as_deref(),
+        Some("http://example.test/clicked"),
+        "content moved out of the clicked link"
+    );
 }

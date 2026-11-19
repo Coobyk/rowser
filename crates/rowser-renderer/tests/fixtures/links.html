@@ -7,6 +7,8 @@
 <a href="http://example.test/plain">plain</a>
 <a id="cancel" href="http://example.test/cancel"><span>cancelled</span></a>
 <a id="rewrite" href="http://example.test/original">rewritten</a>
+<a href="http://example.test/clicked"><span id="moved">moved</span></a>
+<a id="elsewhere" href="http://example.test/elsewhere"></a>
 <script>
   document.getElementById("cancel").addEventListener("click", (e) => {
     e.preventDefault();
@@ -14,5 +16,9 @@
   });
   document.getElementById("rewrite").addEventListener("click", (e) => {
     e.currentTarget.href = "http://example.test/rewritten";
+  });
+  document.getElementById("moved").addEventListener("click", (e) => {
+    document.getElementById("elsewhere").appendChild(e.currentTarget);
+    console.log("moved");
   });
 </script>

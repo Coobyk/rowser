@@ -320,7 +320,10 @@ fn main() {
                 // activation and JS dispatch both target the deepest
                 // element box under the point.
                 let target = page.hit_at(x, y);
-                let mut follow_link = true;
+                // the link is fixed at dispatch; its href is read after
+                // (a handler may rewrite it)
+                let link = target.and_then(|n| page.link_node(n));
+                let mut follow_link = link.is_some();
                 // The click event fires before the link's default action,
                 // so a handler can cancel it (lightboxes, SPA routers).
                 // Dispatch a synthetic click into the live JS context:
@@ -385,8 +388,9 @@ fn main() {
                 // A plain click collapses any selection — repaint to
                 // erase the baked-in highlight (a link hit repaints via
                 // the navigation it triggers instead).
-                // read after dispatch: a handler may have rewritten `href`
-                let found = target.and_then(|n| page.link_href(n)).map(str::to_string);
+                let found = link
+                    .and_then(|a| page.doc.as_ref()?.attr(a, "href"))
+                    .map(str::to_string);
                 if let Some(url) = found.filter(|_| follow_link) {
                     page.clear_sel();
                     // hrefs are raw attribute values — resolve against the
@@ -1298,13 +1302,16 @@ impl Page {
     /// anywhere in a link's box (padding, block children, nested inline
     /// content) activates it, not just over its painted text.
     fn link_href(&self, node: rowser_dom::NodeId) -> Option<&str> {
+        self.doc.as_ref()?.attr(self.link_node(node)?, "href")
+    }
+
+    /// The nearest `<a href>` at or above `node`.
+    fn link_node(&self, node: rowser_dom::NodeId) -> Option<rowser_dom::NodeId> {
         let doc = self.doc.as_ref()?;
         let mut cur = Some(node);
         while let Some(n) = cur {
-            if doc.tag(n) == Some("a") {
-                if let Some(h) = doc.attr(n, "href") {
-                    return Some(h);
-                }
+            if doc.tag(n) == Some("a") && doc.attr(n, "href").is_some() {
+                return Some(n);
             }
             cur = doc.parent(n);
         }
