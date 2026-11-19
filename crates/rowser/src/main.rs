@@ -51,6 +51,27 @@ impl Drop for Tab {
 }
 
 impl Tab {
+    fn new(id: usize, url: String) -> Tab {
+        Tab {
+            id,
+            child: None,
+            ipc_out: None,
+            frame: None,
+            pixels: Vec::new(),
+            buf_size: (0, 0),
+            title: "New Tab".into(),
+            url: url.clone(),
+            alive: false,
+            history: vec![url],
+            hist: 0,
+            sel_text: String::new(),
+        }
+    }
+
+    fn shut_down(mut self) {
+        self.send(&ToRenderer::Shutdown);
+    }
+
     fn stop_renderer(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -290,27 +311,8 @@ impl BrowserView {
         Some((child, reader, parent))
     }
 
-    fn open_tab(&mut self) {
-        dlog("open_tab (ctrl+t / +)");
-        let id = self.next_id;
-        self.next_id += 1;
-        let url = format!("rowser://newtab/{id}");
-
-        let mut tab = Tab {
-            id,
-            child: None,
-            ipc_out: None,
-            frame: None,
-            pixels: Vec::new(),
-            buf_size: (0, 0),
-            title: "New Tab".into(),
-            url: url.clone(),
-            alive: false,
-            history: vec![url.clone()],
-            hist: 0,
-            sel_text: String::new(),
-        };
-
+    fn launch_tab(&self, id: usize, url: String) -> Tab {
+        let mut tab = Tab::new(id, url);
         if let Some((child, out, reader)) = Self::spawn_renderer() {
             tab.child = Some(child);
             tab.ipc_out = Some(out);
@@ -321,6 +323,18 @@ impl BrowserView {
                 width: self.last_viewport.0,
                 height: self.last_viewport.1,
             });
+        }
+        tab
+    }
+
+    fn open_tab(&mut self) {
+        dlog("open_tab (ctrl+t / +)");
+        let id = self.next_id;
+        self.next_id += 1;
+        let url = format!("rowser://newtab/{id}");
+
+        let mut tab = self.launch_tab(id, url.clone());
+        if tab.alive {
             tab.navigate(&url);
         } else {
             tab.title = "spawn failed".into();
@@ -424,43 +438,19 @@ impl BrowserView {
         let id = self.next_id;
         self.next_id += 1;
         let url = self.tabs[idx].url.clone();
-        let mut fresh = Tab {
-            id,
-            child: None,
-            ipc_out: None,
-            frame: None,
-            pixels: Vec::new(),
-            buf_size: (0, 0),
-            title: "New Tab".into(),
-            url: url.clone(),
-            alive: false,
-            history: vec![url.clone()],
-            hist: 0,
-            sel_text: String::new(),
-        };
-        if let Some((child, out, reader)) = Self::spawn_renderer() {
-            fresh.child = Some(child);
-            fresh.ipc_out = Some(out);
-            fresh.alive = true;
-            let tx = self.outbox.clone();
-            thread::spawn(move || reader_loop(id, reader, tx));
-            fresh.send(&ToRenderer::ResizeViewport {
-                width: self.last_viewport.0,
-                height: self.last_viewport.1,
-            });
+        let mut fresh = self.launch_tab(id, url.clone());
+        if fresh.alive {
             fresh.history = self.tabs[idx].history.clone();
             fresh.hist = self.tabs[idx].hist;
             fresh.send(&ToRenderer::Navigate(url));
         }
-        let mut old = std::mem::replace(&mut self.tabs[idx], fresh);
-        old.send(&ToRenderer::Shutdown);
+        let old = std::mem::replace(&mut self.tabs[idx], fresh);
+        old.shut_down();
     }
 
     fn close_tab(&mut self, idx: usize) {
         dlog(&format!("close_tab {idx}"));
-        let mut tab = self.tabs.remove(idx);
-        tab.send(&ToRenderer::Shutdown);
-        drop(tab);
+        self.tabs.remove(idx).shut_down();
         if self.tabs.is_empty() {
             self.open_tab();
         } else {
@@ -1267,25 +1257,14 @@ fn normalize_url(input: &str) -> String {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{Child, Command, Duration, Tab};
+    use super::{read_frame, Child, Command, Duration, Tab, ToRenderer, UnixStream};
     use std::thread;
     use std::time::Instant;
 
     fn tab(child: Option<Child>) -> Tab {
-        Tab {
-            id: 0,
-            child,
-            ipc_out: None,
-            frame: None,
-            pixels: Vec::new(),
-            buf_size: (0, 0),
-            title: String::new(),
-            url: String::new(),
-            alive: false,
-            history: Vec::new(),
-            hist: 0,
-            sel_text: String::new(),
-        }
+        let mut tab = Tab::new(0, String::new());
+        tab.child = child;
+        tab
     }
 
     fn assert_reaped(pid: u32) {
@@ -1296,6 +1275,59 @@ mod tests {
         }
         let state = std::fs::read_to_string(path);
         assert!(state.is_err(), "child {pid} not reaped: {state:?}");
+    }
+
+    #[test]
+    fn new_tab_defaults() {
+        for url in ["rowser://newtab/7", ""] {
+            let tab = Tab::new(7, url.into());
+            assert_eq!(tab.id, 7);
+            assert!(tab.child.is_none());
+            assert!(tab.ipc_out.is_none());
+            assert!(tab.frame.is_none());
+            assert!(tab.pixels.is_empty());
+            assert_eq!(tab.buf_size, (0, 0));
+            assert_eq!(tab.title, "New Tab");
+            assert_eq!(tab.url, url);
+            assert!(!tab.alive);
+            assert_eq!(tab.history, vec![url]);
+            assert_eq!(tab.hist, 0);
+            assert!(tab.sel_text.is_empty());
+        }
+    }
+
+    #[test]
+    fn shut_down_sends_shutdown_and_reaps_child() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        let (out, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tab = tab(Some(child));
+        tab.ipc_out = Some(out);
+        tab.shut_down();
+        let frame = read_frame(&mut peer).unwrap();
+        assert!(matches!(
+            ToRenderer::decode(&frame).unwrap(),
+            ToRenderer::Shutdown
+        ));
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn shut_down_without_renderer() {
+        tab(None).shut_down();
+    }
+
+    #[test]
+    fn shut_down_with_disconnected_socket_reaps_child() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        let (out, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let mut tab = tab(Some(child));
+        tab.ipc_out = Some(out);
+        tab.shut_down();
+        assert_reaped(pid);
     }
 
     #[test]
