@@ -101,18 +101,19 @@ fn main() {
                 }
             }
         };
+        let reload = matches!(msg, ToRenderer::Reload(_));
         match msg {
             ToRenderer::Ping(n) => {
                 let _ = send(&mut output, &ToBrowser::Pong(n));
             }
-            ToRenderer::Navigate(url) => {
+            ToRenderer::Navigate(url) | ToRenderer::Reload(url) => {
                 let (base, frag) = url
                     .split_once('#')
                     .map(|(b, f)| (b, f))
                     .unwrap_or((url.as_str(), ""));
                 let same_page = !page.cur_url.is_empty()
                     && (base == page.cur_url || (base.is_empty() && !frag.is_empty()));
-                if same_page && !frag.is_empty() {
+                if !reload && same_page && !frag.is_empty() {
                     // :target styles may change layout — relayout only
                     // when a sheet could match, then scroll to the
                     // (freshly laid-out) anchor
