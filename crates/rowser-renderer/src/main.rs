@@ -112,7 +112,8 @@ fn main() {
                     .map(|(b, f)| (b, f))
                     .unwrap_or((url.as_str(), ""));
                 let same_page = !page.cur_url.is_empty()
-                    && (base == page.cur_url || (base.is_empty() && !frag.is_empty()));
+                    && (base == page.cur_url.split('#').next().unwrap_or("")
+                        || (base.is_empty() && !frag.is_empty()));
                 if !reload && same_page && !frag.is_empty() {
                     // :target styles may change layout — relayout only
                     // when a sheet could match, then scroll to the

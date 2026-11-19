@@ -1,6 +1,6 @@
 use rowser_ipc::{read_frame, write_frame, ToBrowser, ToRenderer};
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -186,6 +186,53 @@ fn navigation_preserves_redirect_fragments() {
     check_redirect_url("/final", "#details", "#details");
     check_redirect_url("/final#destination", "#details", "#destination");
     check_redirect_url("/final#", "#details", "#");
+}
+
+#[test]
+fn fragment_navigation_after_redirect_does_not_refetch() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let server = std::thread::spawn(move || {
+        let mut requests = 0;
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            if stream.read(&mut request).unwrap() == 0 {
+                break;
+            }
+            requests += 1;
+            let response = if requests == 1 {
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                let body = "<title>Anchors</title><h1 id='a'>A</h1><div style='height: 1500px'></div><h1 id='b'>B</h1>";
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        requests
+    });
+    let mut renderer = Renderer::new();
+    renderer.navigate(format!("{base}/start#a"), &mut String::new());
+    write_frame(
+        renderer.child.stdin.as_mut().unwrap(),
+        &ToRenderer::Navigate(format!("{base}/final#b")).encode(),
+    ).unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = renderer.events.recv_timeout(Duration::from_secs(30)).unwrap();
+        if event == ToBrowser::LoadDone {
+            break;
+        }
+        events.push(event);
+    }
+    drop(TcpStream::connect(addr).unwrap());
+    let requests = server.join().unwrap();
+    assert_eq!(requests, 2, "fragment navigation refetched the document");
+    assert!(!events.contains(&ToBrowser::LoadStarted));
+    assert!(events.iter().all(|event| matches!(event,
+        ToBrowser::Frame { .. } | ToBrowser::FrameRegion { .. } | ToBrowser::ScrollDelta { .. }
+    )), "expected only scroll painting before LoadDone, got {events:?}");
 }
 
 fn check_redirect_url(location: &str, requested_fragment: &str, expected_fragment: &str) {
