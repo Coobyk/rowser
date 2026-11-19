@@ -21,6 +21,16 @@ use bookmarks::Bookmarks;
 
 /// Height of the chrome (tab strip + nav bar) the webview doesn't get.
 const CHROME_PX: f32 = 72.0;
+const DOM_DUMP_LINE_LIMIT: usize = 600;
+
+fn inspector_lines(dump: &str) -> Vec<&str> {
+    let mut lines = dump.lines();
+    let mut visible: Vec<_> = lines.by_ref().take(DOM_DUMP_LINE_LIMIT).collect();
+    if lines.next().is_some() {
+        visible.push("… truncated");
+    }
+    visible
+}
 
 const INSPECTOR_PX: f32 = 320.0;
 
@@ -229,6 +239,7 @@ struct BrowserView {
     page_focus: FocusHandle,
     inspector: bool,
     dom_dump: String,
+    inspector_scroll: ScrollHandle,
     /// In-progress page-text drag: the anchor point in document-space
     /// device px (set on mouse-down, cleared on mouse-up).
     drag: Option<(f32, f32)>,
@@ -377,6 +388,7 @@ impl BrowserView {
             page_focus: cx.focus_handle(),
             inspector: false,
             dom_dump: String::new(),
+            inspector_scroll: ScrollHandle::new(),
             drag: None,
             page_cursor: CursorStyle::Arrow,
         }
@@ -442,6 +454,7 @@ impl BrowserView {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.dom_dump.clear();
+        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
 
         self.url_text = url;
         self.url_editing = editing;
@@ -552,6 +565,7 @@ impl BrowserView {
         old.shut_down();
         if idx == self.active {
             self.dom_dump.clear();
+            self.inspector_scroll.set_offset(point(px(0.), px(0.)));
         }
     }
 
@@ -592,6 +606,7 @@ impl BrowserView {
 
     fn refresh_inspector(&mut self) {
         self.dom_dump.clear();
+        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
         if self.inspector {
             self.tabs[self.active].send(&ToRenderer::DomDump);
         }
@@ -645,7 +660,13 @@ impl BrowserView {
             match event {
                 TabEvent::Msg(msg) => match msg {
                     ToBrowser::Pong(_) => {}
-                    ToBrowser::LoadStarted => tab.title = "Loading…".into(),
+                    ToBrowser::LoadStarted => {
+                        tab.title = "Loading…".into();
+                        if is_active {
+                            self.dom_dump.clear();
+                            self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                        }
+                    }
                     ToBrowser::Title(t) => {
                         tab.set_title(t);
                         if is_inspected {
@@ -706,6 +727,7 @@ impl BrowserView {
                     tab.title = "crashed".into();
                     if is_active {
                         self.dom_dump.clear();
+                        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
                     }
                 }
             }
@@ -1357,19 +1379,23 @@ impl Render for BrowserView {
                     .child(webview.flex_1().min_w_0());
                 if self.inspector {
                     let mut panel = div()
+                        .id("dom-inspector")
                         .w(px(INSPECTOR_PX))
                         .h_full()
                         .flex_shrink_0()
                         .overflow_hidden()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.inspector_scroll)
                         .bg(rgb(0x0c0c10))
                         .border_l_1()
                         .border_color(rgb(0x333344))
                         .p_2()
                         .flex()
                         .flex_col();
-                    for line in self.dom_dump.lines().take(600) {
+                    for line in inspector_lines(&self.dom_dump) {
                         panel = panel.child(
                             div()
+                                .flex_shrink_0()
                                 .text_xs()
                                 .whitespace_nowrap()
                                 .text_color(rgb(0x88aa88))
@@ -1435,8 +1461,8 @@ fn normalize_url(input: &str) -> String {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{
-        narrow_tab_width, read_frame, tab_title_label, Child, Command, Duration, Tab, ToRenderer,
-        UnixStream,
+        narrow_tab_width, read_frame, tab_title_label, Child, Command, Duration, Tab, TabEvent,
+        ToBrowser, ToRenderer, UnixStream,
     };
     use gpui::{px, Styled, TextOverflow};
     use std::thread;
@@ -1641,6 +1667,63 @@ mod tests {
             assert_eq!(view.dom_dump, "<history>");
             assert!(!repainted);
         });
+    }
+
+    #[test]
+    fn inspector_clears_previous_document_on_load_started() {
+        with_inspector(|view, inbox| {
+            view.drain_inbox((8, TabEvent::Msg(ToBrowser::LoadStarted)), inbox);
+            assert_eq!(view.dom_dump, "<history>");
+            view.drain_inbox((7, TabEvent::Msg(ToBrowser::LoadStarted)), inbox);
+            assert!(
+                view.dom_dump.is_empty(),
+                "old document remains in the inspector"
+            );
+        });
+    }
+
+    #[test]
+    fn inspector_scroll_persists_until_document_changes() {
+        with_inspector(|view, inbox| {
+            let offset = gpui::point(gpui::px(0.), gpui::px(-200.));
+            let top = gpui::point(gpui::px(0.), gpui::px(0.));
+            view.inspector_scroll.set_offset(offset);
+            view.drain_inbox(
+                (7, TabEvent::Msg(ToBrowser::DomDump("updated".into()))),
+                inbox,
+            );
+            assert_eq!(view.inspector_scroll.offset(), offset);
+            view.drain_inbox((8, TabEvent::Msg(ToBrowser::LoadStarted)), inbox);
+            assert_eq!(view.inspector_scroll.offset(), offset);
+            view.drain_inbox((7, TabEvent::Msg(ToBrowser::LoadStarted)), inbox);
+            assert_eq!(view.inspector_scroll.offset(), top);
+            view.inspector_scroll.set_offset(offset);
+            view.set_active_tab(1);
+            assert_eq!(view.inspector_scroll.offset(), top);
+            view.inspector_scroll.set_offset(offset);
+            view.set_active_tab(1);
+            assert_eq!(view.inspector_scroll.offset(), offset);
+            view.drain_inbox((8, TabEvent::Disconnected), inbox);
+            assert_eq!(view.inspector_scroll.offset(), top);
+        });
+    }
+
+    #[test]
+    fn inspector_lines_caps_only_truncated_dumps() {
+        assert!(super::inspector_lines("").is_empty());
+        assert_eq!(
+            super::inspector_lines("html\n  body\n"),
+            vec!["html", "  body"]
+        );
+        let dump = "line\n".repeat(super::DOM_DUMP_LINE_LIMIT);
+        assert_eq!(
+            super::inspector_lines(&dump).len(),
+            super::DOM_DUMP_LINE_LIMIT
+        );
+        let longer = dump + "last\n";
+        let lines = super::inspector_lines(&longer);
+        assert_eq!(lines.len(), super::DOM_DUMP_LINE_LIMIT + 1);
+        assert_eq!(lines.last(), Some(&"… truncated"));
     }
 
     #[test]
