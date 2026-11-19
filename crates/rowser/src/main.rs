@@ -663,6 +663,16 @@ fn tab_title_label() -> Div {
     div().flex_1().min_w_0().line_clamp(1).text_ellipsis()
 }
 
+fn narrow_tab_width(viewport: Pixels, rem: Pixels, count: usize) -> Option<Pixels> {
+    if count <= 1 {
+        return None;
+    }
+    // Budget for the strip padding, new-tab button, and gap after each chip.
+    let available = viewport - rem * (3. + 0.25 * count as f32);
+    let width = available / count as f32;
+    (width < px(104.)).then(|| width.max(px(80.)))
+}
+
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Deferred URL-bar focus from `open_tab` — it runs without a
@@ -690,7 +700,8 @@ impl Render for BrowserView {
         }
 
         // Tab strip
-        let compact_tabs = size.width < px(120.) * self.tabs.len();
+        let narrow_width = narrow_tab_width(size.width, window.rem_size(), self.tabs.len());
+        let tab_hover_group = "narrow-tab";
         let mut tab_strip = div()
             .flex()
             .flex_row()
@@ -702,13 +713,21 @@ impl Render for BrowserView {
             .overflow_x_hidden();
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == self.active;
-            let mut chip = div()
+            let title: SharedString = if tab.alive {
+                tab.title.clone().into()
+            } else {
+                format!("⚠ {}", tab.title).into()
+            };
+            let label = || tab_title_label().child(title.clone());
+            let chip = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap_2()
                 .px_3()
-                .when(compact_tabs, |chip| chip.flex_grow().gap_1().px_1p5())
+                .when_some(narrow_width, |chip, width| {
+                    chip.w(width).flex_shrink_0().gap_0().pl_1().pr_0()
+                })
                 .h_full()
                 .min_w(px(80.))
                 .max_w(px(220.))
@@ -731,35 +750,54 @@ impl Render for BrowserView {
                         view.activate_tab(i, window);
                         cx.notify();
                     }),
-                )
-                .child(tab_title_label().child(if tab.alive {
-                    tab.title.clone()
-                } else {
-                    format!("⚠ {}", tab.title)
-                }));
-            if self.tabs.len() > 1 {
-                chip = chip.child(
-                    div()
-                        .flex_shrink_0()
-                        .px_1()
-                        .rounded_sm()
-                        .text_color(rgb(0x777788))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |view, _e, _w, cx| {
-                                view.close_tab(i);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        )
-                        .child("×"),
                 );
-            }
+            let chip = if self.tabs.len() == 1 {
+                chip.child(label())
+            } else {
+                let close = div()
+                    .flex_shrink_0()
+                    .px_1()
+                    .when(narrow_width.is_some(), |close| {
+                        close.w_5().h_5().px_0().flex().items_center().justify_center()
+                    })
+                    .rounded_sm()
+                    .text_color(rgb(0x777788))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _e, _w, cx| {
+                            view.close_tab(i);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child("×");
+                if narrow_width.is_some() && !is_active {
+                    chip.group(tab_hover_group)
+                        .child(label().group_hover(tab_hover_group, |style| style.invisible()))
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .pl_1()
+                                .invisible()
+                                .group_hover(tab_hover_group, |style| style.visible())
+                                .child(label())
+                                .child(close),
+                        )
+                } else {
+                    chip.child(label()).child(close)
+                }
+            };
             tab_strip = tab_strip.child(chip);
         }
         tab_strip = tab_strip.child(
             div()
                 .px_2()
+                .when(narrow_width.is_some(), |button| {
+                    button.w_8().flex_shrink_0().text_center()
+                })
                 .text_lg()
                 .text_color(rgb(0xaaaacc))
                 .on_mouse_down(
@@ -1306,8 +1344,11 @@ fn normalize_url(input: &str) -> String {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{read_frame, tab_title_label, Child, Command, Duration, Tab, ToRenderer, UnixStream};
-    use gpui::{Styled, TextOverflow};
+    use super::{
+        narrow_tab_width, read_frame, tab_title_label, Child, Command, Duration, Tab, ToRenderer,
+        UnixStream,
+    };
+    use gpui::{px, Styled, TextOverflow};
     use std::thread;
     use std::time::Instant;
 
@@ -1318,6 +1359,13 @@ mod tests {
 
         assert_eq!(style.line_clamp, Some(1));
         assert_eq!(style.text_overflow, Some(TextOverflow::Truncate("…".into())));
+    }
+
+    #[test]
+    fn narrow_tab_width_accounts_for_strip_controls_and_minimum() {
+        assert_eq!(narrow_tab_width(px(1280.), px(16.), 8), None);
+        assert_eq!(narrow_tab_width(px(1280.), px(16.), 14), Some(px(84.)));
+        assert_eq!(narrow_tab_width(px(1280.), px(16.), 24), Some(px(80.)));
     }
 
     #[test]
