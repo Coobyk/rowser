@@ -36,16 +36,21 @@ impl Renderer {
         Self { child, events }
     }
 
-    fn navigate(&mut self, url: String, title: &mut String) {
-        self.load(ToRenderer::Navigate(url), title);
+    fn navigate(&mut self, url: String, title: &mut String) -> Option<String> {
+        self.load_events(ToRenderer::Navigate(url), title).1
     }
 
     fn load(&mut self, message: ToRenderer, title: &mut String) {
-        self.load_logs(message, title);
+        self.load_events(message, title);
     }
 
     fn load_logs(&mut self, message: ToRenderer, title: &mut String) -> Vec<String> {
+        self.load_events(message, title).0
+    }
+
+    fn load_events(&mut self, message: ToRenderer, title: &mut String) -> (Vec<String>, Option<String>) {
         let mut logs = Vec::new();
+        let mut committed = None;
         let input = self.child.stdin.as_mut().unwrap();
         write_frame(input, &message.encode()).unwrap();
         input.flush().unwrap();
@@ -54,11 +59,12 @@ impl Renderer {
                 ToBrowser::LoadStarted => *title = "Loading…".into(),
                 ToBrowser::Title(t) => *title = t,
                 ToBrowser::Log(log) => logs.push(log),
+                ToBrowser::NavigationCommitted(url) => committed = Some(url),
                 ToBrowser::LoadDone => break,
                 _ => {}
             }
         }
-        logs
+        (logs, committed)
     }
 }
 
@@ -167,5 +173,43 @@ fn same_page_navigation_preserves_tab_title() {
     for fragment in ["details", "missing", "details"] {
         renderer.navigate(format!("{url}#{fragment}"), &mut title);
         assert_eq!(title, "Anchor navigation test", "fragment: {fragment:?}");
+    }
+}
+
+#[test]
+fn navigation_reports_committed_redirect_url() {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        for redirect in [true, false] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            let response = if redirect {
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                let body = "<title>Final document</title><h1>FINAL DESTINATION</h1>";
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    let mut renderer = Renderer::new();
+    let mut title = String::new();
+    let committed = renderer.navigate(format!("{base}/start"), &mut title);
+    server.join().unwrap();
+    assert_eq!(committed, Some(format!("{base}/final")));
+    assert_eq!(title, "Final document");
+}
+
+#[test]
+fn navigation_reports_direct_and_error_document_urls() {
+    let mut renderer = Renderer::new();
+    let mut title = String::new();
+    for url in ["about:blank", "file:///nonexistent-rowser-commit-test", ""] {
+        assert_eq!(renderer.navigate(url.into(), &mut title), Some(url.into()));
     }
 }

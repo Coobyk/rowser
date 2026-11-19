@@ -193,6 +193,7 @@ fn main() {
                         page.repaint_scrolled(&mut fonts);
                     }
                 }
+                let _ = send(&mut output, &ToBrowser::NavigationCommitted(effective.clone()));
                 let _ = send(&mut output, &ToBrowser::Title(title));
                 send_frame(&mut output, &mut page);
                 let _ = send(&mut output, &ToBrowser::LoadDone);
