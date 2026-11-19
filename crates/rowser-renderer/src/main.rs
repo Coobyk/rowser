@@ -3448,6 +3448,32 @@ mod tests {
         assert_eq!(doc.text_content(link), url);
     }
 
+    #[test]
+    fn history_link_selection_preserves_url() {
+        let url = "https://example.test/one'two&three<4";
+        let doc = rowser_html::parse_scripting(&render_list_page("history", url));
+        let mut page = Page::new();
+        let mut fonts = FontCache::new();
+        page.load(doc, "rowser://history".into(), String::new());
+        page.repaint(&mut fonts);
+
+        let boxes = text_boxes(&page.items, &mut fonts, &mut Vec::new());
+        let first = boxes.iter().find(|b| b.text.starts_with("https://")).unwrap();
+        let last = boxes
+            .iter()
+            .find(|b| b.baseline == first.baseline && b.text.ends_with('4'))
+            .unwrap();
+        let y = first.baseline - 1.0;
+        page.update_sel(
+            &mut fonts,
+            first.x,
+            y,
+            last.x + last.starts[last.nchars()],
+            y,
+        );
+        assert_eq!(page.sel_text, url);
+    }
+
     fn page_with(html: &str, url: &str) -> Page {
         let mut p = Page::new();
         p.doc = Some(rowser_html::parse(html));
