@@ -320,8 +320,7 @@ fn main() {
                 // activation and JS dispatch both target the deepest
                 // element box under the point.
                 let target = page.hit_at(x, y);
-                let found = target.and_then(|n| page.link_href(n)).map(str::to_string);
-                let mut follow_link = found.is_some();
+                let mut follow_link = true;
                 // The click event fires before the link's default action,
                 // so a handler can cancel it (lightboxes, SPA routers).
                 // Dispatch a synthetic click into the live JS context:
@@ -386,6 +385,8 @@ fn main() {
                 // A plain click collapses any selection — repaint to
                 // erase the baked-in highlight (a link hit repaints via
                 // the navigation it triggers instead).
+                // read after dispatch: a handler may have rewritten `href`
+                let found = target.and_then(|n| page.link_href(n)).map(str::to_string);
                 if let Some(url) = found.filter(|_| follow_link) {
                     page.clear_sel();
                     // hrefs are raw attribute values — resolve against the

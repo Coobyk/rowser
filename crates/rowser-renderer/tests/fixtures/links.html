@@ -6,6 +6,13 @@
 </style>
 <a href="http://example.test/plain">plain</a>
 <a id="cancel" href="http://example.test/cancel"><span>cancelled</span></a>
+<a id="rewrite" href="http://example.test/original">rewritten</a>
 <script>
-  document.getElementById("cancel").addEventListener("click", (e) => e.preventDefault());
+  document.getElementById("cancel").addEventListener("click", (e) => {
+    e.preventDefault();
+    console.log("cancelled");
+  });
+  document.getElementById("rewrite").addEventListener("click", (e) => {
+    e.currentTarget.href = "http://example.test/rewritten";
+  });
 </script>

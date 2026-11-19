@@ -61,16 +61,19 @@ impl Renderer {
         logs
     }
 
-    /// Clicks at (x, y) and returns the URL the renderer asks to open, if any.
-    fn click(&mut self, x: f32, y: f32) -> Option<String> {
+    /// Clicks at (x, y) and returns the URL the renderer asks to open, if
+    /// any, plus the logs emitted meanwhile.
+    fn click(&mut self, x: f32, y: f32) -> (Option<String>, Vec<String>) {
+        let mut logs = Vec::new();
         let input = self.child.stdin.as_mut().unwrap();
         write_frame(input, &ToRenderer::Click { x, y }.encode()).unwrap();
         input.flush().unwrap();
         loop {
             match self.events.recv_timeout(Duration::from_secs(2)) {
-                Ok(ToBrowser::NavigationRequest(url)) => return Some(url),
+                Ok(ToBrowser::NavigationRequest(url)) => return (Some(url), logs),
+                Ok(ToBrowser::Log(log)) => logs.push(log),
                 Ok(_) => {}
-                Err(_) => return None,
+                Err(_) => return (None, logs),
             }
         }
     }
@@ -194,7 +197,7 @@ fn click_in_block_link_padding_navigates() {
         let mut renderer = Renderer::with_js(js);
         renderer.navigate(fixture("links.html"), &mut String::new());
         assert_eq!(
-            renderer.click(10.0, 10.0).as_deref(),
+            renderer.click(10.0, 10.0).0.as_deref(),
             Some("http://example.test/plain"),
             "js: {js}"
         );
@@ -205,5 +208,17 @@ fn click_in_block_link_padding_navigates() {
 fn prevented_link_click_does_not_navigate() {
     let mut renderer = Renderer::with_js(true);
     renderer.navigate(fixture("links.html"), &mut String::new());
-    assert_eq!(renderer.click(10.0, 110.0), None);
+    let (nav, logs) = renderer.click(10.0, 110.0);
+    assert!(logs.iter().any(|l| l == "[js console] cancelled"), "listener ran: {logs:?}");
+    assert_eq!(nav, None);
+}
+
+#[test]
+fn link_follows_href_set_by_click_handler() {
+    let mut renderer = Renderer::with_js(true);
+    renderer.navigate(fixture("links.html"), &mut String::new());
+    assert_eq!(
+        renderer.click(10.0, 210.0).0.as_deref(),
+        Some("http://example.test/rewritten")
+    );
 }
