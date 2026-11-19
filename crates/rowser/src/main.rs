@@ -198,9 +198,9 @@ struct BrowserView {
     /// range between anchor and cursor is selected.
     url_anchor: Option<usize>,
     url_editing: bool,
-    /// Focus the URL bar on the next render — set by `open_tab`, which runs
+    /// Focus the new tab on the next render — set by `open_tab_at`, which runs
     /// without access to a `Window`.
-    url_focus_pending: bool,
+    focus_pending: Option<FocusHandle>,
     url_focus: FocusHandle,
     /// Focused whenever the page (not the URL bar) should get keys —
     /// the root div tracks it so unfocused-window keys land on the
@@ -351,7 +351,7 @@ impl BrowserView {
             url_cursor: 0,
             url_anchor: None,
             url_editing: false,
-            url_focus_pending: false,
+            focus_pending: None,
             url_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),
             inspector: false,
@@ -429,7 +429,11 @@ impl BrowserView {
         if editing {
             self.url_select_all();
         }
-        self.url_focus_pending = editing;
+        self.focus_pending = Some(if editing {
+            self.url_focus.clone()
+        } else {
+            self.page_focus.clone()
+        });
     }
 
     // --- URL bar text editing -------------------------------------------
@@ -728,11 +732,10 @@ impl Render for BrowserView {
             // atlas allocation can be reused. Unpainted inbox frames need no eviction.
             window.on_next_frame(move |window, cx| cx.drop_image(old, Some(window)));
         }
-        // Deferred URL-bar focus from `open_tab` — it runs without a
+        // Deferred tab focus from `open_tab_at` — it runs without a
         // `Window`, so the flag is consumed here on the next frame.
-        if self.url_focus_pending {
-            self.url_focus_pending = false;
-            self.url_focus.focus(window);
+        if let Some(focus) = self.focus_pending.take() {
+            focus.focus(window);
         }
 
         // Propagate viewport changes to every live renderer. Frames are
