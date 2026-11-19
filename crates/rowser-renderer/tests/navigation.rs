@@ -220,6 +220,19 @@ fn prevented_link_click_does_not_navigate() {
 }
 
 #[test]
+fn link_click_cancelled_before_a_listener_throws_does_not_navigate() {
+    let mut renderer = Renderer::with_js(true);
+    renderer.navigate(fixture("links.html"), &mut String::new());
+    let (nav, logs) = renderer.click(10.0, 610.0);
+    assert_eq!(nav, None, "cancelled link navigated");
+    assert!(
+        logs.iter().any(|l| l.contains("Uncaught (in event listener)") && l.contains("lightbox failed")),
+        "exception reported: {logs:?}"
+    );
+    assert!(logs.iter().any(|l| l == "[js console] after throw"), "later listener ran: {logs:?}");
+}
+
+#[test]
 fn link_follows_href_set_by_click_handler() {
     let mut renderer = Renderer::with_js(true);
     renderer.navigate(fixture("links.html"), &mut String::new());
