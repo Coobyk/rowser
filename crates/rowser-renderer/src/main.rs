@@ -137,7 +137,14 @@ fn main() {
                 }
                 let _ = send(&mut output, &ToBrowser::LoadStarted);
                 let t0 = std::time::Instant::now();
-                let (html, effective) = load_url(base);
+                let (html, mut effective) = load_url(base);
+                if !frag.is_empty() && !effective.contains('#') {
+                    effective.push('#');
+                    effective.push_str(frag);
+                }
+                let (document_base, frag) = effective
+                    .split_once('#')
+                    .unwrap_or((effective.as_str(), ""));
                 let t_fetch = t0.elapsed();
                 let t1 = std::time::Instant::now();
                 let doc = if js_enabled() {
@@ -171,7 +178,7 @@ fn main() {
                     .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| effective.clone());
                 let looks_empty = page_looks_empty(&doc);
-                page.load(doc, effective.clone(), title.clone());
+                page.load(doc, document_base.to_string(), title.clone());
                 page.js = js;
                 load_web_fonts(&page, &mut fonts);
                 page.state.target_frag = if frag.is_empty() {

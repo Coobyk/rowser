@@ -14,8 +14,12 @@ struct Renderer {
 
 impl Renderer {
     fn new() -> Self {
+        Self::with_js(false)
+    }
+
+    fn with_js(enabled: bool) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_rowser-renderer"))
-            .env("ROWSER_JS", "0")
+            .env("ROWSER_JS", if enabled { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -37,6 +41,11 @@ impl Renderer {
     }
 
     fn load(&mut self, message: ToRenderer, title: &mut String) {
+        self.load_logs(message, title);
+    }
+
+    fn load_logs(&mut self, message: ToRenderer, title: &mut String) -> Vec<String> {
+        let mut logs = Vec::new();
         let input = self.child.stdin.as_mut().unwrap();
         write_frame(input, &message.encode()).unwrap();
         input.flush().unwrap();
@@ -44,9 +53,41 @@ impl Renderer {
             match self.events.recv_timeout(Duration::from_secs(30)).unwrap() {
                 ToBrowser::LoadStarted => *title = "Loading…".into(),
                 ToBrowser::Title(t) => *title = t,
+                ToBrowser::Log(log) => logs.push(log),
                 ToBrowser::LoadDone => break,
                 _ => {}
             }
+        }
+        logs
+    }
+}
+
+#[test]
+fn navigate_and_reload_expose_document_fragment_to_scripts() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(6) {
+            let mut stream = stream.unwrap();
+            let mut request = [0; 4096];
+            let n = stream.read(&mut request).unwrap();
+            if String::from_utf8_lossy(&request[..n]).starts_with("GET /redirect ") {
+                write!(stream, "HTTP/1.1 302 Found\r\nLocation: /target#redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            } else {
+                let body = "<h1>Hash route</h1><script>console.log('hash=' + location.hash)</script>";
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        }
+    });
+    let mut renderer = Renderer::with_js(true);
+    let mut title = String::new();
+    for (path, hash) in [("fixture", "#part"), ("redirect", "#redirect")] {
+        let url = format!("{base}/{path}#part");
+        for message in [ToRenderer::Navigate(url.clone()), ToRenderer::Reload(url)] {
+            let logs = renderer.load_logs(message, &mut title);
+            assert!(logs.iter().any(|log| log == &format!("[js console] hash={hash}")), "{path}: {logs:?}");
+            let document_path = if path == "redirect" { "target" } else { path };
+            assert_eq!(title, format!("{base}/{document_path}{hash}"));
         }
     }
 }
