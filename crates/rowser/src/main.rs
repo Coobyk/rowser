@@ -51,8 +51,8 @@ impl Drop for Tab {
 }
 
 impl Tab {
-    fn new(id: usize, url: String) -> Tab {
-        Tab {
+    fn new(id: usize, url: String) -> Self {
+        Self {
             id,
             child: None,
             ipc_out: None,
@@ -141,13 +141,17 @@ impl Tab {
     /// Navigate, recording the visit in history (drops forward entries).
     fn navigate(&mut self, url: &str) {
         dlog(&format!("navigate {url}"));
+        self.record_visit(url);
+        record_history(url);
+        self.send(&ToRenderer::Navigate(url.to_string()));
+    }
+
+    fn record_visit(&mut self, url: &str) {
         self.url = url.to_string();
         self.sel_text.clear();
         self.history.truncate(self.hist + 1);
         self.history.push(url.to_string());
         self.hist = self.history.len() - 1;
-        record_history(url);
-        self.send(&ToRenderer::Navigate(url.to_string()));
     }
 
     fn go(&mut self, idx: usize) {
@@ -335,7 +339,8 @@ impl BrowserView {
 
         let mut tab = self.launch_tab(id, url.clone());
         if tab.alive {
-            tab.navigate(&url);
+            record_history(&url);
+            tab.send(&ToRenderer::Navigate(url.clone()));
         } else {
             tab.title = "spawn failed".into();
         }
@@ -1275,6 +1280,33 @@ mod tests {
         }
         let state = std::fs::read_to_string(path);
         assert!(state.is_err(), "child {pid} not reaped: {state:?}");
+    }
+
+    #[test]
+    fn fresh_tab_has_no_back_entry() {
+        let url = "rowser://newtab/0";
+        let mut tab = Tab::new(0, url.into());
+        assert_eq!(tab.history, [url]);
+        assert_eq!(tab.hist, 0);
+        assert!(!tab.alive);
+        assert!(tab.child.is_none());
+
+        tab.send(&super::ToRenderer::Navigate(url.into()));
+        assert_eq!(tab.history, [url]);
+        assert_eq!(tab.hist, 0);
+
+        tab.record_visit("about:blank");
+        assert_eq!(tab.hist, 1);
+        tab.go(0);
+        assert_eq!(tab.url, url);
+        tab.go(1);
+        assert_eq!(tab.url, "about:blank");
+        tab.go(2);
+        assert_eq!(tab.hist, 1);
+        tab.go(0);
+        tab.record_visit("rowser://newtab/1");
+        assert_eq!(tab.history, [url, "rowser://newtab/1"]);
+        assert_eq!(tab.hist, 1);
     }
 
     #[test]
