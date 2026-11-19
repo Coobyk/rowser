@@ -60,9 +60,9 @@ impl Tab {
             pixels: Vec::new(),
             buf_size: (0, 0),
             title: "New Tab".into(),
-            url,
+            url: url.clone(),
             alive: false,
-            history: Vec::new(),
+            history: vec![url],
             hist: 0,
             sel_text: String::new(),
         }
@@ -325,7 +325,8 @@ impl BrowserView {
                 width: self.last_viewport.0,
                 height: self.last_viewport.1,
             });
-            tab.navigate(&url);
+            record_history(&url);
+            tab.send(&ToRenderer::Navigate(url.clone()));
         } else {
             tab.title = "spawn failed".into();
         }
@@ -1306,7 +1307,12 @@ mod tests {
     fn fresh_tab_has_no_back_entry() {
         let url = "rowser://newtab/0";
         let mut tab = Tab::new(0, url.into());
-        tab.navigate(url);
+        assert_eq!(tab.history, [url]);
+        assert_eq!(tab.hist, 0);
+        assert!(!tab.alive);
+        assert!(tab.child.is_none());
+
+        tab.send(&super::ToRenderer::Navigate(url.into()));
         assert_eq!(tab.history, [url]);
         assert_eq!(tab.hist, 0);
 
