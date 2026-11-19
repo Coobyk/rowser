@@ -10,7 +10,7 @@
 //! formatting may be dropped), foster parenting (table text lands in the
 //! table), foreign content, CDATA, `<template>`, framesets.
 
-use rowser_dom::{Document, NodeId};
+use rowser_dom::{Document, NodeId, NodeKind};
 
 pub fn parse(html: &str) -> Document {
     Parser::new(html).run()
@@ -888,8 +888,14 @@ impl<'a> Parser<'a> {
     }
 
     fn insert_text(&mut self, text: &str) {
-        let id = self.doc.create_text(text);
         let parent = self.current();
+        if let Some(&last) = self.doc.children(parent).last() {
+            if let NodeKind::Text(existing) = &mut self.doc.nodes[last].kind {
+                existing.push_str(text);
+                return;
+            }
+        }
+        let id = self.doc.create_text(text);
         self.doc.append(parent, id);
     }
 
@@ -1231,6 +1237,15 @@ mod tests {
         assert!(t.contains("fish & chips"), "{t}");
         assert!(t.contains('—'), "{t}");
         assert!(t.contains('☺'), "{t}");
+    }
+
+    #[test]
+    fn adjacent_text_tokens_share_one_node() {
+        let doc = parse("<p>a &amp; b</p>");
+        let p = doc.find_deep(doc.root, "p").unwrap();
+        let children = doc.children(p);
+        assert_eq!(children.len(), 1);
+        assert_eq!(doc.text(children[0]), Some("a & b"));
     }
 
     #[test]

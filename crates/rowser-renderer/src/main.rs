@@ -3068,9 +3068,27 @@ fn run_page_scripts(
     }
 }
 
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn error_page(url: &str, why: &str) -> String {
+    let title = "Cannot display page";
+    let url = escape_html(url);
+    let why = escape_html(why);
     format!(
-        "<html><body><h1>Cannot display page</h1><p><b>{url}</b></p><p>{why}</p><hr><p><small>rowser error page</small></p></body></html>"
+        "<html><head><title>{title}</title></head><body><h1>{title}</h1><p><b>{url}</b></p><p>{why}</p><hr><p><small>rowser error page</small></p></body></html>"
     )
 }
 
@@ -3240,15 +3258,18 @@ fn list_page(name: &str) -> String {
         "{}/.config/rowser/{name}.txt",
         std::env::var("HOME").unwrap_or_default()
     );
+    render_list_page(name, &std::fs::read_to_string(file).unwrap_or_default())
+}
+
+fn render_list_page(name: &str, text: &str) -> String {
     let mut items = String::new();
-    if let Ok(text) = std::fs::read_to_string(&file) {
-        for line in text.lines().rev() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            items.push_str(&format!("<li><a href=\"{}\">{}</a></li>", line, line));
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
         }
+        let url = escape_html(line);
+        items.push_str(&format!("<li><a href=\"{url}\">{url}</a></li>"));
     }
     if items.is_empty() {
         items = "<li><i>nothing yet</i></li>".into();
@@ -3397,6 +3418,61 @@ fn web_fetch(url: &str) -> io::Result<rowser_net::Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_page_escapes_url_and_reason() {
+        let html = error_page(
+            "https://example.test/?q=rock&lang=en",
+            r#"URL isn't available: "2 < 3 > 1""#,
+        );
+
+        assert!(html.contains("<b>https://example.test/?q=rock&amp;lang=en</b>"));
+        assert!(html.contains("<p>URL isn&#39;t available: &quot;2 &lt; 3 &gt; 1&quot;</p>"));
+
+        let doc = rowser_html::parse_scripting(&html);
+        let title = doc.find_deep(doc.root, "title").unwrap();
+        assert_eq!(doc.text_content(title), "Cannot display page");
+    }
+
+    #[test]
+    fn list_page_escapes_url_in_href_and_label() {
+        let url = r#"https://example.test/?q="café"&label='2 < 3 > 1'&kind=&copy;"#;
+        let html = render_list_page("history", url);
+        let escaped =
+            "https://example.test/?q=&quot;café&quot;&amp;label=&#39;2 &lt; 3 &gt; 1&#39;&amp;kind=&amp;copy;";
+        assert!(html.contains(&format!("<a href=\"{escaped}\">{escaped}</a>")));
+
+        let doc = rowser_html::parse(&html);
+        let link = doc.find_deep(doc.root, "a").unwrap();
+        assert_eq!(doc.attr(link, "href"), Some(url));
+        assert_eq!(doc.text_content(link), url);
+    }
+
+    #[test]
+    fn history_link_selection_preserves_url() {
+        let url = "https://example.test/one'two&three<4";
+        let doc = rowser_html::parse_scripting(&render_list_page("history", url));
+        let mut page = Page::new();
+        let mut fonts = FontCache::new();
+        page.load(doc, "rowser://history".into(), String::new());
+        page.repaint(&mut fonts);
+
+        let boxes = text_boxes(&page.items, &mut fonts, &mut Vec::new());
+        let first = boxes.iter().find(|b| b.text.starts_with("https://")).unwrap();
+        let last = boxes
+            .iter()
+            .find(|b| b.baseline == first.baseline && b.text.ends_with('4'))
+            .unwrap();
+        let y = first.baseline - 1.0;
+        page.update_sel(
+            &mut fonts,
+            first.x,
+            y,
+            last.x + last.starts[last.nchars()],
+            y,
+        );
+        assert_eq!(page.sel_text, url);
+    }
 
     fn page_with(html: &str, url: &str) -> Page {
         let mut p = Page::new();
