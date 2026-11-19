@@ -183,6 +183,7 @@ impl Tab {
 }
 
 struct BrowserView {
+    displayed_frame: DisplayedFrame,
     bookmarks: Bookmarks,
     tabs: Vec<Tab>,
     active: usize,
@@ -213,6 +214,23 @@ struct BrowserView {
     /// Cursor the page asked for (`ToBrowser::Cursor`) — applied while
     /// the pointer is over the webview.
     page_cursor: CursorStyle,
+}
+
+#[derive(Default)]
+struct DisplayedFrame(Option<Arc<RenderImage>>);
+
+impl DisplayedFrame {
+    fn replace(&mut self, next: Option<Arc<RenderImage>>) -> Option<Arc<RenderImage>> {
+        if self
+            .0
+            .as_ref()
+            .zip(next.as_ref())
+            .is_some_and(|(old, new)| Arc::ptr_eq(old, new))
+        {
+            return None;
+        }
+        std::mem::replace(&mut self.0, next)
+    }
 }
 
 /// Map a CSS `cursor` keyword (renderer → `ToBrowser::Cursor`) to a GPUI
@@ -319,6 +337,7 @@ impl BrowserView {
         outbox: inbox::Sender<(usize, TabEvent)>,
     ) -> Self {
         Self {
+            displayed_frame: DisplayedFrame::default(),
             bookmarks,
             tabs: Vec::new(),
             active: 0,
@@ -696,6 +715,13 @@ fn reader_loop(id: usize, mut reader: UnixStream, tx: inbox::Sender<(usize, TabE
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = &self.tabs[self.active];
+        let next = active.alive.then(|| active.frame.clone()).flatten();
+        if let Some(old) = self.displayed_frame.replace(next) {
+            // The replacement scene must be presented before its predecessor's
+            // atlas allocation can be reused. Unpainted inbox frames need no eviction.
+            window.on_next_frame(move |window, cx| cx.drop_image(old, Some(window)));
+        }
         // Deferred URL-bar focus from `open_tab` — it runs without a
         // `Window`, so the flag is consumed here on the next frame.
         if self.url_focus_pending {
@@ -1334,6 +1360,54 @@ mod tests {
     use super::{read_frame, Child, Command, Duration, Tab, ToRenderer, UnixStream};
     use std::thread;
     use std::time::Instant;
+
+    fn frame() -> std::sync::Arc<gpui::RenderImage> {
+        std::sync::Arc::new(gpui::RenderImage::new([image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]))
+    }
+
+    #[test]
+    fn displayed_frame_retires_only_replaced_images() {
+        let mut displayed = super::DisplayedFrame::default();
+        assert!(displayed.replace(None).is_none());
+        let first = frame();
+        assert!(displayed.replace(Some(first.clone())).is_none());
+        assert!(displayed.replace(Some(first.clone())).is_none());
+        let next = frame();
+        let retired = displayed.replace(Some(next.clone())).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&retired, &first));
+        let retired = displayed.replace(None).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&retired, &next));
+        assert!(displayed.replace(None).is_none());
+    }
+
+    #[test]
+    fn discarded_tab_keeps_displayed_image_until_replacement_scene() {
+        let mut tab = tab(None);
+        tab.buf_size = (1, 1);
+        tab.pixels = vec![0; 4];
+        tab.refresh_frame();
+        let first = tab.frame.clone().unwrap();
+        let mut displayed = super::DisplayedFrame::default();
+        displayed.replace(tab.frame.clone());
+        tab.refresh_frame();
+        tab.refresh_frame();
+        drop(tab);
+        assert!(std::sync::Arc::ptr_eq(&displayed.replace(None).unwrap(), &first));
+    }
+
+    #[test]
+    fn invalid_frame_preserves_displayed_image() {
+        let mut tab = tab(None);
+        tab.buf_size = (1, 1);
+        tab.pixels = vec![0; 4];
+        tab.refresh_frame();
+        let first = tab.frame.clone().unwrap();
+        tab.pixels.clear();
+        tab.refresh_frame();
+        assert!(std::sync::Arc::ptr_eq(tab.frame.as_ref().unwrap(), &first));
+    }
 
     #[test]
     fn closing_tab_to_left_keeps_active_tab() {
