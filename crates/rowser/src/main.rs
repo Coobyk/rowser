@@ -809,6 +809,8 @@ impl Render for BrowserView {
                     )
                     .child("×");
                 if narrow_width.is_some() && !is_active {
+                    // GPUI lays out before applying group_hover display styles, so
+                    // revealing a display:none child at paint misses prepaint.
                     chip.group(tab_hover_group)
                         .child(label().group_hover(tab_hover_group, |style| style.invisible()))
                         .child(
