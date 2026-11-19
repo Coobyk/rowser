@@ -1298,19 +1298,20 @@ impl Page {
             .map(|h| h.4)
     }
 
-    /// `href` of the nearest `<a href>` at or above `node` — a click
+    /// `href` of the nearest `<a>` at or above `node` — a click
     /// anywhere in a link's box (padding, block children, nested inline
     /// content) activates it, not just over its painted text.
     fn link_href(&self, node: rowser_dom::NodeId) -> Option<&str> {
         self.doc.as_ref()?.attr(self.link_node(node)?, "href")
     }
 
-    /// The nearest `<a href>` at or above `node`.
+    /// The nearest `<a>` at or above `node` — the click's activation
+    /// target, whose `href` may still be set by a click handler.
     fn link_node(&self, node: rowser_dom::NodeId) -> Option<rowser_dom::NodeId> {
         let doc = self.doc.as_ref()?;
         let mut cur = Some(node);
         while let Some(n) = cur {
-            if doc.tag(n) == Some("a") && doc.attr(n, "href").is_some() {
+            if doc.tag(n) == Some("a") {
                 return Some(n);
             }
             cur = doc.parent(n);

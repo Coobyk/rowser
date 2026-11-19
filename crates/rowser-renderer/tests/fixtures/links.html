@@ -9,6 +9,7 @@
 <a id="rewrite" href="http://example.test/original">rewritten</a>
 <a href="http://example.test/clicked"><span id="moved">moved</span></a>
 <a id="elsewhere" href="http://example.test/elsewhere"></a>
+<a id="late">late</a>
 <script>
   document.getElementById("cancel").addEventListener("click", (e) => {
     e.preventDefault();
@@ -19,6 +20,9 @@
   });
   document.getElementById("moved").addEventListener("click", (e) => {
     document.getElementById("elsewhere").appendChild(e.currentTarget);
-    console.log("moved");
+    console.log("moved into " + e.currentTarget.parentNode.id);
+  });
+  document.getElementById("late").addEventListener("click", (e) => {
+    e.currentTarget.href = "http://example.test/late";
   });
 </script>
