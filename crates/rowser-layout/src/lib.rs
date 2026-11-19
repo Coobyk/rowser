@@ -11112,6 +11112,12 @@ mod tests {
         })
     }
 
+    fn font_bytes(family: &str) -> Vec<u8> {
+        let faces = rowser_text::scan_system();
+        let face = rowser_text::select(&faces, family, false, false).expect("installed test font");
+        std::fs::read(&face.path).unwrap()
+    }
+
     #[test]
     fn family_fallback_order() {
         // first unresolvable name is skipped; the second wins
@@ -11129,8 +11135,7 @@ mod tests {
 
     #[test]
     fn registered_webfont_wins() {
-        let bytes =
-            std::fs::read("/usr/share/fonts/liberation/LiberationSerif-Regular.ttf").unwrap();
+        let bytes = font_bytes("liberation serif");
         let mut fonts = FontCache::new();
         let idx = fonts
             .register_bytes("My Web Face", &bytes, 400, false, vec![])
@@ -11146,8 +11151,7 @@ mod tests {
 
     #[test]
     fn unicode_range_picks_per_run_face() {
-        let bytes =
-            std::fs::read("/usr/share/fonts/liberation/LiberationSans-Regular.ttf").unwrap();
+        let bytes = font_bytes("liberation sans");
         let mut fonts = FontCache::new();
         let up = fonts
             .register_bytes("Ranged", &bytes, 400, false, vec![(0x41, 0x5a)])

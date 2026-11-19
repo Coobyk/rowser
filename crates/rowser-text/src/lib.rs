@@ -94,26 +94,41 @@ pub struct FontFace {
 /// Scan a directory (non-recursively) for .ttf/.otf files and read their
 /// `name` tables. Fonts without a `glyf` table (CFF .otf) are skipped.
 pub fn scan_dir(dir: &Path) -> Vec<FontFace> {
+    scan_fonts(dir, false)
+}
+
+fn scan_fonts(root: &Path, recursive: bool) -> Vec<FontFace> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let is_font = path.extension().is_some_and(|e| {
-            ["ttf", "otf", "ttc", "otc"]
-                .iter()
-                .any(|x| e.eq_ignore_ascii_case(x))
-        });
-        if !is_font {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
             continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                if recursive {
+                    pending.push(path);
+                }
+                continue;
+            }
+            let is_font = path.extension().is_some_and(|e| {
+                ["ttf", "otf", "ttc", "otc"]
+                    .iter()
+                    .any(|x| e.eq_ignore_ascii_case(x))
+            });
+            if is_font && (kind.is_file() || (kind.is_symlink() && path.is_file())) {
+                out.extend(inspect(&path));
+            }
         }
-        out.extend(inspect(&path));
     }
     out
 }
 
-/// Scan the usual Linux font directories.
+/// Scan the usual Linux font directories recursively, without following directory symlinks.
 pub fn scan_system() -> Vec<FontFace> {
     let mut out = Vec::new();
     for dir in [
@@ -127,18 +142,7 @@ pub fn scan_system() -> Vec<FontFace> {
         } else {
             PathBuf::from(dir)
         };
-        // One level of subdirectories (fonts are grouped by family).
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    out.extend(scan_dir(&p));
-                } else {
-                    out.extend(scan_dir(&dir));
-                    break;
-                }
-            }
-        }
+        out.extend(scan_fonts(&dir, true));
     }
     out
 }
@@ -1498,11 +1502,44 @@ fn raster_contour(poly: &[(f32, f32)], ox: f32, oy: f32, cov: &mut [u8], w: i32,
 mod tests {
     use super::*;
 
+    fn liberation_face() -> &'static FontFace {
+        static FACE: std::sync::OnceLock<FontFace> = std::sync::OnceLock::new();
+        FACE.get_or_init(|| {
+            select(&scan_system(), "liberation sans", false, false)
+                .expect("installed Liberation Sans font")
+                .clone()
+        })
+    }
+
+    #[test]
+    fn discovers_nested_fonts_without_following_directory_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "rowser-font-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let dir = root.join("truetype/liberation");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("LiberationSans-Regular.ttf");
+        fs::write(&path, font_bytes()).unwrap();
+        fs::write(root.join(".uuid"), b"not a font").unwrap();
+        std::os::unix::fs::symlink(&root, dir.join("loop")).unwrap();
+        std::os::unix::fs::symlink(&dir, root.join("alias")).unwrap();
+
+        let faces = scan_fonts(&root, true);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].path, path);
+    }
+
     fn liberation() -> Font {
-        Font::load(Path::new(
-            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-        ))
-        .expect("load liberation")
+        let face = liberation_face();
+        Font::load_indexed(&face.path, face.face_index).expect("load liberation")
     }
 
     #[test]
@@ -1543,14 +1580,14 @@ mod tests {
 
     #[test]
     fn discovers_fonts() {
-        let faces = scan_dir(Path::new("/usr/share/fonts/liberation"));
+        let faces = scan_dir(liberation_face().path.parent().unwrap());
         assert!(faces.len() >= 12);
         let sans = select(&faces, "sans", true, false).unwrap();
         assert!(sans.bold);
     }
 
     fn font_bytes() -> Vec<u8> {
-        std::fs::read("/usr/share/fonts/liberation/LiberationSans-Regular.ttf").unwrap()
+        fs::read(&liberation_face().path).unwrap()
     }
 
     #[test]
