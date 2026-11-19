@@ -22,6 +22,16 @@ use bookmarks::Bookmarks;
 /// Height of the chrome (tab strip + nav bar) the webview doesn't get.
 const CHROME_PX: f32 = 72.0;
 
+const INSPECTOR_PX: f32 = 320.0;
+
+fn webview_viewport(width: f32, height: f32, scale: f32, inspector: bool) -> (u32, u32) {
+    let width = width - if inspector { INSPECTOR_PX } else { 0.0 };
+    (
+        (width * scale).max(64.0) as u32,
+        ((height - CHROME_PX) * scale).max(64.0) as u32,
+    )
+}
+
 enum TabEvent {
     Msg(ToBrowser),
     /// The renderer's socket closed — it crashed or exited.
@@ -755,8 +765,12 @@ impl Render for BrowserView {
         // isn't bilinearly blurred when GPUI composites the bitmap.
         let size = window.viewport_size();
         let sf = window.scale_factor();
-        let content_w = (f32::from(size.width) * sf).max(64.0) as u32;
-        let content_h = ((f32::from(size.height) - CHROME_PX) * sf).max(64.0) as u32;
+        let (content_w, content_h) = webview_viewport(
+            size.width.into(),
+            size.height.into(),
+            sf,
+            self.inspector,
+        );
         if (content_w, content_h) != self.last_viewport {
             self.last_viewport = (content_w, content_h);
             for tab in &mut self.tabs {
@@ -1334,7 +1348,7 @@ impl Render for BrowserView {
                     .child(webview.flex_1().min_w_0());
                 if self.inspector {
                     let mut panel = div()
-                        .w(px(320.0))
+                        .w(px(INSPECTOR_PX))
                         .h_full()
                         .flex_shrink_0()
                         .overflow_hidden()
@@ -1418,6 +1432,14 @@ mod tests {
     use gpui::{px, Styled, TextOverflow};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn inspector_viewport_tracks_webview_area() {
+        assert_eq!(super::webview_viewport(1280., 800., 1., false), (1280, 728));
+        assert_eq!(super::webview_viewport(1280., 800., 1., true), (960, 728));
+        assert_eq!(super::webview_viewport(1280., 800., 2., true), (1920, 1456));
+        assert_eq!(super::webview_viewport(0., 0., 1., true), (64, 64));
+    }
 
     fn frame() -> std::sync::Arc<gpui::RenderImage> {
         std::sync::Arc::new(gpui::RenderImage::new([image::Frame::new(
