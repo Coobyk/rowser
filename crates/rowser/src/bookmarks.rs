@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -9,9 +8,10 @@ type Version = (u64, u64, u64, i64, i64, i64, i64);
 const RACY_MARGIN: Duration = Duration::from_secs(2);
 
 fn timestamp_is_racy(version: Option<Version>, now: SystemTime) -> bool {
-    let Some((_, _, _, seconds, nanos, _, _)) = version else {
+    let Some((_, _, _, mtime, mtime_nsec, ctime, ctime_nsec)) = version else {
         return false;
     };
+    let (seconds, nanos) = (mtime, mtime_nsec).max((ctime, ctime_nsec));
     let modified = UNIX_EPOCH.checked_add(Duration::new(seconds.max(0) as u64, nanos as u32));
     modified
         .and_then(|modified| now.duration_since(modified).ok())
@@ -22,28 +22,32 @@ pub struct Bookmarks {
     path: PathBuf,
     version: Option<Version>,
     contents: Option<String>,
-    racy: Cell<bool>,
+    racy: bool,
     entries: Vec<String>,
     #[cfg(test)]
     reloads: usize,
     #[cfg(test)]
-    reads: Cell<usize>,
+    reads: usize,
 }
 
 impl Bookmarks {
     pub fn new(path: PathBuf) -> Self {
+        Self::new_at(path, SystemTime::now())
+    }
+
+    fn new_at(path: PathBuf, now: SystemTime) -> Self {
         let mut bookmarks = Self {
             path,
             version: None,
             contents: None,
-            racy: Cell::new(false),
+            racy: false,
             entries: Vec::new(),
             #[cfg(test)]
             reloads: 0,
             #[cfg(test)]
-            reads: Cell::new(0),
+            reads: 0,
         };
-        bookmarks.reload();
+        bookmarks.reload_at(now);
         bookmarks
     }
 
@@ -62,9 +66,12 @@ impl Bookmarks {
     }
 
     fn reload(&mut self) {
-        let now = SystemTime::now();
+        self.reload_at(SystemTime::now());
+    }
+
+    fn reload_at(&mut self, now: SystemTime) {
         self.version = self.version();
-        self.racy.set(timestamp_is_racy(self.version, now));
+        self.racy = timestamp_is_racy(self.version, now);
         #[cfg(test)]
         {
             self.reloads += 1;
@@ -77,24 +84,30 @@ impl Bookmarks {
             .unwrap_or_default();
     }
 
-    pub fn has_changed(&self) -> bool {
-        let now = SystemTime::now();
+    pub fn has_changed(&mut self) -> bool {
+        self.has_changed_at(SystemTime::now())
+    }
+
+    fn has_changed_at(&mut self, now: SystemTime) -> bool {
         if self.version != self.version() {
             return true;
         }
-        if !self.racy.get() {
+        if !self.racy {
             return false;
         }
-        if self.contents != self.read_contents() || self.version != self.version() {
+        let contents = self.read_contents();
+        if self.contents != contents || self.version != self.version() {
             return true;
         }
-        self.racy.set(timestamp_is_racy(self.version, now));
+        self.racy = timestamp_is_racy(self.version, now);
         false
     }
 
-    fn read_contents(&self) -> Option<String> {
+    fn read_contents(&mut self) -> Option<String> {
         #[cfg(test)]
-        self.reads.set(self.reads.get() + 1);
+        {
+            self.reads += 1;
+        }
         std::fs::read_to_string(&self.path).ok()
     }
 
@@ -181,43 +194,32 @@ mod tests {
     fn unchanged_non_racy_bookmarks_are_read_only_once() {
         let fixture = Fixture::new();
         std::fs::write(fixture.file(), "https://example.org\n").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(fixture.file())
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(10))
-            .unwrap();
-        let mut bookmarks = Bookmarks::new(fixture.file());
-        assert!(!bookmarks.racy.get());
+        let mut bookmarks =
+            Bookmarks::new_at(fixture.file(), SystemTime::now() + Duration::from_secs(10));
+        assert!(!bookmarks.racy);
         for _ in 0..100 {
             assert!(!bookmarks.has_changed());
             assert!(bookmarks.contains("https://example.org"));
             assert!(!bookmarks.contains("https://other.org"));
         }
         assert_eq!(bookmarks.reloads, 1);
-        assert_eq!(bookmarks.reads.get(), 1);
+        assert_eq!(bookmarks.reads, 1);
     }
 
     #[test]
     fn matching_contents_become_trusted_after_racy_window() {
         let fixture = Fixture::new();
         std::fs::write(fixture.file(), "one\n").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(fixture.file())
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_secs(10))
-            .unwrap();
         let mut bookmarks = Bookmarks::new(fixture.file());
-        bookmarks.racy.set(true);
-        assert!(!bookmarks.has_changed());
-        assert!(!bookmarks.racy.get());
-        assert_eq!(bookmarks.reads.get(), 2);
+        assert!(bookmarks.racy);
+        assert!(!bookmarks.has_changed_at(SystemTime::now() + Duration::from_secs(10)));
+        assert!(!bookmarks.racy);
+        assert_eq!(bookmarks.reads, 2);
         for _ in 0..100 {
             assert!(!bookmarks.has_changed());
             assert!(bookmarks.contains("one"));
         }
-        assert_eq!(bookmarks.reads.get(), 2);
+        assert_eq!(bookmarks.reads, 2);
     }
 
     #[test]
@@ -238,11 +240,35 @@ mod tests {
     }
 
     #[test]
+    fn later_of_mtime_and_ctime_controls_racy_window() {
+        let now = UNIX_EPOCH + Duration::from_secs(110);
+        assert!(timestamp_is_racy(Some((0, 0, 4, 100, 0, 109, 0)), now));
+        assert!(timestamp_is_racy(Some((0, 0, 4, 109, 0, 100, 0)), now));
+        assert!(!timestamp_is_racy(Some((0, 0, 4, 100, 0, 101, 0)), now));
+    }
+
+    #[test]
+    fn backdated_mtime_does_not_make_fresh_contents_trusted() {
+        let fixture = Fixture::new();
+        std::fs::write(fixture.file(), "one\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(fixture.file())
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(10))
+            .unwrap();
+        let mut bookmarks = Bookmarks::new(fixture.file());
+        assert!(bookmarks.racy);
+        assert!(!bookmarks.has_changed());
+        assert_eq!(bookmarks.reads, 2);
+    }
+
+    #[test]
     fn external_edit_with_matching_metadata_is_detected() {
         let fixture = Fixture::new();
         std::fs::write(fixture.file(), "one\n").unwrap();
         let mut bookmarks = Bookmarks::new(fixture.file());
-        assert!(bookmarks.racy.get());
+        assert!(bookmarks.racy);
         std::fs::write(fixture.file(), "two\n").unwrap();
         // Model a timestamp collision regardless of filesystem granularity.
         bookmarks.version = bookmarks.version();
