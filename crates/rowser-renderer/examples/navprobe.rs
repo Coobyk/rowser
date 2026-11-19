@@ -53,4 +53,5 @@ fn main() {
         }
     }
     let _ = p.kill();
+    let _ = p.wait();
 }
