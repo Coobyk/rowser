@@ -1,0 +1,11 @@
+<!doctype html>
+<title>Link click test</title>
+<style>
+  body { margin: 0 }
+  a { display: block; padding: 40px; width: 200px; height: 20px }
+</style>
+<a href="http://example.test/plain">plain</a>
+<a id="cancel" href="http://example.test/cancel"><span>cancelled</span></a>
+<script>
+  document.getElementById("cancel").addEventListener("click", (e) => e.preventDefault());
+</script>

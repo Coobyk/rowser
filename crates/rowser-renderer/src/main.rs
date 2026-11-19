@@ -313,10 +313,72 @@ fn main() {
                 // element box under the point.
                 let target = page.hit_at(x, y);
                 let found = target.and_then(|n| page.link_href(n)).map(str::to_string);
+                let mut follow_link = found.is_some();
+                // The click event fires before the link's default action,
+                // so a handler can cancel it (lightboxes, SPA routers).
+                // Dispatch a synthetic click into the live JS context:
+                // the event bubbles to delegated listeners (React
+                // attaches at the root container), handlers mutate the
+                // DOM, and we repaint the fresh snapshot.
+                let mut dispatched = false;
+                if let (Some(js), Some(nid)) = (&page.js, target) {
+                    let (rtx, rrx) = std::sync::mpsc::channel();
+                    if js
+                        .send(JsJob::Event {
+                            nid,
+                            ty: "click".into(),
+                            client: (x as f64, y as f64),
+                            reply: rtx,
+                        })
+                        .is_ok()
+                    {
+                        match rrx.recv() {
+                            Ok(rep) => {
+                                dispatched = true;
+                                follow_link &= rep.default && rep.nav.is_none();
+                                if let Some(d) = rep.doc {
+                                    page.doc = Some(d);
+                                }
+                                // The fresh DOM may carry new <style>
+                                // rules — relearn what layout depends
+                                // on before reusing anything.
+                                page.layout_dirty = true;
+                                page.pseudo_mask = page.detect_pseudo_mask();
+                                page.scroll_pinned = page.detect_scroll_pinned();
+                                if let Some((n, c)) = page.edit {
+                                    // JS may have rewritten the
+                                    // value — clamp the caret
+                                    let len =
+                                        page.control_value(n).chars().count();
+                                    page.edit = Some((n, c.min(len)));
+                                }
+                                for l in rep.logs {
+                                    let _ = send(&mut output, &ToBrowser::Log(l));
+                                }
+                                page.clear_sel();
+                                page.start_image_prefetch();
+                                page.repaint(&mut fonts);
+                                send_frame(&mut output, &mut page);
+                                let _ = send(&mut output, &ToBrowser::SelText(String::new()));
+                                // The click handler redirected —
+                                // hand the URL to the browser.
+                                if let Some(u) = rep.nav {
+                                    let _ = send(
+                                        &mut output,
+                                        &ToBrowser::NavigationRequest(u),
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                page.js = None; // interpreter thread died
+                            }
+                        }
+                    }
+                }
                 // A plain click collapses any selection — repaint to
                 // erase the baked-in highlight (a link hit repaints via
                 // the navigation it triggers instead).
-                if let Some(url) = found {
+                if let Some(url) = found.filter(|_| follow_link) {
                     page.clear_sel();
                     // hrefs are raw attribute values — resolve against the
                     // page URL so relative links, //host/path, ?query and
@@ -327,64 +389,6 @@ fn main() {
                         .unwrap_or(url);
                     let _ = send(&mut output, &ToBrowser::NavigationRequest(abs));
                 } else {
-                    // Dispatch a synthetic click into the live JS context:
-                    // the event bubbles to delegated listeners (React
-                    // attaches at the root container), handlers mutate the
-                    // DOM, and we repaint the fresh snapshot.
-                    let mut dispatched = false;
-                    if let (Some(js), Some(nid)) = (&page.js, target) {
-                        let (rtx, rrx) = std::sync::mpsc::channel();
-                        if js
-                            .send(JsJob::Event {
-                                nid,
-                                ty: "click".into(),
-                                client: (x as f64, y as f64),
-                                reply: rtx,
-                            })
-                            .is_ok()
-                        {
-                            match rrx.recv() {
-                                Ok(rep) => {
-                                    dispatched = true;
-                                    if let Some(d) = rep.doc {
-                                        page.doc = Some(d);
-                                    }
-                                    // The fresh DOM may carry new <style>
-                                    // rules — relearn what layout depends
-                                    // on before reusing anything.
-                                    page.layout_dirty = true;
-                                    page.pseudo_mask = page.detect_pseudo_mask();
-                                    page.scroll_pinned = page.detect_scroll_pinned();
-                                    if let Some((n, c)) = page.edit {
-                                        // JS may have rewritten the
-                                        // value — clamp the caret
-                                        let len =
-                                            page.control_value(n).chars().count();
-                                        page.edit = Some((n, c.min(len)));
-                                    }
-                                    for l in rep.logs {
-                                        let _ = send(&mut output, &ToBrowser::Log(l));
-                                    }
-                                    page.clear_sel();
-                                    page.start_image_prefetch();
-                                    page.repaint(&mut fonts);
-                                    send_frame(&mut output, &mut page);
-                                    let _ = send(&mut output, &ToBrowser::SelText(String::new()));
-                                    // The click handler redirected —
-                                    // hand the URL to the browser.
-                                    if let Some(u) = rep.nav {
-                                        let _ = send(
-                                            &mut output,
-                                            &ToBrowser::NavigationRequest(u),
-                                        );
-                                    }
-                                }
-                                Err(_) => {
-                                    page.js = None; // interpreter thread died
-                                }
-                            }
-                        }
-                    }
                     if !dispatched && page.clear_sel() && page.has_doc() {
                         page.repaint_scrolled(&mut fonts);
                         send_frame(&mut output, &mut page);
@@ -612,6 +616,8 @@ struct JsReply {
     logs: Vec<String>,
     /// URL a script asked to navigate to (location.assign/replace).
     nav: Option<String>,
+    /// False when a handler called `preventDefault()` on the event.
+    default: bool,
 }
 
 /// Outcome of a `ToRenderer::Key` press.
@@ -2943,18 +2949,22 @@ fn run_page_scripts(
                         reply,
                     } => {
                         let mut logs = Vec::new();
+                        let mut default = true;
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             // 5s turn budget: the event handler plus the
                             // rAF/timer/microtask work it schedules must
                             // not hang the JS thread (and the browser).
-                            if let Err(e) = dc.dispatch_event_pumped(
+                            match dc.dispatch_event_pumped(
                                 nid,
                                 &ty,
                                 client,
                                 std::time::Duration::from_secs(5),
                             ) {
-                                let msg = dc.ctx.interp.inspect(&e, 0);
-                                logs.push(format!("[js] event {ty}: {msg}"));
+                                Ok(d) => default = d,
+                                Err(e) => {
+                                    let msg = dc.ctx.interp.inspect(&e, 0);
+                                    logs.push(format!("[js] event {ty}: {msg}"));
+                                }
                             }
                         }));
                         for e in dc.errors.drain(..) {
@@ -2968,6 +2978,7 @@ fn run_page_scripts(
                                 doc: Some(dc.snapshot_document()),
                                 logs,
                                 nav: dc.take_nav(),
+                                default,
                             })
                             .is_err()
                         {
@@ -2993,6 +3004,7 @@ fn run_page_scripts(
                                 doc: dc.snapshot_if_mutated(),
                                 logs,
                                 nav: dc.take_nav(),
+                                default: true,
                             })
                             .is_err()
                         {
@@ -3516,6 +3528,33 @@ mod tests {
             None,
             "plain paragraph text"
         );
+    }
+
+    #[test]
+    fn click_in_floated_link_padding_navigates() {
+        let (p, rects) =
+            laid_out_link(r#"<a href="/float" style="float:left;padding:40px">floated</a>"#);
+        let &(x, y, w, h, ..) = rects.first().expect("float box is hit-testable");
+        assert_eq!(link_at(&p, x + 5.0, y + 5.0).as_deref(), Some("/float"), "padding");
+        assert_eq!(link_at(&p, x + w / 2.0, y + h / 2.0).as_deref(), Some("/float"), "text");
+    }
+
+    #[test]
+    fn click_on_raised_link_text_navigates() {
+        let (p, _) = laid_out_link(
+            r#"<p style="line-height:20px">x <a href="/up" style="vertical-align:30px">up</a> y</p>"#,
+        );
+        let (x, baseline) = p
+            .items
+            .iter()
+            .find_map(|i| match i {
+                rowser_layout::DisplayItem::Text { x, baseline, href: Some(_), .. } => {
+                    Some((*x, *baseline))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(link_at(&p, x + 3.0, baseline - 4.0).as_deref(), Some("/up"));
     }
 
     #[test]
