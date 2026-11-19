@@ -137,13 +137,17 @@ impl Tab {
     /// Navigate, recording the visit in history (drops forward entries).
     fn navigate(&mut self, url: &str) {
         dlog(&format!("navigate {url}"));
+        self.record_visit(url);
+        record_history(url);
+        self.send(&ToRenderer::Navigate(url.to_string()));
+    }
+
+    fn record_visit(&mut self, url: &str) {
         self.url = url.to_string();
         self.sel_text.clear();
         self.history.truncate(self.hist + 1);
         self.history.push(url.to_string());
         self.hist = self.history.len() - 1;
-        record_history(url);
-        self.send(&ToRenderer::Navigate(url.to_string()));
     }
 
     fn go(&mut self, idx: usize) {
@@ -1316,7 +1320,7 @@ mod tests {
         assert_eq!(tab.history, [url]);
         assert_eq!(tab.hist, 0);
 
-        tab.navigate("about:blank");
+        tab.record_visit("about:blank");
         assert_eq!(tab.hist, 1);
         tab.go(0);
         assert_eq!(tab.url, url);
@@ -1325,7 +1329,7 @@ mod tests {
         tab.go(2);
         assert_eq!(tab.hist, 1);
         tab.go(0);
-        tab.navigate("rowser://newtab/1");
+        tab.record_visit("rowser://newtab/1");
         assert_eq!(tab.history, [url, "rowser://newtab/1"]);
         assert_eq!(tab.hist, 1);
     }
