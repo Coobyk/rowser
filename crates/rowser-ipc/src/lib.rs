@@ -117,6 +117,8 @@ pub enum ToRenderer {
     Ping(u64),
     /// Navigate to a URL (file://, http(s)://, or a synthetic scheme).
     Navigate(String),
+    /// Reload a URL, bypassing same-document navigation.
+    Reload(String),
     /// Viewport size changed; the renderer should produce a new frame.
     ResizeViewport {
         width: u32,
@@ -226,6 +228,7 @@ const TAG_SELECT: u8 = 8;
 const TAG_MOUSEMOVE: u8 = 9;
 const TAG_MOUSEDOWN: u8 = 10;
 const TAG_KEY: u8 = 11;
+const TAG_RELOAD: u8 = 12;
 const TAG_SHUTDOWN: u8 = 4;
 
 const TAG_PONG: u8 = 0;
@@ -251,6 +254,10 @@ impl ToRenderer {
             }
             Self::Navigate(url) => {
                 w.u8(TAG_NAVIGATE);
+                w.string(url);
+            }
+            Self::Reload(url) => {
+                w.u8(TAG_RELOAD);
                 w.string(url);
             }
             Self::ResizeViewport { width, height } => {
@@ -302,6 +309,7 @@ impl ToRenderer {
         Ok(match r.u8()? {
             TAG_PING => Self::Ping(r.u64()?),
             TAG_NAVIGATE => Self::Navigate(r.string()?),
+            TAG_RELOAD => Self::Reload(r.string()?),
             TAG_RESIZE => Self::ResizeViewport {
                 width: r.u32()?,
                 height: r.u32()?,
@@ -475,6 +483,8 @@ mod tests {
         let msgs = [
             ToRenderer::Ping(42),
             ToRenderer::Navigate("file:///tmp/page.html".into()),
+            ToRenderer::Reload("http://localhost/page#part".into()),
+            ToRenderer::Reload(String::new()),
             ToRenderer::ResizeViewport {
                 width: 1920,
                 height: 1080,

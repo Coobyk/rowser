@@ -606,13 +606,13 @@ impl BrowserView {
         }
     }
 
-    /// Reload the active tab by re-navigating to its current URL (the ⟳
+    /// Reload the active tab from its current URL (the ⟳
     /// button); a dead renderer is respawned instead.
     fn reload_active(&mut self) {
         let i = self.active;
         if self.tabs[i].alive {
             let url = self.tabs[i].url.clone();
-            self.tabs[i].send(&ToRenderer::Navigate(url));
+            self.tabs[i].send(&ToRenderer::Reload(url));
         } else {
             self.respawn_tab(i);
         }
