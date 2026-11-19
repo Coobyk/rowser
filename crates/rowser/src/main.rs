@@ -16,6 +16,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+mod bookmarks;
+use bookmarks::Bookmarks;
+
 /// Height of the chrome (tab strip + nav bar) the webview doesn't get.
 const CHROME_PX: f32 = 72.0;
 
@@ -165,6 +168,7 @@ impl Tab {
 }
 
 struct BrowserView {
+    bookmarks: Bookmarks,
     tabs: Vec<Tab>,
     active: usize,
     next_id: usize,
@@ -245,6 +249,7 @@ impl BrowserView {
     fn new(cx: &mut Context<Self>, initial_url: Option<String>) -> Self {
         let (outbox, inbox) = mpsc::channel::<(usize, TabEvent)>();
         let mut view = Self {
+            bookmarks: Bookmarks::new(config_dir().join("bookmarks.txt")),
             tabs: Vec::new(),
             active: 0,
             next_id: 0,
@@ -743,7 +748,7 @@ impl Render for BrowserView {
         } else {
             div().child(active.url.clone()).into_any_element()
         };
-        let starred = bookmarks().iter().any(|b| *b == active.url);
+        let starred = self.bookmarks.contains(&active.url);
         let alive = active.alive;
         let nav = div()
             .flex()
@@ -914,7 +919,7 @@ impl Render for BrowserView {
                         cx.listener(|view, _e, _w, cx| {
                             let i = view.active;
                             let url = view.tabs[i].url.clone();
-                            toggle_bookmark(&url);
+                            view.bookmarks.toggle(&url);
                             cx.notify();
                         }),
                     )
@@ -1228,23 +1233,6 @@ fn record_history(url: &str) {
         use std::io::Write;
         let _ = writeln!(f, "{url}");
     }
-}
-
-fn bookmarks() -> Vec<String> {
-    std::fs::read_to_string(config_dir().join("bookmarks.txt"))
-        .map(|s| s.lines().map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-fn toggle_bookmark(url: &str) {
-    let path = config_dir().join("bookmarks.txt");
-    let mut bm = bookmarks();
-    if let Some(i) = bm.iter().position(|b| b == url) {
-        bm.remove(i);
-    } else {
-        bm.push(url.to_string());
-    }
-    let _ = std::fs::write(path, bm.join("\n") + "\n");
 }
 
 /// Turn user-typed text into a URL: keep schemes, guess https for hosts,
