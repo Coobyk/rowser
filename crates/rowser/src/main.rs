@@ -259,6 +259,11 @@ fn dlog(msg: &str) {
     }
 }
 
+fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
+    let active = if closed < active { active - 1 } else { active };
+    active.min(remaining - 1)
+}
+
 impl BrowserView {
     fn new(cx: &mut Context<Self>, initial_url: Option<String>) -> Self {
         let (outbox, mut inbox) = inbox::channel::<(usize, TabEvent)>();
@@ -507,7 +512,7 @@ impl BrowserView {
         if self.tabs.is_empty() {
             self.open_tab();
         } else {
-            self.active = self.active.min(self.tabs.len() - 1);
+            self.active = active_after_close(self.active, idx, self.tabs.len());
             if self.tabs[self.active].id != active_id {
                 self.refresh_inspector();
             }
@@ -1329,6 +1334,19 @@ mod tests {
     use super::{read_frame, Child, Command, Duration, Tab, ToRenderer, UnixStream};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn closing_tab_to_left_keeps_active_tab() {
+        let mut tabs = [0, 1, 2, 3].to_vec();
+        let active = 2;
+        let active_tab = tabs[active];
+        let closed = 0;
+        tabs.remove(closed);
+        assert_eq!(
+            tabs[super::active_after_close(active, closed, tabs.len())],
+            active_tab
+        );
+    }
 
     #[test]
     fn inbox_repaint_policy() {
