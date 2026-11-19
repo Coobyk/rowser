@@ -292,9 +292,6 @@ fn main() {
                 }
             }
             ToRenderer::Click { x, y } => {
-                // hit-test link regions in document space — the transform
-                // stack maps each item's coords to painted position, so
-                // the click is inverse-mapped back into that space
                 // release ends :active; focus moves to the nearest
                 // focusable ancestor of the hit (or clears)
                 if page.state.active.is_some() {
@@ -311,53 +308,11 @@ fn main() {
                     page.repaint(&mut fonts);
                     send_frame(&mut output, &mut page);
                 }
-                // hit-test link regions in document space
-                let mut found = None;
-                let mut xf: Vec<rowser_layout::xform::Mat> = Vec::new();
-                for it in &page.items {
-                    match it {
-                        rowser_layout::DisplayItem::PushTransform { m } => {
-                            xf.push(*m);
-                            continue;
-                        }
-                        rowser_layout::DisplayItem::PopTransform => {
-                            xf.pop();
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    if let rowser_layout::DisplayItem::Text {
-                        x: tx,
-                        baseline,
-                        text,
-                        font,
-                        size,
-                        href: Some(href),
-                        ..
-                    } = it
-                    {
-                        let _ = (tx, font);
-                        let w = fonts
-                            .font(*font)
-                            .map(|f| f.measure(text, *size))
-                            .unwrap_or(0.0);
-                        let (cx, cy) = xf
-                            .iter()
-                            .fold(rowser_layout::xform::Mat::IDENTITY, |a, m| a.mul(m))
-                            .inverse()
-                            .map(|inv| inv.apply(x, y))
-                            .unwrap_or((x, y));
-                        // rough hit box: from x to x+width, baseline-ascent to baseline+descent
-                        if cx >= *tx
-                            && cx <= *tx + w
-                            && cy >= baseline - size
-                            && cy <= *baseline + size * 0.4
-                        {
-                            found = Some(href.clone());
-                            break;
-                        }
-                    }
-                }
+                // Re-hit after any focus-triggered re-layout: link
+                // activation and JS dispatch both target the deepest
+                // element box under the point.
+                let target = page.hit_at(x, y);
+                let found = target.and_then(|n| page.link_href(n)).map(str::to_string);
                 // A plain click collapses any selection — repaint to
                 // erase the baked-in highlight (a link hit repaints via
                 // the navigation it triggers instead).
@@ -373,27 +328,9 @@ fn main() {
                     let _ = send(&mut output, &ToBrowser::NavigationRequest(abs));
                 } else {
                     // Dispatch a synthetic click into the live JS context:
-                    // hit-test picks the deepest (smallest) element box,
                     // the event bubbles to delegated listeners (React
                     // attaches at the root container), handlers mutate the
                     // DOM, and we repaint the fresh snapshot.
-                    let target = page
-                        .hits
-                        .iter()
-                        .filter(|(hx, hy, hw, hh, _, m)| {
-                            // inverse-map the click into the hit's
-                            // pre-transform space — exact for rotated /
-                            // skewed / scaled elements, not just a bbox
-                            let Some(inv) = m.inverse() else { return false };
-                            let (px, py) = inv.apply(x, y);
-                            px >= *hx && px <= hx + hw && py >= *hy && py <= hy + hh
-                        })
-                        .min_by(|a, b| {
-                            (a.2 * a.3)
-                                .partial_cmp(&(b.2 * b.3))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|h| h.4);
                     let mut dispatched = false;
                     if let (Some(js), Some(nid)) = (&page.js, target) {
                         let (rtx, rrx) = std::sync::mpsc::channel();
@@ -1340,6 +1277,23 @@ impl Page {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|h| h.4)
+    }
+
+    /// `href` of the nearest `<a href>` at or above `node` — a click
+    /// anywhere in a link's box (padding, block children, nested inline
+    /// content) activates it, not just over its painted text.
+    fn link_href(&self, node: rowser_dom::NodeId) -> Option<&str> {
+        let doc = self.doc.as_ref()?;
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if doc.tag(n) == Some("a") {
+                if let Some(h) = doc.attr(n, "href") {
+                    return Some(h);
+                }
+            }
+            cur = doc.parent(n);
+        }
+        None
     }
 
     /// Nearest focusable element at or above `node` — links, form
@@ -3479,6 +3433,117 @@ mod tests {
         p.doc = Some(rowser_html::parse(html));
         p.cur_url = url.to_string();
         p
+    }
+
+    /// Laid-out page plus its first `<a>` and that link's hit rects.
+    fn laid_out_link(html: &str) -> (Page, Vec<rowser_layout::Hit>) {
+        let mut p = Page::new();
+        p.load(
+            rowser_html::parse(html),
+            "http://example.test/".into(),
+            String::new(),
+        );
+        p.repaint(&mut FontCache::new());
+        let doc = p.doc.as_ref().unwrap();
+        let a = doc.find_deep(doc.root, "a").unwrap();
+        let rects = p.hits.iter().filter(|h| h.4 == a).copied().collect();
+        (p, rects)
+    }
+
+    /// The link a click at (x, y) activates — the Click handler's lookup.
+    fn link_at(p: &Page, x: f32, y: f32) -> Option<String> {
+        p.hit_at(x, y)
+            .and_then(|n| p.link_href(n))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn click_in_block_link_padding_and_text_navigates() {
+        let (p, rects) = laid_out_link(
+            r#"<a href="/next" style="display:block;padding:60px;width:200px">CLICK LINK TEXT</a>"#,
+        );
+        let &(x, y, w, h, ..) = rects
+            .iter()
+            .max_by(|a, b| (a.2 * a.3).total_cmp(&(b.2 * b.3)))
+            .unwrap();
+        assert!(
+            w > 200.0 && h > 120.0,
+            "block box covers the padding: {w}x{h}"
+        );
+        assert_eq!(
+            link_at(&p, x + 10.0, y + 10.0).as_deref(),
+            Some("/next"),
+            "padding"
+        );
+        assert_eq!(
+            link_at(&p, x + w - 10.0, y + h - 10.0).as_deref(),
+            Some("/next"),
+            "padding"
+        );
+        assert_eq!(
+            link_at(&p, x + 70.0, y + h / 2.0).as_deref(),
+            Some("/next"),
+            "text"
+        );
+        assert_eq!(
+            link_at(&p, x + w + 20.0, y + h / 2.0),
+            None,
+            "outside the box"
+        );
+    }
+
+    #[test]
+    fn click_on_inline_and_nested_link_text_navigates() {
+        let (p, rects) = laid_out_link(r#"<p>Go <a href="/inline">here <b>now</b></a> please</p>"#);
+        assert!(!rects.is_empty());
+        for &(x, y, w, h, ..) in &rects {
+            assert_eq!(
+                link_at(&p, x + w / 2.0, y + h / 2.0).as_deref(),
+                Some("/inline")
+            );
+        }
+        let doc = p.doc.as_ref().unwrap();
+        let b = doc.find_deep(doc.root, "b").unwrap();
+        let &(x, y, w, h, ..) = p.hits.iter().find(|h| h.4 == b).unwrap();
+        assert_eq!(
+            link_at(&p, x + w / 2.0, y + h / 2.0).as_deref(),
+            Some("/inline"),
+            "<b> inside <a>"
+        );
+        let left = rects.iter().map(|r| r.0).fold(f32::INFINITY, f32::min);
+        assert_eq!(
+            link_at(&p, left - 15.0, y + h / 2.0),
+            None,
+            "plain paragraph text"
+        );
+    }
+
+    #[test]
+    fn click_in_rotated_block_link_navigates() {
+        let (p, rects) = laid_out_link(
+            r#"<a href="/turned" style="display:block;margin:200px;padding:30px;width:300px;transform:rotate(90deg)">turned</a>"#,
+        );
+        let &(x, y, w, h, _, m) = rects
+            .iter()
+            .max_by(|a, b| (a.2 * a.3).total_cmp(&(b.2 * b.3)))
+            .unwrap();
+        assert_ne!(
+            m,
+            rowser_layout::xform::Mat::IDENTITY,
+            "rotation rides the hit matrix"
+        );
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        // rotated about its centre: the box now stands vertically
+        assert_eq!(
+            link_at(&p, cx, cy + w / 2.0 - 10.0).as_deref(),
+            Some("/turned"),
+            "painted end"
+        );
+        assert_eq!(
+            link_at(&p, x + 10.0, cy),
+            None,
+            "where the unrotated box was"
+        );
     }
 
     fn first_form(p: &Page) -> rowser_dom::NodeId {
