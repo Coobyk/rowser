@@ -5005,6 +5005,15 @@ impl<'a> Layouter<'a> {
                 clip_hits(&mut self.hits, children_hits_start, cx, cy, cw, chh);
             }
         }
+        // element border box → click hit-test map
+        self.push_hit((
+            outer_x,
+            content_top - pt - bw_t,
+            box_w,
+            self.y - content_top + pt + bw_t,
+            node,
+            xform::Mat::IDENTITY,
+        ));
         // floats contain their own floats: the bottom covers nested ones
         let mut bottom = self.y;
         for f in &self.floats[f0..] {
@@ -7315,12 +7324,27 @@ impl<'a> Layouter<'a> {
         line_h: f32,
         m: Option<&xform::Mat>,
     ) {
-        // hit for the owning inline element (e.g. <a> over its text)
+        let text_run = w.payload.is_none() && !w.text.is_empty();
+        let run_baseline = if text_run {
+            match w.va {
+                Va::Baseline => baseline,
+                Va::Shift(f) => baseline - f * w.size,
+                // top/middle/bottom on a text run — run edges vs the line
+                // box (text-top/text-bottom approximate as top/bottom)
+                Va::Top => line_top + w.ascent,
+                Va::Middle => line_top + line_h / 2.0 + w.ascent / 2.0,
+                Va::Bottom => line_top + line_h - w.size * 0.25,
+            }
+        } else {
+            baseline
+        };
+        // hit for the owning inline element (e.g. <a> over its text),
+        // following a vertical-align shift of its run
         if !self.pe_blocked {
             if let Some(o) = w.owner {
                 self.hits.push((
                     x,
-                    line_top,
+                    line_top + run_baseline - baseline,
                     w.width,
                     line_h,
                     o,
@@ -7361,15 +7385,7 @@ impl<'a> Layouter<'a> {
                     color: bg,
                 });
             }
-            let baseline = match w.va {
-                Va::Baseline => baseline,
-                Va::Shift(f) => baseline - f * w.size,
-                // top/middle/bottom on a text run — run edges vs the line
-                // box (text-top/text-bottom approximate as top/bottom)
-                Va::Top => line_top + w.ascent,
-                Va::Middle => line_top + line_h / 2.0 + w.ascent / 2.0,
-                Va::Bottom => line_top + line_h - w.size * 0.25,
-            };
+            let baseline = run_baseline;
             // text-shadow: offset clones under the run, blurred via a
             // filter group when a blur radius is set
             for &(sdx, sdy, blur, scol) in &w.shadow {

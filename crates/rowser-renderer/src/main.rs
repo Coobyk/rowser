@@ -298,9 +298,6 @@ fn main() {
                 }
             }
             ToRenderer::Click { x, y } => {
-                // hit-test link regions in document space — the transform
-                // stack maps each item's coords to painted position, so
-                // the click is inverse-mapped back into that space
                 // release ends :active; focus moves to the nearest
                 // focusable ancestor of the hit (or clears)
                 if page.state.active.is_some() {
@@ -317,57 +314,82 @@ fn main() {
                     page.repaint(&mut fonts);
                     send_frame(&mut output, &mut page);
                 }
-                // hit-test link regions in document space
-                let mut found = None;
-                let mut xf: Vec<rowser_layout::xform::Mat> = Vec::new();
-                for it in &page.items {
-                    match it {
-                        rowser_layout::DisplayItem::PushTransform { m } => {
-                            xf.push(*m);
-                            continue;
-                        }
-                        rowser_layout::DisplayItem::PopTransform => {
-                            xf.pop();
-                            continue;
-                        }
-                        _ => {}
-                    }
-                    if let rowser_layout::DisplayItem::Text {
-                        x: tx,
-                        baseline,
-                        text,
-                        font,
-                        size,
-                        href: Some(href),
-                        ..
-                    } = it
+                // Re-hit after any focus-triggered re-layout: link
+                // activation and JS dispatch both target the deepest
+                // element box under the point.
+                let target = page.hit_at(x, y);
+                // the link is fixed at dispatch; its href is read after
+                // (a handler may rewrite it)
+                let link = target.and_then(|n| page.link_node(n));
+                let mut follow_link = link.is_some();
+                // The click event fires before the link's default action,
+                // so a handler can cancel it (lightboxes, SPA routers).
+                // Dispatch a synthetic click into the live JS context:
+                // the event bubbles to delegated listeners (React
+                // attaches at the root container), handlers mutate the
+                // DOM, and we repaint the fresh snapshot.
+                let mut dispatched = false;
+                if let (Some(js), Some(nid)) = (&page.js, target) {
+                    let (rtx, rrx) = std::sync::mpsc::channel();
+                    if js
+                        .send(JsJob::Event {
+                            nid,
+                            ty: "click".into(),
+                            client: (x as f64, y as f64),
+                            reply: rtx,
+                        })
+                        .is_ok()
                     {
-                        let _ = (tx, font);
-                        let w = fonts
-                            .font(*font)
-                            .map(|f| f.measure(text, *size))
-                            .unwrap_or(0.0);
-                        let (cx, cy) = xf
-                            .iter()
-                            .fold(rowser_layout::xform::Mat::IDENTITY, |a, m| a.mul(m))
-                            .inverse()
-                            .map(|inv| inv.apply(x, y))
-                            .unwrap_or((x, y));
-                        // rough hit box: from x to x+width, baseline-ascent to baseline+descent
-                        if cx >= *tx
-                            && cx <= *tx + w
-                            && cy >= baseline - size
-                            && cy <= *baseline + size * 0.4
-                        {
-                            found = Some(href.clone());
-                            break;
+                        match rrx.recv() {
+                            Ok(rep) => {
+                                dispatched = true;
+                                follow_link &= rep.default && rep.nav.is_none();
+                                if let Some(d) = rep.doc {
+                                    page.doc = Some(d);
+                                }
+                                // The fresh DOM may carry new <style>
+                                // rules — relearn what layout depends
+                                // on before reusing anything.
+                                page.layout_dirty = true;
+                                page.pseudo_mask = page.detect_pseudo_mask();
+                                page.scroll_pinned = page.detect_scroll_pinned();
+                                if let Some((n, c)) = page.edit {
+                                    // JS may have rewritten the
+                                    // value — clamp the caret
+                                    let len =
+                                        page.control_value(n).chars().count();
+                                    page.edit = Some((n, c.min(len)));
+                                }
+                                for l in rep.logs {
+                                    let _ = send(&mut output, &ToBrowser::Log(l));
+                                }
+                                page.clear_sel();
+                                page.start_image_prefetch();
+                                page.repaint(&mut fonts);
+                                send_frame(&mut output, &mut page);
+                                let _ = send(&mut output, &ToBrowser::SelText(String::new()));
+                                // The click handler redirected —
+                                // hand the URL to the browser.
+                                if let Some(u) = rep.nav {
+                                    let _ = send(
+                                        &mut output,
+                                        &ToBrowser::NavigationRequest(u),
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                page.js = None; // interpreter thread died
+                            }
                         }
                     }
                 }
                 // A plain click collapses any selection — repaint to
                 // erase the baked-in highlight (a link hit repaints via
                 // the navigation it triggers instead).
-                if let Some(url) = found {
+                let found = link
+                    .and_then(|a| page.doc.as_ref()?.attr(a, "href"))
+                    .map(str::to_string);
+                if let Some(url) = found.filter(|_| follow_link) {
                     page.clear_sel();
                     // hrefs are raw attribute values — resolve against the
                     // page URL so relative links, //host/path, ?query and
@@ -378,82 +400,6 @@ fn main() {
                         .unwrap_or(url);
                     let _ = send(&mut output, &ToBrowser::NavigationRequest(abs));
                 } else {
-                    // Dispatch a synthetic click into the live JS context:
-                    // hit-test picks the deepest (smallest) element box,
-                    // the event bubbles to delegated listeners (React
-                    // attaches at the root container), handlers mutate the
-                    // DOM, and we repaint the fresh snapshot.
-                    let target = page
-                        .hits
-                        .iter()
-                        .filter(|(hx, hy, hw, hh, _, m)| {
-                            // inverse-map the click into the hit's
-                            // pre-transform space — exact for rotated /
-                            // skewed / scaled elements, not just a bbox
-                            let Some(inv) = m.inverse() else { return false };
-                            let (px, py) = inv.apply(x, y);
-                            px >= *hx && px <= hx + hw && py >= *hy && py <= hy + hh
-                        })
-                        .min_by(|a, b| {
-                            (a.2 * a.3)
-                                .partial_cmp(&(b.2 * b.3))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|h| h.4);
-                    let mut dispatched = false;
-                    if let (Some(js), Some(nid)) = (&page.js, target) {
-                        let (rtx, rrx) = std::sync::mpsc::channel();
-                        if js
-                            .send(JsJob::Event {
-                                nid,
-                                ty: "click".into(),
-                                client: (x as f64, y as f64),
-                                reply: rtx,
-                            })
-                            .is_ok()
-                        {
-                            match rrx.recv() {
-                                Ok(rep) => {
-                                    dispatched = true;
-                                    if let Some(d) = rep.doc {
-                                        page.doc = Some(d);
-                                    }
-                                    // The fresh DOM may carry new <style>
-                                    // rules — relearn what layout depends
-                                    // on before reusing anything.
-                                    page.layout_dirty = true;
-                                    page.pseudo_mask = page.detect_pseudo_mask();
-                                    page.scroll_pinned = page.detect_scroll_pinned();
-                                    if let Some((n, c)) = page.edit {
-                                        // JS may have rewritten the
-                                        // value — clamp the caret
-                                        let len =
-                                            page.control_value(n).chars().count();
-                                        page.edit = Some((n, c.min(len)));
-                                    }
-                                    for l in rep.logs {
-                                        let _ = send(&mut output, &ToBrowser::Log(l));
-                                    }
-                                    page.clear_sel();
-                                    page.start_image_prefetch();
-                                    page.repaint(&mut fonts);
-                                    send_frame(&mut output, &mut page);
-                                    let _ = send(&mut output, &ToBrowser::SelText(String::new()));
-                                    // The click handler redirected —
-                                    // hand the URL to the browser.
-                                    if let Some(u) = rep.nav {
-                                        let _ = send(
-                                            &mut output,
-                                            &ToBrowser::NavigationRequest(u),
-                                        );
-                                    }
-                                }
-                                Err(_) => {
-                                    page.js = None; // interpreter thread died
-                                }
-                            }
-                        }
-                    }
                     if !dispatched && page.clear_sel() && page.has_doc() {
                         page.repaint_scrolled(&mut fonts);
                         send_frame(&mut output, &mut page);
@@ -681,6 +627,8 @@ struct JsReply {
     logs: Vec<String>,
     /// URL a script asked to navigate to (location.assign/replace).
     nav: Option<String>,
+    /// False when a handler called `preventDefault()` on the event.
+    default: bool,
 }
 
 /// Outcome of a `ToRenderer::Key` press.
@@ -1346,6 +1294,27 @@ impl Page {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|h| h.4)
+    }
+
+    /// `href` of the nearest `<a>` at or above `node` — a click
+    /// anywhere in a link's box (padding, block children, nested inline
+    /// content) activates it, not just over its painted text.
+    fn link_href(&self, node: rowser_dom::NodeId) -> Option<&str> {
+        self.doc.as_ref()?.attr(self.link_node(node)?, "href")
+    }
+
+    /// The nearest `<a>` at or above `node` — the click's activation
+    /// target, whose `href` may still be set by a click handler.
+    fn link_node(&self, node: rowser_dom::NodeId) -> Option<rowser_dom::NodeId> {
+        let doc = self.doc.as_ref()?;
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if doc.tag(n) == Some("a") {
+                return Some(n);
+            }
+            cur = doc.parent(n);
+        }
+        None
     }
 
     /// Nearest focusable element at or above `node` — links, form
@@ -2996,18 +2965,22 @@ fn run_page_scripts(
                         reply,
                     } => {
                         let mut logs = Vec::new();
+                        let mut default = true;
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             // 5s turn budget: the event handler plus the
                             // rAF/timer/microtask work it schedules must
                             // not hang the JS thread (and the browser).
-                            if let Err(e) = dc.dispatch_event_pumped(
+                            match dc.dispatch_event_pumped(
                                 nid,
                                 &ty,
                                 client,
                                 std::time::Duration::from_secs(5),
                             ) {
-                                let msg = dc.ctx.interp.inspect(&e, 0);
-                                logs.push(format!("[js] event {ty}: {msg}"));
+                                Ok(d) => default = d,
+                                Err(e) => {
+                                    let msg = dc.ctx.interp.inspect(&e, 0);
+                                    logs.push(format!("[js] event {ty}: {msg}"));
+                                }
                             }
                         }));
                         for e in dc.errors.drain(..) {
@@ -3021,6 +2994,7 @@ fn run_page_scripts(
                                 doc: Some(dc.snapshot_document()),
                                 logs,
                                 nav: dc.take_nav(),
+                                default,
                             })
                             .is_err()
                         {
@@ -3046,6 +3020,7 @@ fn run_page_scripts(
                                 doc: dc.snapshot_if_mutated(),
                                 logs,
                                 nav: dc.take_nav(),
+                                default: true,
                             })
                             .is_err()
                         {
@@ -3486,6 +3461,144 @@ mod tests {
         p.doc = Some(rowser_html::parse(html));
         p.cur_url = url.to_string();
         p
+    }
+
+    /// Laid-out page plus its first `<a>` and that link's hit rects.
+    fn laid_out_link(html: &str) -> (Page, Vec<rowser_layout::Hit>) {
+        let mut p = Page::new();
+        p.load(
+            rowser_html::parse(html),
+            "http://example.test/".into(),
+            String::new(),
+        );
+        p.repaint(&mut FontCache::new());
+        let doc = p.doc.as_ref().unwrap();
+        let a = doc.find_deep(doc.root, "a").unwrap();
+        let rects = p.hits.iter().filter(|h| h.4 == a).copied().collect();
+        (p, rects)
+    }
+
+    /// The link a click at (x, y) activates — the Click handler's lookup.
+    fn link_at(p: &Page, x: f32, y: f32) -> Option<String> {
+        p.hit_at(x, y)
+            .and_then(|n| p.link_href(n))
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn click_in_block_link_padding_and_text_navigates() {
+        let (p, rects) = laid_out_link(
+            r#"<a href="/next" style="display:block;padding:60px;width:200px">CLICK LINK TEXT</a>"#,
+        );
+        let &(x, y, w, h, ..) = rects
+            .iter()
+            .max_by(|a, b| (a.2 * a.3).total_cmp(&(b.2 * b.3)))
+            .unwrap();
+        assert!(
+            w > 200.0 && h > 120.0,
+            "block box covers the padding: {w}x{h}"
+        );
+        assert_eq!(
+            link_at(&p, x + 10.0, y + 10.0).as_deref(),
+            Some("/next"),
+            "padding"
+        );
+        assert_eq!(
+            link_at(&p, x + w - 10.0, y + h - 10.0).as_deref(),
+            Some("/next"),
+            "padding"
+        );
+        assert_eq!(
+            link_at(&p, x + 70.0, y + h / 2.0).as_deref(),
+            Some("/next"),
+            "text"
+        );
+        assert_eq!(
+            link_at(&p, x + w + 20.0, y + h / 2.0),
+            None,
+            "outside the box"
+        );
+    }
+
+    #[test]
+    fn click_on_inline_and_nested_link_text_navigates() {
+        let (p, rects) = laid_out_link(r#"<p>Go <a href="/inline">here <b>now</b></a> please</p>"#);
+        assert!(!rects.is_empty());
+        for &(x, y, w, h, ..) in &rects {
+            assert_eq!(
+                link_at(&p, x + w / 2.0, y + h / 2.0).as_deref(),
+                Some("/inline")
+            );
+        }
+        let doc = p.doc.as_ref().unwrap();
+        let b = doc.find_deep(doc.root, "b").unwrap();
+        let &(x, y, w, h, ..) = p.hits.iter().find(|h| h.4 == b).unwrap();
+        assert_eq!(
+            link_at(&p, x + w / 2.0, y + h / 2.0).as_deref(),
+            Some("/inline"),
+            "<b> inside <a>"
+        );
+        let left = rects.iter().map(|r| r.0).fold(f32::INFINITY, f32::min);
+        assert_eq!(
+            link_at(&p, left - 15.0, y + h / 2.0),
+            None,
+            "plain paragraph text"
+        );
+    }
+
+    #[test]
+    fn click_in_floated_link_padding_navigates() {
+        let (p, rects) =
+            laid_out_link(r#"<a href="/float" style="float:left;padding:40px">floated</a>"#);
+        let &(x, y, w, h, ..) = rects.first().expect("float box is hit-testable");
+        assert_eq!(link_at(&p, x + 5.0, y + 5.0).as_deref(), Some("/float"), "padding");
+        assert_eq!(link_at(&p, x + w / 2.0, y + h / 2.0).as_deref(), Some("/float"), "text");
+    }
+
+    #[test]
+    fn click_on_raised_link_text_navigates() {
+        let (p, _) = laid_out_link(
+            r#"<p style="line-height:20px">x <a href="/up" style="vertical-align:30px">up</a> y</p>"#,
+        );
+        let (x, baseline) = p
+            .items
+            .iter()
+            .find_map(|i| match i {
+                rowser_layout::DisplayItem::Text { x, baseline, href: Some(_), .. } => {
+                    Some((*x, *baseline))
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(link_at(&p, x + 3.0, baseline - 4.0).as_deref(), Some("/up"));
+    }
+
+    #[test]
+    fn click_in_rotated_block_link_navigates() {
+        let (p, rects) = laid_out_link(
+            r#"<a href="/turned" style="display:block;margin:200px;padding:30px;width:300px;transform:rotate(90deg)">turned</a>"#,
+        );
+        let &(x, y, w, h, _, m) = rects
+            .iter()
+            .max_by(|a, b| (a.2 * a.3).total_cmp(&(b.2 * b.3)))
+            .unwrap();
+        assert_ne!(
+            m,
+            rowser_layout::xform::Mat::IDENTITY,
+            "rotation rides the hit matrix"
+        );
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        // rotated about its centre: the box now stands vertically
+        assert_eq!(
+            link_at(&p, cx, cy + w / 2.0 - 10.0).as_deref(),
+            Some("/turned"),
+            "painted end"
+        );
+        assert_eq!(
+            link_at(&p, x + 10.0, cy),
+            None,
+            "where the unrotated box was"
+        );
     }
 
     fn first_form(p: &Page) -> rowser_dom::NodeId {
