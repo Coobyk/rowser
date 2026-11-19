@@ -137,7 +137,7 @@ fn main() {
                 }
                 let _ = send(&mut output, &ToBrowser::LoadStarted);
                 let t0 = std::time::Instant::now();
-                let (html, effective) = load_url(&url);
+                let (html, effective) = load_url(base);
                 let t_fetch = t0.elapsed();
                 let t1 = std::time::Instant::now();
                 let doc = if js_enabled() {

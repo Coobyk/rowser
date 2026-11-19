@@ -77,9 +77,28 @@ fn reload_after_anchor_refetches_changed_document() {
     renderer.load(ToRenderer::Reload(anchored), &mut title);
     assert_eq!(requests.load(Ordering::SeqCst), 2, "reload must refetch");
     assert_eq!(title, "Revision 2");
+    renderer.navigate(format!("{url}#other"), &mut title);
+    assert_eq!(requests.load(Ordering::SeqCst), 2, "anchor after reload must not fetch");
+    assert_eq!(title, "Revision 2");
     renderer.load(ToRenderer::Reload(url), &mut title);
     assert_eq!(requests.load(Ordering::SeqCst), 3, "hashless reload must refetch");
     assert_eq!(title, "Revision 3");
+}
+
+#[test]
+fn reload_after_file_anchor_refetches_changed_document() {
+    let path = std::env::temp_dir().join(format!("rowser-reload-{}.html", std::process::id()));
+    std::fs::write(&path, "<title>Revision 1</title><h1 id='part'>Part</h1>").unwrap();
+    let url = format!("file://{}", path.display());
+    let mut renderer = Renderer::new();
+    let mut title = String::new();
+    renderer.navigate(url.clone(), &mut title);
+    renderer.navigate(format!("{url}#part"), &mut title);
+    assert_eq!(title, "Revision 1");
+    std::fs::write(&path, "<title>Revision 2</title><h1 id='part'>Part</h1>").unwrap();
+    renderer.load(ToRenderer::Reload(format!("{url}#part")), &mut title);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(title, "Revision 2", "file reload must refetch without the fragment");
 }
 
 #[test]
