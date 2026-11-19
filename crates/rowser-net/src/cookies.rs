@@ -342,7 +342,7 @@ impl Session {
                     io::Error::new(io::ErrorKind::InvalidData, "redirect without Location")
                 })?;
             parsed = parsed
-                .resolve(&location)
+                .resolve_redirect(&location)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         }
         Err(io::Error::new(
@@ -448,7 +448,7 @@ fn fetch_loop(url: &str, jar: &Mutex<CookieJar>, pool: &mut ConnPool) -> io::Res
                 io::Error::new(io::ErrorKind::InvalidData, "redirect without Location")
             })?;
         parsed = parsed
-            .resolve(&location)
+            .resolve_redirect(&location)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     }
     Err(io::Error::new(

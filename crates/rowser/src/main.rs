@@ -203,6 +203,11 @@ impl Tab {
         };
     }
 
+    fn commit_url(&mut self, url: String) {
+        self.history[self.hist] = url.clone();
+        self.url = url;
+    }
+
     fn go(&mut self, idx: usize) {
         if idx < self.history.len() {
             self.hist = idx;
@@ -665,6 +670,12 @@ impl BrowserView {
                         if is_active {
                             self.dom_dump.clear();
                             self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                        }
+                    }
+                    ToBrowser::NavigationCommitted(url) => {
+                        tab.commit_url(url);
+                        if !self.url_editing && is_active {
+                            self.url_text = tab.url.clone();
                         }
                     }
                     ToBrowser::Title(t) => {
@@ -1586,6 +1597,50 @@ mod tests {
 
         tab.set_title(String::new());
         assert_eq!(tab.title, "rowser://newtab/0");
+    }
+
+    #[test]
+    fn committed_url_replaces_current_entry_and_preserves_traversal() {
+        let mut tab = Tab::new(0, "about:blank".into());
+        tab.record_visit("http://localhost/start");
+        tab.commit_url("http://localhost/final".into());
+        assert_eq!(tab.url, "http://localhost/final");
+        assert_eq!(tab.history, ["about:blank", "http://localhost/final"]);
+        assert_eq!(tab.hist, 1);
+        assert!(tab.ipc_out.is_none());
+        tab.go(0);
+        tab.commit_url("about:blank".into());
+        assert_eq!(tab.url, "about:blank");
+        tab.go(1);
+        assert_eq!(tab.url, "http://localhost/final");
+        tab.commit_url("http://localhost/new-destination".into());
+        assert_eq!(tab.hist, 1);
+        assert_eq!(tab.history, ["about:blank", "http://localhost/new-destination"]);
+    }
+
+    #[test]
+    fn committed_url_updates_chrome_without_overwriting_an_edit() {
+        with_inspector(|view, inbox| {
+            use super::{TabEvent, ToBrowser};
+            view.inspector = false;
+            view.url_editing = false;
+            let commit = |url: &str| TabEvent::Msg(ToBrowser::NavigationCommitted(url.into()));
+            assert!(view.drain_inbox((7, commit("http://localhost/final")), inbox));
+            assert_eq!(view.url_text, "http://localhost/final");
+            view.url_editing = true;
+            view.url_text = "my unfinished URL".into();
+            view.url_cursor = 3;
+            view.url_anchor = Some(1);
+            assert!(view.drain_inbox((7, commit("about:blank")), inbox));
+            assert_eq!(view.tabs[0].url, "about:blank");
+            assert_eq!(view.url_text, "my unfinished URL");
+            assert_eq!(view.url_cursor, 3);
+            assert_eq!(view.url_anchor, Some(1));
+            view.url_editing = false;
+            assert!(view.drain_inbox((8, commit("http://localhost/background")), inbox));
+            assert_eq!(view.url_text, "my unfinished URL");
+            assert_eq!(view.tabs[1].url, "http://localhost/background");
+        });
     }
 
     #[test]

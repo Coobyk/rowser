@@ -1,6 +1,6 @@
 use rowser_ipc::{read_frame, write_frame, ToBrowser, ToRenderer};
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -36,16 +36,21 @@ impl Renderer {
         Self { child, events }
     }
 
-    fn navigate(&mut self, url: String, title: &mut String) {
-        self.load(ToRenderer::Navigate(url), title);
+    fn navigate(&mut self, url: String, title: &mut String) -> Option<String> {
+        self.load_events(ToRenderer::Navigate(url), title).1
     }
 
     fn load(&mut self, message: ToRenderer, title: &mut String) {
-        self.load_logs(message, title);
+        self.load_events(message, title);
     }
 
     fn load_logs(&mut self, message: ToRenderer, title: &mut String) -> Vec<String> {
+        self.load_events(message, title).0
+    }
+
+    fn load_events(&mut self, message: ToRenderer, title: &mut String) -> (Vec<String>, Option<String>) {
         let mut logs = Vec::new();
+        let mut committed = None;
         let input = self.child.stdin.as_mut().unwrap();
         write_frame(input, &message.encode()).unwrap();
         input.flush().unwrap();
@@ -54,11 +59,12 @@ impl Renderer {
                 ToBrowser::LoadStarted => *title = "Loading…".into(),
                 ToBrowser::Title(t) => *title = t,
                 ToBrowser::Log(log) => logs.push(log),
+                ToBrowser::NavigationCommitted(url) => committed = Some(url),
                 ToBrowser::LoadDone => break,
                 _ => {}
             }
         }
-        logs
+        (logs, committed)
     }
 
     /// Clicks at (x, y) and returns the URL the renderer asks to open, if
@@ -233,4 +239,98 @@ fn link_follows_href_set_by_click_handler() {
         Some("http://example.test/late"),
         "href added by the handler"
     );
+}
+
+#[test]
+fn navigation_reports_committed_redirect_url() {
+    check_redirect_url("/final", "", "");
+}
+
+#[test]
+fn navigation_preserves_redirect_fragments() {
+    check_redirect_url("/final", "#details", "#details");
+    check_redirect_url("/final#destination", "#details", "#destination");
+    check_redirect_url("/final#", "#details", "#");
+}
+
+#[test]
+fn fragment_navigation_after_redirect_does_not_refetch() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    let server = std::thread::spawn(move || {
+        let mut requests = 0;
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            if stream.read(&mut request).unwrap() == 0 {
+                break;
+            }
+            requests += 1;
+            let response = if requests == 1 {
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                let body = "<title>Anchors</title><h1 id='a'>A</h1><div style='height: 1500px'></div><h1 id='b'>B</h1>";
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+        requests
+    });
+    let mut renderer = Renderer::new();
+    renderer.navigate(format!("{base}/start#a"), &mut String::new());
+    write_frame(
+        renderer.child.stdin.as_mut().unwrap(),
+        &ToRenderer::Navigate(format!("{base}/final#b")).encode(),
+    ).unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = renderer.events.recv_timeout(Duration::from_secs(30)).unwrap();
+        if event == ToBrowser::LoadDone {
+            break;
+        }
+        events.push(event);
+    }
+    drop(TcpStream::connect(addr).unwrap());
+    let requests = server.join().unwrap();
+    assert_eq!(requests, 2, "fragment navigation refetched the document");
+    assert!(!events.contains(&ToBrowser::LoadStarted));
+    assert!(events.iter().all(|event| matches!(event,
+        ToBrowser::Frame { .. } | ToBrowser::FrameRegion { .. } | ToBrowser::ScrollDelta { .. }
+    )), "expected only scroll painting before LoadDone, got {events:?}");
+}
+
+fn check_redirect_url(location: &str, requested_fragment: &str, expected_fragment: &str) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let location = location.to_string();
+    let server = std::thread::spawn(move || {
+        for redirect in [true, false] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            let response = if redirect {
+                format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            } else {
+                let body = "<title>Final document</title><h1>FINAL DESTINATION</h1>";
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            };
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+    let mut renderer = Renderer::new();
+    let mut title = String::new();
+    let committed = renderer.navigate(format!("{base}/start{requested_fragment}"), &mut title);
+    server.join().unwrap();
+    assert_eq!(committed, Some(format!("{base}/final{expected_fragment}")));
+    assert_eq!(title, "Final document");
+}
+
+#[test]
+fn navigation_reports_direct_and_error_document_urls() {
+    let mut renderer = Renderer::new();
+    let mut title = String::new();
+    for url in ["about:blank", "file:///nonexistent-rowser-commit-test", ""] {
+        assert_eq!(renderer.navigate(url.into(), &mut title), Some(url.into()));
+    }
 }

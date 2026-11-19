@@ -174,6 +174,8 @@ pub enum ToRenderer {
 pub enum ToBrowser {
     Pong(u64),
     LoadStarted,
+    /// Effective document URL after navigation (including HTTP redirects).
+    NavigationCommitted(String),
     /// Document title after navigation completes.
     Title(String),
     /// A newly painted frame: premultiplied BGRA pixels.
@@ -243,6 +245,7 @@ const TAG_SELTEXT: u8 = 8;
 const TAG_CURSOR: u8 = 9;
 const TAG_FRAME_REGION: u8 = 10;
 const TAG_SCROLL_DELTA: u8 = 11;
+const TAG_NAV_COMMITTED: u8 = 12;
 
 impl ToRenderer {
     pub fn encode(&self) -> Vec<u8> {
@@ -362,6 +365,10 @@ impl ToBrowser {
                 w.u64(*n);
             }
             Self::LoadStarted => w.u8(TAG_LOAD_STARTED),
+            Self::NavigationCommitted(url) => {
+                w.u8(TAG_NAV_COMMITTED);
+                w.string(url);
+            }
             Self::Title(title) => {
                 w.u8(TAG_TITLE);
                 w.string(title);
@@ -436,6 +443,7 @@ impl ToBrowser {
         Ok(match r.u8()? {
             TAG_PONG => Self::Pong(r.u64()?),
             TAG_LOAD_STARTED => Self::LoadStarted,
+            TAG_NAV_COMMITTED => Self::NavigationCommitted(r.string()?),
             TAG_TITLE => Self::Title(r.string()?),
             TAG_FRAME => Self::Frame {
                 width: r.u32()?,
@@ -517,6 +525,8 @@ mod tests {
             ToBrowser::Pong(7),
             ToBrowser::LoadStarted,
             ToBrowser::Title("hello".into()),
+            ToBrowser::NavigationCommitted("http://localhost/final".into()),
+            ToBrowser::NavigationCommitted(String::new()),
             ToBrowser::Frame {
                 width: 2,
                 height: 2,

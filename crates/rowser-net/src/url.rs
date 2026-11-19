@@ -150,6 +150,14 @@ impl Url {
         self.query.as_deref().map(percent_decode).transpose()
     }
 
+    pub(crate) fn resolve_redirect(&self, location: &str) -> Result<Url, UrlError> {
+        let mut url = self.resolve(location)?;
+        if url.fragment.is_none() {
+            url.fragment = self.fragment.clone();
+        }
+        Ok(url)
+    }
+
     /// Percent-decoded view of the fragment, if present.
     pub fn decoded_fragment(&self) -> Result<Option<String>, UrlError> {
         self.fragment.as_deref().map(percent_decode).transpose()

@@ -112,7 +112,8 @@ fn main() {
                     .map(|(b, f)| (b, f))
                     .unwrap_or((url.as_str(), ""));
                 let same_page = !page.cur_url.is_empty()
-                    && (base == page.cur_url || (base.is_empty() && !frag.is_empty()));
+                    && (base == page.cur_url.split('#').next().unwrap_or("")
+                        || (base.is_empty() && !frag.is_empty()));
                 if !reload && same_page && !frag.is_empty() {
                     // :target styles may change layout — relayout only
                     // when a sheet could match, then scroll to the
@@ -137,11 +138,7 @@ fn main() {
                 }
                 let _ = send(&mut output, &ToBrowser::LoadStarted);
                 let t0 = std::time::Instant::now();
-                let (html, mut effective) = load_url(base);
-                if !frag.is_empty() && !effective.contains('#') {
-                    effective.push('#');
-                    effective.push_str(frag);
-                }
+                let (html, effective) = load_url(&url);
                 let (document_base, frag) = effective
                     .split_once('#')
                     .unwrap_or((effective.as_str(), ""));
@@ -193,6 +190,7 @@ fn main() {
                         page.repaint_scrolled(&mut fonts);
                     }
                 }
+                let _ = send(&mut output, &ToBrowser::NavigationCommitted(effective.clone()));
                 let _ = send(&mut output, &ToBrowser::Title(title));
                 send_frame(&mut output, &mut page);
                 let _ = send(&mut output, &ToBrowser::LoadDone);
@@ -2788,7 +2786,8 @@ fn load_web_fonts(page: &Page, fonts: &mut FontCache) {
 }
 
 fn load_url(url: &str) -> (String, String) {
-    if let Some(rest) = url.strip_prefix("file://") {
+    let base = url.split_once('#').map_or(url, |(base, _)| base);
+    if let Some(rest) = base.strip_prefix("file://") {
         let path = rowser_net::percent_decode(rest).unwrap_or_else(|_| rest.to_string());
         return match std::fs::read_to_string(&path) {
             Ok(html) => (html, url.to_string()),
@@ -2799,7 +2798,7 @@ fn load_url(url: &str) -> (String, String) {
         };
     }
     if url.starts_with("rowser://") {
-        let name = url.trim_start_matches("rowser://").trim_end_matches('/');
+        let name = base.trim_start_matches("rowser://").trim_end_matches('/');
         if name == "bookmarks" || name == "history" {
             return (list_page(name), url.to_string());
         }
@@ -2817,12 +2816,12 @@ fn load_url(url: &str) -> (String, String) {
             ),
         };
     }
-    if url == "about:blank" {
+    if base == "about:blank" {
         return ("<html><body></body></html>".into(), url.into());
     }
     // Bare path? try as file
-    if std::path::Path::new(url).exists() {
-        if let Ok(html) = std::fs::read_to_string(url) {
+    if std::path::Path::new(base).exists() {
+        if let Ok(html) = std::fs::read_to_string(base) {
             return (html, format!("file://{url}"));
         }
     }
