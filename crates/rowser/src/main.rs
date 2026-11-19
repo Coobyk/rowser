@@ -172,6 +172,17 @@ impl Tab {
         self.hist = self.history.len() - 1;
     }
 
+    fn set_title(&mut self, mut title: String) {
+        if title.contains(['\r', '\n']) {
+            title = title.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        self.title = if title.is_empty() {
+            self.url.clone()
+        } else {
+            title
+        };
+    }
+
     fn go(&mut self, idx: usize) {
         if idx < self.history.len() {
             self.hist = idx;
@@ -560,11 +571,7 @@ impl BrowserView {
                     ToBrowser::Pong(_) => {}
                     ToBrowser::LoadStarted => tab.title = "Loading…".into(),
                     ToBrowser::Title(t) => {
-                        if t.is_empty() {
-                            tab.title = tab.url.clone();
-                        } else {
-                            tab.title = t;
-                        }
+                        tab.set_title(t);
                         tab.send(&ToRenderer::DomDump);
                         if !self.url_editing && is_active {
                             self.url_text = tab.url.clone();
@@ -652,6 +659,10 @@ fn reader_loop(id: usize, mut reader: UnixStream, tx: inbox::Sender<(usize, TabE
     }
 }
 
+fn tab_title_label() -> Div {
+    div().flex_1().min_w_0().line_clamp(1).text_ellipsis()
+}
+
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Deferred URL-bar focus from `open_tab` — it runs without a
@@ -679,6 +690,7 @@ impl Render for BrowserView {
         }
 
         // Tab strip
+        let compact_tabs = size.width < px(120.) * self.tabs.len();
         let mut tab_strip = div()
             .flex()
             .flex_row()
@@ -696,6 +708,7 @@ impl Render for BrowserView {
                 .items_center()
                 .gap_2()
                 .px_3()
+                .when(compact_tabs, |chip| chip.flex_grow().gap_1().px_1p5())
                 .h_full()
                 .min_w(px(80.))
                 .max_w(px(220.))
@@ -719,7 +732,7 @@ impl Render for BrowserView {
                         cx.notify();
                     }),
                 )
-                .child(div().flex_1().overflow_hidden().child(if tab.alive {
+                .child(tab_title_label().child(if tab.alive {
                     tab.title.clone()
                 } else {
                     format!("⚠ {}", tab.title)
@@ -727,6 +740,7 @@ impl Render for BrowserView {
             if self.tabs.len() > 1 {
                 chip = chip.child(
                     div()
+                        .flex_shrink_0()
                         .px_1()
                         .rounded_sm()
                         .text_color(rgb(0x777788))
@@ -1292,9 +1306,30 @@ fn normalize_url(input: &str) -> String {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{read_frame, Child, Command, Duration, Tab, ToRenderer, UnixStream};
+    use super::{read_frame, tab_title_label, Child, Command, Duration, Tab, ToRenderer, UnixStream};
+    use gpui::{Styled, TextOverflow};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn tab_title_labels_stay_on_one_line_and_ellipsize() {
+        let mut label = tab_title_label();
+        let style = label.text_style().as_ref().unwrap();
+
+        assert_eq!(style.line_clamp, Some(1));
+        assert_eq!(style.text_overflow, Some(TextOverflow::Truncate("…".into())));
+    }
+
+    #[test]
+    fn tab_titles_remove_hard_line_breaks_and_keep_url_fallback() {
+        let mut tab = Tab::new(0, "rowser://newtab/0".into());
+
+        tab.set_title("Welcome to\r\n  Rowser".into());
+        assert_eq!(tab.title, "Welcome to Rowser");
+
+        tab.set_title(String::new());
+        assert_eq!(tab.title, "rowser://newtab/0");
+    }
 
     #[test]
     fn inbox_repaint_policy() {
