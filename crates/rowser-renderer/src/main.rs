@@ -106,7 +106,6 @@ fn main() {
                 let _ = send(&mut output, &ToBrowser::Pong(n));
             }
             ToRenderer::Navigate(url) => {
-                let _ = send(&mut output, &ToBrowser::LoadStarted);
                 let (base, frag) = url
                     .split_once('#')
                     .map(|(b, f)| (b, f))
@@ -135,6 +134,7 @@ fn main() {
                     let _ = send(&mut output, &ToBrowser::LoadDone);
                     continue;
                 }
+                let _ = send(&mut output, &ToBrowser::LoadStarted);
                 let t0 = std::time::Instant::now();
                 let (html, effective) = load_url(&url);
                 let t_fetch = t0.elapsed();
