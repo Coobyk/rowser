@@ -16,6 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 mod bookmarks;
+mod inbox;
 use bookmarks::Bookmarks;
 
 /// Height of the chrome (tab strip + nav bar) the webview doesn't get.
@@ -186,7 +187,7 @@ struct BrowserView {
     tabs: Vec<Tab>,
     active: usize,
     next_id: usize,
-    outbox: async_channel::Sender<(usize, TabEvent)>,
+    outbox: inbox::Sender<(usize, TabEvent)>,
     last_viewport: (u32, u32),
     logs: Vec<String>,
     url_text: String,
@@ -260,7 +261,7 @@ fn dlog(msg: &str) {
 
 impl BrowserView {
     fn new(cx: &mut Context<Self>, initial_url: Option<String>) -> Self {
-        let (outbox, inbox) = async_channel::unbounded::<(usize, TabEvent)>();
+        let (outbox, mut inbox) = inbox::channel::<(usize, TabEvent)>();
         let mut view = Self {
             bookmarks: Bookmarks::new(config_dir().join("bookmarks.txt")),
             tabs: Vec::new(),
@@ -284,7 +285,7 @@ impl BrowserView {
 
         // Await renderer messages, batching queued events into one repaint.
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            while let Ok(event) = inbox.recv().await {
+            while let Some(event) = inbox.recv().await {
                 if this
                     .update(&mut *cx, |view, cx| {
                         if view.drain_inbox(event, &inbox) {
@@ -545,12 +546,10 @@ impl BrowserView {
     fn drain_inbox(
         &mut self,
         first: (usize, TabEvent),
-        inbox: &async_channel::Receiver<(usize, TabEvent)>,
+        inbox: &inbox::Receiver<(usize, TabEvent)>,
     ) -> bool {
         let mut changed = false;
-        for (id, event) in
-            std::iter::once(first).chain(std::iter::from_fn(|| inbox.try_recv().ok()))
-        {
+        for (id, event) in std::iter::once(first).chain(std::iter::from_fn(|| inbox.try_recv())) {
             let is_active = self.tabs.get(self.active).is_some_and(|t| t.id == id);
             let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
                 continue;
@@ -627,18 +626,18 @@ impl BrowserView {
     }
 }
 
-fn reader_loop(id: usize, mut reader: UnixStream, tx: async_channel::Sender<(usize, TabEvent)>) {
+fn reader_loop(id: usize, mut reader: UnixStream, tx: inbox::Sender<(usize, TabEvent)>) {
     loop {
         match read_frame(&mut reader) {
             Ok(payload) => match ToBrowser::decode(&payload) {
                 Ok(msg) => {
-                    if tx.send_blocking((id, TabEvent::Msg(msg))).is_err() {
+                    if tx.send((id, TabEvent::Msg(msg))).is_err() {
                         break;
                     }
                 }
                 Err(_) => {
                     if tx
-                        .send_blocking((id, TabEvent::Msg(ToBrowser::Log("bad frame".into()))))
+                        .send((id, TabEvent::Msg(ToBrowser::Log("bad frame".into()))))
                         .is_err()
                     {
                         break;
@@ -646,7 +645,7 @@ fn reader_loop(id: usize, mut reader: UnixStream, tx: async_channel::Sender<(usi
                 }
             },
             Err(_) => {
-                let _ = tx.send_blocking((id, TabEvent::Disconnected));
+                let _ = tx.send((id, TabEvent::Disconnected));
                 break;
             }
         }
@@ -1330,7 +1329,7 @@ mod tests {
     #[test]
     fn reader_delivers_messages_and_disconnect() {
         let (reader, mut peer) = UnixStream::pair().unwrap();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, mut rx) = super::inbox::channel();
         let reader = thread::spawn(move || super::reader_loop(7, reader, tx));
         super::write_frame(&mut peer, &super::ToBrowser::Pong(42).encode()).unwrap();
         super::write_frame(&mut peer, &[]).unwrap();
@@ -1338,23 +1337,28 @@ mod tests {
         reader.join().unwrap();
         assert!(matches!(
             rx.try_recv(),
-            Ok((7, super::TabEvent::Msg(super::ToBrowser::Pong(42))))
+            Some((7, super::TabEvent::Msg(super::ToBrowser::Pong(42))))
         ));
         assert!(matches!(
             rx.try_recv(),
-            Ok((7, super::TabEvent::Msg(super::ToBrowser::Log(_))))
+            Some((7, super::TabEvent::Msg(super::ToBrowser::Log(_))))
         ));
         assert!(matches!(
             rx.try_recv(),
-            Ok((7, super::TabEvent::Disconnected))
+            Some((7, super::TabEvent::Disconnected))
         ));
-        assert!(rx.recv_blocking().is_err());
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            std::future::Future::poll(std::pin::pin!(rx.recv()).as_mut(), &mut cx),
+            std::task::Poll::Ready(None)
+        ));
     }
 
     #[test]
     fn reader_exits_when_receiver_is_dropped() {
         let (reader, mut peer) = UnixStream::pair().unwrap();
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = super::inbox::channel();
         drop(rx);
         super::write_frame(&mut peer, &super::ToBrowser::Pong(0).encode()).unwrap();
         super::reader_loop(0, reader, tx);
