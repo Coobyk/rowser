@@ -282,6 +282,13 @@ fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
     active.min(remaining - 1)
 }
 
+fn new_tab_location(id: usize, initial_url: Option<&str>) -> (String, bool) {
+    let url = initial_url
+        .map(normalize_url)
+        .unwrap_or_else(|| format!("rowser://newtab/{id}"));
+    (url, initial_url.is_none())
+}
+
 impl BrowserView {
     fn new(cx: &mut Context<Self>, initial_url: Option<String>) -> Self {
         let (outbox, mut inbox) = inbox::channel::<(usize, TabEvent)>();
@@ -322,12 +329,7 @@ impl BrowserView {
         )
         .detach();
 
-        view.open_tab();
-        if let Some(url) = initial_url {
-            let url = normalize_url(&url);
-            view.url_text = url.clone();
-            view.tabs[0].navigate(&url);
-        }
+        view.open_tab_at(initial_url.as_deref());
         view
     }
 
@@ -399,10 +401,14 @@ impl BrowserView {
     }
 
     fn open_tab(&mut self) {
+        self.open_tab_at(None);
+    }
+
+    fn open_tab_at(&mut self, initial_url: Option<&str>) {
         dlog("open_tab (ctrl+t / +)");
         let id = self.next_id;
         self.next_id += 1;
-        let url = format!("rowser://newtab/{id}");
+        let (url, editing) = new_tab_location(id, initial_url);
 
         let mut tab = self.launch_tab(id, url.clone());
         if tab.alive {
@@ -416,14 +422,14 @@ impl BrowserView {
         self.active = self.tabs.len() - 1;
         self.dom_dump.clear();
 
-        // A new tab puts its whole URL in the bar pre-selected, so typing
-        // immediately replaces it — like Ctrl+L + type in a real browser.
-        // `open_tab` has no `Window`, so the focus itself is deferred to
-        // `render` via `url_focus_pending`.
         self.url_text = url;
-        self.url_editing = true;
-        self.url_select_all();
-        self.url_focus_pending = true;
+        self.url_editing = editing;
+        self.url_cursor = 0;
+        self.url_anchor = None;
+        if editing {
+            self.url_select_all();
+        }
+        self.url_focus_pending = editing;
     }
 
     // --- URL bar text editing -------------------------------------------
@@ -1360,6 +1366,30 @@ mod tests {
     use super::{read_frame, Child, Command, Duration, Tab, ToRenderer, UnixStream};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn startup_url_is_not_an_address_bar_edit() {
+        for input in [
+            "file:///a/long/startup-page.html",
+            "https://example.com/a/long/path",
+            "https://example.com/é日本語",
+            "rowser://newtab/0",
+            "file:///missing-startup-page.html",
+            "",
+        ] {
+            let (url, editing) = super::new_tab_location(0, Some(input));
+            assert_eq!(url, super::normalize_url(input));
+            assert!(!editing, "startup URL {input:?} must not start an edit");
+        }
+    }
+
+    #[test]
+    fn blank_tab_starts_an_address_bar_edit() {
+        assert_eq!(
+            super::new_tab_location(7, None),
+            ("rowser://newtab/7".into(), true)
+        );
+    }
 
     fn frame() -> std::sync::Arc<gpui::RenderImage> {
         std::sync::Arc::new(gpui::RenderImage::new([image::Frame::new(
