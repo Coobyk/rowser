@@ -4646,6 +4646,7 @@ dependencies = [
 name = "rowser"
 version = "0.0.0"
 dependencies = [
+ "async-channel 2.5.0",
  "gpui",
  "image",
  "rowser-ipc",
