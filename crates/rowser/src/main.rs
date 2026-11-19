@@ -21,6 +21,26 @@ use bookmarks::Bookmarks;
 
 /// Height of the chrome (tab strip + nav bar) the webview doesn't get.
 const CHROME_PX: f32 = 72.0;
+const DOM_DUMP_LINE_LIMIT: usize = 600;
+
+fn inspector_lines(dump: &str) -> Vec<&str> {
+    let mut lines = dump.lines();
+    let mut visible: Vec<_> = lines.by_ref().take(DOM_DUMP_LINE_LIMIT).collect();
+    if lines.next().is_some() {
+        visible.push("… truncated");
+    }
+    visible
+}
+
+const INSPECTOR_PX: f32 = 320.0;
+
+fn webview_viewport(width: f32, height: f32, scale: f32, inspector: bool) -> (u32, u32) {
+    let width = width - if inspector { INSPECTOR_PX } else { 0.0 };
+    (
+        (width * scale).max(64.0) as u32,
+        ((height - CHROME_PX) * scale).max(64.0) as u32,
+    )
+}
 
 enum TabEvent {
     Msg(ToBrowser),
@@ -209,9 +229,9 @@ struct BrowserView {
     /// range between anchor and cursor is selected.
     url_anchor: Option<usize>,
     url_editing: bool,
-    /// Focus the URL bar on the next render — set by `open_tab`, which runs
+    /// Focus the new tab on the next render — set by `open_tab_at`, which runs
     /// without access to a `Window`.
-    url_focus_pending: bool,
+    focus_pending: Option<FocusHandle>,
     url_focus: FocusHandle,
     /// Focused whenever the page (not the URL bar) should get keys —
     /// the root div tracks it so unfocused-window keys land on the
@@ -219,6 +239,7 @@ struct BrowserView {
     page_focus: FocusHandle,
     inspector: bool,
     dom_dump: String,
+    inspector_scroll: ScrollHandle,
     /// In-progress page-text drag: the anchor point in document-space
     /// device px (set on mouse-down, cleared on mouse-up).
     drag: Option<(f32, f32)>,
@@ -293,6 +314,13 @@ fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
     active.min(remaining - 1)
 }
 
+fn new_tab_location(id: usize, initial_url: Option<&str>) -> (String, bool) {
+    let url = initial_url
+        .map(normalize_url)
+        .unwrap_or_else(|| format!("rowser://newtab/{id}"));
+    (url, initial_url.is_none())
+}
+
 impl BrowserView {
     fn new(cx: &mut Context<Self>, initial_url: Option<String>) -> Self {
         let (outbox, mut inbox) = inbox::channel::<(usize, TabEvent)>();
@@ -333,12 +361,7 @@ impl BrowserView {
         )
         .detach();
 
-        view.open_tab();
-        if let Some(url) = initial_url {
-            let url = normalize_url(&url);
-            view.url_text = url.clone();
-            view.tabs[0].navigate(&url);
-        }
+        view.open_tab_at(initial_url.as_deref());
         view
     }
 
@@ -360,11 +383,12 @@ impl BrowserView {
             url_cursor: 0,
             url_anchor: None,
             url_editing: false,
-            url_focus_pending: false,
+            focus_pending: None,
             url_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),
             inspector: false,
             dom_dump: String::new(),
+            inspector_scroll: ScrollHandle::new(),
             drag: None,
             page_cursor: CursorStyle::Arrow,
         }
@@ -410,10 +434,14 @@ impl BrowserView {
     }
 
     fn open_tab(&mut self) {
+        self.open_tab_at(None);
+    }
+
+    fn open_tab_at(&mut self, initial_url: Option<&str>) {
         dlog("open_tab (ctrl+t / +)");
         let id = self.next_id;
         self.next_id += 1;
-        let url = format!("rowser://newtab/{id}");
+        let (url, editing) = new_tab_location(id, initial_url);
 
         let mut tab = self.launch_tab(id, url.clone());
         if tab.alive {
@@ -426,15 +454,20 @@ impl BrowserView {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.dom_dump.clear();
+        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
 
-        // A new tab puts its whole URL in the bar pre-selected, so typing
-        // immediately replaces it — like Ctrl+L + type in a real browser.
-        // `open_tab` has no `Window`, so the focus itself is deferred to
-        // `render` via `url_focus_pending`.
         self.url_text = url;
-        self.url_editing = true;
-        self.url_select_all();
-        self.url_focus_pending = true;
+        self.url_editing = editing;
+        self.url_cursor = 0;
+        self.url_anchor = None;
+        if editing {
+            self.url_select_all();
+        }
+        self.focus_pending = Some(if editing {
+            self.url_focus.clone()
+        } else {
+            self.page_focus.clone()
+        });
     }
 
     // --- URL bar text editing -------------------------------------------
@@ -532,6 +565,7 @@ impl BrowserView {
         old.shut_down();
         if idx == self.active {
             self.dom_dump.clear();
+            self.inspector_scroll.set_offset(point(px(0.), px(0.)));
         }
     }
 
@@ -572,6 +606,7 @@ impl BrowserView {
 
     fn refresh_inspector(&mut self) {
         self.dom_dump.clear();
+        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
         if self.inspector {
             self.tabs[self.active].send(&ToRenderer::DomDump);
         }
@@ -586,13 +621,13 @@ impl BrowserView {
         }
     }
 
-    /// Reload the active tab by re-navigating to its current URL (the ⟳
+    /// Reload the active tab from its current URL (the ⟳
     /// button); a dead renderer is respawned instead.
     fn reload_active(&mut self) {
         let i = self.active;
         if self.tabs[i].alive {
             let url = self.tabs[i].url.clone();
-            self.tabs[i].send(&ToRenderer::Navigate(url));
+            self.tabs[i].send(&ToRenderer::Reload(url));
         } else {
             self.respawn_tab(i);
         }
@@ -625,7 +660,13 @@ impl BrowserView {
             match event {
                 TabEvent::Msg(msg) => match msg {
                     ToBrowser::Pong(_) => {}
-                    ToBrowser::LoadStarted => tab.title = "Loading…".into(),
+                    ToBrowser::LoadStarted => {
+                        tab.title = "Loading…".into();
+                        if is_active {
+                            self.dom_dump.clear();
+                            self.inspector_scroll.set_offset(point(px(0.), px(0.)));
+                        }
+                    }
                     ToBrowser::Title(t) => {
                         tab.set_title(t);
                         if is_inspected {
@@ -686,6 +727,7 @@ impl BrowserView {
                     tab.title = "crashed".into();
                     if is_active {
                         self.dom_dump.clear();
+                        self.inspector_scroll.set_offset(point(px(0.), px(0.)));
                     }
                 }
             }
@@ -743,11 +785,10 @@ impl Render for BrowserView {
             // atlas allocation can be reused. Unpainted inbox frames need no eviction.
             window.on_next_frame(move |window, cx| cx.drop_image(old, Some(window)));
         }
-        // Deferred URL-bar focus from `open_tab` — it runs without a
+        // Deferred tab focus from `open_tab_at` — it runs without a
         // `Window`, so the flag is consumed here on the next frame.
-        if self.url_focus_pending {
-            self.url_focus_pending = false;
-            self.url_focus.focus(window);
+        if let Some(focus) = self.focus_pending.take() {
+            focus.focus(window);
         }
 
         // Propagate viewport changes to every live renderer. Frames are
@@ -755,8 +796,12 @@ impl Render for BrowserView {
         // isn't bilinearly blurred when GPUI composites the bitmap.
         let size = window.viewport_size();
         let sf = window.scale_factor();
-        let content_w = (f32::from(size.width) * sf).max(64.0) as u32;
-        let content_h = ((f32::from(size.height) - CHROME_PX) * sf).max(64.0) as u32;
+        let (content_w, content_h) = webview_viewport(
+            size.width.into(),
+            size.height.into(),
+            sf,
+            self.inspector,
+        );
         if (content_w, content_h) != self.last_viewport {
             self.last_viewport = (content_w, content_h);
             for tab in &mut self.tabs {
@@ -1334,19 +1379,23 @@ impl Render for BrowserView {
                     .child(webview.flex_1().min_w_0());
                 if self.inspector {
                     let mut panel = div()
-                        .w(px(320.0))
+                        .id("dom-inspector")
+                        .w(px(INSPECTOR_PX))
                         .h_full()
                         .flex_shrink_0()
                         .overflow_hidden()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.inspector_scroll)
                         .bg(rgb(0x0c0c10))
                         .border_l_1()
                         .border_color(rgb(0x333344))
                         .p_2()
                         .flex()
                         .flex_col();
-                    for line in self.dom_dump.lines().take(600) {
+                    for line in inspector_lines(&self.dom_dump) {
                         panel = panel.child(
                             div()
+                                .flex_shrink_0()
                                 .text_xs()
                                 .whitespace_nowrap()
                                 .text_color(rgb(0x88aa88))
@@ -1412,12 +1461,44 @@ fn normalize_url(input: &str) -> String {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::{
-        narrow_tab_width, read_frame, tab_title_label, Child, Command, Duration, Tab, ToRenderer,
-        UnixStream,
+        narrow_tab_width, read_frame, tab_title_label, Child, Command, Duration, Tab, TabEvent,
+        ToBrowser, ToRenderer, UnixStream,
     };
     use gpui::{px, Styled, TextOverflow};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn inspector_viewport_tracks_webview_area() {
+        assert_eq!(super::webview_viewport(1280., 800., 1., false), (1280, 728));
+        assert_eq!(super::webview_viewport(1280., 800., 1., true), (960, 728));
+        assert_eq!(super::webview_viewport(1280., 800., 2., true), (1920, 1456));
+        assert_eq!(super::webview_viewport(0., 0., 1., true), (64, 64));
+    }
+
+    #[test]
+    fn startup_url_is_not_an_address_bar_edit() {
+        for input in [
+            "file:///a/long/startup-page.html",
+            "https://example.com/a/long/path",
+            "https://example.com/é日本語",
+            "rowser://newtab/0",
+            "file:///missing-startup-page.html",
+            "",
+        ] {
+            let (url, editing) = super::new_tab_location(0, Some(input));
+            assert_eq!(url, super::normalize_url(input));
+            assert!(!editing, "startup URL {input:?} must not start an edit");
+        }
+    }
+
+    #[test]
+    fn blank_tab_starts_an_address_bar_edit() {
+        assert_eq!(
+            super::new_tab_location(7, None),
+            ("rowser://newtab/7".into(), true)
+        );
+    }
 
     fn frame() -> std::sync::Arc<gpui::RenderImage> {
         std::sync::Arc::new(gpui::RenderImage::new([image::Frame::new(
@@ -1586,6 +1667,63 @@ mod tests {
             assert_eq!(view.dom_dump, "<history>");
             assert!(!repainted);
         });
+    }
+
+    #[test]
+    fn inspector_clears_previous_document_on_load_started() {
+        with_inspector(|view, inbox| {
+            view.drain_inbox((8, TabEvent::Msg(ToBrowser::LoadStarted)), inbox);
+            assert_eq!(view.dom_dump, "<history>");
+            view.drain_inbox((7, TabEvent::Msg(ToBrowser::LoadStarted)), inbox);
+            assert!(
+                view.dom_dump.is_empty(),
+                "old document remains in the inspector"
+            );
+        });
+    }
+
+    #[test]
+    fn inspector_scroll_persists_until_document_changes() {
+        with_inspector(|view, inbox| {
+            let offset = gpui::point(gpui::px(0.), gpui::px(-200.));
+            let top = gpui::point(gpui::px(0.), gpui::px(0.));
+            view.inspector_scroll.set_offset(offset);
+            view.drain_inbox(
+                (7, TabEvent::Msg(ToBrowser::DomDump("updated".into()))),
+                inbox,
+            );
+            assert_eq!(view.inspector_scroll.offset(), offset);
+            view.drain_inbox((8, TabEvent::Msg(ToBrowser::LoadStarted)), inbox);
+            assert_eq!(view.inspector_scroll.offset(), offset);
+            view.drain_inbox((7, TabEvent::Msg(ToBrowser::LoadStarted)), inbox);
+            assert_eq!(view.inspector_scroll.offset(), top);
+            view.inspector_scroll.set_offset(offset);
+            view.set_active_tab(1);
+            assert_eq!(view.inspector_scroll.offset(), top);
+            view.inspector_scroll.set_offset(offset);
+            view.set_active_tab(1);
+            assert_eq!(view.inspector_scroll.offset(), offset);
+            view.drain_inbox((8, TabEvent::Disconnected), inbox);
+            assert_eq!(view.inspector_scroll.offset(), top);
+        });
+    }
+
+    #[test]
+    fn inspector_lines_caps_only_truncated_dumps() {
+        assert!(super::inspector_lines("").is_empty());
+        assert_eq!(
+            super::inspector_lines("html\n  body\n"),
+            vec!["html", "  body"]
+        );
+        let dump = "line\n".repeat(super::DOM_DUMP_LINE_LIMIT);
+        assert_eq!(
+            super::inspector_lines(&dump).len(),
+            super::DOM_DUMP_LINE_LIMIT
+        );
+        let longer = dump + "last\n";
+        let lines = super::inspector_lines(&longer);
+        assert_eq!(lines.len(), super::DOM_DUMP_LINE_LIMIT + 1);
+        assert_eq!(lines.last(), Some(&"… truncated"));
     }
 
     #[test]

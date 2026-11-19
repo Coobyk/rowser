@@ -101,18 +101,19 @@ fn main() {
                 }
             }
         };
+        let reload = matches!(msg, ToRenderer::Reload(_));
         match msg {
             ToRenderer::Ping(n) => {
                 let _ = send(&mut output, &ToBrowser::Pong(n));
             }
-            ToRenderer::Navigate(url) => {
+            ToRenderer::Navigate(url) | ToRenderer::Reload(url) => {
                 let (base, frag) = url
                     .split_once('#')
                     .map(|(b, f)| (b, f))
                     .unwrap_or((url.as_str(), ""));
                 let same_page = !page.cur_url.is_empty()
                     && (base == page.cur_url || (base.is_empty() && !frag.is_empty()));
-                if same_page && !frag.is_empty() {
+                if !reload && same_page && !frag.is_empty() {
                     // :target styles may change layout — relayout only
                     // when a sheet could match, then scroll to the
                     // (freshly laid-out) anchor
@@ -136,7 +137,14 @@ fn main() {
                 }
                 let _ = send(&mut output, &ToBrowser::LoadStarted);
                 let t0 = std::time::Instant::now();
-                let (html, effective) = load_url(&url);
+                let (html, mut effective) = load_url(base);
+                if !frag.is_empty() && !effective.contains('#') {
+                    effective.push('#');
+                    effective.push_str(frag);
+                }
+                let (document_base, frag) = effective
+                    .split_once('#')
+                    .unwrap_or((effective.as_str(), ""));
                 let t_fetch = t0.elapsed();
                 let t1 = std::time::Instant::now();
                 let doc = if js_enabled() {
@@ -170,7 +178,7 @@ fn main() {
                     .filter(|t| !t.is_empty())
                     .unwrap_or_else(|| effective.clone());
                 let looks_empty = page_looks_empty(&doc);
-                page.load(doc, effective.clone(), title.clone());
+                page.load(doc, document_base.to_string(), title.clone());
                 page.js = js;
                 load_web_fonts(&page, &mut fonts);
                 page.state.target_frag = if frag.is_empty() {
