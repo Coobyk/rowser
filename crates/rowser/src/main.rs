@@ -44,7 +44,25 @@ struct Tab {
     sel_text: String,
 }
 
+impl Drop for Tab {
+    fn drop(&mut self) {
+        self.stop_renderer();
+    }
+}
+
 impl Tab {
+    fn stop_renderer(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            // Waiting for process exit must not stall the UI thread.
+            thread::spawn(move || {
+                if let Err(err) = child.wait() {
+                    eprintln!("failed to reap renderer: {err}");
+                }
+            });
+        }
+    }
+
     fn send(&mut self, msg: &ToRenderer) {
         if let Some(out) = &mut self.ipc_out {
             let _ = write_frame(out, &msg.encode());
@@ -251,6 +269,7 @@ impl BrowserView {
 
     fn spawn_renderer() -> Option<(Child, UnixStream, UnixStream)> {
         let (parent, child_end) = UnixStream::pair().ok()?;
+        let reader = parent.try_clone().ok()?;
         let child_out = child_end.try_clone().ok()?;
         let exe = std::env::current_exe()
             .ok()?
@@ -268,7 +287,7 @@ impl BrowserView {
             cmd.stderr(Stdio::from(f));
         }
         let child = cmd.spawn().ok()?;
-        Some((child, parent.try_clone().ok()?, parent))
+        Some((child, reader, parent))
     }
 
     fn open_tab(&mut self) {
@@ -435,18 +454,13 @@ impl BrowserView {
         }
         let mut old = std::mem::replace(&mut self.tabs[idx], fresh);
         old.send(&ToRenderer::Shutdown);
-        if let Some(mut c) = old.child.take() {
-            let _ = c.kill();
-        }
     }
 
     fn close_tab(&mut self, idx: usize) {
         dlog(&format!("close_tab {idx}"));
         let mut tab = self.tabs.remove(idx);
         tab.send(&ToRenderer::Shutdown);
-        if let Some(mut c) = tab.child.take() {
-            let _ = c.kill();
-        }
+        drop(tab);
         if self.tabs.is_empty() {
             self.open_tab();
         } else {
@@ -563,6 +577,7 @@ impl BrowserView {
                     ToBrowser::Log(m) => self.logs.push(format!("tab {id}: {m}")),
                 },
                 TabEvent::Disconnected => {
+                    tab.stop_renderer();
                     tab.alive = false;
                     tab.ipc_out = None;
                     tab.frame = None;
@@ -1248,4 +1263,67 @@ fn normalize_url(input: &str) -> String {
         return format!("file://{s}");
     }
     format!("https://{s}")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{Child, Command, Duration, Tab};
+    use std::thread;
+    use std::time::Instant;
+
+    fn tab(child: Option<Child>) -> Tab {
+        Tab {
+            id: 0,
+            child,
+            ipc_out: None,
+            frame: None,
+            pixels: Vec::new(),
+            buf_size: (0, 0),
+            title: String::new(),
+            url: String::new(),
+            alive: false,
+            history: Vec::new(),
+            hist: 0,
+            sel_text: String::new(),
+        }
+    }
+
+    fn assert_reaped(pid: u32) {
+        let path = format!("/proc/{pid}/stat");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while std::path::Path::new(&path).exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let state = std::fs::read_to_string(path);
+        assert!(state.is_err(), "child {pid} not reaped: {state:?}");
+    }
+
+    #[test]
+    fn removed_tab_reaps_running_child() {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        let mut tabs = vec![tab(Some(child))];
+        drop(tabs.remove(0));
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn replaced_tab_reaps_exited_child() {
+        let child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let path = format!("/proc/{pid}/stat");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !std::fs::read_to_string(&path).unwrap().contains(") Z ") {
+            assert!(Instant::now() < deadline, "child did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let mut old = tab(Some(child));
+        drop(std::mem::replace(&mut old, tab(None)));
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn drop_tab_without_child() {
+        drop(tab(None));
+    }
 }
