@@ -14,7 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod bookmarks;
 use bookmarks::Bookmarks;
@@ -287,12 +287,18 @@ impl BrowserView {
 
         // Drain renderer messages into the UI. Polling via gpui::Timer keeps
         // this dep-free — no async channel crate needed.
-        cx.spawn(
-            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut last_bookmark_check = Instant::now();
+            loop {
                 Timer::after(Duration::from_millis(4)).await;
                 if this
                     .update(&mut *cx, |view, cx| {
-                        if view.drain_inbox() {
+                        let mut changed = view.drain_inbox();
+                        if last_bookmark_check.elapsed() >= Duration::from_secs(1) {
+                            last_bookmark_check = Instant::now();
+                            changed |= view.bookmarks.has_changed();
+                        }
+                        if changed {
                             cx.notify();
                         }
                     })
@@ -300,8 +306,8 @@ impl BrowserView {
                 {
                     break;
                 }
-            },
-        )
+            }
+        })
         .detach();
 
         view.open_tab();

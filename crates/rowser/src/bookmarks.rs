@@ -49,8 +49,12 @@ impl Bookmarks {
             .unwrap_or_default();
     }
 
+    pub fn has_changed(&self) -> bool {
+        self.version != self.version()
+    }
+
     fn refresh(&mut self) {
-        if self.version != self.version() {
+        if self.has_changed() {
             self.reload();
         }
     }
@@ -100,6 +104,32 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn change_detection_does_not_read_or_reload() {
+        let fixture = Fixture::new();
+        let mut bookmarks = Bookmarks::new(fixture.file());
+        assert!(!bookmarks.has_changed());
+        std::fs::write(fixture.file(), "one\n").unwrap();
+        assert!(bookmarks.has_changed());
+        assert!(bookmarks.has_changed());
+        assert_eq!(bookmarks.reads, 1);
+        assert!(bookmarks.entries.is_empty());
+        assert!(bookmarks.contains("one"));
+        assert!(!bookmarks.has_changed());
+
+        std::fs::write(fixture.file(), "longer-url\n").unwrap();
+        assert!(bookmarks.has_changed());
+        assert_eq!(bookmarks.reads, 2);
+        assert!(bookmarks.contains("longer-url"));
+        assert!(!bookmarks.has_changed());
+
+        std::fs::remove_file(fixture.file()).unwrap();
+        assert!(bookmarks.has_changed());
+        assert_eq!(bookmarks.reads, 3);
+        assert!(!bookmarks.contains("longer-url"));
+        assert!(!bookmarks.has_changed());
     }
 
     #[test]
