@@ -32,6 +32,16 @@ fn inspector_lines(dump: &str) -> Vec<&str> {
     visible
 }
 
+const INSPECTOR_PX: f32 = 320.0;
+
+fn webview_viewport(width: f32, height: f32, scale: f32, inspector: bool) -> (u32, u32) {
+    let width = width - if inspector { INSPECTOR_PX } else { 0.0 };
+    (
+        (width * scale).max(64.0) as u32,
+        ((height - CHROME_PX) * scale).max(64.0) as u32,
+    )
+}
+
 enum TabEvent {
     Msg(ToBrowser),
     /// The renderer's socket closed — it crashed or exited.
@@ -219,9 +229,9 @@ struct BrowserView {
     /// range between anchor and cursor is selected.
     url_anchor: Option<usize>,
     url_editing: bool,
-    /// Focus the URL bar on the next render — set by `open_tab`, which runs
+    /// Focus the new tab on the next render — set by `open_tab_at`, which runs
     /// without access to a `Window`.
-    url_focus_pending: bool,
+    focus_pending: Option<FocusHandle>,
     url_focus: FocusHandle,
     /// Focused whenever the page (not the URL bar) should get keys —
     /// the root div tracks it so unfocused-window keys land on the
@@ -304,6 +314,13 @@ fn active_after_close(active: usize, closed: usize, remaining: usize) -> usize {
     active.min(remaining - 1)
 }
 
+fn new_tab_location(id: usize, initial_url: Option<&str>) -> (String, bool) {
+    let url = initial_url
+        .map(normalize_url)
+        .unwrap_or_else(|| format!("rowser://newtab/{id}"));
+    (url, initial_url.is_none())
+}
+
 impl BrowserView {
     fn new(cx: &mut Context<Self>, initial_url: Option<String>) -> Self {
         let (outbox, mut inbox) = inbox::channel::<(usize, TabEvent)>();
@@ -344,12 +361,7 @@ impl BrowserView {
         )
         .detach();
 
-        view.open_tab();
-        if let Some(url) = initial_url {
-            let url = normalize_url(&url);
-            view.url_text = url.clone();
-            view.tabs[0].navigate(&url);
-        }
+        view.open_tab_at(initial_url.as_deref());
         view
     }
 
@@ -371,7 +383,7 @@ impl BrowserView {
             url_cursor: 0,
             url_anchor: None,
             url_editing: false,
-            url_focus_pending: false,
+            focus_pending: None,
             url_focus: cx.focus_handle(),
             page_focus: cx.focus_handle(),
             inspector: false,
@@ -422,10 +434,14 @@ impl BrowserView {
     }
 
     fn open_tab(&mut self) {
+        self.open_tab_at(None);
+    }
+
+    fn open_tab_at(&mut self, initial_url: Option<&str>) {
         dlog("open_tab (ctrl+t / +)");
         let id = self.next_id;
         self.next_id += 1;
-        let url = format!("rowser://newtab/{id}");
+        let (url, editing) = new_tab_location(id, initial_url);
 
         let mut tab = self.launch_tab(id, url.clone());
         if tab.alive {
@@ -440,14 +456,18 @@ impl BrowserView {
         self.dom_dump.clear();
         self.inspector_scroll.set_offset(point(px(0.), px(0.)));
 
-        // A new tab puts its whole URL in the bar pre-selected, so typing
-        // immediately replaces it — like Ctrl+L + type in a real browser.
-        // `open_tab` has no `Window`, so the focus itself is deferred to
-        // `render` via `url_focus_pending`.
         self.url_text = url;
-        self.url_editing = true;
-        self.url_select_all();
-        self.url_focus_pending = true;
+        self.url_editing = editing;
+        self.url_cursor = 0;
+        self.url_anchor = None;
+        if editing {
+            self.url_select_all();
+        }
+        self.focus_pending = Some(if editing {
+            self.url_focus.clone()
+        } else {
+            self.page_focus.clone()
+        });
     }
 
     // --- URL bar text editing -------------------------------------------
@@ -765,11 +785,10 @@ impl Render for BrowserView {
             // atlas allocation can be reused. Unpainted inbox frames need no eviction.
             window.on_next_frame(move |window, cx| cx.drop_image(old, Some(window)));
         }
-        // Deferred URL-bar focus from `open_tab` — it runs without a
+        // Deferred tab focus from `open_tab_at` — it runs without a
         // `Window`, so the flag is consumed here on the next frame.
-        if self.url_focus_pending {
-            self.url_focus_pending = false;
-            self.url_focus.focus(window);
+        if let Some(focus) = self.focus_pending.take() {
+            focus.focus(window);
         }
 
         // Propagate viewport changes to every live renderer. Frames are
@@ -777,8 +796,12 @@ impl Render for BrowserView {
         // isn't bilinearly blurred when GPUI composites the bitmap.
         let size = window.viewport_size();
         let sf = window.scale_factor();
-        let content_w = (f32::from(size.width) * sf).max(64.0) as u32;
-        let content_h = ((f32::from(size.height) - CHROME_PX) * sf).max(64.0) as u32;
+        let (content_w, content_h) = webview_viewport(
+            size.width.into(),
+            size.height.into(),
+            sf,
+            self.inspector,
+        );
         if (content_w, content_h) != self.last_viewport {
             self.last_viewport = (content_w, content_h);
             for tab in &mut self.tabs {
@@ -1357,7 +1380,7 @@ impl Render for BrowserView {
                 if self.inspector {
                     let mut panel = div()
                         .id("dom-inspector")
-                        .w(px(320.0))
+                        .w(px(INSPECTOR_PX))
                         .h_full()
                         .flex_shrink_0()
                         .overflow_hidden()
@@ -1444,6 +1467,38 @@ mod tests {
     use gpui::{px, Styled, TextOverflow};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn inspector_viewport_tracks_webview_area() {
+        assert_eq!(super::webview_viewport(1280., 800., 1., false), (1280, 728));
+        assert_eq!(super::webview_viewport(1280., 800., 1., true), (960, 728));
+        assert_eq!(super::webview_viewport(1280., 800., 2., true), (1920, 1456));
+        assert_eq!(super::webview_viewport(0., 0., 1., true), (64, 64));
+    }
+
+    #[test]
+    fn startup_url_is_not_an_address_bar_edit() {
+        for input in [
+            "file:///a/long/startup-page.html",
+            "https://example.com/a/long/path",
+            "https://example.com/é日本語",
+            "rowser://newtab/0",
+            "file:///missing-startup-page.html",
+            "",
+        ] {
+            let (url, editing) = super::new_tab_location(0, Some(input));
+            assert_eq!(url, super::normalize_url(input));
+            assert!(!editing, "startup URL {input:?} must not start an edit");
+        }
+    }
+
+    #[test]
+    fn blank_tab_starts_an_address_bar_edit() {
+        assert_eq!(
+            super::new_tab_location(7, None),
+            ("rowser://newtab/7".into(), true)
+        );
+    }
 
     fn frame() -> std::sync::Arc<gpui::RenderImage> {
         std::sync::Arc::new(gpui::RenderImage::new([image::Frame::new(
