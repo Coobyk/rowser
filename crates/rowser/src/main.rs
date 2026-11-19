@@ -14,7 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod bookmarks;
 use bookmarks::Bookmarks;
@@ -26,6 +26,21 @@ enum TabEvent {
     Msg(ToBrowser),
     /// The renderer's socket closed — it crashed or exited.
     Disconnected,
+}
+
+impl TabEvent {
+    fn needs_repaint(&self, inspector: bool) -> bool {
+        match self {
+            Self::Msg(
+                ToBrowser::Pong(_)
+                | ToBrowser::LoadDone
+                | ToBrowser::SelText(_)
+                | ToBrowser::Log(_),
+            ) => false,
+            Self::Msg(ToBrowser::DomDump(_)) => inspector,
+            _ => true,
+        }
+    }
 }
 
 struct Tab {
@@ -272,20 +287,27 @@ impl BrowserView {
 
         // Drain renderer messages into the UI. Polling via gpui::Timer keeps
         // this dep-free — no async channel crate needed.
-        cx.spawn(
-            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| loop {
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut last_bookmark_check = Instant::now();
+            loop {
                 Timer::after(Duration::from_millis(4)).await;
                 if this
                     .update(&mut *cx, |view, cx| {
-                        view.drain_inbox();
-                        cx.notify();
+                        let mut changed = view.drain_inbox();
+                        if last_bookmark_check.elapsed() >= Duration::from_secs(1) {
+                            last_bookmark_check = Instant::now();
+                            changed |= view.bookmarks.has_changed();
+                        }
+                        if changed {
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
                     break;
                 }
-            },
-        )
+            }
+        })
         .detach();
 
         view.open_tab();
@@ -514,12 +536,14 @@ impl BrowserView {
         self.url_focus.focus(window);
     }
 
-    fn drain_inbox(&mut self) {
+    fn drain_inbox(&mut self) -> bool {
+        let mut changed = false;
         while let Ok((id, event)) = self.inbox.try_recv() {
             let is_active = self.tabs.get(self.active).is_some_and(|t| t.id == id);
             let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
                 continue;
             };
+            changed |= event.needs_repaint(self.inspector);
             match event {
                 TabEvent::Msg(msg) => match msg {
                     ToBrowser::Pong(_) => {}
@@ -587,6 +611,7 @@ impl BrowserView {
                 }
             }
         }
+        changed
     }
 }
 
@@ -673,8 +698,9 @@ impl Render for BrowserView {
                 .overflow_hidden()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |view, _e, window, _cx| {
+                    cx.listener(move |view, _e, window, cx| {
                         view.activate_tab(i, window);
+                        cx.notify();
                     }),
                 )
                 .child(div().flex_1().overflow_hidden().child(if tab.alive {
@@ -1253,6 +1279,36 @@ mod tests {
     use super::{read_frame, Child, Command, Duration, Tab, ToRenderer, UnixStream};
     use std::thread;
     use std::time::Instant;
+
+    #[test]
+    fn inbox_repaint_policy() {
+        use super::{TabEvent, ToBrowser};
+
+        for event in [
+            TabEvent::Msg(ToBrowser::Pong(0)),
+            TabEvent::Msg(ToBrowser::LoadDone),
+            TabEvent::Msg(ToBrowser::SelText("selected".into())),
+            TabEvent::Msg(ToBrowser::Log("message".into())),
+        ] {
+            assert!(!event.needs_repaint(false));
+            assert!(!event.needs_repaint(true));
+        }
+        let dump = TabEvent::Msg(ToBrowser::DomDump(String::new()));
+        assert!(!dump.needs_repaint(false));
+        assert!(dump.needs_repaint(true));
+        for event in [
+            TabEvent::Msg(ToBrowser::LoadStarted),
+            TabEvent::Msg(ToBrowser::Title(String::new())),
+            TabEvent::Msg(ToBrowser::Frame {
+                width: 0,
+                height: 0,
+                pixels: vec![],
+            }),
+            TabEvent::Disconnected,
+        ] {
+            assert!(event.needs_repaint(false));
+        }
+    }
 
     fn tab(child: Option<Child>) -> Tab {
         let mut tab = Tab::new(0, String::new());
