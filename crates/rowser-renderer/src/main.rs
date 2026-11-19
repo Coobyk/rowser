@@ -3084,10 +3084,11 @@ fn escape_html(text: &str) -> String {
 }
 
 fn error_page(url: &str, why: &str) -> String {
+    let title = "Cannot display page";
     let url = escape_html(url);
     let why = escape_html(why);
     format!(
-        "<html><body><h1>Cannot display page</h1><p><b>{url}</b></p><p>{why}</p><hr><p><small>rowser error page</small></p></body></html>"
+        "<html><head><title>{title}</title></head><body><h1>{title}</h1><p><b>{url}</b></p><p>{why}</p><hr><p><small>rowser error page</small></p></body></html>"
     )
 }
 
@@ -3427,6 +3428,10 @@ mod tests {
 
         assert!(html.contains("<b>https://example.test/?q=rock&amp;lang=en</b>"));
         assert!(html.contains("<p>URL isn&#39;t available: &quot;2 &lt; 3 &gt; 1&quot;</p>"));
+
+        let doc = rowser_html::parse_scripting(&html);
+        let title = doc.find_deep(doc.root, "title").unwrap();
+        assert_eq!(doc.text_content(title), "Cannot display page");
     }
 
     #[test]
