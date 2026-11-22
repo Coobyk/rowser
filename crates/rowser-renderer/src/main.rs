@@ -605,6 +605,10 @@ type ImgTx = std::sync::mpsc::Sender<(String, ImgMsg)>;
 /// A job for the persistent JS interpreter thread: dispatch a DOM event
 /// at `nid` and reply with the post-event document snapshot + log lines.
 enum JsJob {
+    SetControlValue {
+        nid: rowser_dom::NodeId,
+        value: String,
+    },
     Event {
         nid: rowser_dom::NodeId,
         ty: String,
@@ -1512,6 +1516,9 @@ impl Page {
             if s != self.control_value(nid) {
                 if let Some(doc) = &mut self.doc {
                     doc.set_attr(nid, "value", &s);
+                }
+                if let Some(js) = &self.js {
+                    let _ = js.send(JsJob::SetControlValue { nid, value: s });
                 }
                 // the value's text width changed — real layout geometry
                 self.layout_dirty = true;
@@ -2958,6 +2965,9 @@ fn run_page_scripts(
             // context and replies with the mutated snapshot + new logs.
             while let Ok(job) = job_rx.recv() {
                 match job {
+                    JsJob::SetControlValue { nid, value } => {
+                        dc.set_control_value(nid, &value);
+                    }
                     JsJob::Event {
                         nid,
                         ty,
