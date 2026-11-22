@@ -198,6 +198,32 @@ fn fixture(name: &str) -> String {
 }
 
 #[test]
+fn native_input_value_reaches_javascript_and_survives_clicks() {
+    let mut renderer = Renderer::with_js(true);
+    renderer.navigate(fixture("input-value.html"), &mut String::new());
+    renderer.click(10.0, 10.0);
+    for (keys, expected) in [
+        (vec![("end", ""), ("", "XYZ")], "seedXYZ"),
+        (vec![("home", ""), ("delete", "")], "eedXYZ"),
+        (vec![("end", ""), ("backspace", ""), ("backspace", ""), ("backspace", ""), ("backspace", ""), ("backspace", ""), ("backspace", "")], ""),
+    ] {
+        renderer.click(10.0, 10.0);
+        for (key, text) in keys {
+            let input = renderer.child.stdin.as_mut().unwrap();
+            write_frame(input, &ToRenderer::Key {
+                key: key.into(), text: text.into(), shift: false,
+            }.encode()).unwrap();
+            input.flush().unwrap();
+        }
+        for _ in 0..2 {
+            let (nav, logs) = renderer.click(10.0, 90.0);
+            assert_eq!(nav, None);
+            assert!(logs.iter().any(|log| log == &format!("[js console] value={expected}")), "{logs:?}");
+        }
+    }
+}
+
+#[test]
 fn click_in_block_link_padding_navigates() {
     for js in [false, true] {
         let mut renderer = Renderer::with_js(js);

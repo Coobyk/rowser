@@ -1,0 +1,10 @@
+<!doctype html>
+<style>body { margin: 0 } input, a { display: block; height: 60px; }</style>
+<input id="field" value="seed">
+<a id="read" href="http://example.test/read">Read input</a>
+<script>
+document.getElementById('read').addEventListener('click', function(event) {
+    event.preventDefault();
+    console.log('value=' + document.getElementById('field').value);
+});
+</script>

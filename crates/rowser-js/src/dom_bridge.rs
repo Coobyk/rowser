@@ -4501,6 +4501,13 @@ impl DomContext {
         self.drain_microtasks();
     }
 
+    /// Apply a native text-control edit to the live JS document.
+    pub fn set_control_value(&mut self, nid: NodeId, value: &str) {
+        with_ds(&mut self.ctx.interp, |ds| {
+            ds.docs[0].set_attr(nid, "value", value);
+        });
+    }
+
     /// Current document (immutable view).
     pub fn document(&self) -> &Document {
         let st = self
